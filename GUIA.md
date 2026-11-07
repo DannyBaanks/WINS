@@ -26,6 +26,28 @@ Extraction complete. Output is untrusted; inspect before use.
 
 Para Inno se usa la misma forma con la ruta del ejecutable `innoextract` y el último argumento `inno`; esa ruta también se probó con el instalador de WinMerge. El paquete se monta en solo lectura, el directorio de salida se monta para escritura y no hay red. `/usr` está montado en solo lectura para proporcionar bibliotecas y utilidades: no es un sistema operativo Windows vacío.
 
+### MSI y archivos Compound
+
+Los MSI suelen contener tablas Compound y pueden apuntar a archivos CAB externos. Compila esta versión del controlador, sin sobrescribir las anteriores:
+
+```sh
+zig build-exe native/main.zig -O ReleaseSafe -femit-bin=build/wins-msi
+```
+
+Salida real: ninguna. Para extraer los flujos de un MSI, usa `msi`:
+
+```sh
+build/wins-msi extract '/home/danny/Descargas/WINS-3dsMax-2026/3dsMax-2026.msi' /tmp/wins-3dsmax-msi-guide-20261107 '/home/danny/.cache/electron-builder/7zip@1.0.0/7zip-linux-x64-16wjr/bin/7zz' msi
+```
+
+Salida real:
+
+```text
+Compound streams extracted; application payloads may be external. Output is untrusted.
+```
+
+Elige una carpeta de salida nueva. WINS selecciona el contenedor Compound completo en lugar de descender automáticamente a un ejecutable interno; también detecta la cabecera Compound cuando el tipo elegido es `7z`. Extraer las tablas MSI **no instala la aplicación** ni extrae automáticamente CAB externos.
+
 ## Inspeccionar
 
 ```sh

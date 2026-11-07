@@ -80,11 +80,17 @@ fn imports(gpa: std.mem.Allocator, io: Io, path: []const u8, json: bool) !void {
     try say(io, "Delay imports: NOT_ANALYZED\n");
 }
 fn extract(gpa: std.mem.Allocator, io: Io, input: []const u8, output: []const u8, tool: []const u8, kind: []const u8) !void {
-    if (!std.mem.eql(u8, kind, "7z") and !std.mem.eql(u8, kind, "inno")) return error.InvalidExtractor;
+    if (!std.mem.eql(u8, kind, "7z") and !std.mem.eql(u8, kind, "inno") and !std.mem.eql(u8, kind, "msi")) return error.InvalidExtractor;
     const in_abs = try Dir.cwd().realPathFileAlloc(io, input, gpa);
     defer gpa.free(in_abs);
     const tool_abs = try Dir.cwd().realPathFileAlloc(io, tool, gpa);
     defer gpa.free(tool_abs);
+    const input_file = try Dir.cwd().openFile(io, in_abs, .{});
+    defer input_file.close(io);
+    var header: [8]u8 = undefined;
+    const header_len = try input_file.readPositionalAll(io, &header, 0);
+    const compound = header_len == header.len and std.mem.eql(u8, &header, "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1");
+    if (std.mem.eql(u8, kind, "msi") and !compound) return error.NotCompound;
     // A new directory avoids silently overwriting any previous evidence.
     try Dir.cwd().createDir(io, output, .default_dir);
     const out_abs = try Dir.cwd().realPathFileAlloc(io, output, gpa);
@@ -93,7 +99,14 @@ fn extract(gpa: std.mem.Allocator, io: Io, input: []const u8, output: []const u8
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(gpa);
     try args.appendSlice(gpa, &common);
-    if (std.mem.eql(u8, kind, "7z")) try args.appendSlice(gpa, &.{ "x", "-y", "/input", "-o/output" }) else try args.appendSlice(gpa, &.{ "--extract", "--output-dir", "/output", "/input" });
+    if (std.mem.eql(u8, kind, "inno")) {
+        try args.appendSlice(gpa, &.{ "--extract", "--output-dir", "/output", "/input" });
+    } else if (compound) {
+        // 7-Zip's auto-detection can descend into an MSI's embedded PE.
+        try args.appendSlice(gpa, &.{ "x", "-tCompound", "-y", "/input", "-o/output" });
+    } else {
+        try args.appendSlice(gpa, &.{ "x", "-y", "/input", "-o/output" });
+    }
     const result = try std.process.run(gpa, io, .{ .argv = args.items, .stdout_limit = .limited(1024 * 1024), .stderr_limit = .limited(1024 * 1024), .timeout = .{ .duration = .{ .raw = .fromSeconds(120), .clock = .awake } } });
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
@@ -101,7 +114,11 @@ fn extract(gpa: std.mem.Allocator, io: Io, input: []const u8, output: []const u8
         try Io.File.stderr().writeStreamingAll(io, result.stderr);
         return error.ExtractionFailed;
     }
-    try say(io, "Extraction complete. Output is untrusted; inspect before use.\n");
+    if (compound and !std.mem.eql(u8, kind, "inno")) {
+        try say(io, "Compound streams extracted; application payloads may be external. Output is untrusted.\n");
+    } else {
+        try say(io, "Extraction complete. Output is untrusted; inspect before use.\n");
+    }
 }
 fn compileC(gpa: std.mem.Allocator, io: Io, source: []const u8, output: []const u8, zig_dir: []const u8) !void {
     const src = try Dir.cwd().realPathFileAlloc(io, source, gpa);
@@ -181,5 +198,5 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("comparison: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
-    } else fail(io, "Usage: wins-native inspect FILE | imports FILE [--json] | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS\n");
+    } else fail(io, "Usage: wins-native inspect FILE | imports FILE [--json] | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno|msi> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS\n");
 }
