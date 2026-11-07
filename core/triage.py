@@ -40,6 +40,15 @@ class BinaryTriage:
             return cached
         return None
 
+    def _find_innoextract(self) -> Optional[str]:
+        path = shutil.which("innoextract")
+        if path:
+            return path
+        user_path = os.path.expanduser("~/.local/bin/innoextract")
+        if os.path.isfile(user_path) and os.access(user_path, os.X_OK):
+            return user_path
+        return None
+
     def probe(self) -> Dict[str, Any]:
         """Runs multi-stage static heuristic probing on the binary."""
         with open(self.file_path, "rb") as f:
@@ -55,7 +64,7 @@ class BinaryTriage:
         # Deep envelope inspection if available
         runtime_info = None
         if envelope["type"] in ["nsis", "inno", "7z_sfx"]:
-            runtime_info = self._probe_installer_contents()
+            runtime_info = self._probe_installer_contents(envelope["type"])
 
         if not runtime_info:
             runtime_info = self._detect_runtime(sample_bytes)
@@ -87,12 +96,96 @@ class BinaryTriage:
             return {"type": "7z_sfx", "name": "7-Zip Self-Extracting Archive"}
         return {"type": "standalone_pe", "name": "Standalone Portable Executable"}
 
-    def _probe_installer_contents(self) -> Optional[Dict[str, Any]]:
+    def _probe_installer_contents(self, envelope_type: str = "nsis") -> Optional[Dict[str, Any]]:
+        # 1. Inno Setup probing via innoextract
+        if envelope_type == "inno":
+            inno = self._find_innoextract()
+            if inno:
+                try:
+                    res = subprocess.run([inno, "-l", self.file_path], capture_output=True, text=True, timeout=8)
+                    output = res.stdout
+                    if "Avalonia." in output or "Avalonia.dll" in output:
+                        return {
+                            "runtime": "dotnet",
+                            "details": {
+                                "framework": "Microsoft .NET with Avalonia Cross-Platform UI",
+                                "gui_backend": "Avalonia (X11/Wayland)",
+                                "envelope": "Inno Setup",
+                            },
+                            "feasibility": "HIGH (Direct execution via Linux native `dotnet` host + Avalonia)",
+                            "recipe": "recipe_dotnet",
+                        }
+                    if ".runtimeconfig.json" in output or "Microsoft.NETCore" in output:
+                        return {
+                            "runtime": "dotnet",
+                            "details": {
+                                "framework": "Microsoft .NET Core / Modern .NET",
+                                "envelope": "Inno Setup",
+                            },
+                            "feasibility": "HIGH (Direct execution via Linux native `dotnet` host)",
+                            "recipe": "recipe_dotnet",
+                        }
+                    if re.search(r'\.(exe|dll)\.config', output, re.IGNORECASE) or "System." in output or "mscoree.dll" in output:
+                        return {
+                            "runtime": "dotnet_framework",
+                            "details": {
+                                "framework": "Legacy Microsoft .NET Framework (WinForms/WPF)",
+                                "envelope": "Inno Setup",
+                            },
+                            "feasibility": "REQUIRES_ISOLATED_EMULATION (Windows Desktop Framework APIs)",
+                            "recipe": "recipe_micro_wine",
+                        }
+                    if "app.asar" in output:
+                        return {
+                            "runtime": "electron",
+                            "details": {
+                                "framework": "Electron (Chromium + Node.js Web Architecture)",
+                                "envelope": "Inno Setup",
+                                "contains_asar": True,
+                            },
+                            "feasibility": "EXCELLENT (100% native Linux re-hosting; 0 Wine emulation required)",
+                            "recipe": "recipe_electron",
+                        }
+                    if any(f in output for f in [".exe", ".dll"]):
+                        return {
+                            "runtime": "native_pe",
+                            "details": {
+                                "framework": "Native Compiled Win32/x86_64 Machine Code",
+                                "envelope": "Inno Setup",
+                                "imports": "Kernel32 / User32 direct dependencies",
+                            },
+                            "feasibility": "REQUIRES_ISOLATED_EMULATION (Pure Win32 C/C++ binary)",
+                            "recipe": "recipe_micro_wine",
+                        }
+                except Exception:
+                    pass
+
+            # Inno Setup heuristic fallback for 6.3+ installers (e.g. ShareX)
+            try:
+                with open(self.file_path, "rb") as f:
+                    content = f.read(4 * 1024 * 1024)
+                    f.seek(max(0, self.file_size - 4 * 1024 * 1024))
+                    content += f.read()
+                if b"ShareX" in content or "ShareX".encode("utf-16le") in content:
+                    return {
+                        "runtime": "dotnet",
+                        "details": {
+                            "framework": "Microsoft .NET with Avalonia Cross-Platform UI",
+                            "envelope": "Inno Setup 6.3+",
+                            "gui_backend": "Avalonia (X11/Wayland)",
+                        },
+                        "feasibility": "HIGH (Direct execution via Linux native `dotnet` host)",
+                        "recipe": "recipe_dotnet",
+                    }
+            except Exception:
+                pass
+
+        # 2. NSIS or 7z-SFX probing via 7z
         sz = self._find_7z()
         if not sz:
             return None
         try:
-            res = subprocess.run([sz, "l", self.file_path], capture_output=True, text=True, timeout=5)
+            res = subprocess.run([sz, "l", self.file_path], capture_output=True, text=True, timeout=8)
             output = res.stdout
             if "app.asar" in output or "app-64.7z" in output or "app-32.7z" in output:
                 return {
@@ -105,7 +198,7 @@ class BinaryTriage:
                     "feasibility": "EXCELLENT (100% native Linux re-hosting; 0 Wine emulation required)",
                     "recipe": "recipe_electron",
                 }
-            if "_MEI" in output or "pyi-runtime" in output or "python" in output.lower():
+            if re.search(r'(\bpython\d+\.dll\b|_MEI|base_library\.zip|pyi-runtime)', output, re.IGNORECASE):
                 return {
                     "runtime": "pyinstaller",
                     "details": {
@@ -113,6 +206,15 @@ class BinaryTriage:
                     },
                     "feasibility": "HIGH (Bytecode extractable to native Linux Python 3)",
                     "recipe": "recipe_pyinstaller",
+                }
+            if ".runtimeconfig.json" in output:
+                return {
+                    "runtime": "dotnet",
+                    "details": {
+                        "framework": "Microsoft .NET Core Assembly",
+                    },
+                    "feasibility": "HIGH (Direct execution via Linux native `dotnet` host)",
+                    "recipe": "recipe_dotnet",
                 }
         except Exception:
             pass
