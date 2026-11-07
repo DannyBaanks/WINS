@@ -100,6 +100,31 @@ build/wins-pe imports '/tmp/wins-guide-npp-1107/notepad++.exe' --json > /tmp/win
 
 Salida real: ninguna; el JSON contiene SHA-256, arquitectura, DLL, nombres, ordinales e indicios (`hint`). El parser cubre la tabla normal de imports de PE32 y PE32+; los imports diferidos (`delay imports`), exports, desensamblado y firmas de funciones aún no se analizan. Los imports son un inventario de dependencias, no código fuente ni implementaciones portadas.
 
+## Localizar un miembro de un CAB
+
+Compila una versión nueva del controlador:
+
+```sh
+zig build-exe native/main.zig -O ReleaseSafe -femit-bin=/tmp/wins-cab-20261107
+```
+
+Salida real: ninguna. A partir del identificador obtenido en la tabla `File` del MSI, inspecciona el índice del CAB:
+
+```sh
+/tmp/wins-cab-20261107 cab-find /tmp/wins-3dsmax-maxcab-prefix-20261107.cab fil965675F3D3F24E86CBB33BA5F0DD4753
+```
+
+Salida real:
+
+```text
+Member: fil965675F3D3F24E86CBB33BA5F0DD4753
+Uncompressed bytes: 11970840
+CAB folder: 2229, data offset: 841987311, compression: MSZIP
+Input length: 43686638; CAB declared: 1202855828; integrity: NOT_VERIFIED
+```
+
+Añade `--json` para obtener estos datos estructurados. El comando lee como máximo los primeros 16 MiB y busca un miembro exacto; no descomprime, no verifica la integridad y no admite CAB divididos entre volúmenes. `data offset` ubica el bloque comprimido de la carpeta dentro del CAB, no el archivo sin comprimir. En el ejemplo, el CAB de entrada es solo un prefijo; el resultado **no** demuestra que el ejecutable esté presente.
+
 ## Compilar y contrastar un candidato
 
 La interfaz experimental admite funciones C puras de tipo `uint64_t(uint64_t)`: el candidato exporta `wins_candidate` y el oráculo independiente exporta `wins_oracle`. Los ejemplos están en `native/examples/`.

@@ -79,6 +79,27 @@ fn imports(gpa: std.mem.Allocator, io: Io, path: []const u8, json: bool) !void {
     }
     try say(io, "Delay imports: NOT_ANALYZED\n");
 }
+fn cabFind(gpa: std.mem.Allocator, io: Io, path: []const u8, member: []const u8, json: bool) !void {
+    const file = try Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const limit: usize = @intCast(@min(stat.size, 16 * 1024 * 1024));
+    const data = try gpa.alloc(u8, limit);
+    defer gpa.free(data);
+    const n = try file.readPositionalAll(io, data, 0);
+    const result = try @import("cab.zig").find(data[0..n], member);
+    if (json) {
+        const doc = .{ .input_length = stat.size, .metadata_bytes_read = n, .cabinet = result };
+        const output = try std.json.Stringify.valueAlloc(gpa, doc, .{ .whitespace = .indent_2 });
+        defer gpa.free(output);
+        try say(io, output);
+        try say(io, "\n");
+    } else {
+        const output = try std.fmt.allocPrint(gpa, "Member: {s}\nUncompressed bytes: {d}\nCAB folder: {d}, data offset: {d}, compression: {s}\nInput length: {d}; CAB declared: {d}; integrity: {s}\n", .{ result.member, result.uncompressed_size, result.folder_index, result.folder_data_offset, result.compression, stat.size, result.cabinet_declared_bytes, result.integrity });
+        defer gpa.free(output);
+        try say(io, output);
+    }
+}
 fn extract(gpa: std.mem.Allocator, io: Io, input: []const u8, output: []const u8, tool: []const u8, kind: []const u8) !void {
     if (!std.mem.eql(u8, kind, "7z") and !std.mem.eql(u8, kind, "inno") and !std.mem.eql(u8, kind, "msi")) return error.InvalidExtractor;
     const in_abs = try Dir.cwd().realPathFileAlloc(io, input, gpa);
@@ -183,6 +204,11 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("imports: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
+    } else if ((args.len == 4 or (args.len == 5 and std.mem.eql(u8, args[4], "--json"))) and std.mem.eql(u8, args[1], "cab-find")) {
+        cabFind(a, io, args[2], args[3], args.len == 5) catch |e| {
+            std.log.err("cab-find: {s}", .{@errorName(e)});
+            std.process.exit(1);
+        };
     } else if (args.len == 6 and std.mem.eql(u8, args[1], "extract")) {
         extract(a, io, args[2], args[3], args[4], args[5]) catch |e| {
             std.log.err("extraction: {s}", .{@errorName(e)});
@@ -198,5 +224,5 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("comparison: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
-    } else fail(io, "Usage: wins-native inspect FILE | imports FILE [--json] | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno|msi> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS\n");
+    } else fail(io, "Usage: wins-native inspect FILE | cab-find FILE MEMBER [--json] | imports FILE [--json] | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno|msi> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS\n");
 }
