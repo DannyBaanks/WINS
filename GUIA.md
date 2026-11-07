@@ -125,6 +125,16 @@ Input length: 43686638; CAB declared: 1202855828; integrity: NOT_VERIFIED
 
 Añade `--json` para obtener estos datos estructurados. El comando lee como máximo los primeros 16 MiB y busca un miembro exacto; no descomprime, no verifica la integridad y no admite CAB divididos entre volúmenes. `data offset` ubica el bloque comprimido de la carpeta dentro del CAB, no el archivo sin comprimir. En el ejemplo, el CAB de entrada es solo un prefijo; el resultado **no** demuestra que el ejecutable esté presente.
 
+### Con el CAB completo
+
+Si el CAB está completo, 7-Zip lo extrae del bloque `.7z` y el miembro se saca con su identificador de la tabla `File` (directorio de salida nuevo):
+
+```sh
+7zz x -omax-exe-20261107 max-cab-20261107/x64/max/max.cab fil965675F3D3F24E86CBB33BA5F0DD4753
+```
+
+Salida real, abreviada: `Archives with Warnings: 1` (`There are data after the end of archive`: 10.584 bytes tras el final declarado) y `Size: 11970840`. El SHA-256 resultante, `a4cdd99b23d2933674e41fe99fb9e988d6052845c2684bfc14f69d95a4b8aa7b`, coincide con el tamaño de la tabla MSI pero **no** con un hash del MSI (`MsiFileHash` no lo incluye). `imports` sobre ese PE: 98 bibliotecas, 5698 imports. No es un port ni prueba que el programa funcione.
+
 ## Compilar y contrastar un candidato
 
 La interfaz experimental admite funciones C puras de tipo `uint64_t(uint64_t)`: el candidato exporta `wins_candidate` y el oráculo independiente exporta `wins_oracle`. Los ejemplos están en `native/examples/`.
