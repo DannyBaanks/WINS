@@ -1,0 +1,34 @@
+# WINS (WINS Is Not a Sandbox) .gitignore
+# STRICT POLICY: Never track proprietary binaries, assets, or runtimes
+
+# Binaries & packages
+*.exe
+*.dll
+*.so
+*.dylib
+*.node
+*.pyd
+*.asar
+*.AppImage
+*.zip
+*.tar.*
+*.deb
+*.rpm
+
+# Staging & scratchpads
+scratch/
+tmp/
+dist/
+build/
+wineprefix/
+cleanroom/
+.cache/
+
+# Python & runtime caches
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+
+# Logs
+*.log

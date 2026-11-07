@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""
+WINS (WINS Is Not a Sandbox) - Unified CLI
+De-layer and re-host Windows runtime-wrapped applications natively on Linux.
+"""
+
+import sys
+import os
+import argparse
+import json
+
+# Ensure core is on path
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+
+from core.triage import BinaryTriage
+from core.recipes.electron import ElectronRecipe
+from core.recipes.pyinstaller import PyInstallerRecipe
+from core.recipes.dotnet import DotNetRecipe
+
+RECIPES = [
+    ElectronRecipe(),
+    PyInstallerRecipe(),
+    DotNetRecipe(),
+]
+
+BANNER = r"""
+ __      __ _____  _   _   _____ 
+ \ \    / /|_   _|| \ | | / ____|
+  \ \  / /   | |  |  \| || (___  
+   \ \/ /    | |  | . ` | \___ \ 
+    \  /    _| |_ | |\  | ____) |
+     \/    |_____||_| \_||_____/ 
+   WINS Is Not a Sandbox (v0.1.0)
+   Post-Wine Desktop Software Re-hosting Framework
+"""
+
+def cmd_probe(args):
+    triage = BinaryTriage(args.target).probe()
+    if args.json:
+        print(json.dumps(triage, indent=2))
+        return
+
+    print(f"\n[TARGET] {triage['target']['name']} ({triage['target']['size_human']})")
+    print(f"  SHA-256:  {triage['target']['sha256']}")
+    print(f"\n[ENVELOPE] {triage['envelope']['name']}")
+    print(f"\n[DETECTED RUNTIME] {triage['runtime'].upper()}")
+    for k, v in triage['runtime_details'].items():
+        print(f"  {k}: {v}")
+    print(f"\n[PORTING FEASIBILITY] {triage['feasibility']}")
+    print(f"[RECOMMENDED RECIPE]  {triage['recommended_recipe']}\n")
+
+def cmd_transmute(args):
+    triage = BinaryTriage(args.target).probe()
+    recipe_name = triage.get("recommended_recipe")
+
+    matched_recipe = None
+    for r in RECIPES:
+        if r.can_handle(triage):
+            matched_recipe = r
+            break
+
+    if not matched_recipe:
+        print(f"[ERROR] No transmutation recipe found for runtime: {triage.get('runtime')}", file=sys.stderr)
+        sys.exit(1)
+
+    dest_dir = os.path.expanduser(args.dest) if args.dest else os.path.expanduser(f"~/.local/share/{triage['target']['name'].split('-')[0].lower()}-desktop")
+    options = {
+        "bin_dir": args.bin_dir,
+        "electron_version": args.electron_version,
+    }
+
+    print(f"[WINS] Selected Recipe: {matched_recipe.name} ({matched_recipe.description})")
+    success = matched_recipe.transmute(triage, dest_dir, options)
+    if not success:
+        print("[WINS] Transmutation failed.", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_list(args):
+    print("\nAvailable WINS Transmutation Recipes:")
+    for r in RECIPES:
+        print(f"  - {r.name.ljust(15)} : {r.description}")
+    print("")
+
+def main():
+    parser = argparse.ArgumentParser(description="WINS - Re-host Windows apps natively on Linux.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # probe
+    p_probe = subparsers.add_parser("probe", help="Inspect and classify binary taxonomy")
+    p_probe.add_argument("target", help="Path to Windows .exe")
+    p_probe.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_probe.set_defaults(func=cmd_probe)
+
+    # transmute
+    p_trans = subparsers.add_parser("transmute", help="Execute de-layering and native re-hosting")
+    p_trans.add_argument("target", help="Path to Windows .exe")
+    p_trans.add_argument("--dest", help="Destination directory (default: ~/.local/share/<app>-desktop)")
+    p_trans.add_argument("--bin-dir", default="~/.local/bin", help="Launcher bin directory")
+    p_trans.add_argument("--electron-version", default="35.1.4", help="Target Electron runtime version")
+    p_trans.set_defaults(func=cmd_transmute)
+
+    # list
+    p_list = subparsers.add_parser("list", help="List available transmutation recipes")
+    p_list.set_defaults(func=cmd_list)
+
+    if len(sys.argv) == 1:
+        print(BANNER)
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
