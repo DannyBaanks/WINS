@@ -197,6 +197,13 @@ fn compare(gpa: std.mem.Allocator, io: Io, candidate_path: []const u8, oracle_pa
     try Io.File.stderr().writeStreamingAll(io, result.stderr);
     if (result.term != .exited or result.term.exited != 0) return error.FuzzFailed;
 }
+fn closureCmd(gpa: std.mem.Allocator, io: Io, cab: []const u8, tsv: []const u8, key: []const u8, extractor: []const u8, out: []const u8) !void {
+    const report = try @import("closure.zig").run(gpa, io, cab, tsv, key, extractor, out);
+    const output = try std.json.Stringify.valueAlloc(gpa, report, .{ .whitespace = .indent_1 });
+    defer gpa.free(output);
+    try say(io, output);
+    try say(io, "\n");
+}
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const a = init.arena.allocator();
@@ -226,10 +233,15 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("compilation: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
+    } else if (args.len == 7 and std.mem.eql(u8, args[1], "closure")) {
+        closureCmd(a, io, args[2], args[3], args[4], args[5], args[6]) catch |e| {
+            std.log.err("closure: {s}", .{@errorName(e)});
+            std.process.exit(1);
+        };
     } else if (args.len == 6 and std.mem.eql(u8, args[1], "compare")) {
         compare(a, io, args[2], args[3], args[4], args[5]) catch |e| {
             std.log.err("comparison: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
-    } else fail(io, "Usage: wins-native inspect FILE | cab-find FILE MEMBER [--json] | imports FILE [--json] | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno|msi> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS\n");
+    } else fail(io, "Usage: wins-native inspect FILE | cab-find FILE MEMBER [--json] | imports FILE [--json] | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno|msi> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS | closure CAB FILE_TSV ROOT_KEY EXTRACTOR NEW_OUT_DIR\n");
 }

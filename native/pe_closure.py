@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Dependency closure of an MSI-installed PE inside its external CAB.
+"""REFERENCE implementation (Python) of native/closure.zig, kept to cross-check the Zig port.
+Heavy work belongs in Zig (`wins-native closure`); this script is slower and is not the tool to use.
+
+Dependency closure of an MSI-installed PE inside its external CAB.
 
 Static only: parses PE headers (imports, delay imports, CLR header) and extracts
 members with an external extractor into a NEW directory. Nothing is executed.

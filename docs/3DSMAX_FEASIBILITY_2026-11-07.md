@@ -39,3 +39,6 @@ Los 4 candidatos existen como funciones de un protocolo de prueba (`wins_mb2wc`�
 
 ## NOT_DEMONSTRATED
 Cargador PE; emulación del motor MSI y de sus `CustomAction`; ejecución de cualquier binario; licencia; rendimiento/GPU; granularidad de reemplazos UTF-8 de Windows real (ver `native/shims/GUIA.md`).
+
+## Actualización: `wintrust` y `winhttp` (2026-11-07)
+La clausura mostró que lo que 3ds Max y su pila Qt piden a estas dos bibliotecas es pequeño: `wintrust` (`WinVerifyTrust` + 3 ayudantes `WTHelper*`, 9 PE) y `winhttp` (solo detección de proxy desde `qt6network`/`qt6webenginecore`, 7 funciones). Se construyeron réplicas Linux parciales, `winluxtrust` (mitad del digest Authenticode, nunca informa confianza) y `winluxhttp` (selección de proxy), ambas verificadas con fuzzers en Zig y controles negativos; ver `native/shims/GUIA.md`. **No cambian el veredicto:** sin cargador de PE ninguna es invocable por `3dsmax.exe`, y faltan los ayudantes `WTHelper*` (estructuras `CRYPT_PROVIDER_DATA`), la validación de cadena, PAC/WPAD, y el resto de los 3 129 pares externos.
