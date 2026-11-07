@@ -77,7 +77,14 @@ fn imports(gpa: std.mem.Allocator, io: Io, path: []const u8, json: bool) !void {
             try say(io, symbol);
         }
     }
-    try say(io, "Delay imports: NOT_ANALYZED\n");
+    const tail = try std.fmt.allocPrint(gpa, "Delay imports: {d} libraries, {d} imports\nManaged (CLR) header: {s}\n", .{ report.delay_libraries.len, report.delay_imports_count, if (report.managed_clr) "yes" else "no" });
+    defer gpa.free(tail);
+    try say(io, tail);
+    for (report.delay_libraries) |lib| {
+        const line = try std.fmt.allocPrint(gpa, "  delay {s} ({d})\n", .{ lib.name, lib.symbols.len });
+        defer gpa.free(line);
+        try say(io, line);
+    }
 }
 fn cabFind(gpa: std.mem.Allocator, io: Io, path: []const u8, member: []const u8, json: bool) !void {
     const file = try Dir.cwd().openFile(io, path, .{});

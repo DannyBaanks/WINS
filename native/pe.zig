@@ -9,7 +9,11 @@ pub const Report = struct {
     sections: u16,
     libraries: []const Library,
     imports_count: usize,
-    delay_imports: []const u8 = "NOT_ANALYZED",
+    /// Delay-load import descriptors (data directory 13). RVA-based form only.
+    delay_libraries: []const Library = &.{},
+    delay_imports_count: usize = 0,
+    /// True when the CLR runtime header (data directory 14) is present: managed code.
+    managed_clr: bool = false,
 };
 
 fn read(comptime T: type, b: []const u8, p: usize) !T {
@@ -53,6 +57,37 @@ const Image = struct {
         return s[0..end];
     }
 };
+
+fn readThunks(a: std.mem.Allocator, image: Image, is64: bool, table_rva: u32, total: *usize) ![]const Import {
+    const thunks = try image.span(table_rva);
+    const width: usize = if (is64) 8 else 4;
+    var symbols: std.ArrayList(Import) = .empty;
+    var off: usize = 0;
+    var terminated = false;
+    while (off <= thunks.len and width <= thunks.len - off) : (off += width) {
+        const value: u64 = if (is64) try read(u64, thunks, off) else try read(u32, thunks, off);
+        if (value == 0) {
+            terminated = true;
+            break;
+        }
+        if (total.* >= 100_000) return error.TooManyImports;
+        const mask: u64 = if (is64) @as(u64, 1) << 63 else @as(u64, 1) << 31;
+        if (value & mask != 0) {
+            if (value & ~(mask | 0xffff) != 0) return error.InvalidOrdinal;
+            try symbols.append(a, .{ .ordinal = @intCast(value & 0xffff) });
+        } else {
+            if (value > std.math.maxInt(u32) - 2) return error.InvalidRva;
+            const rva: u32 = @intCast(value);
+            const hn = try image.span(rva);
+            const hint = try read(u16, hn, 0);
+            const name = try image.string(rva + 2);
+            try symbols.append(a, .{ .name = name, .hint = hint });
+        }
+        total.* += 1;
+    }
+    if (!terminated) return error.UnterminatedThunks;
+    return symbols.toOwnedSlice(a);
+}
 
 pub fn parse(a: std.mem.Allocator, b: []const u8) !Report {
     if (b.len < 64 or !std.mem.eql(u8, b[0..2], "MZ")) return error.NotPe;
@@ -102,37 +137,44 @@ pub fn parse(a: std.mem.Allocator, b: []const u8) !Report {
                 }
                 if (dll_rva == 0 or (ilt == 0 and iat == 0)) return error.InvalidImportDirectory;
                 const dll = try image.string(dll_rva);
-                const thunks = try image.span(if (ilt != 0) ilt else iat);
-                const width: usize = if (is64) 8 else 4;
-                var symbols: std.ArrayList(Import) = .empty;
-                var off: usize = 0;
-                var thunk_terminated = false;
-                while (off <= thunks.len and width <= thunks.len - off) : (off += width) {
-                    const value: u64 = if (is64) try read(u64, thunks, off) else try read(u32, thunks, off);
-                    if (value == 0) {
-                        thunk_terminated = true;
-                        break;
-                    }
-                    if (total >= 100_000) return error.TooManyImports;
-                    const mask: u64 = if (is64) @as(u64, 1) << 63 else @as(u64, 1) << 31;
-                    if (value & mask != 0) {
-                        if (value & ~(mask | 0xffff) != 0) return error.InvalidOrdinal;
-                        try symbols.append(a, .{ .ordinal = @intCast(value & 0xffff) });
-                    } else {
-                        if (value > std.math.maxInt(u32) - 2) return error.InvalidRva;
-                        const rva: u32 = @intCast(value);
-                        const hn = try image.span(rva);
-                        const hint = try read(u16, hn, 0);
-                        const name = try image.string(rva + 2);
-                        try symbols.append(a, .{ .name = name, .hint = hint });
-                    }
-                    total += 1;
-                }
-                if (!thunk_terminated) return error.UnterminatedThunks;
-                try libs.append(a, .{ .name = dll, .symbols = try symbols.toOwnedSlice(a) });
+                const symbols = try readThunks(a, image, is64, if (ilt != 0) ilt else iat, &total);
+                try libs.append(a, .{ .name = dll, .symbols = symbols });
             }
             if (!terminated) return error.UnterminatedImportDirectory;
         }
     }
-    return .{ .format = if (is64) "PE32+" else "PE32", .machine = machine, .sections = count, .libraries = try libs.toOwnedSlice(a), .imports_count = total };
+    var delay_libs: std.ArrayList(Library) = .empty;
+    var delay_total: usize = 0;
+    if (num_dirs > 13) {
+        if (opt_size < directory_start + 14 * 8) return error.Truncated;
+        const delay_rva = try read(u32, b, opt + directory_start + 13 * 8);
+        if (delay_rva != 0) {
+            const directory = try image.span(delay_rva);
+            var pos: usize = 0;
+            var terminated = false;
+            while (pos + 32 <= directory.len) : (pos += 32) {
+                if (delay_libs.items.len >= 4096) return error.TooManyImports;
+                const attrs = try read(u32, directory, pos);
+                const dll_rva = try read(u32, directory, pos + 4);
+                const int_rva = try read(u32, directory, pos + 16);
+                if (attrs == 0 and dll_rva == 0 and int_rva == 0 and try read(u32, directory, pos + 8) == 0) {
+                    terminated = true;
+                    break;
+                }
+                // Old (pre-VC7) descriptors store virtual addresses: refuse rather than guess.
+                if (attrs & 1 == 0) return error.UnsupportedDelayFormat;
+                if (dll_rva == 0 or int_rva == 0) return error.InvalidImportDirectory;
+                const dll = try image.string(dll_rva);
+                const symbols = try readThunks(a, image, is64, int_rva, &delay_total);
+                try delay_libs.append(a, .{ .name = dll, .symbols = symbols });
+            }
+            if (!terminated) return error.UnterminatedImportDirectory;
+        }
+    }
+    var clr = false;
+    if (num_dirs > 14) {
+        if (opt_size < directory_start + 15 * 8) return error.Truncated;
+        clr = try read(u32, b, opt + directory_start + 14 * 8) != 0;
+    }
+    return .{ .format = if (is64) "PE32+" else "PE32", .machine = machine, .sections = count, .libraries = try libs.toOwnedSlice(a), .imports_count = total, .delay_libraries = try delay_libs.toOwnedSlice(a), .delay_imports_count = delay_total, .managed_clr = clr };
 }

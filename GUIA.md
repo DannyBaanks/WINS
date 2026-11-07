@@ -89,7 +89,8 @@ PE32+ machine=0x8664: 21 libraries, 629 imports
     ...
     ordinal #17
     ...
-Delay imports: NOT_ANALYZED
+Delay imports: 0 libraries, 0 imports
+Managed (CLR) header: no
 ```
 
 Para alimentar otra herramienta, guarda el reporte estructurado. Elige un nombre nuevo: la redirección `>` sobrescribe un archivo existente:
@@ -98,7 +99,7 @@ Para alimentar otra herramienta, guarda el reporte estructurado. Elige un nombre
 build/wins-pe imports '/tmp/wins-guide-npp-1107/notepad++.exe' --json > /tmp/wins-guide-imports-1107.json
 ```
 
-Salida real: ninguna; el JSON contiene SHA-256, arquitectura, DLL, nombres, ordinales e indicios (`hint`). El parser cubre la tabla normal de imports de PE32 y PE32+; los imports diferidos (`delay imports`), exports, desensamblado y firmas de funciones aún no se analizan. Los imports son un inventario de dependencias, no código fuente ni implementaciones portadas.
+Salida real: ninguna; el JSON contiene SHA-256, arquitectura, DLL, nombres, ordinales e indicios (`hint`). El parser cubre la tabla normal de imports y los imports diferidos (`delay imports`, solo el formato con RVA; el antiguo basado en direcciones virtuales se rechaza) de PE32 y PE32+, y señala si hay cabecera CLR (código gestionado). En el JSON constan como `delay_libraries`, `delay_imports_count` y `managed_clr`. Exports, desensamblado y firmas de funciones aún no se analizan. Verificado: sobre los 198 PE de la clausura de 3ds Max coincide con un analizador independiente (925 imports diferidos; solo `3dsmax_interop.dll` es CLR). Los imports son un inventario de dependencias, no código fuente ni implementaciones portadas.
 
 ## Localizar un miembro de un CAB
 

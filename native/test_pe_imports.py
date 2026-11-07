@@ -37,7 +37,8 @@ def fixture(is64=True, fallback=False):
     b[0x292:0x29e] = b'CreateFileA\0'
     return b
 
-class ImportTests(unittest.TestCase):
+class PeBinaryCase(unittest.TestCase):
+    __test__ = False
     @classmethod
     def setUpClass(cls):
         cls.tmp = pathlib.Path(tempfile.mkdtemp(prefix='wins-pe-test-'))
@@ -49,6 +50,10 @@ class ImportTests(unittest.TestCase):
         path = self.tmp / 'fixture.exe'
         path.write_bytes(data)
         return subprocess.run([str(self.exe), 'imports', str(path), '--json'], text=True, capture_output=True)
+
+
+class ImportTests(PeBinaryCase):
+    __test__ = True
 
     def test_32_64_named_ordinal_and_iat_fallback(self):
         for is64 in (False, True):
@@ -114,7 +119,7 @@ class ImportTests(unittest.TestCase):
             with self.subTest(target=str(target)):
                 out = subprocess.run([str(self.exe), 'imports', str(target), '--json'], capture_output=True, text=True, check=True)
                 report = json.loads(out.stdout)['pe']
-                oracle = subprocess.run(['objdump', '-p', str(target)], capture_output=True, text=True, check=True).stdout
+                oracle = subprocess.run(['objdump', '-p', str(target)], capture_output=True, text=True, check=True, env={'LC_ALL': 'C', 'PATH': os.environ['PATH']}).stdout
                 table = oracle.split('The Import Tables', 1)[1].split('The Function Table', 1)[0]
                 expected = {}
                 current = None
@@ -131,6 +136,79 @@ class ImportTests(unittest.TestCase):
                 actual = {lib['name']: [('name', s['name']) if s['name'] is not None else ('ordinal', s['ordinal']) for s in lib['symbols']] for lib in report['libraries']}
                 self.assertEqual(actual, expected)
                 self.assertEqual(report['imports_count'], sum(map(len, expected.values())))
+
+def delay_fixture(is64=True, va_based=False, terminate=True, clr=False):
+    """Fixture with a normal import table plus one delay-load descriptor (USER32!MessageBoxW + ordinal 9)."""
+    b = fixture(is64)
+    opt, dirs = 0x98, (112 if is64 else 96)
+    struct.pack_into('<II', b, opt + dirs + 13 * 8, 0x10c0, 64)
+    if clr:
+        struct.pack_into('<II', b, opt + dirs + 14 * 8, 0x1100, 72)
+    # descriptor: attrs, dll name, hmod, IAT, INT, bound IAT, unload IAT, timestamp
+    struct.pack_into('<IIIIIIII', b, 0x2c0, 0 if va_based else 1, 0x1100, 0x1180, 0x1160, 0x1120, 0, 0, 0)
+    if terminate:
+        b[0x2e0:0x300] = bytes(32)
+    else:
+        b[0x2e0:0x300] = b'\x01' * 32
+    b[0x300:0x30b] = b'USER32.dll\0'
+    if is64:
+        struct.pack_into('<QQQ', b, 0x320, 0x1140, (1 << 63) | 9, 0)
+    else:
+        struct.pack_into('<III', b, 0x320, 0x1140, (1 << 31) | 9, 0)
+    struct.pack_into('<H', b, 0x340, 7)
+    b[0x342:0x34e] = b'MessageBoxW\0'
+    return b
+
+class DelayImportTests(PeBinaryCase):
+    __test__ = True
+
+    def test_delay_imports_32_and_64(self):
+        for is64 in (False, True):
+            with self.subTest(is64=is64):
+                result = self.run_imports(delay_fixture(is64))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rep = json.loads(result.stdout)['pe']
+                self.assertEqual(rep['imports_count'], 2)          # normal table untouched
+                self.assertEqual(rep['delay_imports_count'], 2)
+                self.assertFalse(rep['managed_clr'])
+                self.assertEqual(rep['delay_libraries'], [{'name': 'USER32.dll', 'symbols': [
+                    {'name': 'MessageBoxW', 'ordinal': None, 'hint': 7},
+                    {'name': None, 'ordinal': 9, 'hint': None}]}])
+
+    def test_delay_absent_means_empty_not_error(self):
+        result = self.run_imports(fixture(True))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rep = json.loads(result.stdout)['pe']
+        self.assertEqual((rep['delay_libraries'], rep['delay_imports_count'], rep['managed_clr']), ([], 0, False))
+
+    def test_clr_header_is_reported(self):
+        rep = json.loads(self.run_imports(delay_fixture(True, clr=True)).stdout)['pe']
+        self.assertTrue(rep['managed_clr'])
+
+    def test_delay_unsupported_or_unterminated_fails_closed(self):
+        for kwargs in ({'va_based': True}, {'terminate': False}):
+            with self.subTest(**kwargs):
+                result = self.run_imports(delay_fixture(True, **kwargs))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+
+    def test_delay_mutations_do_not_crash(self):
+        rng = random.Random(4242)
+        original = delay_fixture(True, clr=True)
+        for case in range(150):
+            data = bytearray(original)
+            if case < 40:
+                del data[rng.randrange(0x200, len(data)):]
+            else:
+                for _ in range(1 + rng.randrange(8)):
+                    data[rng.randrange(0x2c0, 0x350)] = rng.randrange(256)
+            result = self.run_imports(data)
+            self.assertGreaterEqual(result.returncode, 0, result.stderr)
+            if result.returncode == 0:
+                json.loads(result.stdout)
+            else:
+                self.assertEqual(result.stdout, '')
+
 
 if __name__ == '__main__':
     unittest.main()
