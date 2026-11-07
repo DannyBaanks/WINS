@@ -49,6 +49,36 @@ fn inspect(gpa: std.mem.Allocator, io: Io, path: []const u8) !void {
         try say(io, line);
     }
 }
+fn imports(gpa: std.mem.Allocator, io: Io, path: []const u8, json: bool) !void {
+    const bytes = try Dir.cwd().readFileAlloc(io, path, gpa, .limited(512 * 1024 * 1024));
+    defer gpa.free(bytes);
+    const report = try @import("pe.zig").parse(gpa, bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    if (json) {
+        const doc = .{ .sha256 = &hash, .size_bytes = bytes.len, .pe = report };
+        const output = try std.json.Stringify.valueAlloc(gpa, doc, .{ .whitespace = .indent_2 });
+        defer gpa.free(output);
+        try say(io, output);
+        try say(io, "\n");
+        return;
+    }
+    const header = try std.fmt.allocPrint(gpa, "SHA256: {s}\n{s} machine=0x{x}: {d} libraries, {d} imports\n", .{ &hash, report.format, report.machine, report.libraries.len, report.imports_count });
+    defer gpa.free(header);
+    try say(io, header);
+    for (report.libraries) |lib| {
+        const line = try std.fmt.allocPrint(gpa, "  {s} ({d})\n", .{ lib.name, lib.symbols.len });
+        defer gpa.free(line);
+        try say(io, line);
+        for (lib.symbols) |sym| {
+            const symbol = if (sym.name) |name| try std.fmt.allocPrint(gpa, "    {s} (hint {d})\n", .{ name, sym.hint.? }) else try std.fmt.allocPrint(gpa, "    ordinal #{d}\n", .{sym.ordinal.?});
+            defer gpa.free(symbol);
+            try say(io, symbol);
+        }
+    }
+    try say(io, "Delay imports: NOT_ANALYZED\n");
+}
 fn extract(gpa: std.mem.Allocator, io: Io, input: []const u8, output: []const u8, tool: []const u8, kind: []const u8) !void {
     if (!std.mem.eql(u8, kind, "7z") and !std.mem.eql(u8, kind, "inno")) return error.InvalidExtractor;
     const in_abs = try Dir.cwd().realPathFileAlloc(io, input, gpa);
@@ -131,6 +161,11 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("inspection: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
+    } else if ((args.len == 3 or (args.len == 4 and std.mem.eql(u8, args[3], "--json"))) and std.mem.eql(u8, args[1], "imports")) {
+        imports(a, io, args[2], args.len == 4) catch |e| {
+            std.log.err("imports: {s}", .{@errorName(e)});
+            std.process.exit(1);
+        };
     } else if (args.len == 6 and std.mem.eql(u8, args[1], "extract")) {
         extract(a, io, args[2], args[3], args[4], args[5]) catch |e| {
             std.log.err("extraction: {s}", .{@errorName(e)});
@@ -146,5 +181,5 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("comparison: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
-    } else fail(io, "Usage: wins-native inspect FILE | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS\n");
+    } else fail(io, "Usage: wins-native inspect FILE | imports FILE [--json] | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS\n");
 }

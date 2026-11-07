@@ -41,7 +41,42 @@ PE: PE32+, machine=0x8664, sections=7
   .text: offset=1024 size=4548608
 ```
 
-`inspect` calcula SHA-256 y lee cabeceras y secciones; **todavía no** extrae imports ni desensambla. Está limitado a archivos de 512 MiB.
+`inspect` calcula SHA-256 y lee cabeceras y secciones; no desensambla. Está limitado a archivos de 512 MiB.
+
+## Inventariar imports del PE
+
+Compila el controlador actualizado con un nombre nuevo para no sobrescribir una versión anterior:
+
+```sh
+zig build-exe native/main.zig -O ReleaseSafe -femit-bin=build/wins-pe
+```
+
+Salida real: ninguna. Inspecciona el ejecutable extraído:
+
+```sh
+build/wins-pe imports '/tmp/wins-guide-npp-1107/notepad++.exe'
+```
+
+Salida real, abreviada:
+
+```text
+SHA256: b1bb271b558f6e33f357276fa530363c18494a4e9d3be973e3ccd8cb626b867d
+PE32+ machine=0x8664: 21 libraries, 629 imports
+  COMCTL32.dll (24)
+    ImageList_EndDrag (hint 95)
+    ...
+    ordinal #17
+    ...
+Delay imports: NOT_ANALYZED
+```
+
+Para alimentar otra herramienta, guarda el reporte estructurado. Elige un nombre nuevo: la redirección `>` sobrescribe un archivo existente:
+
+```sh
+build/wins-pe imports '/tmp/wins-guide-npp-1107/notepad++.exe' --json > /tmp/wins-guide-imports-1107.json
+```
+
+Salida real: ninguna; el JSON contiene SHA-256, arquitectura, DLL, nombres, ordinales e indicios (`hint`). El parser cubre la tabla normal de imports de PE32 y PE32+; los imports diferidos (`delay imports`), exports, desensamblado y firmas de funciones aún no se analizan. Los imports son un inventario de dependencias, no código fuente ni implementaciones portadas.
 
 ## Compilar y contrastar un candidato
 
