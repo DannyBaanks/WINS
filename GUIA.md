@@ -1,0 +1,107 @@
+# WINS: caja de análisis nativa
+
+Desde la raíz del repositorio, compila el controlador Zig:
+
+```sh
+mkdir -p build && zig build-exe native/main.zig -O ReleaseSafe -femit-bin=build/wins-native && zig build-exe native/compare.zig -lc -O ReleaseSafe -femit-bin=build/wins-compare
+```
+
+Salida: ninguna si la compilación termina bien.
+
+**Regla de oro:** el contenido extraído es material no confiable. No ejecutes un PE ni cargues sus bibliotecas en Linux; la caja ejecuta únicamente el extractor o los candidatos ELF que tú indiques. No ejecuta Windows ni implementa sus APIs.
+
+Necesitas Linux, Zig 0.16, `bubblewrap` funcional y un extractor Linux (`7zz` o `innoextract`). Las salidas deben ser directorios **nuevos**; en caso de fallo se conservan para inspección, así que usa otro nombre al reintentar. Las rutas siguientes corresponden a la máquina en que se verificó el ejemplo; adáptalas a tu instalación.
+
+## Depositar el contenido de un instalador
+
+```sh
+build/wins-native extract '/home/danny/Descargas/wins-samples/npp.8.9.9.Installer.x64.exe' /tmp/wins-guide-npp-1107 /home/danny/.cache/electron-builder/7zip@1.0.0/7zip-linux-x64-16wjr/bin/7zz 7z
+```
+
+Salida real:
+
+```text
+Extraction complete. Output is untrusted; inspect before use.
+```
+
+Para Inno se usa la misma forma con la ruta del ejecutable `innoextract` y el último argumento `inno`; esa ruta también se probó con el instalador de WinMerge. El paquete se monta en solo lectura, el directorio de salida se monta para escritura y no hay red. `/usr` está montado en solo lectura para proporcionar bibliotecas y utilidades: no es un sistema operativo Windows vacío.
+
+## Inspeccionar
+
+```sh
+build/wins-native inspect '/tmp/wins-guide-npp-1107/notepad++.exe'
+```
+
+Salida real, abreviada:
+
+```text
+SHA256: b1bb271b558f6e33f357276fa530363c18494a4e9d3be973e3ccd8cb626b867d
+Size: 8584176
+PE: PE32+, machine=0x8664, sections=7
+  .text: offset=1024 size=4548608
+```
+
+`inspect` calcula SHA-256 y lee cabeceras y secciones; **todavía no** extrae imports ni desensambla. Está limitado a archivos de 512 MiB.
+
+## Compilar y contrastar un candidato
+
+La interfaz experimental admite funciones C puras de tipo `uint64_t(uint64_t)`: el candidato exporta `wins_candidate` y el oráculo independiente exporta `wins_oracle`. Los ejemplos están en `native/examples/`.
+
+```sh
+build/wins-native compile-c native/examples/candidate.c /tmp/wins-guide-candidate-1107 /home/danny/.local/opt/zig-x86_64-linux-0.16.0
+```
+
+Salida real:
+
+```text
+Compiled candidate.so. Compilation does not establish PE equivalence.
+```
+
+Compila también el oráculo y el candidato defectuoso; ambos producen la misma salida:
+
+```sh
+build/wins-native compile-c native/examples/oracle.c /tmp/wins-guide-oracle-1107 /home/danny/.local/opt/zig-x86_64-linux-0.16.0
+```
+
+```sh
+build/wins-native compile-c native/examples/wrong.c /tmp/wins-guide-wrong-1107 /home/danny/.local/opt/zig-x86_64-linux-0.16.0
+```
+
+Para comparar los resultados:
+
+```sh
+build/wins-native compare /tmp/wins-guide-candidate-1107/candidate.so /tmp/wins-guide-oracle-1107/candidate.so build/wins-compare 10000
+```
+
+Salida real:
+
+```text
+MATCHED samples=10000 seed=11400714819323198485 (not a proof of equivalence)
+```
+
+Con el candidato incorrecto:
+
+```sh
+build/wins-native compare /tmp/wins-guide-wrong-1107/candidate.so /tmp/wins-guide-oracle-1107/candidate.so build/wins-compare 10000
+```
+
+Salida real, código 1:
+
+```text
+DIVERGENCE iteration=0 input=0 expected=1 actual=2
+error: comparison: FuzzFailed
+```
+
+El corredor carga ambos ELF **dentro de la caja**; la comparación solo cubre la función y las entradas probadas, y ambos comparten proceso. Un oráculo correcto e independiente debe ser aportado por quien desarrolla el puerto. Las funciones con efectos laterales, punteros o estado aún no tienen un contrato aquí.
+
+## Interpretar el resultado
+
+| Resultado | Significado | Acción |
+|---|---|---|
+| `Extraction complete` | El extractor terminó con código 0. | Inspecciona la salida; no supone que el programa funcione. |
+| `Compiled candidate.so` | Se compiló C para Linux. | Contrástalo con un oráculo apropiado. |
+| `MATCHED` | No se encontraron diferencias en esas muestras. | Amplía el oráculo y los casos; no es una prueba general. |
+| `DIVERGENCE` | Se encontró una entrada distinta. | Revisa entrada, resultado esperado y obtenido. |
+| Error de `bwrap`, timeout o directorio existente | La operación no se completó. | Conserva la salida parcial y reintenta con un directorio nuevo. |
+
+La caja usa espacios de nombres y tiempos límite, pero no establece cuotas de memoria o disco: usa una VM o límites adicionales si necesitas procesar material hostil. Extraer archivos no recompila ni traduce automáticamente un PE cerrado. El flujo Zig actual es experimental y no reemplaza aún todos los comandos y recetas Python. El `compile-fuzz` Python heredado está desactivado; el fuzzer Zig anterior contiene comparaciones de modelos que no demuestran equivalencia con el PE.
