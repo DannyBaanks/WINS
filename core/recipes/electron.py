@@ -12,6 +12,7 @@ import tempfile
 import re
 from typing import Dict, Any, List, Optional
 from .base import BaseRecipe
+from ..healers.native_modules import NativeModuleHealer
 
 class ElectronRecipe(BaseRecipe):
     name = "electron"
@@ -48,13 +49,17 @@ class ElectronRecipe(BaseRecipe):
                 print("[WINS:Electron:ERROR] Failed to unpack app.asar.", file=sys.stderr)
                 return False
 
-            # 4. Audit Native Modules (.node)
-            native_modules = self._find_native_modules(app_dir)
-            if native_modules:
-                print(f"[WINS:Electron:WARN] Found {len(native_modules)} native C++ binary addons (.node):")
-                for mod in native_modules:
-                    print(f"  - {os.path.relpath(mod, app_dir)}")
-                print("[WINS:Electron:WARN] These modules may require re-compiling with node-gyp for Linux.")
+            # 4. Audit & Auto-Heal Native Modules (.node)
+            healer = NativeModuleHealer(target_arch=options.get("arch", "x64"))
+            heal_report = healer.heal(app_dir)
+
+            # Also heal companion unpacked resources if present
+            unpacked_companion = asar_path + ".unpacked"
+            if os.path.isdir(unpacked_companion):
+                healer.heal(unpacked_companion)
+
+            if heal_report["total_addons"] > 0:
+                print(f"[WINS:Electron] [✓] Native Addons Healed: {len(heal_report['healed_prebuild'])} prebuilds resolved, {len(heal_report['healed_stub'])} safe stubs injected.")
             else:
                 print("[WINS:Electron] [✓] Zero native C++ binary addons detected. Code is 100% portable JavaScript/TypeScript!")
 
@@ -64,8 +69,8 @@ class ElectronRecipe(BaseRecipe):
             if os.path.isfile(pkg_path):
                 with open(pkg_path, "r", encoding="utf-8") as f:
                     pkg_data = json.load(f)
-            app_id = pkg_data.get("name", "qwen").lower()
-            app_title = pkg_data.get("description", pkg_data.get("name", "App"))
+            app_id = pkg_data.get("name", "app").lower()
+            app_title = pkg_data.get("productName", pkg_data.get("description", pkg_data.get("name", "App")))
             main_script = pkg_data.get("main", "./out/main/index.js")
             if main_script.startswith("./"):
                 main_script = main_script[2:]
@@ -85,7 +90,8 @@ class ElectronRecipe(BaseRecipe):
                                 self._patch_main_script(os.path.join(root, f))
 
             # 7. Provision Native Linux Electron Runtime
-            electron_ver = options.get("electron_version", "35.1.4")
+            raw_electron_ver = options.get("electron_version") or pkg_data.get("devDependencies", {}).get("electron") or "35.1.4"
+            electron_ver = re.sub(r'^[^\d]*', '', raw_electron_ver)
             runtime_dist = self._provision_electron_runtime(electron_ver, scratch)
             if not runtime_dist:
                 print("[WINS:Electron:ERROR] Failed to provision native Electron runtime.", file=sys.stderr)
@@ -144,7 +150,8 @@ class ElectronRecipe(BaseRecipe):
                 f.write(f"""#!/usr/bin/env bash
 # WINS Generated Launcher for {app_title}
 APP_DIR="{dest_dir}"
-exec "$APP_DIR/{app_id}" --no-sandbox "$@"
+cd "$APP_DIR/resources/app" 2>/dev/null || true
+exec "$APP_DIR/{app_id}" --no-sandbox "$APP_DIR/resources/app" "$@"
 """)
             os.chmod(launcher_path, 0o755)
             print(f"[WINS:Electron] [✓] Launcher created: {launcher_path}")
@@ -207,12 +214,26 @@ exec "$APP_DIR/{app_id}" --no-sandbox "$@"
         return None
 
     def _unpack_asar(self, asar_path: str, dest_dir: str) -> bool:
+        cmd = None
         if shutil.which("bunx"):
-            res = subprocess.run(["bunx", "@electron/asar", "extract", asar_path, dest_dir], capture_output=True)
-            return res.returncode == 0
-        if shutil.which("npx"):
-            res = subprocess.run(["npx", "-y", "@electron/asar", "extract", asar_path, dest_dir], capture_output=True)
-            return res.returncode == 0
+            cmd = ["bunx", "@electron/asar", "extract", asar_path, dest_dir]
+        elif shutil.which("npx"):
+            cmd = ["npx", "-y", "@electron/asar", "extract", asar_path, dest_dir]
+
+        if cmd:
+            res = subprocess.run(cmd, cwd=os.path.dirname(asar_path), capture_output=True)
+            if res.returncode == 0:
+                # Sync companion unpacked directory if present
+                companion = asar_path + ".unpacked"
+                if os.path.isdir(companion):
+                    for root, _, files in os.walk(companion):
+                        for f in files:
+                            src_f = os.path.join(root, f)
+                            rel_p = os.path.relpath(src_f, companion)
+                            dst_f = os.path.join(dest_dir, rel_p)
+                            os.makedirs(os.path.dirname(dst_f), exist_ok=True)
+                            shutil.copy2(src_f, dst_f)
+                return True
         return False
 
     def _find_native_modules(self, app_dir: str) -> List[str]:
@@ -246,23 +267,36 @@ exec "$APP_DIR/{app_id}" --no-sandbox "$@"
                 f.write(code)
 
     def _provision_electron_runtime(self, version: str, scratch: str) -> Optional[str]:
-        cache_dir = os.path.expanduser("~/.cache/qwen-transmuter")
-        cached_zip = os.path.join(cache_dir, f"electron-v{version}-linux-x64.zip")
+        primary_cache = os.path.expanduser("~/.cache/wins/runtimes/electron")
+        os.makedirs(primary_cache, exist_ok=True)
+        cache_dirs = [
+            primary_cache,
+            os.path.expanduser("~/.cache/qwen-transmuter"),
+        ]
+
         target_dist = os.path.join(scratch, "electron_dist")
         os.makedirs(target_dist, exist_ok=True)
 
         zip_to_extract = None
-        if os.path.isfile(cached_zip):
-            zip_to_extract = cached_zip
-        else:
+        for cd in cache_dirs:
+            cand = os.path.join(cd, f"electron-v{version}-linux-x64.zip")
+            if os.path.isfile(cand):
+                zip_to_extract = cand
+                break
+
+        if not zip_to_extract:
             url = f"https://github.com/electron/electron/releases/download/v{version}/electron-v{version}-linux-x64.zip"
-            dl_path = os.path.join(scratch, "electron.zip")
+            dl_path = os.path.join(primary_cache, f"electron-v{version}-linux-x64.zip")
             print(f"[WINS:Electron] Downloading Electron v{version} runtime...")
             res = subprocess.run(["curl", "-L", "--fail", "--progress-bar", url, "-o", dl_path])
-            if res.returncode == 0:
+            if res.returncode == 0 and os.path.isfile(dl_path):
                 zip_to_extract = dl_path
-                os.makedirs(cache_dir, exist_ok=True)
-                shutil.copy2(dl_path, cached_zip)
+            else:
+                # Fallback to cached default runtime (e.g. 35.1.4)
+                print(f"[WINS:Electron:WARN] Electron v{version} download failed. Falling back to cached v35.1.4 runtime...")
+                fallback_zip = os.path.expanduser("~/.cache/qwen-transmuter/electron-v35.1.4-linux-x64.zip")
+                if os.path.isfile(fallback_zip):
+                    zip_to_extract = fallback_zip
 
         if zip_to_extract:
             subprocess.run(["unzip", "-q", zip_to_extract, "-d", target_dist])

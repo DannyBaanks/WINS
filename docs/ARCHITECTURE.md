@@ -71,15 +71,35 @@ The triage engine inspects target binaries in two stages:
 
 ### 2.3 The Universal Electron Recipe (`core/recipes/electron.py`)
 1. **Extraction:** Isolates `app.asar` from the installer payload.
-2. **Native Module Audit:** Scans all extracted JavaScript modules for compiled C++ binaries (`*.node`).
-   * If zero `.node` files are detected, the app is certified as 100% portable pure JavaScript.
-   * If native modules exist, they are enumerated with relocation/re-compilation advice.
+2. **Native Module Healing:** Integrates `NativeModuleHealer` to resolve GNU glibc prebuilds from npm/GitHub or inject safe JavaScript proxy stubs for Windows-exclusive hooks.
 3. **AST Platform Patching:** Analyzes the main process scripts for OS assertion bottlenecks:
    * Expands `platform === "win32"` to support `platform === "linux"` (`linux-x64` / `linux-arm64`).
    * Neutralizes Windows-specific auto-updater feeds.
 4. **Runtime Provisioning:** Binds the application logic to a verified native Linux Electron runtime (matching the upstream version).
 5. **MCP Subsystem Wiring:** Automatically discovers and symlinks host development tools (`bun`, `uv`, `uvx`) into the application's internal resources path, enabling full Model Context Protocol (MCP) tool execution.
 6. **Desktop Integration:** Registers modern user-space launchers in `~/.local/bin` and desktop shortcuts with high-resolution icons in `~/.local/share/applications`.
+
+### 2.4 The Native Module Healer (`core/healers/native_modules.py`)
+Resolves native C++ binary addons (`.node`) using a dual-healing architecture:
+1. **Prebuild Resolver:**
+   * Distinguishes GNU glibc vs Musl libc binaries.
+   * Fetches official Linux ELF `.node` prebuilds directly from npm/GitHub releases for cross-platform modules (`better-sqlite3`, `sqlite3`, `sharp`, `keytar`).
+   * Replaces Windows PE `.node` files in-place with genuine Linux ELF binaries.
+2. **Universal Safe Proxy Stubber:**
+   * For Windows-only platform dependencies (`@vscode/windows-registry`, `@jasonscheirer/native-progress-bar`, `cf-prefs`, `@notionhq/desktop-native`), generates zero-overhead JavaScript Proxy polyfills (`Proxy(noop, handler)`).
+   * Prevents `ERR_DLOPEN_FAILED` and invalid ELF header crashes, allowing apps to run continuously on Linux.
+
+### 2.5 The .NET Core & Avalonia Recipe (`core/recipes/dotnet.py`)
+1. **Cleanroom Unpacking:** Uses `innoextract` or ephemeral cleanroom Wine execution to extract managed CIL assemblies.
+2. **Runtime Configuration Adaptation:** Analyzes `*.runtimeconfig.json` and updates framework bindings to point to the host Linux `Microsoft.NETCore.App` runtime.
+3. **Native Host Wiring:** Symlinks host Linux native shared objects (`libhostpolicy.so`, `libcoreclr.so`, `libSystem.Native.so`).
+4. **Avalonia X11 Activation:** Configures `AVALONIA_PLATFORM=x11` and globalization invariant mode for cross-platform GUI rendering.
+
+### 2.6 The Cleanroom Diagnostic Engine (`core/tester.py`)
+Executes transmuted applications in an isolated subprocess with telemetry logging:
+* Real-time stream parsing for FFI failures, dlopen errors, missing modules, and unhandled rejections.
+* Analyzes execution health (`HEALTHY_RUNNING`, `CLEAN_EXIT`, `CRITICAL_ANOMALIES_DETECTED`).
+* Generates structured machine-readable JSON with actionable patch instructions for AI agents.
 
 ---
 
@@ -89,8 +109,14 @@ WINS is designed to be operated both by human engineers and by autonomous AI age
 
 Agents can invoke WINS via CLI or MCP subprocess:
 ```bash
-# Obtain machine-readable JSON taxonomy:
+# 1. Obtain machine-readable JSON taxonomy:
 wins probe path/to/app.exe --json
+
+# 2. Transmute binary to native Linux application:
+wins transmute path/to/app.exe --dest ~/.local/share/app-desktop
+
+# 3. Test and diagnose runtime telemetry:
+wins test app-name --timeout 5 --json
 ```
 
 Output:

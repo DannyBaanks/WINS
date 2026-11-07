@@ -17,6 +17,7 @@ from core.triage import BinaryTriage
 from core.recipes.electron import ElectronRecipe
 from core.recipes.pyinstaller import PyInstallerRecipe
 from core.recipes.dotnet import DotNetRecipe
+from core.tester import CleanroomTester
 
 RECIPES = [
     ElectronRecipe(),
@@ -76,6 +77,29 @@ def cmd_transmute(args):
         print("[WINS] Transmutation failed.", file=sys.stderr)
         sys.exit(1)
 
+def cmd_test(args):
+    tester = CleanroomTester(args.target, timeout=args.timeout, headless=args.headless)
+    report = tester.execute()
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    print(f"\n[WINS TEST REPORT] {report['target']}")
+    print(f"  Status:    {report['status']}")
+    print(f"  Duration:  {report['duration_seconds']}s (Timed out: {report['timed_out']}, Exit Code: {report['exit_code']})")
+    print(f"  Summary:   {report['summary']}\n")
+
+    if report["anomalies"]:
+        print("[DETECTED ANOMALIES]")
+        for an in report["anomalies"]:
+            print(f"  - [{an['severity']}] {an['type']}: {an['detail']}")
+        print("")
+
+    print("[AGENT ACTIONABLE RECOMMENDATIONS]")
+    for act in report["agent_actions"]:
+        print(f"  -> {act}")
+    print("")
+
 def cmd_list(args):
     print("\nAvailable WINS Transmutation Recipes:")
     for r in RECIPES:
@@ -95,10 +119,18 @@ def main():
     # transmute
     p_trans = subparsers.add_parser("transmute", help="Execute de-layering and native re-hosting")
     p_trans.add_argument("target", help="Path to Windows .exe")
-    p_trans.add_argument("--dest", help="Destination directory (default: ~/.local/share/<app>-desktop)")
+    p_trans.add_argument("--dest", "--out", dest="dest", help="Destination directory (default: ~/.local/share/<app>-desktop)")
     p_trans.add_argument("--bin-dir", default="~/.local/bin", help="Launcher bin directory")
     p_trans.add_argument("--electron-version", default="35.1.4", help="Target Electron runtime version")
     p_trans.set_defaults(func=cmd_transmute)
+
+    # test
+    p_test = subparsers.add_parser("test", help="Execute black-box cleanroom test and diagnose anomalies")
+    p_test.add_argument("target", help="Path to launcher executable, directory, or app name (e.g. notion)")
+    p_test.add_argument("--timeout", type=float, default=5.0, help="Test execution timeout in seconds (default: 5.0)")
+    p_test.add_argument("--headless", action="store_true", help="Run under xvfb virtual display if available")
+    p_test.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_test.set_defaults(func=cmd_test)
 
     # list
     p_list = subparsers.add_parser("list", help="List available transmutation recipes")
