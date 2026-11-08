@@ -82,6 +82,11 @@ const Ucontext = extern struct {
     uc_sigmask: [2]u32,
 };
 
+// Set once from WINS_CRASH_TRAP=1. When a debugger is attached, trapping after
+// the report keeps the process alive for inspection instead of exit_group()ing,
+// which destroys the frame state gdb would need.
+var g_crash_trap: bool = false;
+
 fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
     _ = sig;
     std.debug.print("\n=======================================================\n", .{});
@@ -132,9 +137,47 @@ fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque
                 }
             }
             if (printed == 0) std.debug.print("    (none: the stack holds no guest address)\n", .{});
+
+            // The object behind a null field dereference. By the time the fault
+            // lands, EAX is the field that was read, but EDI is usually still the
+            // pointer the object came from, so `[EDI]` names the base. This is how
+            // "the whole object is zero" was discovered on 7zr: an entirely blank
+            // block means it was never constructed, which no register dump shows.
+            const edi_val = uctx.uc_mcontext.edi;
+            if (edi_val > 0x1000 and edi_val + 8 < 0xFFFFF000) {
+                const obj: usize = @as(*const usize, @ptrFromInt(edi_val)).*;
+                // Not gated to the guest image: a heap block from our own malloc is
+                // a valid host address, and the guest reading obj+0x2b0 without
+                // faulting proves those pages are mapped.
+                const base = if (obj > 0x1000 and obj + 0x300 < 0xFFFFF000) obj else edi_val;
+                if (base > 0x1000) {
+                    var nonzeros: usize = 0;
+                    var o: usize = 0;
+                    while (o < 0x300) : (o += 4) {
+                        if (@as(*const u32, @ptrFromInt(base + o)).* != 0) nonzeros += 1;
+                    }
+                    std.debug.print("  Object base [EDI=0x{x}] = 0x{x}: {d} non-zero words in +0x000..0x300\n", .{ edi_val, base, nonzeros });
+                    if (nonzeros > 0 and nonzeros < 64) {
+                        o = 0;
+                        while (o < 0x300) : (o += 4) {
+                            const v: u32 = @as(*const u32, @ptrFromInt(base + o)).*;
+                            if (v != 0) std.debug.print("    +0x{x:0>3}: 0x{x:0>8}\n", .{ o, v });
+                        }
+                    } else if (nonzeros >= 64) {
+                        std.debug.print("    (too populated to summarise; the object was likely constructed)\n", .{});
+                    } else {
+                        std.debug.print("    ALL ZERO: uninitialised memory, never constructed by the guest.\n", .{});
+                    }
+                }
+            }
         }
     }
     std.debug.print("=======================================================\n", .{});
+    if (g_crash_trap) {
+        // A debugger gets the frame intact: trap here instead of dying.
+        std.debug.print("[WINS:winrun32] WINS_CRASH_TRAP=1: trapping for the debugger.\n", .{});
+        asm volatile ("int3");
+    }
     linux.exit_group(139);
 }
 
@@ -3371,6 +3414,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Install diagnostic crash interception
     installCrashHandlers();
+    g_crash_trap = std.mem.eql(u8, init.environ_map.get("WINS_CRASH_TRAP") orelse "", "1");
     msvcrt_mod.trace_static_init = std.mem.eql(u8, init.environ_map.get("WINS_TRACE") orelse "", "1");
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, target_path, allocator, .limited(64 * 1024 * 1024)) catch |e| {

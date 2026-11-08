@@ -2402,6 +2402,10 @@ fn _XcptFilter(xcpt: u32, exc: ?*const anyopaque) callconv(C) i32 {
 /// unwinding here there is nothing to unwind, so a plain return is the only
 /// reachable behaviour. Documented, not hidden behind a stub.
 fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C) void {
+    // Traced: reaching this means the guest took a C++ error path. Returning
+    // instead of unwinding leaves the construction half-finished, which is the
+    // state the 0x411717 null dereference is sitting on.
+    if (trace_static_init) std.debug.print("[msvcrt] _CxxThrowException thrown (unwinding NOT implemented)\n", .{});
     _ = exc;
     _ = dp;
 }
