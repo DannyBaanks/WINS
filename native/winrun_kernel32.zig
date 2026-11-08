@@ -1974,7 +1974,345 @@ fn GetQueuedCompletionStatus(CompletionPort: usize, lpNumberOfBytesTransferred: 
     return 0;
 }
 
+fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(W) ?*anyopaque {
+    _ = flAllocationType; _ = flProtect;
+    const rounded = (dwSize + 4095) & ~@as(usize, 4095);
+    const sz = if (rounded == 0) 4096 else rounded;
+    const hint: ?[*]align(4096) u8 = if (lpAddress) |addr| @ptrCast(@alignCast(addr)) else null;
+    const mrc = linux.mmap(hint, sz, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    const signed: isize = @bitCast(mrc);
+    if (signed < 0 and signed >= -4095) return null;
+    return @ptrFromInt(mrc);
+}
+
+fn VirtualFree(lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32) callconv(W) i32 {
+    _ = dwFreeType;
+    if (lpAddress) |addr| {
+        _ = linux.munmap(@ptrCast(@alignCast(addr)), dwSize);
+    }
+    return 1;
+}
+
+fn GetThreadContext(hThread: usize, lpContext: ?*anyopaque) callconv(W) i32 {
+    _ = hThread; _ = lpContext;
+    return 1;
+}
+
+fn SuspendThread(hThread: usize) callconv(W) u32 {
+    _ = hThread;
+    return 0;
+}
+
+fn CreateMutexA(lpMutexAttributes: ?*anyopaque, bInitialOwner: i32, lpName: ?[*:0]const u8) callconv(W) usize {
+    _ = lpMutexAttributes; _ = bInitialOwner; _ = lpName;
+    return 0x5001;
+}
+
+fn CreateSemaphoreA(lpSemaphoreAttributes: ?*anyopaque, lInitialCount: i32, lMaximumCount: i32, lpName: ?[*:0]const u8) callconv(W) usize {
+    _ = lpSemaphoreAttributes; _ = lInitialCount; _ = lMaximumCount; _ = lpName;
+    return 0x5002;
+}
+
+fn OpenEventA(dwDesiredAccess: u32, bInheritHandle: i32, lpName: ?[*:0]const u8) callconv(W) usize {
+    _ = dwDesiredAccess; _ = bInheritHandle; _ = lpName;
+    return 0x5003;
+}
+
+fn SetWaitableTimer(hTimer: usize, lpDueTime: ?*const anyopaque, lPeriod: i32, pfnCompletionRoutine: ?*anyopaque, lpArgToCompletionRoutine: ?*anyopaque, fResume: i32) callconv(W) i32 {
+    _ = hTimer; _ = lpDueTime; _ = lPeriod; _ = pfnCompletionRoutine; _ = lpArgToCompletionRoutine; _ = fResume;
+    return 1;
+}
+
+fn CreateWaitableTimerA(lpTimerAttributes: ?*anyopaque, bManualReset: i32, lpTimerName: ?[*:0]const u8) callconv(W) usize {
+    _ = lpTimerAttributes; _ = bManualReset; _ = lpTimerName;
+    return 0x5004;
+}
+
+fn SignalObjectAndWait(hObjectToSignal: usize, hObjectToWaitOn: usize, dwMilliseconds: u32, bAlertable: i32) callconv(W) u32 {
+    _ = hObjectToSignal; _ = hObjectToWaitOn; _ = dwMilliseconds; _ = bAlertable;
+    return 0;
+}
+
+fn SetThreadPriority(hThread: usize, nPriority: i32) callconv(W) i32 {
+    _ = hThread; _ = nPriority;
+    return 1;
+}
+
+fn SetThreadAffinityMask(hThread: usize, dwThreadAffinityMask: usize) callconv(W) usize {
+    _ = hThread;
+    return dwThreadAffinityMask;
+}
+
+fn SwitchToThread() callconv(W) i32 {
+    return 1;
+}
+
+fn InterlockedPopEntrySList(ListHead: ?*anyopaque) callconv(W) ?*anyopaque {
+    _ = ListHead;
+    return null;
+}
+
+const MemoryStatusEx = extern struct {
+    dwLength: u32,
+    dwMemoryLoad: u32,
+    ullTotalPhys: u64,
+    ullAvailPhys: u64,
+    ullTotalPageFile: u64,
+    ullAvailPageFile: u64,
+    ullTotalVirtual: u64,
+    ullAvailVirtual: u64,
+    ullAvailExtendedVirtual: u64,
+};
+
+fn GlobalMemoryStatusEx(lpBuffer: ?*MemoryStatusEx) callconv(W) i32 {
+    if (lpBuffer) |b| {
+        b.dwMemoryLoad = 25;
+        b.ullTotalPhys = 16 * 1024 * 1024 * 1024;
+        b.ullAvailPhys = 12 * 1024 * 1024 * 1024;
+        b.ullTotalPageFile = 16 * 1024 * 1024 * 1024;
+        b.ullAvailPageFile = 12 * 1024 * 1024 * 1024;
+        b.ullTotalVirtual = 128 * 1024 * 1024 * 1024 * 1024;
+        b.ullAvailVirtual = 127 * 1024 * 1024 * 1024 * 1024;
+        b.ullAvailExtendedVirtual = 0;
+    }
+    return 1;
+}
+
+const MemoryStatus = extern struct {
+    dwLength: u32,
+    dwMemoryLoad: u32,
+    dwTotalPhys: usize,
+    dwAvailPhys: usize,
+    dwTotalPageFile: usize,
+    dwAvailPageFile: usize,
+    dwTotalVirtual: usize,
+    dwAvailVirtual: usize,
+};
+
+fn GlobalMemoryStatus(lpBuffer: ?*MemoryStatus) callconv(W) void {
+    if (lpBuffer) |b| {
+        b.dwMemoryLoad = 25;
+        b.dwTotalPhys = 4 * 1024 * 1024 * 1024;
+        b.dwAvailPhys = 3 * 1024 * 1024 * 1024;
+        b.dwTotalPageFile = 4 * 1024 * 1024 * 1024;
+        b.dwAvailPageFile = 3 * 1024 * 1024 * 1024;
+        b.dwTotalVirtual = 2 * 1024 * 1024 * 1024;
+        b.dwAvailVirtual = 2 * 1024 * 1024 * 1024;
+    }
+}
+
+const SystemPowerStatus = extern struct {
+    ACLineStatus: u8,
+    BatteryFlag: u8,
+    BatteryLifePercent: u8,
+    SystemStatusFlag: u8,
+    BatteryLifeTime: u32,
+    BatteryFullLifeTime: u32,
+};
+
+fn GetSystemPowerStatus(lpSystemPowerStatus: ?*SystemPowerStatus) callconv(W) i32 {
+    if (lpSystemPowerStatus) |s| {
+        s.ACLineStatus = 1;
+        s.BatteryFlag = 0;
+        s.BatteryLifePercent = 100;
+        s.SystemStatusFlag = 0;
+        s.BatteryLifeTime = 0xFFFFFFFF;
+        s.BatteryFullLifeTime = 0xFFFFFFFF;
+    }
+    return 1;
+}
+
+fn GetComputerNameW(lpBuffer: ?[*]u16, nSize: ?*u32) callconv(W) i32 {
+    const name_w = [_]u16{ 'W', 'I', 'N', 'S', '-', 'P', 'C', 0 };
+    if (lpBuffer != null and nSize != null and nSize.?.* >= name_w.len) {
+        @memcpy(lpBuffer.?[0..name_w.len], &name_w);
+        nSize.?.* = name_w.len - 1;
+        return 1;
+    }
+    if (nSize) |s| s.* = name_w.len;
+    return 0;
+}
+
+fn GetVersionExW(lpVersionInformation: ?*anyopaque) callconv(W) i32 {
+    if (lpVersionInformation) |info| {
+        const p: [*]u32 = @ptrCast(@alignCast(info));
+        p[1] = 10;
+        p[2] = 0;
+        p[3] = 19045;
+        p[4] = 2;
+    }
+    return 1;
+}
+
+fn GetUserDefaultUILanguage() callconv(W) u16 {
+    return 0x0409;
+}
+
+fn GetStartupInfoA(lpStartupInfo: ?*anyopaque) callconv(W) void {
+    if (lpStartupInfo) |si| {
+        @memset(@as([*]u8, @ptrCast(si))[0..68], 0);
+    }
+}
+
+fn GetTempFileNameW(lpPathName: ?*const u16, lpPrefixString: ?*const u16, uUnique: u32, lpTempFileName: ?[*]u16) callconv(W) u32 {
+    _ = lpPathName; _ = lpPrefixString;
+    const name_w = [_]u16{ 'C', ':', '\\', 'T', 'e', 'm', 'p', '\\', 'w', 'i', 'n', 's', '.', 't', 'm', 'p', 0 };
+    if (lpTempFileName) |p| {
+        @memcpy(p[0..name_w.len], &name_w);
+    }
+    return if (uUnique != 0) uUnique else 1;
+}
+
+fn GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: ?[*]u8) callconv(W) u32 {
+    const dir = "C:\\WINS";
+    if (lpBuffer != null and nBufferLength >= dir.len + 1) {
+        @memcpy(lpBuffer.?[0..dir.len], dir);
+        lpBuffer.?[dir.len] = 0;
+        return dir.len;
+    }
+    return dir.len + 1;
+}
+
+fn RemoveDirectoryW(lpPathName: ?*const u16) callconv(W) i32 {
+    _ = lpPathName;
+    return 1;
+}
+
+fn ReplaceFileW(lpReplacedFileName: ?*const u16, lpReplacementFileName: ?*const u16, lpBackupFileName: ?*const u16, dwReplaceFlags: u32, lpExclude: ?*anyopaque, lpReserved: ?*anyopaque) callconv(W) i32 {
+    _ = lpReplacedFileName; _ = lpReplacementFileName; _ = lpBackupFileName; _ = dwReplaceFlags; _ = lpExclude; _ = lpReserved;
+    return 1;
+}
+
+fn GetOverlappedResult(hFile: usize, lpOverlapped: ?*anyopaque, lpNumberOfBytesTransferred: ?*u32, bWait: i32) callconv(W) i32 {
+    _ = hFile; _ = lpOverlapped; _ = bWait;
+    if (lpNumberOfBytesTransferred) |p| p.* = 0;
+    return 1;
+}
+
+fn CancelIo(hFile: usize) callconv(W) i32 {
+    _ = hFile;
+    return 1;
+}
+
+fn GetFileTime(hFile: usize, lpCreationTime: ?*anyopaque, lpLastAccessTime: ?*anyopaque, lpLastWriteTime: ?*anyopaque) callconv(W) i32 {
+    _ = hFile; _ = lpCreationTime; _ = lpLastAccessTime; _ = lpLastWriteTime;
+    return 1;
+}
+
+fn FileTimeToLocalFileTime(lpFileTime: ?*const u64, lpLocalFileTime: ?*u64) callconv(W) i32 {
+    if (lpFileTime != null and lpLocalFileTime != null) {
+        lpLocalFileTime.?.* = lpFileTime.?.*;
+    }
+    return 1;
+}
+
+fn FileTimeToDosDateTime(lpFileTime: ?*const u64, lpFatDate: ?*u16, lpFatTime: ?*u16) callconv(W) i32 {
+    _ = lpFileTime;
+    if (lpFatDate) |d| d.* = 0x5821;
+    if (lpFatTime) |t| t.* = 0x6000;
+    return 1;
+}
+
+fn FindFirstFileExA(lpFileName: ?[*:0]const u8, fInfoLevelId: u32, lpFindFileData: ?*anyopaque, fSearchOp: u32, lpSearchFilter: ?*anyopaque, dwAdditionalFlags: u32) callconv(W) usize {
+    _ = lpFileName; _ = fInfoLevelId; _ = lpFindFileData; _ = fSearchOp; _ = lpSearchFilter; _ = dwAdditionalFlags;
+    return ~@as(usize, 0);
+}
+
+fn FlushConsoleInputBuffer(hConsoleInput: usize) callconv(W) i32 {
+    _ = hConsoleInput;
+    return 1;
+}
+
+fn FlushInstructionCache(hProcess: usize, lpBaseAddress: ?*const anyopaque, dwSize: usize) callconv(W) i32 {
+    _ = hProcess; _ = lpBaseAddress; _ = dwSize;
+    return 1;
+}
+
+fn HeapQueryInformation(HeapHandle: usize, HeapInformationClass: u32, HeapInformation: ?*anyopaque, HeapInformationLength: usize, ReturnLength: ?*usize) callconv(W) i32 {
+    _ = HeapHandle; _ = HeapInformationClass; _ = HeapInformation; _ = HeapInformationLength;
+    if (ReturnLength) |p| p.* = 0;
+    return 1;
+}
+
+fn VerifyVersionInfoA(lpVersionInformation: ?*anyopaque, dwTypeMask: u32, dwlConditionMask: u64) callconv(W) i32 {
+    _ = lpVersionInformation; _ = dwTypeMask; _ = dwlConditionMask;
+    return 1;
+}
+
+fn ExpandEnvironmentStringsA(lpSrc: ?[*:0]const u8, lpDst: ?[*]u8, nSize: u32) callconv(W) u32 {
+    if (lpSrc == null) return 0;
+    var len: u32 = 0;
+    while (lpSrc.?[len] != 0) : (len += 1) {}
+    if (lpDst != null and nSize >= len + 1) {
+        @memcpy(lpDst.?[0..len], lpSrc.?[0..len]);
+        lpDst.?[len] = 0;
+        return len + 1;
+    }
+    return len + 1;
+}
+
+fn SetDllDirectoryW(lpPathName: ?*const u16) callconv(W) i32 {
+    _ = lpPathName;
+    return 1;
+}
+
+fn lstrcpyA(lpString1: ?[*]u8, lpString2: ?[*:0]const u8) callconv(W) ?[*]u8 {
+    if (lpString1 == null or lpString2 == null) return lpString1;
+    var i: usize = 0;
+    while (lpString2.?[i] != 0) : (i += 1) {
+        lpString1.?[i] = lpString2.?[i];
+    }
+    lpString1.?[i] = 0;
+    return lpString1;
+}
+
+fn lstrlenA(lpString: ?[*:0]const u8) callconv(W) i32 {
+    if (lpString == null) return 0;
+    var len: i32 = 0;
+    while (lpString.?[@intCast(len)] != 0) : (len += 1) {}
+    return len;
+}
+
 pub fn lookup(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "VirtualAlloc")) return @intFromPtr(&VirtualAlloc);
+    if (std.mem.eql(u8, name, "VirtualFree")) return @intFromPtr(&VirtualFree);
+    if (std.mem.eql(u8, name, "GetThreadContext")) return @intFromPtr(&GetThreadContext);
+    if (std.mem.eql(u8, name, "SuspendThread")) return @intFromPtr(&SuspendThread);
+    if (std.mem.eql(u8, name, "CreateMutexA")) return @intFromPtr(&CreateMutexA);
+    if (std.mem.eql(u8, name, "CreateSemaphoreA")) return @intFromPtr(&CreateSemaphoreA);
+    if (std.mem.eql(u8, name, "OpenEventA")) return @intFromPtr(&OpenEventA);
+    if (std.mem.eql(u8, name, "SetWaitableTimer")) return @intFromPtr(&SetWaitableTimer);
+    if (std.mem.eql(u8, name, "CreateWaitableTimerA")) return @intFromPtr(&CreateWaitableTimerA);
+    if (std.mem.eql(u8, name, "SignalObjectAndWait")) return @intFromPtr(&SignalObjectAndWait);
+    if (std.mem.eql(u8, name, "SetThreadPriority")) return @intFromPtr(&SetThreadPriority);
+    if (std.mem.eql(u8, name, "SetThreadAffinityMask")) return @intFromPtr(&SetThreadAffinityMask);
+    if (std.mem.eql(u8, name, "SwitchToThread")) return @intFromPtr(&SwitchToThread);
+    if (std.mem.eql(u8, name, "InterlockedPopEntrySList")) return @intFromPtr(&InterlockedPopEntrySList);
+    if (std.mem.eql(u8, name, "GlobalMemoryStatusEx")) return @intFromPtr(&GlobalMemoryStatusEx);
+    if (std.mem.eql(u8, name, "GlobalMemoryStatus")) return @intFromPtr(&GlobalMemoryStatus);
+    if (std.mem.eql(u8, name, "GetSystemPowerStatus")) return @intFromPtr(&GetSystemPowerStatus);
+    if (std.mem.eql(u8, name, "GetComputerNameW")) return @intFromPtr(&GetComputerNameW);
+    if (std.mem.eql(u8, name, "GetVersionExW")) return @intFromPtr(&GetVersionExW);
+    if (std.mem.eql(u8, name, "GetUserDefaultUILanguage")) return @intFromPtr(&GetUserDefaultUILanguage);
+    if (std.mem.eql(u8, name, "GetStartupInfoA")) return @intFromPtr(&GetStartupInfoA);
+    if (std.mem.eql(u8, name, "GetTempFileNameW")) return @intFromPtr(&GetTempFileNameW);
+    if (std.mem.eql(u8, name, "GetCurrentDirectoryA")) return @intFromPtr(&GetCurrentDirectoryA);
+    if (std.mem.eql(u8, name, "RemoveDirectoryW")) return @intFromPtr(&RemoveDirectoryW);
+    if (std.mem.eql(u8, name, "ReplaceFileW")) return @intFromPtr(&ReplaceFileW);
+    if (std.mem.eql(u8, name, "GetOverlappedResult")) return @intFromPtr(&GetOverlappedResult);
+    if (std.mem.eql(u8, name, "CancelIo")) return @intFromPtr(&CancelIo);
+    if (std.mem.eql(u8, name, "GetFileTime")) return @intFromPtr(&GetFileTime);
+    if (std.mem.eql(u8, name, "FileTimeToLocalFileTime")) return @intFromPtr(&FileTimeToLocalFileTime);
+    if (std.mem.eql(u8, name, "FileTimeToDosDateTime")) return @intFromPtr(&FileTimeToDosDateTime);
+    if (std.mem.eql(u8, name, "FindFirstFileExA")) return @intFromPtr(&FindFirstFileExA);
+    if (std.mem.eql(u8, name, "FlushConsoleInputBuffer")) return @intFromPtr(&FlushConsoleInputBuffer);
+    if (std.mem.eql(u8, name, "FlushInstructionCache")) return @intFromPtr(&FlushInstructionCache);
+    if (std.mem.eql(u8, name, "HeapQueryInformation")) return @intFromPtr(&HeapQueryInformation);
+    if (std.mem.eql(u8, name, "VerifyVersionInfoA")) return @intFromPtr(&VerifyVersionInfoA);
+    if (std.mem.eql(u8, name, "ExpandEnvironmentStringsA")) return @intFromPtr(&ExpandEnvironmentStringsA);
+    if (std.mem.eql(u8, name, "SetDllDirectoryW")) return @intFromPtr(&SetDllDirectoryW);
+    if (std.mem.eql(u8, name, "lstrcpyA")) return @intFromPtr(&lstrcpyA);
+    if (std.mem.eql(u8, name, "lstrlenA")) return @intFromPtr(&lstrlenA);
     if (std.mem.eql(u8, name, "GlobalAlloc")) return @intFromPtr(&GlobalAlloc);
     if (std.mem.eql(u8, name, "GlobalLock")) return @intFromPtr(&GlobalLock);
     if (std.mem.eql(u8, name, "GlobalUnlock")) return @intFromPtr(&GlobalUnlock);

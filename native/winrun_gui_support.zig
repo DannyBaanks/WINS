@@ -572,7 +572,55 @@ fn SetPixelFormat(hdc: usize, format: i32, ppfd: ?*const anyopaque) callconv(W) 
     return 1;
 }
 
+fn BitBlt(hdc: usize, x: i32, y: i32, cx: i32, cy: i32, hdcSrc: usize, x1: i32, y1: i32, rop: u32) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y; _ = cx; _ = cy; _ = hdcSrc; _ = x1; _ = y1; _ = rop;
+    return 1;
+}
+
+fn SelectObject(hdc: usize, h: usize) callconv(W) usize {
+    _ = hdc;
+    return h;
+}
+
+fn CreateCompatibleDC(hdc: usize) callconv(W) usize {
+    _ = hdc;
+    return 0xB002;
+}
+
+fn CreateCompatibleBitmap(hdc: usize, cx: i32, cy: i32) callconv(W) usize {
+    _ = hdc; _ = cx; _ = cy;
+    return 0xB003;
+}
+
+fn GetObjectA(h: usize, c: i32, pv: ?*anyopaque) callconv(W) i32 {
+    _ = h; _ = c; _ = pv;
+    return 0;
+}
+
+fn GetObjectW(h: usize, c: i32, pv: ?*anyopaque) callconv(W) i32 {
+    _ = h; _ = c; _ = pv;
+    return 0;
+}
+
+fn CreateBitmap(nWidth: i32, nHeight: i32, nPlanes: u32, nBitCount: u32, lpBits: ?*const anyopaque) callconv(W) usize {
+    _ = nWidth; _ = nHeight; _ = nPlanes; _ = nBitCount; _ = lpBits;
+    return 0xB004;
+}
+
+fn GetStockObject(i: i32) callconv(W) usize {
+    _ = i;
+    return 0xB005;
+}
+
 pub fn lookupGdi32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "BitBlt")) return @intFromPtr(&BitBlt);
+    if (std.mem.eql(u8, name, "SelectObject")) return @intFromPtr(&SelectObject);
+    if (std.mem.eql(u8, name, "CreateCompatibleDC")) return @intFromPtr(&CreateCompatibleDC);
+    if (std.mem.eql(u8, name, "CreateCompatibleBitmap")) return @intFromPtr(&CreateCompatibleBitmap);
+    if (std.mem.eql(u8, name, "GetObjectA")) return @intFromPtr(&GetObjectA);
+    if (std.mem.eql(u8, name, "GetObjectW")) return @intFromPtr(&GetObjectW);
+    if (std.mem.eql(u8, name, "CreateBitmap")) return @intFromPtr(&CreateBitmap);
+    if (std.mem.eql(u8, name, "GetStockObject")) return @intFromPtr(&GetStockObject);
     if (std.mem.eql(u8, name, "GetDeviceCaps")) return @intFromPtr(&GetDeviceCaps);
     if (std.mem.eql(u8, name, "CreateFontW")) return @intFromPtr(&CreateFontW);
     if (std.mem.eql(u8, name, "DeleteObject")) return @intFromPtr(&DeleteObject);
@@ -665,7 +713,469 @@ fn GetCapture() callconv(W) usize {
     return 0;
 }
 
+fn GetCursorPos(lpPoint: ?*anyopaque) callconv(W) i32 {
+    if (lpPoint) |p| {
+        const pt: *Point = @ptrCast(@alignCast(p));
+        pt.x = 640;
+        pt.y = 360;
+    }
+    return 1;
+}
+
+const MonitorInfo = extern struct {
+    cbSize: u32,
+    rcMonitor: Rect,
+    rcWork: Rect,
+    dwFlags: u32,
+};
+
+fn GetMonitorInfoW(hMonitor: usize, lpmi: ?*MonitorInfo) callconv(W) i32 {
+    _ = hMonitor;
+    if (lpmi) |mi| {
+        mi.rcMonitor = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+        mi.rcWork = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 };
+        mi.dwFlags = 1;
+    }
+    return 1;
+}
+
+fn GetMonitorInfoA(hMonitor: usize, lpmi: ?*MonitorInfo) callconv(W) i32 {
+    return GetMonitorInfoW(hMonitor, lpmi);
+}
+
+fn MonitorFromPoint(pt_x: i32, pt_y: i32, dwFlags: u32) callconv(W) usize {
+    _ = pt_x; _ = pt_y; _ = dwFlags;
+    return 0x10001;
+}
+
+fn MonitorFromRect(lprc: ?*const anyopaque, dwFlags: u32) callconv(W) usize {
+    _ = lprc; _ = dwFlags;
+    return 0x10001;
+}
+
+fn MonitorFromWindow(hwnd: usize, dwFlags: u32) callconv(W) usize {
+    _ = hwnd; _ = dwFlags;
+    return 0x10001;
+}
+
+fn GetParent(hwnd: usize) callconv(W) usize {
+    _ = hwnd;
+    return 0;
+}
+
+fn GetWindowLongPtrW(hwnd: usize, nIndex: i32) callconv(W) isize {
+    _ = hwnd;
+    if (nIndex == -16) return 0x10000000 | 0x00cf0000;
+    return 0;
+}
+
+fn SetWindowLongPtrW(hwnd: usize, nIndex: i32, dwNewLong: isize) callconv(W) isize {
+    _ = hwnd; _ = nIndex;
+    return dwNewLong;
+}
+
+fn GetWindowLongW(hwnd: usize, nIndex: i32) callconv(W) i32 {
+    return @truncate(GetWindowLongPtrW(hwnd, nIndex));
+}
+
+fn SetWindowLongW(hwnd: usize, nIndex: i32, dwNewLong: i32) callconv(W) i32 {
+    return @truncate(SetWindowLongPtrW(hwnd, nIndex, dwNewLong));
+}
+
+fn GetWindowLongPtrA(hwnd: usize, nIndex: i32) callconv(W) isize {
+    return GetWindowLongPtrW(hwnd, nIndex);
+}
+
+fn SetWindowLongPtrA(hwnd: usize, nIndex: i32, dwNewLong: isize) callconv(W) isize {
+    return SetWindowLongPtrW(hwnd, nIndex, dwNewLong);
+}
+
+fn GetWindowLongA(hwnd: usize, nIndex: i32) callconv(W) i32 {
+    return GetWindowLongW(hwnd, nIndex);
+}
+
+fn SetWindowLongA(hwnd: usize, nIndex: i32, dwNewLong: i32) callconv(W) i32 {
+    return SetWindowLongW(hwnd, nIndex, dwNewLong);
+}
+
+const WindowPlacement = extern struct {
+    length: u32,
+    flags: u32,
+    showCmd: u32,
+    ptMinPosition: Point,
+    ptMaxPosition: Point,
+    rcNormalPosition: Rect,
+};
+
+fn GetWindowPlacement(hwnd: usize, lpwndpl: ?*WindowPlacement) callconv(W) i32 {
+    _ = hwnd;
+    if (lpwndpl) |wp| {
+        wp.showCmd = 1;
+        wp.rcNormalPosition = .{ .left = 0, .top = 0, .right = 1280, .bottom = 720 };
+    }
+    return 1;
+}
+
+fn SetWindowPlacement(hwnd: usize, lpwndpl: ?*const anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = lpwndpl;
+    return 1;
+}
+
+fn IsDialogMessageW(hDlg: usize, lpMsg: ?*const anyopaque) callconv(W) i32 {
+    _ = hDlg; _ = lpMsg;
+    return 0;
+}
+
+fn SetTimer(hwnd: usize, nIDEvent: usize, uElapse: u32, lpTimerFunc: ?*const anyopaque) callconv(W) usize {
+    _ = hwnd; _ = uElapse; _ = lpTimerFunc;
+    return if (nIDEvent != 0) nIDEvent else 1;
+}
+
+fn KillTimer(hwnd: usize, uIDEvent: usize) callconv(W) i32 {
+    _ = hwnd; _ = uIDEvent;
+    return 1;
+}
+
+fn OffsetRect(lprc: ?*Rect, dx: i32, dy: i32) callconv(W) i32 {
+    if (lprc) |r| {
+        r.left += dx;
+        r.right += dx;
+        r.top += dy;
+        r.bottom += dy;
+    }
+    return 1;
+}
+
+fn CopyRect(lprcDst: ?*Rect, lprcSrc: ?*const Rect) callconv(W) i32 {
+    if (lprcDst != null and lprcSrc != null) {
+        lprcDst.?.* = lprcSrc.?.*;
+    }
+    return 1;
+}
+
+fn ScreenToClient(hwnd: usize, lpPoint: ?*anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = lpPoint;
+    return 1;
+}
+
+fn SetCursor(hCursor: usize) callconv(W) usize {
+    return hCursor;
+}
+
+fn ShowCursor(bShow: i32) callconv(W) i32 {
+    return if (bShow != 0) 1 else 0;
+}
+
+fn SetCursorPos(x: i32, y: i32) callconv(W) i32 {
+    _ = x; _ = y;
+    return 1;
+}
+
+fn ClipCursor(lpRect: ?*const anyopaque) callconv(W) i32 {
+    _ = lpRect;
+    return 1;
+}
+
+fn SetFocus(hwnd: usize) callconv(W) usize {
+    return hwnd;
+}
+
+fn SetForegroundWindow(hwnd: usize) callconv(W) i32 {
+    _ = hwnd;
+    return 1;
+}
+
+fn TrackMouseEvent(lpEventTrack: ?*anyopaque) callconv(W) i32 {
+    _ = lpEventTrack;
+    return 1;
+}
+
+fn UnregisterClassW(lpClassName: ?*const u16, hInstance: usize) callconv(W) i32 {
+    _ = lpClassName; _ = hInstance;
+    return 1;
+}
+
+fn ValidateRect(hwnd: usize, lpRect: ?*const anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = lpRect;
+    return 1;
+}
+
+fn RegisterRawInputDevices(pRawInputDevices: ?*const anyopaque, uiNumDevices: u32, cbSize: u32) callconv(W) i32 {
+    _ = pRawInputDevices; _ = uiNumDevices; _ = cbSize;
+    return 1;
+}
+
+fn GetRawInputDeviceInfoW(hDevice: usize, uiCommand: u32, pData: ?*anyopaque, pcbSize: ?*u32) callconv(W) u32 {
+    _ = hDevice; _ = uiCommand; _ = pData;
+    if (pcbSize) |p| p.* = 0;
+    return 0;
+}
+
+fn GetRawInputData(hRawInput: usize, uiCommand: u32, pData: ?*anyopaque, pcbSize: ?*u32, cbSizeHeader: u32) callconv(W) u32 {
+    _ = hRawInput; _ = uiCommand; _ = pData; _ = cbSizeHeader;
+    if (pcbSize) |p| p.* = 0;
+    return 0;
+}
+
+fn GetRawInputDeviceList(pRawInputDeviceList: ?*anyopaque, puiNumDevices: ?*u32, cbSize: u32) callconv(W) u32 {
+    _ = pRawInputDeviceList; _ = cbSize;
+    if (puiNumDevices) |p| p.* = 0;
+    return 0;
+}
+
+fn RegisterDeviceNotificationW(hRecipient: usize, NotificationFilter: ?*anyopaque, Flags: u32) callconv(W) usize {
+    _ = hRecipient; _ = NotificationFilter; _ = Flags;
+    return 0x20001;
+}
+
+fn UnregisterDeviceNotification(Handle: usize) callconv(W) i32 {
+    _ = Handle;
+    return 1;
+}
+
+fn GetKeyNameTextW(lParam: i32, lpString: ?[*]u16, cchSize: i32) callconv(W) i32 {
+    _ = lParam; _ = lpString; _ = cchSize;
+    return 0;
+}
+
+fn GetAsyncKeyState(vKey: i32) callconv(W) i16 {
+    _ = vKey;
+    return 0;
+}
+
+fn GetMessagePos() callconv(W) u32 {
+    return 0;
+}
+
+fn GetMessageExtraInfo() callconv(W) isize {
+    return 0;
+}
+
+fn DragDetect(hwnd: usize, pt_x: i32, pt_y: i32) callconv(W) i32 {
+    _ = hwnd; _ = pt_x; _ = pt_y;
+    return 0;
+}
+
+fn GetMessageA(lpMsg: ?*anyopaque, hwnd: usize, wMsgFilterMin: u32, wMsgFilterMax: u32) callconv(W) i32 {
+    _ = lpMsg; _ = hwnd; _ = wMsgFilterMin; _ = wMsgFilterMax;
+    return 0;
+}
+
+fn CopyImage(h: usize, uType: u32, cx: i32, cy: i32, uFlags: u32) callconv(W) usize {
+    _ = uType; _ = cx; _ = cy; _ = uFlags;
+    return h;
+}
+
+fn wvsprintfA(lpOut: ?[*]u8, lpFmt: ?[*:0]const u8, arglist: ?*anyopaque) callconv(W) i32 {
+    _ = lpFmt; _ = arglist;
+    if (lpOut) |p| p[0] = 0;
+    return 0;
+}
+
+fn wsprintfA(lpOut: ?[*]u8, lpFmt: ?[*:0]const u8) callconv(W) i32 {
+    _ = lpFmt;
+    if (lpOut) |p| p[0] = 0;
+    return 0;
+}
+
+fn EnumDisplaySettingsA(lpszDeviceName: ?[*:0]const u8, iModeNum: u32, lpDevMode: ?*anyopaque) callconv(W) i32 {
+    _ = lpszDeviceName; _ = iModeNum; _ = lpDevMode;
+    return 0;
+}
+
+fn EnumDisplaySettingsW(lpszDeviceName: ?*const u16, iModeNum: u32, lpDevMode: ?*anyopaque) callconv(W) i32 {
+    _ = lpszDeviceName; _ = iModeNum; _ = lpDevMode;
+    return 0;
+}
+
+fn ChangeDisplaySettingsW(lpDevMode: ?*anyopaque, dwFlags: u32) callconv(W) i32 {
+    _ = lpDevMode; _ = dwFlags;
+    return 0;
+}
+
+fn EnumDisplayMonitors(hdc: usize, lprcClip: ?*const anyopaque, lpfnEnum: ?*anyopaque, dwData: usize) callconv(W) i32 {
+    _ = hdc; _ = lprcClip; _ = lpfnEnum; _ = dwData;
+    return 1;
+}
+
+fn EnumDisplayDevicesA(lpDevice: ?[*:0]const u8, iDevNum: u32, lpDisplayDevice: ?*anyopaque, dwFlags: u32) callconv(W) i32 {
+    _ = lpDevice; _ = iDevNum; _ = lpDisplayDevice; _ = dwFlags;
+    return 0;
+}
+
+fn GetCaretBlinkTime() callconv(W) u32 {
+    return 530;
+}
+
+fn IsClipboardFormatAvailable(format: u32) callconv(W) i32 {
+    _ = format;
+    return 0;
+}
+
+fn LoadCursorA(hInstance: usize, lpCursorName: ?*const anyopaque) callconv(W) usize {
+    _ = hInstance; _ = lpCursorName;
+    return 0x30001;
+}
+
+fn LoadIconA(hInstance: usize, lpIconName: ?*const anyopaque) callconv(W) usize {
+    _ = hInstance; _ = lpIconName;
+    return 0x30002;
+}
+
+fn CreateIconIndirect(piconinfo: ?*anyopaque) callconv(W) usize {
+    _ = piconinfo;
+    return 0x30003;
+}
+
+fn GetThreadDesktop(dwThreadId: u32) callconv(W) usize {
+    _ = dwThreadId;
+    return 0x40001;
+}
+
+fn GetUserObjectInformationA(hObj: usize, nIndex: i32, pvInfo: ?*anyopaque, nLength: u32, lpnLengthNeeded: ?*u32) callconv(W) i32 {
+    _ = hObj; _ = nIndex; _ = pvInfo; _ = nLength;
+    if (lpnLengthNeeded) |p| p.* = 0;
+    return 1;
+}
+
+fn GetUserObjectInformationW(hObj: usize, nIndex: i32, pvInfo: ?*anyopaque, nLength: u32, lpnLengthNeeded: ?*u32) callconv(W) i32 {
+    _ = hObj; _ = nIndex; _ = pvInfo; _ = nLength;
+    if (lpnLengthNeeded) |p| p.* = 0;
+    return 1;
+}
+
+fn GetProcessWindowStation() callconv(W) usize {
+    return 0x40002;
+}
+
+fn RegisterWindowMessageA(lpString: ?[*:0]const u8) callconv(W) u32 {
+    _ = lpString;
+    return 0xC001;
+}
+
+fn SendMessageA(hwnd: usize, msg: u32, wparam: usize, lparam: isize) callconv(W) isize {
+    _ = hwnd; _ = msg; _ = wparam; _ = lparam;
+    return 0;
+}
+
+fn SendMessageTimeoutA(hwnd: usize, msg: u32, wparam: usize, lparam: isize, fuFlags: u32, uTimeout: u32, lpdwResult: ?*usize) callconv(W) isize {
+    _ = hwnd; _ = msg; _ = wparam; _ = lparam; _ = fuFlags; _ = uTimeout;
+    if (lpdwResult) |p| p.* = 0;
+    return 1;
+}
+
+fn EnumWindows(lpEnumFunc: ?*anyopaque, lParam: isize) callconv(W) i32 {
+    _ = lpEnumFunc; _ = lParam;
+    return 1;
+}
+
+fn CreateDialogParamA(hInstance: usize, lpTemplateName: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*anyopaque, dwInitParam: isize) callconv(W) usize {
+    _ = hInstance; _ = lpTemplateName; _ = hWndParent; _ = lpDialogFunc; _ = dwInitParam;
+    return 0x50001;
+}
+
+fn DialogBoxParamA(hInstance: usize, lpTemplateName: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*anyopaque, dwInitParam: isize) callconv(W) isize {
+    _ = hInstance; _ = lpTemplateName; _ = hWndParent; _ = lpDialogFunc; _ = dwInitParam;
+    return 1;
+}
+
+fn AdjustWindowRectEx(lpRect: ?*Rect, dwStyle: u32, bMenu: i32, dwExStyle: u32) callconv(W) i32 {
+    _ = lpRect; _ = dwStyle; _ = bMenu; _ = dwExStyle;
+    return 1;
+}
+
+fn SetDlgItemTextA(hDlg: usize, nIDDlgItem: i32, lpString: ?[*:0]const u8) callconv(W) i32 {
+    _ = hDlg; _ = nIDDlgItem; _ = lpString;
+    return 1;
+}
+
+fn CheckDlgButton(hDlg: usize, nIDButton: i32, uCheck: u32) callconv(W) i32 {
+    _ = hDlg; _ = nIDButton; _ = uCheck;
+    return 1;
+}
+
+fn IsDlgButtonChecked(hDlg: usize, nIDButton: i32) callconv(W) u32 {
+    _ = hDlg; _ = nIDButton;
+    return 0;
+}
+
+fn GetDesktopWindow() callconv(W) usize {
+    return 0x10000;
+}
+
 pub fn lookup(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "GetCursorPos")) return @intFromPtr(&GetCursorPos);
+    if (std.mem.eql(u8, name, "GetMonitorInfoW")) return @intFromPtr(&GetMonitorInfoW);
+    if (std.mem.eql(u8, name, "GetMonitorInfoA")) return @intFromPtr(&GetMonitorInfoA);
+    if (std.mem.eql(u8, name, "MonitorFromPoint")) return @intFromPtr(&MonitorFromPoint);
+    if (std.mem.eql(u8, name, "MonitorFromRect")) return @intFromPtr(&MonitorFromRect);
+    if (std.mem.eql(u8, name, "MonitorFromWindow")) return @intFromPtr(&MonitorFromWindow);
+    if (std.mem.eql(u8, name, "GetParent")) return @intFromPtr(&GetParent);
+    if (std.mem.eql(u8, name, "GetWindowLongPtrW")) return @intFromPtr(&GetWindowLongPtrW);
+    if (std.mem.eql(u8, name, "SetWindowLongPtrW")) return @intFromPtr(&SetWindowLongPtrW);
+    if (std.mem.eql(u8, name, "GetWindowLongW")) return @intFromPtr(&GetWindowLongW);
+    if (std.mem.eql(u8, name, "SetWindowLongW")) return @intFromPtr(&SetWindowLongW);
+    if (std.mem.eql(u8, name, "GetWindowLongPtrA")) return @intFromPtr(&GetWindowLongPtrA);
+    if (std.mem.eql(u8, name, "SetWindowLongPtrA")) return @intFromPtr(&SetWindowLongPtrA);
+    if (std.mem.eql(u8, name, "GetWindowLongA")) return @intFromPtr(&GetWindowLongA);
+    if (std.mem.eql(u8, name, "SetWindowLongA")) return @intFromPtr(&SetWindowLongA);
+    if (std.mem.eql(u8, name, "GetWindowPlacement")) return @intFromPtr(&GetWindowPlacement);
+    if (std.mem.eql(u8, name, "SetWindowPlacement")) return @intFromPtr(&SetWindowPlacement);
+    if (std.mem.eql(u8, name, "IsDialogMessageW")) return @intFromPtr(&IsDialogMessageW);
+    if (std.mem.eql(u8, name, "SetTimer")) return @intFromPtr(&SetTimer);
+    if (std.mem.eql(u8, name, "KillTimer")) return @intFromPtr(&KillTimer);
+    if (std.mem.eql(u8, name, "OffsetRect")) return @intFromPtr(&OffsetRect);
+    if (std.mem.eql(u8, name, "CopyRect")) return @intFromPtr(&CopyRect);
+    if (std.mem.eql(u8, name, "ScreenToClient")) return @intFromPtr(&ScreenToClient);
+    if (std.mem.eql(u8, name, "SetCursor")) return @intFromPtr(&SetCursor);
+    if (std.mem.eql(u8, name, "ShowCursor")) return @intFromPtr(&ShowCursor);
+    if (std.mem.eql(u8, name, "SetCursorPos")) return @intFromPtr(&SetCursorPos);
+    if (std.mem.eql(u8, name, "ClipCursor")) return @intFromPtr(&ClipCursor);
+    if (std.mem.eql(u8, name, "SetFocus")) return @intFromPtr(&SetFocus);
+    if (std.mem.eql(u8, name, "SetForegroundWindow")) return @intFromPtr(&SetForegroundWindow);
+    if (std.mem.eql(u8, name, "TrackMouseEvent")) return @intFromPtr(&TrackMouseEvent);
+    if (std.mem.eql(u8, name, "UnregisterClassW")) return @intFromPtr(&UnregisterClassW);
+    if (std.mem.eql(u8, name, "ValidateRect")) return @intFromPtr(&ValidateRect);
+    if (std.mem.eql(u8, name, "RegisterRawInputDevices")) return @intFromPtr(&RegisterRawInputDevices);
+    if (std.mem.eql(u8, name, "GetRawInputDeviceInfoW")) return @intFromPtr(&GetRawInputDeviceInfoW);
+    if (std.mem.eql(u8, name, "GetRawInputData")) return @intFromPtr(&GetRawInputData);
+    if (std.mem.eql(u8, name, "GetRawInputDeviceList")) return @intFromPtr(&GetRawInputDeviceList);
+    if (std.mem.eql(u8, name, "RegisterDeviceNotificationW")) return @intFromPtr(&RegisterDeviceNotificationW);
+    if (std.mem.eql(u8, name, "UnregisterDeviceNotification")) return @intFromPtr(&UnregisterDeviceNotification);
+    if (std.mem.eql(u8, name, "GetKeyNameTextW")) return @intFromPtr(&GetKeyNameTextW);
+    if (std.mem.eql(u8, name, "GetAsyncKeyState")) return @intFromPtr(&GetAsyncKeyState);
+    if (std.mem.eql(u8, name, "GetMessagePos")) return @intFromPtr(&GetMessagePos);
+    if (std.mem.eql(u8, name, "GetMessageExtraInfo")) return @intFromPtr(&GetMessageExtraInfo);
+    if (std.mem.eql(u8, name, "DragDetect")) return @intFromPtr(&DragDetect);
+    if (std.mem.eql(u8, name, "GetMessageA")) return @intFromPtr(&GetMessageA);
+    if (std.mem.eql(u8, name, "CopyImage")) return @intFromPtr(&CopyImage);
+    if (std.mem.eql(u8, name, "wvsprintfA")) return @intFromPtr(&wvsprintfA);
+    if (std.mem.eql(u8, name, "wsprintfA")) return @intFromPtr(&wsprintfA);
+    if (std.mem.eql(u8, name, "EnumDisplaySettingsA")) return @intFromPtr(&EnumDisplaySettingsA);
+    if (std.mem.eql(u8, name, "EnumDisplaySettingsW")) return @intFromPtr(&EnumDisplaySettingsW);
+    if (std.mem.eql(u8, name, "ChangeDisplaySettingsW")) return @intFromPtr(&ChangeDisplaySettingsW);
+    if (std.mem.eql(u8, name, "EnumDisplayMonitors")) return @intFromPtr(&EnumDisplayMonitors);
+    if (std.mem.eql(u8, name, "EnumDisplayDevicesA")) return @intFromPtr(&EnumDisplayDevicesA);
+    if (std.mem.eql(u8, name, "GetCaretBlinkTime")) return @intFromPtr(&GetCaretBlinkTime);
+    if (std.mem.eql(u8, name, "IsClipboardFormatAvailable")) return @intFromPtr(&IsClipboardFormatAvailable);
+    if (std.mem.eql(u8, name, "LoadCursorA")) return @intFromPtr(&LoadCursorA);
+    if (std.mem.eql(u8, name, "LoadIconA")) return @intFromPtr(&LoadIconA);
+    if (std.mem.eql(u8, name, "CreateIconIndirect")) return @intFromPtr(&CreateIconIndirect);
+    if (std.mem.eql(u8, name, "GetThreadDesktop")) return @intFromPtr(&GetThreadDesktop);
+    if (std.mem.eql(u8, name, "GetUserObjectInformationA")) return @intFromPtr(&GetUserObjectInformationA);
+    if (std.mem.eql(u8, name, "GetUserObjectInformationW")) return @intFromPtr(&GetUserObjectInformationW);
+    if (std.mem.eql(u8, name, "GetProcessWindowStation")) return @intFromPtr(&GetProcessWindowStation);
+    if (std.mem.eql(u8, name, "RegisterWindowMessageA")) return @intFromPtr(&RegisterWindowMessageA);
+    if (std.mem.eql(u8, name, "SendMessageA")) return @intFromPtr(&SendMessageA);
+    if (std.mem.eql(u8, name, "SendMessageTimeoutA")) return @intFromPtr(&SendMessageTimeoutA);
+    if (std.mem.eql(u8, name, "EnumWindows")) return @intFromPtr(&EnumWindows);
+    if (std.mem.eql(u8, name, "CreateDialogParamA")) return @intFromPtr(&CreateDialogParamA);
+    if (std.mem.eql(u8, name, "DialogBoxParamA")) return @intFromPtr(&DialogBoxParamA);
+    if (std.mem.eql(u8, name, "AdjustWindowRectEx")) return @intFromPtr(&AdjustWindowRectEx);
+    if (std.mem.eql(u8, name, "SetDlgItemTextA")) return @intFromPtr(&SetDlgItemTextA);
+    if (std.mem.eql(u8, name, "CheckDlgButton")) return @intFromPtr(&CheckDlgButton);
+    if (std.mem.eql(u8, name, "IsDlgButtonChecked")) return @intFromPtr(&IsDlgButtonChecked);
+    if (std.mem.eql(u8, name, "GetDesktopWindow")) return @intFromPtr(&GetDesktopWindow);
     if (std.mem.eql(u8, name, "ClientToScreen")) return @intFromPtr(&ClientToScreen);
     if (std.mem.eql(u8, name, "OpenClipboard")) return @intFromPtr(&OpenClipboard);
     if (std.mem.eql(u8, name, "CloseClipboard")) return @intFromPtr(&CloseClipboard);

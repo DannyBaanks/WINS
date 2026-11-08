@@ -84,7 +84,9 @@ fn resolveImport(dll: []const u8, sym: []const u8) bool {
         std.ascii.eqlIgnoreCase(dll, "secur32.dll") or
         std.ascii.eqlIgnoreCase(dll, "comctl32.dll") or
         std.ascii.eqlIgnoreCase(dll, "wintrust.dll") or
-        std.ascii.eqlIgnoreCase(dll, "iphlpapi.dll"))
+        std.ascii.eqlIgnoreCase(dll, "iphlpapi.dll") or
+        std.ascii.eqlIgnoreCase(dll, "dnsapi.dll") or
+        std.ascii.eqlIgnoreCase(dll, "winhttp.dll"))
     {
         return extra.lookupMisc(sym) != null;
     }
@@ -344,10 +346,14 @@ pub fn main(init: std.process.Init) !void {
 
     var corpus_dir: []const u8 = "corpus";
     var json_mode = false;
+    var victim_filter: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--json")) {
             json_mode = true;
+        } else if (std.mem.eql(u8, args[i], "--victim") and i + 1 < args.len) {
+            i += 1;
+            victim_filter = args[i];
         } else if (std.mem.eql(u8, args[i], "--corpus") and i + 1 < args.len) {
             i += 1;
             corpus_dir = args[i];
@@ -486,6 +492,18 @@ pub fn main(init: std.process.Init) !void {
         try out.print(a, "#{d:<5} {s:<42} {d:<12} {s:<20}\n", .{
             idx + 1, item.symbol, item.count, item.sample_victim,
         });
+    }
+
+    if (victim_filter) |vf| {
+        try out.print(a, "\n[MISSING IMPORTS FOR {s}]\n", .{vf});
+        var count: usize = 0;
+        for (missing_all.items) |m| {
+            if (std.ascii.eqlIgnoreCase(m.victim, vf)) {
+                count += 1;
+                try out.print(a, "  {s}!{s}\n", .{ m.dll, m.symbol });
+            }
+        }
+        try out.print(a, "Total missing for {s}: {d}\n", .{ vf, count });
     }
     try out.print(a, "\n", .{});
     writeAllFd(1, out.items);

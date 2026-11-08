@@ -1,6 +1,7 @@
 """Synthetic USER32 popup through the experimental PE loader, in private Xvfb."""
 from pathlib import Path
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -112,7 +113,7 @@ class WinrunGuiTests(unittest.TestCase):
                       '--', '/loader', '--sha256', digest, '/probe.exe']
         result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 4, result.stderr)
-        self.assertIn('GetCursorPos', result.stderr)
+        self.assertIn('CascadeWindows', result.stderr)
 
     def test_tls_data_only_probe_runs(self):
         """GUI loader must execute a PE with data-only TLS (0 callbacks)."""
@@ -200,6 +201,25 @@ class WinrunGuiTests(unittest.TestCase):
         self.assertIn('READY', result.stderr)
         self.assertIn('imports=67', result.stderr)
         self.assertIn('relocs=745', result.stderr)
+
+    def test_unity_player_corpus_resolution(self):
+        """UnityPlayer.dll (Unity 2017 Win64 engine) must achieve 100.0% import resolution (486/486)."""
+        unity_dll = ROOT / 'corpus' / 'UnityPlayer.dll'
+        if not unity_dll.is_file():
+            self.skipTest('corpus/UnityPlayer.dll not present')
+        fuzzer_bin = Path('/tmp/wins_fuzzer')
+        if not fuzzer_bin.is_file():
+            subprocess.run(['zig', 'build-exe', str(ROOT / 'native' / 'wins_fuzzer.zig'),
+                            '-O', 'Debug', '-lc', '-lX11', '-fPIC', f'-femit-bin={fuzzer_bin}'],
+                           check=True, capture_output=True)
+        res = subprocess.run([str(fuzzer_bin), str(ROOT / 'corpus'), '--json'],
+                             capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        unity_entry = next((b for b in data['binaries'] if b['name'] == 'UnityPlayer.dll'), None)
+        self.assertIsNotNone(unity_entry)
+        self.assertEqual(unity_entry['missing'], 0, f"Missing imports in UnityPlayer: {unity_entry}")
+        self.assertEqual(unity_entry['resolved'], 486)
+        self.assertEqual(unity_entry['readiness_pct'], 100.0)
 
 
 if __name__ == '__main__':

@@ -235,7 +235,9 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                 std.ascii.eqlIgnoreCase(lib, "secur32.dll") or
                 std.ascii.eqlIgnoreCase(lib, "comctl32.dll") or
                 std.ascii.eqlIgnoreCase(lib, "wintrust.dll") or
-                std.ascii.eqlIgnoreCase(lib, "iphlpapi.dll"))
+                std.ascii.eqlIgnoreCase(lib, "iphlpapi.dll") or
+                std.ascii.eqlIgnoreCase(lib, "dnsapi.dll") or
+                std.ascii.eqlIgnoreCase(lib, "winhttp.dll"))
             {
                 return @import("winrun_extra_dlls.zig").lookupMisc(name);
             }

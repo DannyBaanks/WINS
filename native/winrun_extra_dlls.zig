@@ -245,7 +245,72 @@ fn RegSetValueExA(hKey: usize, lpValueName: ?[*:0]const u8, Reserved: u32, dwTyp
     return 0;
 }
 
+var sid_sub_auth: u32 = 0;
+var sid_sub_count: u8 = 1;
+
+fn GetSidSubAuthority(pSid: ?*anyopaque, nSubAuthority: u32) callconv(W) ?*u32 {
+    _ = pSid; _ = nSubAuthority;
+    return &sid_sub_auth;
+}
+
+fn GetSidSubAuthorityCount(pSid: ?*anyopaque) callconv(W) ?*u8 {
+    _ = pSid;
+    return &sid_sub_count;
+}
+
+fn IsValidSid(pSid: ?*anyopaque) callconv(W) i32 {
+    _ = pSid;
+    return 1;
+}
+
+fn ReportEventW(hEventLog: usize, wType: u16, wCategory: u16, dwEventID: u32, lpUserSid: ?*anyopaque, wNumStrings: u16, dwDataSize: u32, lpStrings: ?*anyopaque, lpRawData: ?*anyopaque) callconv(W) i32 {
+    _ = hEventLog; _ = wType; _ = wCategory; _ = dwEventID; _ = lpUserSid; _ = wNumStrings; _ = dwDataSize; _ = lpStrings; _ = lpRawData;
+    return 1;
+}
+
+fn RegisterEventSourceW(lpUNCServerName: ?*const anyopaque, lpSourceName: ?*const anyopaque) callconv(W) usize {
+    _ = lpUNCServerName; _ = lpSourceName;
+    return 0x50001;
+}
+
+fn DeregisterEventSource(hEventLog: usize) callconv(W) i32 {
+    _ = hEventLog;
+    return 1;
+}
+
+fn RegDeleteValueA(hKey: usize, lpValueName: ?[*:0]const u8) callconv(W) i32 {
+    _ = hKey; _ = lpValueName;
+    return 0;
+}
+
+fn RegDeleteValueW(hKey: usize, lpValueName: ?*const u16) callconv(W) i32 {
+    _ = hKey; _ = lpValueName;
+    return 0;
+}
+
+fn RegCreateKeyW(hKey: usize, lpSubKey: ?*const u16, phkResult: ?*usize) callconv(W) i32 {
+    _ = hKey; _ = lpSubKey;
+    if (phkResult) |p| p.* = 0x2001;
+    return 0;
+}
+
+fn RegCreateKeyA(hKey: usize, lpSubKey: ?[*:0]const u8, phkResult: ?*usize) callconv(W) i32 {
+    _ = hKey; _ = lpSubKey;
+    if (phkResult) |p| p.* = 0x2001;
+    return 0;
+}
+
 pub fn lookupAdvapi32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "GetSidSubAuthority")) return @intFromPtr(&GetSidSubAuthority);
+    if (std.mem.eql(u8, name, "GetSidSubAuthorityCount")) return @intFromPtr(&GetSidSubAuthorityCount);
+    if (std.mem.eql(u8, name, "IsValidSid")) return @intFromPtr(&IsValidSid);
+    if (std.mem.eql(u8, name, "ReportEventW")) return @intFromPtr(&ReportEventW);
+    if (std.mem.eql(u8, name, "RegisterEventSourceW")) return @intFromPtr(&RegisterEventSourceW);
+    if (std.mem.eql(u8, name, "DeregisterEventSource")) return @intFromPtr(&DeregisterEventSource);
+    if (std.mem.eql(u8, name, "RegDeleteValueA")) return @intFromPtr(&RegDeleteValueA);
+    if (std.mem.eql(u8, name, "RegDeleteValueW")) return @intFromPtr(&RegDeleteValueW);
+    if (std.mem.eql(u8, name, "RegCreateKeyW")) return @intFromPtr(&RegCreateKeyW);
+    if (std.mem.eql(u8, name, "RegCreateKeyA")) return @intFromPtr(&RegCreateKeyA);
     if (std.mem.eql(u8, name, "RegOpenKeyExW")) return @intFromPtr(&RegOpenKeyExW);
     if (std.mem.eql(u8, name, "RegOpenKeyExA")) return @intFromPtr(&RegOpenKeyExA);
     if (std.mem.eql(u8, name, "RegCreateKeyExW")) return @intFromPtr(&RegCreateKeyExW);
@@ -587,7 +652,44 @@ fn if_nametoindex(name: ?[*:0]const u8) callconv(W) u32 {
     return 1;
 }
 
+fn WSARecvFrom(s: usize, lpBuffers: ?*anyopaque, dwBufferCount: u32, lpNumberOfBytesRecvd: ?*u32, lpFlags: ?*u32, lpFrom: ?*anyopaque, lpFromlen: ?*i32, lpOverlapped: ?*anyopaque, lpCompletionRoutine: ?*anyopaque) callconv(W) i32 {
+    _ = s; _ = lpBuffers; _ = dwBufferCount; _ = lpFlags; _ = lpFrom; _ = lpFromlen; _ = lpOverlapped; _ = lpCompletionRoutine;
+    if (lpNumberOfBytesRecvd) |p| p.* = 0;
+    return 0;
+}
+
+fn WSASetEvent(hEvent: usize) callconv(W) i32 {
+    _ = hEvent;
+    return 1;
+}
+
+fn gethostbyname(name: ?[*:0]const u8) callconv(W) ?*anyopaque {
+    _ = name;
+    return null;
+}
+
+fn getprotobyname(name: ?[*:0]const u8) callconv(W) ?*anyopaque {
+    _ = name;
+    return null;
+}
+
+fn WSAAsyncGetHostByName(hWnd: usize, wMsg: u32, name: ?[*:0]const u8, buf: ?[*]u8, buflen: i32) callconv(W) usize {
+    _ = hWnd; _ = wMsg; _ = name; _ = buf; _ = buflen;
+    return 0x7001;
+}
+
+fn WSACancelAsyncRequest(hAsyncTaskHandle: usize) callconv(W) i32 {
+    _ = hAsyncTaskHandle;
+    return 0;
+}
+
 pub fn lookupWs2_32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "WSARecvFrom")) return @intFromPtr(&WSARecvFrom);
+    if (std.mem.eql(u8, name, "WSASetEvent")) return @intFromPtr(&WSASetEvent);
+    if (std.mem.eql(u8, name, "gethostbyname")) return @intFromPtr(&gethostbyname);
+    if (std.mem.eql(u8, name, "getprotobyname")) return @intFromPtr(&getprotobyname);
+    if (std.mem.eql(u8, name, "WSAAsyncGetHostByName")) return @intFromPtr(&WSAAsyncGetHostByName);
+    if (std.mem.eql(u8, name, "WSACancelAsyncRequest")) return @intFromPtr(&WSACancelAsyncRequest);
     if (std.mem.eql(u8, name, "WSAStartup")) return @intFromPtr(&WSAStartup);
     if (std.mem.eql(u8, name, "WSACleanup")) return @intFromPtr(&WSACleanup);
     if (std.mem.eql(u8, name, "WSAGetLastError")) return @intFromPtr(&WSAGetLastError);
@@ -766,7 +868,13 @@ fn PathCanonicalizeW(pszBuf: ?[*]u16, pszPath: ?[*:0]const u16) callconv(W) i32 
     return 1;
 }
 
+fn SHDeleteKeyW(hKey: usize, pszSubKey: ?*const u16) callconv(W) i32 {
+    _ = hKey; _ = pszSubKey;
+    return 0;
+}
+
 pub fn lookupShlwapi(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "SHDeleteKeyW")) return @intFromPtr(&SHDeleteKeyW);
     if (std.mem.eql(u8, name, "PathCanonicalizeW")) return @intFromPtr(&PathCanonicalizeW);
     if (std.mem.eql(u8, name, "PathFileExistsW")) return @intFromPtr(&PathFileExistsW);
     if (std.mem.eql(u8, name, "PathFileExistsA")) return @intFromPtr(&PathFileExistsA);
@@ -810,7 +918,18 @@ fn ShellExecuteExA(pExecInfo: ?*anyopaque) callconv(W) i32 {
     return 1;
 }
 
+var argv_ptrs: [8]?[*]u16 = undefined;
+var dummy_cmd_arg: [2]u16 = .{ 'w', 0 };
+
+fn CommandLineToArgvW(lpCmdLine: ?*const u16, pNumArgs: ?*i32) callconv(W) ?[*]?[*]u16 {
+    _ = lpCmdLine;
+    if (pNumArgs) |p| p.* = 1;
+    argv_ptrs[0] = &dummy_cmd_arg;
+    return &argv_ptrs;
+}
+
 pub fn lookupShell32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "CommandLineToArgvW")) return @intFromPtr(&CommandLineToArgvW);
     if (std.mem.eql(u8, name, "ShellExecuteExA")) return @intFromPtr(&ShellExecuteExA);
     if (std.mem.eql(u8, name, "ShellExecuteW")) return @intFromPtr(&ShellExecuteW);
     if (std.mem.eql(u8, name, "SHGetFolderPathW")) return @intFromPtr(&SHGetFolderPathW);
@@ -891,6 +1010,11 @@ fn VariantClear(pv: ?*anyopaque) callconv(W) i32 {
     return 0; // S_OK
 }
 
+fn VariantCopy(pvargDest: ?*anyopaque, pvargSrc: ?*const anyopaque) callconv(W) i32 {
+    _ = pvargDest; _ = pvargSrc;
+    return 0; // S_OK
+}
+
 fn GetErrorInfo(dwReserved: u32, ppErrInfo: ?*?*anyopaque) callconv(W) i32 {
     _ = dwReserved;
     if (ppErrInfo) |p| p.* = null;
@@ -898,6 +1022,7 @@ fn GetErrorInfo(dwReserved: u32, ppErrInfo: ?*?*anyopaque) callconv(W) i32 {
 }
 
 pub fn lookupOleaut32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "VariantCopy")) return @intFromPtr(&VariantCopy);
     if (std.mem.eql(u8, name, "SysAllocString")) return @intFromPtr(&SysAllocString);
     if (std.mem.eql(u8, name, "SysAllocStringLen")) return @intFromPtr(&SysAllocStringLen);
     if (std.mem.eql(u8, name, "SysAllocStringByteLen")) return @intFromPtr(&SysAllocStringByteLen);
@@ -928,7 +1053,48 @@ fn CoCreateInstance(rclsid: ?*const anyopaque, pUnkOuter: ?*anyopaque, dwClsCont
 
 fn CoUninitialize() callconv(W) void {}
 
+fn CoInitialize(pvReserved: ?*anyopaque) callconv(W) i32 {
+    _ = pvReserved;
+    return 0; // S_OK
+}
+
+fn CoTaskMemFree(pv: ?*anyopaque) callconv(W) void {
+    _ = pv;
+}
+
+fn CoTaskMemAlloc(cb: usize) callconv(W) ?*anyopaque {
+    _ = cb;
+    return @ptrFromInt(0x900000);
+}
+
+fn CoCreateGuid(pguid: ?*anyopaque) callconv(W) i32 {
+    _ = pguid;
+    return 0;
+}
+
+fn PropVariantClear(pvar: ?*anyopaque) callconv(W) i32 {
+    _ = pvar;
+    return 0;
+}
+
+fn CoSetProxyBlanket(pProxy: ?*anyopaque, dwAuthnSvc: u32, dwAuthzSvc: u32, pServerPrincName: ?*anyopaque, dwAuthnLevel: u32, dwImpLevel: u32, pAuthInfo: ?*anyopaque, dwCapabilities: u32) callconv(W) i32 {
+    _ = pProxy; _ = dwAuthnSvc; _ = dwAuthzSvc; _ = pServerPrincName; _ = dwAuthnLevel; _ = dwImpLevel; _ = pAuthInfo; _ = dwCapabilities;
+    return 0;
+}
+
+fn StringFromGUID2(rguid: ?*const anyopaque, lpsz: ?[*]u16, cchMax: i32) callconv(W) i32 {
+    _ = rguid; _ = lpsz; _ = cchMax;
+    return 39;
+}
+
 pub fn lookupOle32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "CoInitialize")) return @intFromPtr(&CoInitialize);
+    if (std.mem.eql(u8, name, "CoTaskMemFree")) return @intFromPtr(&CoTaskMemFree);
+    if (std.mem.eql(u8, name, "CoTaskMemAlloc")) return @intFromPtr(&CoTaskMemAlloc);
+    if (std.mem.eql(u8, name, "CoCreateGuid")) return @intFromPtr(&CoCreateGuid);
+    if (std.mem.eql(u8, name, "PropVariantClear")) return @intFromPtr(&PropVariantClear);
+    if (std.mem.eql(u8, name, "CoSetProxyBlanket")) return @intFromPtr(&CoSetProxyBlanket);
+    if (std.mem.eql(u8, name, "StringFromGUID2")) return @intFromPtr(&StringFromGUID2);
     if (std.mem.eql(u8, name, "OleRun")) return @intFromPtr(&OleRun);
     if (std.mem.eql(u8, name, "CoInitializeEx")) return @intFromPtr(&CoInitializeEx);
     if (std.mem.eql(u8, name, "CoCreateInstance")) return @intFromPtr(&CoCreateInstance);
@@ -996,7 +1162,32 @@ fn WinVerifyTrust(hwnd: usize, pgActionID: ?*const anyopaque, pWVTData: ?*anyopa
     return 0;
 }
 
+fn GetIpAddrTable(pIpAddrTable: ?*anyopaque, pdwSize: ?*u32, bOrder: i32) callconv(W) u32 {
+    _ = pIpAddrTable; _ = bOrder;
+    if (pdwSize) |p| p.* = 0;
+    return 0;
+}
+
+fn DnsQuery_A(pszName: ?*const u8, wType: u16, Options: u32, pExtra: ?*anyopaque, ppQueryResults: ?*?*anyopaque, pReserved: ?*anyopaque) callconv(W) i32 {
+    _ = pszName; _ = wType; _ = Options; _ = pExtra; _ = pReserved;
+    if (ppQueryResults) |p| p.* = null;
+    return 0;
+}
+
+fn DnsFree(pData: ?*anyopaque, FreeType: u32) callconv(W) void {
+    _ = pData; _ = FreeType;
+}
+
+fn WinHttpGetIEProxyConfigForCurrentUser(pProxyConfig: ?*anyopaque) callconv(W) i32 {
+    _ = pProxyConfig;
+    return 0;
+}
+
 pub fn lookupMisc(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "GetIpAddrTable")) return @intFromPtr(&GetIpAddrTable);
+    if (std.mem.eql(u8, name, "DnsQuery_A")) return @intFromPtr(&DnsQuery_A);
+    if (std.mem.eql(u8, name, "DnsFree")) return @intFromPtr(&DnsFree);
+    if (std.mem.eql(u8, name, "WinHttpGetIEProxyConfigForCurrentUser")) return @intFromPtr(&WinHttpGetIEProxyConfigForCurrentUser);
     if (std.mem.eql(u8, name, "InitCommonControlsEx")) return @intFromPtr(&InitCommonControlsEx);
     if (std.mem.eql(u8, name, "InitSecurityInterfaceA")) return @intFromPtr(&InitSecurityInterfaceA);
     if (std.mem.eql(u8, name, "IsDestinationReachableW")) return @intFromPtr(&IsDestinationReachableW);
