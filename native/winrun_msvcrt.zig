@@ -352,16 +352,12 @@ fn __acrt_iob_func(idx: u32) callconv(W) ?*MsvcrtFile {
 }
 
 fn normalizePathA(src: [*:0]const u8, out: *[512:0]u8) void {
-    var i: usize = 0;
-    var start: usize = 0;
-    if ((src[0] == 'C' or src[0] == 'c' or src[0] == 'Z' or src[0] == 'z') and src[1] == ':' and (src[2] == '\\' or src[2] == '/')) {
-        start = 2;
-    }
-    while (src[start + i] != 0 and i < 511) : (i += 1) {
-        const ch = src[start + i];
-        out[i] = if (ch == '\\') '/' else ch;
-    }
-    out[i] = 0;
+    const src_slice = std.mem.span(src);
+    var buf: [512]u8 = undefined;
+    const res = @import("wins_graph.zig").normalizePath(&buf, src_slice);
+    const copy_len = @min(res.len, 511);
+    @memcpy(out[0..copy_len], res[0..copy_len]);
+    out[copy_len] = 0;
 }
 
 fn fopen(filename: ?[*:0]const u8, mode: ?[*:0]const u8) callconv(W) ?*MsvcrtFile {

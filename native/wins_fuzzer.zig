@@ -9,6 +9,7 @@ const k32 = @import("winrun_kernel32.zig");
 const user32 = @import("winrun_gui_support.zig");
 const msvcrt = @import("winrun_msvcrt.zig");
 const extra = @import("winrun_extra_dlls.zig");
+const ordinals = @import("winrun_ordinals.zig");
 
 const PeInfo = struct {
     name: []const u8,
@@ -45,6 +46,9 @@ fn resolveImport(dll: []const u8, sym: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(dll, "user32.dll")) {
         return user32.lookup(sym) != null or extra.lookupUser32Console(sym) != null;
     }
+    if (std.ascii.eqlIgnoreCase(dll, "gdi32.dll")) {
+        return user32.lookupGdi32(sym) != null;
+    }
     if (std.ascii.eqlIgnoreCase(dll, "msvcrt.dll") or std.ascii.eqlIgnoreCase(dll, "ucrtbase.dll")) {
         return msvcrt.lookup(sym) != null;
     }
@@ -53,6 +57,35 @@ fn resolveImport(dll: []const u8, sym: []const u8) bool {
     }
     if (std.ascii.eqlIgnoreCase(dll, "ws2_32.dll") or std.ascii.eqlIgnoreCase(dll, "wsock32.dll")) {
         return extra.lookupWs2_32(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "shlwapi.dll")) {
+        return extra.lookupShlwapi(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "shell32.dll")) {
+        return extra.lookupShell32(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "oleaut32.dll")) {
+        return extra.lookupOleaut32(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "ole32.dll")) {
+        return extra.lookupOle32(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "wldap32.dll")) {
+        return extra.lookupWldap32(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "crypt32.dll")) {
+        return extra.lookupCrypt32(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "ncrypt.dll") or std.ascii.eqlIgnoreCase(dll, "bcrypt.dll")) {
+        return extra.lookupNcrypt(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "sensapi.dll") or
+        std.ascii.eqlIgnoreCase(dll, "secur32.dll") or
+        std.ascii.eqlIgnoreCase(dll, "comctl32.dll") or
+        std.ascii.eqlIgnoreCase(dll, "wintrust.dll") or
+        std.ascii.eqlIgnoreCase(dll, "iphlpapi.dll"))
+    {
+        return extra.lookupMisc(sym) != null;
     }
     return false;
 }
@@ -177,8 +210,15 @@ fn analyzePe(
                 total_imp += 1;
 
                 if (thunk_val >> 63 != 0) {
+                    const ord: u16 = @truncate(thunk_val & 0xffff);
+                    if (ordinals.getOrdinalName(dll_name, ord)) |ord_sym| {
+                        if (resolveImport(dll_name, ord_sym)) {
+                            resolved_imp += 1;
+                            continue;
+                        }
+                    }
                     missing_imp += 1;
-                    const full = try std.fmt.allocPrint(allocator, "{s}!#{d}", .{ dll_name, thunk_val & 0xffff });
+                    const full = try std.fmt.allocPrint(allocator, "{s}!#{d}", .{ dll_name, ord });
                     try missing_list.append(allocator, .{
                         .dll = dll_name,
                         .symbol = full,

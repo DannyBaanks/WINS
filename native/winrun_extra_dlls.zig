@@ -203,6 +203,13 @@ pub fn lookupAdvapi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "SaferCreateLevel")) return @intFromPtr(&SaferCreateLevel);
     if (std.mem.eql(u8, name, "SetTokenInformation")) return @intFromPtr(&SetTokenInformation);
     if (std.mem.eql(u8, name, "SystemFunction036")) return @intFromPtr(&SystemFunction036);
+    if (std.mem.eql(u8, name, "CryptCreateHash")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CryptDestroyHash")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CryptHashData")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CryptGetHashParam")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CryptEncrypt")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CryptImportKey")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CryptDestroyKey")) return @intFromPtr(&crypt_ret_one);
     return null;
 }
 
@@ -413,6 +420,106 @@ fn ws2_select(nfds: i32, readfds: ?*anyopaque, writefds: ?*anyopaque, exceptfds:
     return 0;
 }
 
+fn WSACreateEvent() callconv(W) usize {
+    return 0x6001;
+}
+
+fn WSACloseEvent(h: usize) callconv(W) i32 {
+    _ = h;
+    return 1;
+}
+
+fn WSAResetEvent(h: usize) callconv(W) i32 {
+    _ = h;
+    return 1;
+}
+
+fn WSAWaitForMultipleEvents(count: u32, handles: ?*const usize, wait_all: i32, ms: u32, alertable: i32) callconv(W) u32 {
+    _ = count; _ = handles; _ = wait_all; _ = ms; _ = alertable;
+    return 0;
+}
+
+fn WSAIoctl(s: usize, code: u32, in_buf: ?*anyopaque, in_sz: u32, out_buf: ?*anyopaque, out_sz: u32, ret: ?*u32, ov: ?*anyopaque, cr: ?*anyopaque) callconv(W) i32 {
+    _ = s; _ = code; _ = in_buf; _ = in_sz; _ = out_buf; _ = out_sz; _ = ov; _ = cr;
+    if (ret) |r| r.* = 0;
+    return 0;
+}
+
+fn send(s: usize, buf: ?[*]const u8, len: i32, flags: i32) callconv(W) i32 {
+    if (buf == null or len <= 0) return 0;
+    const rc = linux.sendto(@intCast(s & 0x7fffffff), buf.?, @intCast(len), @intCast(flags), null, 0);
+    if (linux.errno(rc) != .SUCCESS) return -1;
+    return @intCast(rc);
+}
+
+fn sendto(s: usize, buf: ?[*]const u8, len: i32, flags: i32, to: ?*const anyopaque, tolen: i32) callconv(W) i32 {
+    if (buf == null or len <= 0) return 0;
+    const sa: ?*const linux.sockaddr = if (to) |p| @ptrCast(@alignCast(p)) else null;
+    const rc = linux.sendto(@intCast(s & 0x7fffffff), buf.?, @intCast(len), @intCast(flags), sa, @intCast(@max(tolen, 0)));
+    if (linux.errno(rc) != .SUCCESS) return -1;
+    return @intCast(rc);
+}
+
+fn recvfrom(s: usize, buf: ?[*]u8, len: i32, flags: i32, from: ?*anyopaque, fromlen: ?*i32) callconv(W) i32 {
+    if (buf == null or len <= 0) return 0;
+    var alen_u32: u32 = if (fromlen) |p| @intCast(@max(p.*, 0)) else 0;
+    const sa: ?*linux.sockaddr = if (from) |p| @ptrCast(@alignCast(p)) else null;
+    const plen: ?*u32 = if (fromlen != null) &alen_u32 else null;
+    const rc = linux.recvfrom(@intCast(s & 0x7fffffff), buf.?, @intCast(len), @intCast(flags), sa, plen);
+    if (linux.errno(rc) != .SUCCESS) return -1;
+    if (fromlen) |p| p.* = @intCast(alen_u32);
+    return @intCast(rc);
+}
+
+fn getsockname(s: usize, name: ?*anyopaque, namelen: ?*i32) callconv(W) i32 {
+    if (name == null or namelen == null) return -1;
+    var alen_u32: u32 = @intCast(@max(namelen.?.*, 0));
+    const sa: *linux.sockaddr = @ptrCast(@alignCast(name.?));
+    const rc = linux.getsockname(@intCast(s & 0x7fffffff), sa, &alen_u32);
+    if (linux.errno(rc) != .SUCCESS) return -1;
+    namelen.?.* = @intCast(alen_u32);
+    return 0;
+}
+
+fn getsockopt(s: usize, level: i32, optname: i32, optval: ?[*]u8, optlen: ?*i32) callconv(W) i32 {
+    _ = s; _ = level; _ = optname;
+    if (optval != null and optlen != null and optlen.?.* >= 4) {
+        @memset(optval.?[0..4], 0);
+        optlen.?.* = 4;
+    }
+    return 0;
+}
+
+fn ioctlsocket(s: usize, cmd: i32, argp: ?*u32) callconv(W) i32 {
+    _ = s; _ = cmd; _ = argp;
+    return 0;
+}
+
+fn htonl(hostlong: u32) callconv(W) u32 {
+    return std.mem.nativeToBig(u32, hostlong);
+}
+
+fn htons(hostshort: u16) callconv(W) u16 {
+    return std.mem.nativeToBig(u16, hostshort);
+}
+
+fn ntohl(netlong: u32) callconv(W) u32 {
+    return std.mem.bigToNative(u32, netlong);
+}
+
+fn ntohs(netshort: u16) callconv(W) u16 {
+    return std.mem.bigToNative(u16, netshort);
+}
+
+fn socket(af: i32, sock_type: i32, protocol: i32) callconv(W) usize {
+    return WSASocketA(af, sock_type, protocol, null, 0, 0);
+}
+
+fn if_nametoindex(name: ?[*:0]const u8) callconv(W) u32 {
+    _ = name;
+    return 1;
+}
+
 pub fn lookupWs2_32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "WSAStartup")) return @intFromPtr(&WSAStartup);
     if (std.mem.eql(u8, name, "WSACleanup")) return @intFromPtr(&WSACleanup);
@@ -421,6 +528,11 @@ pub fn lookupWs2_32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "WSASocketA")) return @intFromPtr(&WSASocketA);
     if (std.mem.eql(u8, name, "WSAEventSelect")) return @intFromPtr(&WSAEventSelect);
     if (std.mem.eql(u8, name, "WSAEnumNetworkEvents")) return @intFromPtr(&WSAEnumNetworkEvents);
+    if (std.mem.eql(u8, name, "WSACreateEvent")) return @intFromPtr(&WSACreateEvent);
+    if (std.mem.eql(u8, name, "WSACloseEvent")) return @intFromPtr(&WSACloseEvent);
+    if (std.mem.eql(u8, name, "WSAResetEvent")) return @intFromPtr(&WSAResetEvent);
+    if (std.mem.eql(u8, name, "WSAWaitForMultipleEvents")) return @intFromPtr(&WSAWaitForMultipleEvents);
+    if (std.mem.eql(u8, name, "WSAIoctl")) return @intFromPtr(&WSAIoctl);
     if (std.mem.eql(u8, name, "__WSAFDIsSet")) return @intFromPtr(&__WSAFDIsSet);
     if (std.mem.eql(u8, name, "accept")) return @intFromPtr(&accept);
     if (std.mem.eql(u8, name, "bind")) return @intFromPtr(&bind);
@@ -432,13 +544,25 @@ pub fn lookupWs2_32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "gethostname")) return @intFromPtr(&gethostname);
     if (std.mem.eql(u8, name, "getnameinfo")) return @intFromPtr(&getnameinfo);
     if (std.mem.eql(u8, name, "getpeername")) return @intFromPtr(&getpeername);
+    if (std.mem.eql(u8, name, "getsockname")) return @intFromPtr(&getsockname);
+    if (std.mem.eql(u8, name, "getsockopt")) return @intFromPtr(&getsockopt);
     if (std.mem.eql(u8, name, "inet_addr")) return @intFromPtr(&inet_addr);
     if (std.mem.eql(u8, name, "inet_ntoa")) return @intFromPtr(&inet_ntoa);
+    if (std.mem.eql(u8, name, "ioctlsocket")) return @intFromPtr(&ioctlsocket);
     if (std.mem.eql(u8, name, "listen")) return @intFromPtr(&listen);
     if (std.mem.eql(u8, name, "recv")) return @intFromPtr(&recv);
+    if (std.mem.eql(u8, name, "recvfrom")) return @intFromPtr(&recvfrom);
     if (std.mem.eql(u8, name, "select")) return @intFromPtr(&ws2_select);
+    if (std.mem.eql(u8, name, "send")) return @intFromPtr(&send);
+    if (std.mem.eql(u8, name, "sendto")) return @intFromPtr(&sendto);
     if (std.mem.eql(u8, name, "setsockopt")) return @intFromPtr(&setsockopt);
     if (std.mem.eql(u8, name, "shutdown")) return @intFromPtr(&shutdown);
+    if (std.mem.eql(u8, name, "socket")) return @intFromPtr(&socket);
+    if (std.mem.eql(u8, name, "htonl")) return @intFromPtr(&htonl);
+    if (std.mem.eql(u8, name, "htons")) return @intFromPtr(&htons);
+    if (std.mem.eql(u8, name, "ntohl")) return @intFromPtr(&ntohl);
+    if (std.mem.eql(u8, name, "ntohs")) return @intFromPtr(&ntohs);
+    if (std.mem.eql(u8, name, "if_nametoindex")) return @intFromPtr(&if_nametoindex);
     return null;
 }
 
@@ -506,5 +630,294 @@ pub fn lookupUser32Console(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "IsWindowVisible")) return @intFromPtr(&IsWindowVisible);
     if (std.mem.eql(u8, name, "ShowWindow")) return @intFromPtr(&ShowWindow);
     if (std.mem.eql(u8, name, "MsgWaitForMultipleObjects")) return @intFromPtr(&MsgWaitForMultipleObjects);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// 4. SHLWAPI.dll
+// ---------------------------------------------------------------------------
+
+fn PathFileExistsW(pszPath: ?[*:0]const u16) callconv(W) i32 {
+    if (pszPath == null) return 0;
+    return 1;
+}
+
+fn PathFileExistsA(pszPath: ?[*:0]const u8) callconv(W) i32 {
+    if (pszPath == null) return 0;
+    return 1;
+}
+
+fn PathIsDirectoryW(pszPath: ?[*:0]const u16) callconv(W) i32 {
+    if (pszPath == null) return 0;
+    return 1;
+}
+
+fn PathFindFileNameW(pszPath: ?[*:0]const u16) callconv(W) ?[*:0]const u16 {
+    if (pszPath == null) return null;
+    var last: [*:0]const u16 = pszPath.?;
+    var i: usize = 0;
+    while (pszPath.?[i] != 0) : (i += 1) {
+        if (pszPath.?[i] == '\\' or pszPath.?[i] == '/') {
+            last = pszPath.? + i + 1;
+        }
+    }
+    return last;
+}
+
+fn PathFindExtensionW(pszPath: ?[*:0]const u16) callconv(W) ?[*:0]const u16 {
+    if (pszPath == null) return null;
+    var dot: ?[*:0]const u16 = null;
+    var i: usize = 0;
+    while (pszPath.?[i] != 0) : (i += 1) {
+        if (pszPath.?[i] == '.') dot = pszPath.? + i;
+        if (pszPath.?[i] == '\\' or pszPath.?[i] == '/') dot = null;
+    }
+    return dot orelse (pszPath.? + i);
+}
+
+fn PathRemoveFileSpecW(pszPath: ?[*]u16) callconv(W) i32 {
+    if (pszPath == null) return 0;
+    var last_sep: ?usize = null;
+    var i: usize = 0;
+    while (pszPath.?[i] != 0) : (i += 1) {
+        if (pszPath.?[i] == '\\' or pszPath.?[i] == '/') last_sep = i;
+    }
+    if (last_sep) |idx| {
+        pszPath.?[idx] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+pub fn lookupShlwapi(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "PathFileExistsW")) return @intFromPtr(&PathFileExistsW);
+    if (std.mem.eql(u8, name, "PathFileExistsA")) return @intFromPtr(&PathFileExistsA);
+    if (std.mem.eql(u8, name, "PathIsDirectoryW")) return @intFromPtr(&PathIsDirectoryW);
+    if (std.mem.eql(u8, name, "PathFindFileNameW")) return @intFromPtr(&PathFindFileNameW);
+    if (std.mem.eql(u8, name, "PathFindExtensionW")) return @intFromPtr(&PathFindExtensionW);
+    if (std.mem.eql(u8, name, "PathRemoveFileSpecW")) return @intFromPtr(&PathRemoveFileSpecW);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// 5. SHELL32.dll
+// ---------------------------------------------------------------------------
+
+fn ShellExecuteW(hwnd: usize, op: ?[*:0]const u16, file: ?[*:0]const u16, params: ?[*:0]const u16, dir: ?[*:0]const u16, show: i32) callconv(W) usize {
+    _ = hwnd; _ = op; _ = file; _ = params; _ = dir; _ = show;
+    return 42; // > 32 indicates success
+}
+
+fn SHGetFolderPathW(hwnd: usize, csidl: i32, token: usize, flags: u32, pszPath: ?[*]u16) callconv(W) i32 {
+    _ = hwnd; _ = csidl; _ = token; _ = flags;
+    if (pszPath) |p| {
+        const default_path = [_]u16{ 'C', ':', '\\', 'U', 's', 'e', 'r', 's', '\\', 'U', 's', 'e', 'r', '\\', 'A', 'p', 'p', 'D', 'a', 't', 'a', '\\', 'R', 'o', 'a', 'm', 'i', 'n', 'g', 0 };
+        @memcpy(p[0..default_path.len], &default_path);
+    }
+    return 0; // S_OK
+}
+
+fn SHCreateDirectoryExW(hwnd: usize, pszPath: ?[*:0]const u16, psa: ?*anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = pszPath; _ = psa;
+    return 0; // ERROR_SUCCESS
+}
+
+fn SHFileOperationW(lpFileOp: ?*anyopaque) callconv(W) i32 {
+    _ = lpFileOp;
+    return 0; // ERROR_SUCCESS
+}
+
+pub fn lookupShell32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "ShellExecuteW")) return @intFromPtr(&ShellExecuteW);
+    if (std.mem.eql(u8, name, "SHGetFolderPathW")) return @intFromPtr(&SHGetFolderPathW);
+    if (std.mem.eql(u8, name, "SHCreateDirectoryExW")) return @intFromPtr(&SHCreateDirectoryExW);
+    if (std.mem.eql(u8, name, "SHFileOperationW")) return @intFromPtr(&SHFileOperationW);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// 6. OLEAUT32.dll & ole32.dll
+// ---------------------------------------------------------------------------
+
+var ole_buf: [16384]u8 align(16) = undefined;
+var ole_buf_off: usize = 16;
+
+fn SysAllocString(s: ?[*:0]const u16) callconv(W) ?[*]u16 {
+    if (s == null) return null;
+    var len: u32 = 0;
+    while (s.?[len] != 0) : (len += 1) {}
+    const byte_len = len * 2;
+    const total = 4 + byte_len + 2;
+    if (ole_buf_off + total > ole_buf.len) ole_buf_off = 16;
+    const base: [*]u8 = @ptrCast(&ole_buf[ole_buf_off]);
+    ole_buf_off = std.mem.alignForward(usize, ole_buf_off + total, 8);
+    std.mem.writeInt(u32, base[0..4], byte_len, .little);
+    const chars: [*]u16 = @ptrCast(@alignCast(base + 4));
+    @memcpy(chars[0..len], s.?[0..len]);
+    chars[len] = 0;
+    return chars;
+}
+
+fn SysAllocStringLen(s: ?[*]const u16, len: u32) callconv(W) ?[*]u16 {
+    const byte_len = len * 2;
+    const total = 4 + byte_len + 2;
+    if (ole_buf_off + total > ole_buf.len) ole_buf_off = 16;
+    const base: [*]u8 = @ptrCast(&ole_buf[ole_buf_off]);
+    ole_buf_off = std.mem.alignForward(usize, ole_buf_off + total, 8);
+    std.mem.writeInt(u32, base[0..4], byte_len, .little);
+    const chars: [*]u16 = @ptrCast(@alignCast(base + 4));
+    if (s) |src| @memcpy(chars[0..len], src[0..len]) else @memset(chars[0..len], 0);
+    chars[len] = 0;
+    return chars;
+}
+
+fn SysAllocStringByteLen(s: ?[*]const u8, len: u32) callconv(W) ?[*]u8 {
+    const total = 4 + len + 2;
+    if (ole_buf_off + total > ole_buf.len) ole_buf_off = 16;
+    const base: [*]u8 = @ptrCast(&ole_buf[ole_buf_off]);
+    ole_buf_off = std.mem.alignForward(usize, ole_buf_off + total, 8);
+    std.mem.writeInt(u32, base[0..4], len, .little);
+    const chars = base + 4;
+    if (s) |src| @memcpy(chars[0..len], src[0..len]) else @memset(chars[0..len], 0);
+    chars[len] = 0;
+    chars[len + 1] = 0;
+    return chars;
+}
+
+fn SysFreeString(bstr: ?[*]u16) callconv(W) void {
+    _ = bstr;
+}
+
+fn SysStringByteLen(bstr: ?[*]u16) callconv(W) u32 {
+    if (bstr == null) return 0;
+    const p: [*]u8 = @ptrCast(bstr.?);
+    return std.mem.readInt(u32, (p - 4)[0..4], .little);
+}
+
+fn SysStringLen(bstr: ?[*]u16) callconv(W) u32 {
+    return SysStringByteLen(bstr) / 2;
+}
+
+fn VariantInit(pv: ?*anyopaque) callconv(W) void {
+    if (pv) |p| @memset(@as([*]u8, @ptrCast(p))[0..24], 0);
+}
+
+fn VariantClear(pv: ?*anyopaque) callconv(W) i32 {
+    if (pv) |p| @memset(@as([*]u8, @ptrCast(p))[0..24], 0);
+    return 0; // S_OK
+}
+
+fn GetErrorInfo(dwReserved: u32, ppErrInfo: ?*?*anyopaque) callconv(W) i32 {
+    _ = dwReserved;
+    if (ppErrInfo) |p| p.* = null;
+    return 1; // S_FALSE
+}
+
+pub fn lookupOleaut32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "SysAllocString")) return @intFromPtr(&SysAllocString);
+    if (std.mem.eql(u8, name, "SysAllocStringLen")) return @intFromPtr(&SysAllocStringLen);
+    if (std.mem.eql(u8, name, "SysAllocStringByteLen")) return @intFromPtr(&SysAllocStringByteLen);
+    if (std.mem.eql(u8, name, "SysFreeString")) return @intFromPtr(&SysFreeString);
+    if (std.mem.eql(u8, name, "SysStringByteLen")) return @intFromPtr(&SysStringByteLen);
+    if (std.mem.eql(u8, name, "SysStringLen")) return @intFromPtr(&SysStringLen);
+    if (std.mem.eql(u8, name, "VariantInit")) return @intFromPtr(&VariantInit);
+    if (std.mem.eql(u8, name, "VariantClear")) return @intFromPtr(&VariantClear);
+    if (std.mem.eql(u8, name, "GetErrorInfo")) return @intFromPtr(&GetErrorInfo);
+    return null;
+}
+
+fn OleRun(p: ?*anyopaque) callconv(W) i32 {
+    _ = p;
+    return 0; // S_OK
+}
+
+fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) callconv(W) i32 {
+    _ = pvReserved; _ = dwCoInit;
+    return 0; // S_OK
+}
+
+fn CoCreateInstance(rclsid: ?*const anyopaque, pUnkOuter: ?*anyopaque, dwClsContext: u32, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) i32 {
+    _ = rclsid; _ = pUnkOuter; _ = dwClsContext; _ = riid;
+    if (ppv) |p| p.* = null;
+    return @bitCast(@as(u32, 0x80004002)); // E_NOINTERFACE
+}
+
+fn CoUninitialize() callconv(W) void {}
+
+pub fn lookupOle32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "OleRun")) return @intFromPtr(&OleRun);
+    if (std.mem.eql(u8, name, "CoInitializeEx")) return @intFromPtr(&CoInitializeEx);
+    if (std.mem.eql(u8, name, "CoCreateInstance")) return @intFromPtr(&CoCreateInstance);
+    if (std.mem.eql(u8, name, "CoUninitialize")) return @intFromPtr(&CoUninitialize);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// 7. WLDAP32.dll (stubs)
+// ---------------------------------------------------------------------------
+
+fn ldap_stub() callconv(W) usize { return 0; }
+fn ldap_unbind_s(ld: ?*anyopaque) callconv(W) u32 { _ = ld; return 0; }
+fn ldap_err2string(err: u32) callconv(W) [*:0]const u8 { _ = err; return "Success"; }
+
+pub fn lookupWldap32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "ldap_unbind_s")) return @intFromPtr(&ldap_unbind_s);
+    if (std.mem.eql(u8, name, "ldap_err2string")) return @intFromPtr(&ldap_err2string);
+    if (std.mem.startsWith(u8, name, "ldap_") or std.mem.startsWith(u8, name, "ber_")) {
+        return @intFromPtr(&ldap_stub);
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// 8. CRYPT32.dll & ncrypt.dll / bcrypt.dll
+// ---------------------------------------------------------------------------
+
+fn crypt_ret_zero() callconv(W) usize { return 0; }
+fn crypt_ret_one() callconv(W) u32 { return 1; }
+
+pub fn lookupCrypt32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "CertOpenStore")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CertCloseStore")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CertCreateCertificateContext")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CertFreeCertificateContext")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CertAddCertificateContextToStore")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CertCreateCertificateChainEngine")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CertFreeCTLContext")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CertFreeCRLContext")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CryptMsgClose")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.startsWith(u8, name, "Cert") or std.mem.startsWith(u8, name, "Crypt") or std.mem.startsWith(u8, name, "PFX")) {
+        return @intFromPtr(&crypt_ret_zero);
+    }
+    return null;
+}
+
+pub fn lookupNcrypt(name: []const u8) ?usize {
+    if (std.mem.startsWith(u8, name, "BCrypt") or std.mem.startsWith(u8, name, "NCrypt")) {
+        return @intFromPtr(&crypt_ret_zero);
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// 9. Auxiliary DLLs (SensApi, Secur32, COMCTL32, WINTRUST, IPHLPAPI)
+// ---------------------------------------------------------------------------
+
+fn InitCommonControlsEx(p: ?*anyopaque) callconv(W) i32 { _ = p; return 1; }
+fn InitSecurityInterfaceA() callconv(W) ?*anyopaque { return null; }
+fn IsDestinationReachableW(dest: ?[*:0]const u16, q: ?*anyopaque) callconv(W) i32 { _ = dest; _ = q; return 1; }
+fn IsNetworkAlive(flags: ?*u32) callconv(W) i32 { if (flags) |f| f.* = 1; return 1; }
+fn WinVerifyTrust(hwnd: usize, pgActionID: ?*const anyopaque, pWVTData: ?*anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = pgActionID; _ = pWVTData;
+    return 0;
+}
+
+pub fn lookupMisc(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "InitCommonControlsEx")) return @intFromPtr(&InitCommonControlsEx);
+    if (std.mem.eql(u8, name, "InitSecurityInterfaceA")) return @intFromPtr(&InitSecurityInterfaceA);
+    if (std.mem.eql(u8, name, "IsDestinationReachableW")) return @intFromPtr(&IsDestinationReachableW);
+    if (std.mem.eql(u8, name, "IsNetworkAlive")) return @intFromPtr(&IsNetworkAlive);
+    if (std.mem.eql(u8, name, "WinVerifyTrust")) return @intFromPtr(&WinVerifyTrust);
+    if (std.mem.eql(u8, name, "if_nametoindex")) return @intFromPtr(&if_nametoindex);
     return null;
 }

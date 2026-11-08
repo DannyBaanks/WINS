@@ -405,6 +405,159 @@ fn dispatchMessageW(lp_msg: ?*const MSG) callconv(W) usize {
     return 0;
 }
 
+fn MessageBoxW(hwnd: usize, lpText: ?[*:0]const u16, lpCaption: ?[*:0]const u16, uType: u32) callconv(W) i32 {
+    _ = hwnd; _ = lpText; _ = lpCaption; _ = uType;
+    return 1;
+}
+
+fn MessageBoxA(hwnd: usize, lpText: ?[*:0]const u8, lpCaption: ?[*:0]const u8, uType: u32) callconv(W) i32 {
+    _ = hwnd; _ = lpText; _ = lpCaption; _ = uType;
+    return 1;
+}
+
+fn GetDC(hwnd: usize) callconv(W) usize {
+    _ = hwnd;
+    return 0xDC0001;
+}
+
+fn ReleaseDC(hwnd: usize, hdc: usize) callconv(W) i32 {
+    _ = hwnd; _ = hdc;
+    return 1;
+}
+
+fn GetSystemMetrics(nIndex: i32) callconv(W) i32 {
+    return switch (nIndex) {
+        0 => 1920,
+        1 => 1080,
+        else => 0,
+    };
+}
+
+fn SetWindowPos(hwnd: usize, hwndInsertAfter: usize, x: i32, y: i32, cx: i32, cy: i32, uFlags: u32) callconv(W) i32 {
+    _ = hwnd; _ = hwndInsertAfter; _ = x; _ = y; _ = cx; _ = cy; _ = uFlags;
+    return 1;
+}
+
+fn GetWindowRect(hwnd: usize, lpRect: ?*Rect) callconv(W) i32 {
+    _ = hwnd;
+    if (lpRect) |r| {
+        r.left = 0;
+        r.top = 0;
+        r.right = 800;
+        r.bottom = 600;
+    }
+    return 1;
+}
+
+fn SetWindowTextW(hwnd: usize, lpString: ?[*:0]const u16) callconv(W) i32 {
+    _ = hwnd; _ = lpString;
+    return 1;
+}
+
+fn SetDlgItemTextW(hDlg: usize, nIDDlgItem: i32, lpString: ?[*:0]const u16) callconv(W) i32 {
+    _ = hDlg; _ = nIDDlgItem; _ = lpString;
+    return 1;
+}
+
+fn GetDlgItemTextW(hDlg: usize, nIDDlgItem: i32, lpString: ?[*]u16, cchMax: i32) callconv(W) i32 {
+    _ = hDlg; _ = nIDDlgItem;
+    if (lpString != null and cchMax > 0) lpString.?[0] = 0;
+    return 0;
+}
+
+fn SendDlgItemMessageW(hDlg: usize, nIDDlgItem: i32, msg: u32, wParam: usize, lParam: usize) callconv(W) usize {
+    _ = hDlg; _ = nIDDlgItem; _ = msg; _ = wParam; _ = lParam;
+    return 0;
+}
+
+fn GetDlgItem(hDlg: usize, nIDDlgItem: i32) callconv(W) usize {
+    _ = hDlg;
+    return 0xDD0000 + @as(usize, @intCast(@max(nIDDlgItem, 0)));
+}
+
+fn GetDlgItemInt(hDlg: usize, nIDDlgItem: i32, lpTranslated: ?*i32, bSigned: i32) callconv(W) u32 {
+    _ = hDlg; _ = nIDDlgItem; _ = bSigned;
+    if (lpTranslated) |p| p.* = 1;
+    return 0;
+}
+
+fn SetDlgItemInt(hDlg: usize, nIDDlgItem: i32, uValue: u32, bSigned: i32) callconv(W) i32 {
+    _ = hDlg; _ = nIDDlgItem; _ = uValue; _ = bSigned;
+    return 1;
+}
+
+fn DialogBoxParamW(hInstance: usize, lpTemplateName: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*const anyopaque, dwInitParam: usize) callconv(W) isize {
+    _ = hInstance; _ = lpTemplateName; _ = hWndParent; _ = lpDialogFunc; _ = dwInitParam;
+    return 1;
+}
+
+fn EndDialog(hDlg: usize, nResult: isize) callconv(W) i32 {
+    _ = hDlg; _ = nResult;
+    return 1;
+}
+
+fn EnableWindow(hWnd: usize, bEnable: i32) callconv(W) i32 {
+    _ = hWnd; _ = bEnable;
+    return 0;
+}
+
+fn LoadImageW(hInst: usize, name: ?*const anyopaque, uType: u32, cx: i32, cy: i32, fuLoad: u32) callconv(W) usize {
+    _ = hInst; _ = name; _ = uType; _ = cx; _ = cy; _ = fuLoad;
+    return 0x770001;
+}
+
+fn SystemParametersInfoW(uiAction: u32, uiParam: u32, pvParam: ?*anyopaque, fWinIni: u32) callconv(W) i32 {
+    _ = uiAction; _ = uiParam; _ = pvParam; _ = fWinIni;
+    return 1;
+}
+
+fn FindWindowExW(hWndParent: usize, hWndChildAfter: usize, lpszClass: ?*const anyopaque, lpszWindow: ?*const anyopaque) callconv(W) usize {
+    _ = hWndParent; _ = hWndChildAfter; _ = lpszClass; _ = lpszWindow;
+    return 0;
+}
+
+fn SetWindowsHookExW(idHook: i32, lpfn: ?*const anyopaque, hmod: usize, dwThreadId: u32) callconv(W) usize {
+    _ = idHook; _ = lpfn; _ = hmod; _ = dwThreadId;
+    return 0x880001;
+}
+
+fn UnhookWindowsHookEx(hhk: usize) callconv(W) i32 {
+    _ = hhk;
+    return 1;
+}
+
+fn CallNextHookEx(hhk: usize, nCode: i32, wParam: usize, lParam: usize) callconv(W) isize {
+    _ = hhk; _ = nCode; _ = wParam; _ = lParam;
+    return 0;
+}
+
+// GDI32.dll
+fn GetDeviceCaps(hdc: usize, nIndex: i32) callconv(W) i32 {
+    _ = hdc;
+    return switch (nIndex) {
+        88 => 96,
+        90 => 96,
+        else => 0,
+    };
+}
+
+fn CreateFontW(cHeight: i32, cWidth: i32, cEscapement: i32, cOrientation: i32, cWeight: i32, bItalic: u32, bUnderline: u32, bStrikeOut: u32, iCharSet: u32, iOutPrecision: u32, iClipPrecision: u32, iQuality: u32, iPitchAndFamily: u32, pszFaceName: ?[*:0]const u16) callconv(W) usize {
+    _ = cHeight; _ = cWidth; _ = cEscapement; _ = cOrientation; _ = cWeight; _ = bItalic; _ = bUnderline; _ = bStrikeOut; _ = iCharSet; _ = iOutPrecision; _ = iClipPrecision; _ = iQuality; _ = iPitchAndFamily; _ = pszFaceName;
+    return 0xF0001;
+}
+
+fn DeleteObject(ho: usize) callconv(W) i32 {
+    _ = ho;
+    return 1;
+}
+
+pub fn lookupGdi32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "GetDeviceCaps")) return @intFromPtr(&GetDeviceCaps);
+    if (std.mem.eql(u8, name, "CreateFontW")) return @intFromPtr(&CreateFontW);
+    if (std.mem.eql(u8, name, "DeleteObject")) return @intFromPtr(&DeleteObject);
+    return null;
+}
+
 pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "CreateWindowExW")) return @intFromPtr(&createWindowExW);
     if (std.mem.eql(u8, name, "GetClientRect")) return @intFromPtr(&getClientRect);
@@ -421,5 +574,28 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "PostQuitMessage")) return @intFromPtr(&postQuitMessage);
     if (std.mem.eql(u8, name, "PostMessageW")) return @intFromPtr(&postMessageW);
     if (std.mem.eql(u8, name, "SendMessageW")) return @intFromPtr(&sendMessageW);
+    if (std.mem.eql(u8, name, "MessageBoxW")) return @intFromPtr(&MessageBoxW);
+    if (std.mem.eql(u8, name, "MessageBoxA")) return @intFromPtr(&MessageBoxA);
+    if (std.mem.eql(u8, name, "GetDC")) return @intFromPtr(&GetDC);
+    if (std.mem.eql(u8, name, "ReleaseDC")) return @intFromPtr(&ReleaseDC);
+    if (std.mem.eql(u8, name, "GetSystemMetrics")) return @intFromPtr(&GetSystemMetrics);
+    if (std.mem.eql(u8, name, "SetWindowPos")) return @intFromPtr(&SetWindowPos);
+    if (std.mem.eql(u8, name, "GetWindowRect")) return @intFromPtr(&GetWindowRect);
+    if (std.mem.eql(u8, name, "SetWindowTextW")) return @intFromPtr(&SetWindowTextW);
+    if (std.mem.eql(u8, name, "SetDlgItemTextW")) return @intFromPtr(&SetDlgItemTextW);
+    if (std.mem.eql(u8, name, "GetDlgItemTextW")) return @intFromPtr(&GetDlgItemTextW);
+    if (std.mem.eql(u8, name, "SendDlgItemMessageW")) return @intFromPtr(&SendDlgItemMessageW);
+    if (std.mem.eql(u8, name, "GetDlgItem")) return @intFromPtr(&GetDlgItem);
+    if (std.mem.eql(u8, name, "GetDlgItemInt")) return @intFromPtr(&GetDlgItemInt);
+    if (std.mem.eql(u8, name, "SetDlgItemInt")) return @intFromPtr(&SetDlgItemInt);
+    if (std.mem.eql(u8, name, "DialogBoxParamW")) return @intFromPtr(&DialogBoxParamW);
+    if (std.mem.eql(u8, name, "EndDialog")) return @intFromPtr(&EndDialog);
+    if (std.mem.eql(u8, name, "EnableWindow")) return @intFromPtr(&EnableWindow);
+    if (std.mem.eql(u8, name, "LoadImageW")) return @intFromPtr(&LoadImageW);
+    if (std.mem.eql(u8, name, "SystemParametersInfoW")) return @intFromPtr(&SystemParametersInfoW);
+    if (std.mem.eql(u8, name, "FindWindowExW")) return @intFromPtr(&FindWindowExW);
+    if (std.mem.eql(u8, name, "SetWindowsHookExW")) return @intFromPtr(&SetWindowsHookExW);
+    if (std.mem.eql(u8, name, "UnhookWindowsHookEx")) return @intFromPtr(&UnhookWindowsHookEx);
+    if (std.mem.eql(u8, name, "CallNextHookEx")) return @intFromPtr(&CallNextHookEx);
     return null;
 }

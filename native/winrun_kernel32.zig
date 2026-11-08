@@ -1267,8 +1267,36 @@ fn PeekNamedPipe(pipe: usize, buf: ?[*]u8, sz: u32, read: ?*u32, avail: ?*u32, l
     return 1;
 }
 
-fn CreateProcessW(...) callconv(W) u32 {
-    return 0;
+fn CreateProcessW(
+    app: ?[*:0]const u16,
+    cmd: ?[*:0]u16,
+    pa: ?*anyopaque,
+    ta: ?*anyopaque,
+    inh: u32,
+    flags: u32,
+    env: ?*anyopaque,
+    dir: ?[*:0]const u16,
+    si: ?*anyopaque,
+    pi: ?*anyopaque,
+) callconv(W) u32 {
+    _ = app; _ = pa; _ = ta; _ = inh; _ = flags; _ = env; _ = dir; _ = si;
+    if (cmd) |c| {
+        var utf8_buf: [1024]u8 = undefined;
+        var i: usize = 0;
+        while (c[i] != 0 and i < 1023) : (i += 1) {
+            utf8_buf[i] = @truncate(c[i]);
+        }
+        utf8_buf[i] = 0;
+        _ = @import("wins_graph.zig").translateCommandLine(utf8_buf[0..i]);
+    }
+    if (pi) |p| {
+        const ptr: [*]u8 = @ptrCast(p);
+        std.mem.writeInt(usize, ptr[0..8], 0x6001, .little);
+        std.mem.writeInt(usize, ptr[8..16], 0x6002, .little);
+        std.mem.writeInt(u32, ptr[16..20], 1234, .little);
+        std.mem.writeInt(u32, ptr[20..24], 1235, .little);
+    }
+    return 1;
 }
 
 fn GetExitCodeProcess(proc: usize, exit_code: ?*u32) callconv(W) u32 {
@@ -1464,9 +1492,31 @@ fn CreateFileMappingA(file: usize, sa: ?*anyopaque, prot: u32, max_h: u32, max_l
     return 0x3000;
 }
 
-fn CreateProcessA(app: ?[*:0]const u8, cmd: ?[*:0]u8, pa: ?*anyopaque, ta: ?*anyopaque, inh: u32, flags: u32, env: ?*anyopaque, dir: ?[*:0]const u8, si: ?*anyopaque, pi: ?*anyopaque) callconv(W) u32 {
-    _ = app; _ = cmd; _ = pa; _ = ta; _ = inh; _ = flags; _ = env; _ = dir; _ = si; _ = pi;
-    return 0;
+fn CreateProcessA(
+    app: ?[*:0]const u8,
+    cmd: ?[*:0]u8,
+    pa: ?*anyopaque,
+    ta: ?*anyopaque,
+    inh: u32,
+    flags: u32,
+    env: ?*anyopaque,
+    dir: ?[*:0]const u8,
+    si: ?*anyopaque,
+    pi: ?*anyopaque,
+) callconv(W) u32 {
+    _ = pa; _ = ta; _ = inh; _ = flags; _ = env; _ = dir; _ = si;
+    const cmd_str: []const u8 = if (cmd) |c| std.mem.span(c) else if (app) |a| std.mem.span(a) else "";
+    if (cmd_str.len > 0) {
+        _ = @import("wins_graph.zig").translateCommandLine(cmd_str);
+    }
+    if (pi) |p| {
+        const ptr: [*]u8 = @ptrCast(p);
+        std.mem.writeInt(usize, ptr[0..8], 0x6001, .little);
+        std.mem.writeInt(usize, ptr[8..16], 0x6002, .little);
+        std.mem.writeInt(u32, ptr[16..20], 1234, .little);
+        std.mem.writeInt(u32, ptr[20..24], 1235, .little);
+    }
+    return 1;
 }
 
 fn CreateRemoteThread(proc: usize, sa: ?*anyopaque, stack_sz: usize, start: usize, param: usize, flags: u32, tid: ?*u32) callconv(W) usize {
@@ -1690,6 +1740,191 @@ fn SetHandleInformation(h: usize, mask: u32, flags: u32) callconv(W) u32 {
 
 fn SetSystemTime(st: ?*const SYSTEMTIME) callconv(W) u32 {
     _ = st;
+    return 1;
+}
+
+fn CreateEventW(sa: ?*anyopaque, manual_reset: u32, initial_state: u32, name: ?[*:0]const u16) callconv(W) usize {
+    _ = sa; _ = manual_reset; _ = initial_state; _ = name;
+    return 0x6001;
+}
+
+fn SetEvent(h: usize) callconv(W) u32 {
+    _ = h;
+    return 1;
+}
+
+fn CreateSemaphoreW(sa: ?*anyopaque, init_cnt: i32, max_cnt: i32, name: ?[*:0]const u16) callconv(W) usize {
+    _ = sa; _ = init_cnt; _ = max_cnt; _ = name;
+    return 0x6002;
+}
+
+fn ReleaseSemaphore(h: usize, rel_cnt: i32, prev_cnt: ?*i32) callconv(W) u32 {
+    _ = h; _ = rel_cnt;
+    if (prev_cnt) |p| p.* = 1;
+    return 1;
+}
+
+fn OpenMutexW(access: u32, inh: u32, name: ?[*:0]const u16) callconv(W) usize {
+    _ = access; _ = inh; _ = name;
+    return 0;
+}
+
+fn AcquireSRWLockExclusive(srw: ?*anyopaque) callconv(W) void {
+    _ = srw;
+}
+
+fn ReleaseSRWLockExclusive(srw: ?*anyopaque) callconv(W) void {
+    _ = srw;
+}
+
+fn TryAcquireSRWLockExclusive(srw: ?*anyopaque) callconv(W) u8 {
+    _ = srw;
+    return 1;
+}
+
+fn SleepConditionVariableSRW(cv: ?*anyopaque, srw: ?*anyopaque, ms: u32, flags: u32) callconv(W) u32 {
+    _ = cv; _ = srw; _ = ms; _ = flags;
+    return 1;
+}
+
+fn WakeConditionVariable(cv: ?*anyopaque) callconv(W) void {
+    _ = cv;
+}
+
+fn WakeAllConditionVariable(cv: ?*anyopaque) callconv(W) void {
+    _ = cv;
+}
+
+fn InitializeCriticalSectionEx(cs: ?*anyopaque, spin: u32, flags: u32) callconv(W) u32 {
+    _ = spin; _ = flags;
+    InitializeCriticalSection(cs);
+    return 1;
+}
+
+fn GetExitCodeThread(h: usize, code: ?*u32) callconv(W) u32 {
+    _ = h;
+    if (code) |c| c.* = 0;
+    return 1;
+}
+
+fn VerSetConditionMask(cond: u64, type_mask: u32, condition: u8) callconv(W) u64 {
+    _ = type_mask; _ = condition;
+    return cond | 1;
+}
+
+fn VerifyVersionInfoW(vi: ?*anyopaque, mask: u32, cond: u64) callconv(W) u32 {
+    _ = vi; _ = mask; _ = cond;
+    return 1;
+}
+
+fn lstrlenW(s: ?[*:0]const u16) callconv(W) i32 {
+    if (s == null) return 0;
+    var len: i32 = 0;
+    while (s.?[@intCast(len)] != 0) : (len += 1) {}
+    return len;
+}
+
+fn lstrcpyW(dst: ?[*]u16, src: ?[*:0]const u16) callconv(W) ?[*]u16 {
+    if (dst == null or src == null) return dst;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        dst.?[i] = src.?[i];
+        if (src.?[i] == 0) break;
+    }
+    return dst;
+}
+
+fn lstrcmpW(s1: ?[*:0]const u16, s2: ?[*:0]const u16) callconv(W) i32 {
+    if (s1 == null and s2 == null) return 0;
+    if (s1 == null) return -1;
+    if (s2 == null) return 1;
+    var i: usize = 0;
+    while (s1.?[i] != 0 and s1.?[i] == s2.?[i]) : (i += 1) {}
+    if (s1.?[i] < s2.?[i]) return -1;
+    if (s1.?[i] > s2.?[i]) return 1;
+    return 0;
+}
+
+fn MulDiv(nNumber: i32, nNumerator: i32, nDenominator: i32) callconv(W) i32 {
+    if (nDenominator == 0) return -1;
+    const prod: i64 = @as(i64, nNumber) * @as(i64, nNumerator);
+    const half: i64 = @divTrunc(nDenominator, 2);
+    const res = @divTrunc(prod + half, nDenominator);
+    if (res > std.math.maxInt(i32) or res < std.math.minInt(i32)) return -1;
+    return @intCast(res);
+}
+
+fn MoveFileW(from: ?[*:0]const u16, to: ?[*:0]const u16) callconv(W) u32 {
+    _ = from; _ = to;
+    return 1;
+}
+
+fn MoveFileExW(from: ?[*:0]const u16, to: ?[*:0]const u16, flags: u32) callconv(W) u32 {
+    _ = from; _ = to; _ = flags;
+    return 1;
+}
+
+fn GetWindowsDirectoryW(buf: ?[*]u16, sz: u32) callconv(W) u32 {
+    const win_dir = [_]u16{ 'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's' };
+    if (buf == null or sz < win_dir.len + 1) return win_dir.len + 1;
+    @memcpy(buf.?[0..win_dir.len], &win_dir);
+    buf.?[win_dir.len] = 0;
+    return win_dir.len;
+}
+
+fn ExpandEnvironmentStringsW(src: ?[*:0]const u16, dst: ?[*]u16, sz: u32) callconv(W) u32 {
+    if (src == null) return 0;
+    const len: u32 = @intCast(lstrlenW(src));
+    if (dst == null or sz < len + 1) return len + 1;
+    @memcpy(dst.?[0..len], src.?[0..len]);
+    dst.?[len] = 0;
+    return len + 1;
+}
+
+fn CompareFileTime(t1: ?*const u64, t2: ?*const u64) callconv(W) i32 {
+    if (t1 == null or t2 == null) return 0;
+    if (t1.?.* < t2.?.*) return -1;
+    if (t1.?.* > t2.?.*) return 1;
+    return 0;
+}
+
+fn GetLocalTime(st: ?*SYSTEMTIME) callconv(W) void {
+    GetSystemTime(st);
+}
+
+fn GetDateFormatEx(locale: ?[*:0]const u16, flags: u32, date: ?*const SYSTEMTIME, fmt: ?[*:0]const u16, str: ?[*]u16, cch: i32, cal: ?*anyopaque) callconv(W) i32 {
+    _ = locale; _ = cal;
+    return GetDateFormatW(0, flags, date, fmt, str, cch);
+}
+
+fn GetTimeFormatEx(locale: ?[*:0]const u16, flags: u32, time: ?*const SYSTEMTIME, fmt: ?[*:0]const u16, str: ?[*]u16, cch: i32) callconv(W) i32 {
+    _ = locale;
+    return GetTimeFormatW(0, flags, time, fmt, str, cch);
+}
+
+fn GetLocaleInfoEx(locale: ?[*:0]const u16, lctype: u32, lpData: ?[*]u16, cchData: i32) callconv(W) i32 {
+    _ = locale;
+    return GetLocaleInfoW(0, lctype, lpData, cchData);
+}
+
+fn LCMapStringEx(locale: ?[*:0]const u16, flags: u32, src: ?[*]const u16, src_len: i32, dst: ?[*]u16, dst_len: i32, ver: ?*anyopaque, res: ?*anyopaque, handle: isize) callconv(W) i32 {
+    _ = locale; _ = ver; _ = res; _ = handle;
+    return LCMapStringW(0, flags, src, src_len, dst, dst_len);
+}
+
+fn LocalAlloc(flags: u32, bytes: usize) callconv(W) ?[*]u8 {
+    _ = flags;
+    return HeapAlloc(HEAP_COOKIE, 0, bytes);
+}
+
+fn GetFileInformationByHandleEx(h: usize, class: u32, buf: ?*anyopaque, sz: u32) callconv(W) u32 {
+    _ = h; _ = class;
+    if (buf != null and sz > 0) @memset(@as([*]u8, @ptrCast(buf.?))[0..sz], 0);
+    return 1;
+}
+
+fn SetFileInformationByHandle(h: usize, class: u32, buf: ?*const anyopaque, sz: u32) callconv(W) u32 {
+    _ = h; _ = class; _ = buf; _ = sz;
     return 1;
 }
 
@@ -1939,6 +2174,38 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "SetErrorMode")) return @intFromPtr(&SetErrorMode);
     if (std.mem.eql(u8, name, "SetHandleInformation")) return @intFromPtr(&SetHandleInformation);
     if (std.mem.eql(u8, name, "SetSystemTime")) return @intFromPtr(&SetSystemTime);
+    if (std.mem.eql(u8, name, "CreateEventW")) return @intFromPtr(&CreateEventW);
+    if (std.mem.eql(u8, name, "SetEvent")) return @intFromPtr(&SetEvent);
+    if (std.mem.eql(u8, name, "CreateSemaphoreW")) return @intFromPtr(&CreateSemaphoreW);
+    if (std.mem.eql(u8, name, "ReleaseSemaphore")) return @intFromPtr(&ReleaseSemaphore);
+    if (std.mem.eql(u8, name, "OpenMutexW")) return @intFromPtr(&OpenMutexW);
+    if (std.mem.eql(u8, name, "AcquireSRWLockExclusive")) return @intFromPtr(&AcquireSRWLockExclusive);
+    if (std.mem.eql(u8, name, "ReleaseSRWLockExclusive")) return @intFromPtr(&ReleaseSRWLockExclusive);
+    if (std.mem.eql(u8, name, "TryAcquireSRWLockExclusive")) return @intFromPtr(&TryAcquireSRWLockExclusive);
+    if (std.mem.eql(u8, name, "SleepConditionVariableSRW")) return @intFromPtr(&SleepConditionVariableSRW);
+    if (std.mem.eql(u8, name, "WakeConditionVariable")) return @intFromPtr(&WakeConditionVariable);
+    if (std.mem.eql(u8, name, "WakeAllConditionVariable")) return @intFromPtr(&WakeAllConditionVariable);
+    if (std.mem.eql(u8, name, "InitializeCriticalSectionEx")) return @intFromPtr(&InitializeCriticalSectionEx);
+    if (std.mem.eql(u8, name, "GetExitCodeThread")) return @intFromPtr(&GetExitCodeThread);
+    if (std.mem.eql(u8, name, "VerSetConditionMask")) return @intFromPtr(&VerSetConditionMask);
+    if (std.mem.eql(u8, name, "VerifyVersionInfoW")) return @intFromPtr(&VerifyVersionInfoW);
+    if (std.mem.eql(u8, name, "lstrlenW")) return @intFromPtr(&lstrlenW);
+    if (std.mem.eql(u8, name, "lstrcpyW")) return @intFromPtr(&lstrcpyW);
+    if (std.mem.eql(u8, name, "lstrcmpW")) return @intFromPtr(&lstrcmpW);
+    if (std.mem.eql(u8, name, "MulDiv")) return @intFromPtr(&MulDiv);
+    if (std.mem.eql(u8, name, "MoveFileW")) return @intFromPtr(&MoveFileW);
+    if (std.mem.eql(u8, name, "MoveFileExW")) return @intFromPtr(&MoveFileExW);
+    if (std.mem.eql(u8, name, "GetWindowsDirectoryW")) return @intFromPtr(&GetWindowsDirectoryW);
+    if (std.mem.eql(u8, name, "ExpandEnvironmentStringsW")) return @intFromPtr(&ExpandEnvironmentStringsW);
+    if (std.mem.eql(u8, name, "CompareFileTime")) return @intFromPtr(&CompareFileTime);
+    if (std.mem.eql(u8, name, "GetLocalTime")) return @intFromPtr(&GetLocalTime);
+    if (std.mem.eql(u8, name, "GetDateFormatEx")) return @intFromPtr(&GetDateFormatEx);
+    if (std.mem.eql(u8, name, "GetTimeFormatEx")) return @intFromPtr(&GetTimeFormatEx);
+    if (std.mem.eql(u8, name, "GetLocaleInfoEx")) return @intFromPtr(&GetLocaleInfoEx);
+    if (std.mem.eql(u8, name, "LCMapStringEx")) return @intFromPtr(&LCMapStringEx);
+    if (std.mem.eql(u8, name, "LocalAlloc")) return @intFromPtr(&LocalAlloc);
+    if (std.mem.eql(u8, name, "GetFileInformationByHandleEx")) return @intFromPtr(&GetFileInformationByHandleEx);
+    if (std.mem.eql(u8, name, "SetFileInformationByHandle")) return @intFromPtr(&SetFileInformationByHandle);
 
     return null;
 }

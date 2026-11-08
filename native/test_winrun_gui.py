@@ -112,7 +112,7 @@ class WinrunGuiTests(unittest.TestCase):
                       '--', '/loader', '--sha256', digest, '/probe.exe']
         result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 4, result.stderr)
-        self.assertIn('GetWindowRect', result.stderr)
+        self.assertIn('GetCursorPos', result.stderr)
 
     def test_tls_data_only_probe_runs(self):
         """GUI loader must execute a PE with data-only TLS (0 callbacks)."""
@@ -170,6 +170,21 @@ class WinrunGuiTests(unittest.TestCase):
                       'private-x11', '/usr/bin/wine', '/probe.exe']
         result = subprocess.run(argv, capture_output=True, text=True, timeout=180)
         self.assertEqual(result.returncode, 52, result.stderr)
+
+
+    def test_gup_corpus_check(self):
+        """GUP.exe (Win64 Notepad++ updater GUI) must resolve all 298 imports and relocations in check mode."""
+        gup = ROOT / 'corpus' / 'GUP.exe'
+        if not gup.is_file():
+            self.skipTest('corpus/GUP.exe not present')
+        digest = hashlib.sha256(gup.read_bytes()).hexdigest()
+        argv = BOX + ['--ro-bind', str(gup), '/probe.exe',
+                      '--ro-bind', str(self.loader), '/loader',
+                      '--', '/loader', '--sha256', digest, '--check', '/probe.exe']
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('READY', result.stderr)
+        self.assertIn('imports=298', result.stderr)
 
 
 if __name__ == '__main__':

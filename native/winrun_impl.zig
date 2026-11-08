@@ -204,6 +204,41 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                 }
                 return @import("winrun_extra_dlls.zig").lookupUser32Console(name);
             }
+            if (std.ascii.eqlIgnoreCase(lib, "gdi32.dll")) {
+                if (comptime gui) {
+                    if (@import("winrun_gui_support.zig").lookupGdi32(name)) |addr| return addr;
+                }
+                return null;
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "shlwapi.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupShlwapi(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "shell32.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupShell32(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "oleaut32.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupOleaut32(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "ole32.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupOle32(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "wldap32.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupWldap32(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "crypt32.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupCrypt32(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "ncrypt.dll") or std.ascii.eqlIgnoreCase(lib, "bcrypt.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupNcrypt(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "sensapi.dll") or
+                std.ascii.eqlIgnoreCase(lib, "secur32.dll") or
+                std.ascii.eqlIgnoreCase(lib, "comctl32.dll") or
+                std.ascii.eqlIgnoreCase(lib, "wintrust.dll") or
+                std.ascii.eqlIgnoreCase(lib, "iphlpapi.dll"))
+            {
+                return @import("winrun_extra_dlls.zig").lookupMisc(name);
+            }
             return null;
         }
 
@@ -468,7 +503,15 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                         if (thunk == 0) break;
                         if (at + 8 > size_of_image) die(.bad_image, "IAT beyond image", .{});
                         if (thunk >> 63 != 0) {
-                            try missing.print(a, "  {s}!#{d} (by ordinal)\n", .{ lib, thunk & 0xffff });
+                            const ord: u16 = @truncate(thunk & 0xffff);
+                            if (@import("winrun_ordinals.zig").getOrdinalName(lib, ord)) |ord_sym| {
+                                if (lookup(lib, ord_sym)) |addr| {
+                                    std.mem.writeInt(u64, img[at..][0..8], addr, .little);
+                                    n_imports += 1;
+                                    continue;
+                                }
+                            }
+                            try missing.print(a, "  {s}!#{d} (by ordinal)\n", .{ lib, ord });
                             continue;
                         }
                         const sym = cstr(img, @intCast((thunk & 0x7fffffff) + 2), "import name");
