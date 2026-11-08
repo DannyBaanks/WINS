@@ -10,6 +10,7 @@ const user32 = @import("winrun_gui_support.zig");
 const msvcrt = @import("winrun_msvcrt.zig");
 const extra = @import("winrun_extra_dlls.zig");
 const ordinals = @import("winrun_ordinals.zig");
+const directx = @import("winrun_directx.zig");
 
 const PeInfo = struct {
     name: []const u8,
@@ -86,6 +87,25 @@ fn resolveImport(dll: []const u8, sym: []const u8) bool {
         std.ascii.eqlIgnoreCase(dll, "iphlpapi.dll"))
     {
         return extra.lookupMisc(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "d3d11.dll") or
+        std.ascii.eqlIgnoreCase(dll, "dxgi.dll") or
+        std.ascii.eqlIgnoreCase(dll, "d3dcompiler_47.dll") or
+        std.ascii.eqlIgnoreCase(dll, "d3dcompiler.dll") or
+        std.ascii.eqlIgnoreCase(dll, "d3d12.dll") or
+        std.ascii.eqlIgnoreCase(dll, "d3d9.dll") or
+        std.ascii.eqlIgnoreCase(dll, "xinput1_4.dll") or
+        std.ascii.eqlIgnoreCase(dll, "xinput1_3.dll") or
+        std.ascii.eqlIgnoreCase(dll, "xinput9_1_0.dll") or
+        std.ascii.eqlIgnoreCase(dll, "opengl32.dll") or
+        std.ascii.eqlIgnoreCase(dll, "hid.dll") or
+        std.ascii.eqlIgnoreCase(dll, "winmm.dll") or
+        std.ascii.eqlIgnoreCase(dll, "imm32.dll") or
+        std.ascii.eqlIgnoreCase(dll, "version.dll") or
+        std.ascii.eqlIgnoreCase(dll, "setupapi.dll") or
+        std.ascii.eqlIgnoreCase(dll, "unityplayer.dll"))
+    {
+        return directx.lookupDirectX(sym) != null;
     }
     return false;
 }

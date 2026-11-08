@@ -186,6 +186,21 @@ class WinrunGuiTests(unittest.TestCase):
         self.assertIn('READY', result.stderr)
         self.assertIn('imports=298', result.stderr)
 
+    def test_cuphead_corpus_check(self):
+        """Cuphead.exe (Unity 2017 PE binary) must resolve all 67 imports and relocations in check mode."""
+        cup = ROOT / 'corpus' / 'Cuphead.exe'
+        if not cup.is_file():
+            self.skipTest('corpus/Cuphead.exe not present')
+        digest = hashlib.sha256(cup.read_bytes()).hexdigest()
+        argv = BOX + ['--ro-bind', str(cup), '/probe.exe',
+                      '--ro-bind', str(self.loader), '/loader',
+                      '--', '/loader', '--sha256', digest, '--check', '/probe.exe']
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('READY', result.stderr)
+        self.assertIn('imports=67', result.stderr)
+        self.assertIn('relocs=745', result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

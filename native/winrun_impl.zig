@@ -239,6 +239,28 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             {
                 return @import("winrun_extra_dlls.zig").lookupMisc(name);
             }
+            if (std.ascii.eqlIgnoreCase(lib, "d3d11.dll") or
+                std.ascii.eqlIgnoreCase(lib, "dxgi.dll") or
+                std.ascii.eqlIgnoreCase(lib, "d3dcompiler_47.dll") or
+                std.ascii.eqlIgnoreCase(lib, "d3dcompiler.dll") or
+                std.ascii.eqlIgnoreCase(lib, "d3d12.dll") or
+                std.ascii.eqlIgnoreCase(lib, "d3d9.dll") or
+                std.ascii.eqlIgnoreCase(lib, "xinput1_4.dll") or
+                std.ascii.eqlIgnoreCase(lib, "xinput1_3.dll") or
+                std.ascii.eqlIgnoreCase(lib, "xinput9_1_0.dll") or
+                std.ascii.eqlIgnoreCase(lib, "opengl32.dll") or
+                std.ascii.eqlIgnoreCase(lib, "hid.dll") or
+                std.ascii.eqlIgnoreCase(lib, "winmm.dll") or
+                std.ascii.eqlIgnoreCase(lib, "imm32.dll") or
+                std.ascii.eqlIgnoreCase(lib, "version.dll") or
+                std.ascii.eqlIgnoreCase(lib, "setupapi.dll") or
+                std.ascii.eqlIgnoreCase(lib, "unityplayer.dll"))
+            {
+                if (@import("winrun_directx.zig").lookupDirectX(name)) |func| {
+                    return @intFromPtr(func);
+                }
+                return null;
+            }
             return null;
         }
 

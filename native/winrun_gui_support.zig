@@ -551,14 +551,139 @@ fn DeleteObject(ho: usize) callconv(W) i32 {
     return 1;
 }
 
+fn CreateDIBSection(hdc: usize, pbmi: ?*const anyopaque, usage: u32, ppvBits: ?*?*anyopaque, hSection: usize, offset: u32) callconv(W) usize {
+    _ = hdc; _ = pbmi; _ = usage; _ = hSection; _ = offset;
+    if (ppvBits) |p| p.* = @ptrFromInt(0x800000);
+    return 0xB001;
+}
+
+fn SwapBuffers(hdc: usize) callconv(W) i32 {
+    _ = hdc;
+    return 1;
+}
+
+fn ChoosePixelFormat(hdc: usize, ppfd: ?*const anyopaque) callconv(W) i32 {
+    _ = hdc; _ = ppfd;
+    return 1;
+}
+
+fn SetPixelFormat(hdc: usize, format: i32, ppfd: ?*const anyopaque) callconv(W) i32 {
+    _ = hdc; _ = format; _ = ppfd;
+    return 1;
+}
+
 pub fn lookupGdi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "GetDeviceCaps")) return @intFromPtr(&GetDeviceCaps);
     if (std.mem.eql(u8, name, "CreateFontW")) return @intFromPtr(&CreateFontW);
     if (std.mem.eql(u8, name, "DeleteObject")) return @intFromPtr(&DeleteObject);
+    if (std.mem.eql(u8, name, "CreateDIBSection")) return @intFromPtr(&CreateDIBSection);
+    if (std.mem.eql(u8, name, "SwapBuffers")) return @intFromPtr(&SwapBuffers);
+    if (std.mem.eql(u8, name, "ChoosePixelFormat")) return @intFromPtr(&ChoosePixelFormat);
+    if (std.mem.eql(u8, name, "SetPixelFormat")) return @intFromPtr(&SetPixelFormat);
     return null;
 }
 
+fn ClientToScreen(hwnd: usize, lpPoint: ?*anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = lpPoint;
+    return 1;
+}
+
+fn OpenClipboard(hwnd: usize) callconv(W) i32 {
+    _ = hwnd;
+    return 1;
+}
+
+fn CloseClipboard() callconv(W) i32 {
+    return 1;
+}
+
+fn EmptyClipboard() callconv(W) i32 {
+    return 1;
+}
+
+fn GetClipboardData(uFormat: u32) callconv(W) ?*anyopaque {
+    _ = uFormat;
+    return null;
+}
+
+fn SetClipboardData(uFormat: u32, hMem: ?*anyopaque) callconv(W) ?*anyopaque {
+    _ = uFormat;
+    return hMem;
+}
+
+fn CreateDialogParamW(hInstance: usize, lpTemplateName: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*const anyopaque, dwInitParam: usize) callconv(W) usize {
+    _ = hInstance; _ = lpTemplateName; _ = hWndParent; _ = lpDialogFunc; _ = dwInitParam;
+    return 0xD001;
+}
+
+fn DestroyCursor(hCursor: usize) callconv(W) i32 {
+    _ = hCursor;
+    return 1;
+}
+
+fn DestroyIcon(hIcon: usize) callconv(W) i32 {
+    _ = hIcon;
+    return 1;
+}
+
+fn GetActiveWindow() callconv(W) usize {
+    return 1;
+}
+
+fn GetAncestor(hwnd: usize, gaFlags: u32) callconv(W) usize {
+    _ = gaFlags;
+    return hwnd;
+}
+
+fn GetFocus() callconv(W) usize {
+    return 1;
+}
+
+fn GetKeyState(nVirtKey: i32) callconv(W) i16 {
+    _ = nVirtKey;
+    return 0;
+}
+
+fn GetMessageTime() callconv(W) i32 {
+    return 1000;
+}
+
+fn PtInRect(lprc: ?*const anyopaque, pt_x: i32, pt_y: i32) callconv(W) i32 {
+    _ = lprc; _ = pt_x; _ = pt_y;
+    return 1;
+}
+
+fn ReleaseCapture() callconv(W) i32 {
+    return 1;
+}
+
+fn SetCapture(hwnd: usize) callconv(W) usize {
+    return hwnd;
+}
+
+fn GetCapture() callconv(W) usize {
+    return 0;
+}
+
 pub fn lookup(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "ClientToScreen")) return @intFromPtr(&ClientToScreen);
+    if (std.mem.eql(u8, name, "OpenClipboard")) return @intFromPtr(&OpenClipboard);
+    if (std.mem.eql(u8, name, "CloseClipboard")) return @intFromPtr(&CloseClipboard);
+    if (std.mem.eql(u8, name, "EmptyClipboard")) return @intFromPtr(&EmptyClipboard);
+    if (std.mem.eql(u8, name, "GetClipboardData")) return @intFromPtr(&GetClipboardData);
+    if (std.mem.eql(u8, name, "SetClipboardData")) return @intFromPtr(&SetClipboardData);
+    if (std.mem.eql(u8, name, "CreateDialogParamW")) return @intFromPtr(&CreateDialogParamW);
+    if (std.mem.eql(u8, name, "DestroyCursor")) return @intFromPtr(&DestroyCursor);
+    if (std.mem.eql(u8, name, "DestroyIcon")) return @intFromPtr(&DestroyIcon);
+    if (std.mem.eql(u8, name, "GetActiveWindow")) return @intFromPtr(&GetActiveWindow);
+    if (std.mem.eql(u8, name, "GetAncestor")) return @intFromPtr(&GetAncestor);
+    if (std.mem.eql(u8, name, "GetFocus")) return @intFromPtr(&GetFocus);
+    if (std.mem.eql(u8, name, "GetKeyState")) return @intFromPtr(&GetKeyState);
+    if (std.mem.eql(u8, name, "GetMessageTime")) return @intFromPtr(&GetMessageTime);
+    if (std.mem.eql(u8, name, "PtInRect")) return @intFromPtr(&PtInRect);
+    if (std.mem.eql(u8, name, "ReleaseCapture")) return @intFromPtr(&ReleaseCapture);
+    if (std.mem.eql(u8, name, "SetCapture")) return @intFromPtr(&SetCapture);
+    if (std.mem.eql(u8, name, "GetCapture")) return @intFromPtr(&GetCapture);
     if (std.mem.eql(u8, name, "CreateWindowExW")) return @intFromPtr(&createWindowExW);
     if (std.mem.eql(u8, name, "GetClientRect")) return @intFromPtr(&getClientRect);
     if (std.mem.eql(u8, name, "DestroyWindow")) return @intFromPtr(&destroyWindow);

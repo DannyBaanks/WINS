@@ -186,7 +186,74 @@ fn SaferComputeTokenFromLevel(level_h: usize, in_token: usize, out_token: ?*usiz
     return 1;
 }
 
+fn RegOpenKeyExW(hKey: usize, lpSubKey: ?[*:0]const u16, ulOptions: u32, samDesired: u32, phkResult: ?*usize) callconv(W) i32 {
+    _ = hKey; _ = lpSubKey; _ = ulOptions; _ = samDesired;
+    if (phkResult) |p| p.* = 0x8001;
+    return 0;
+}
+
+fn RegOpenKeyExA(hKey: usize, lpSubKey: ?[*:0]const u8, ulOptions: u32, samDesired: u32, phkResult: ?*usize) callconv(W) i32 {
+    _ = hKey; _ = lpSubKey; _ = ulOptions; _ = samDesired;
+    if (phkResult) |p| p.* = 0x8001;
+    return 0;
+}
+
+fn RegCreateKeyExW(hKey: usize, lpSubKey: ?[*:0]const u16, Reserved: u32, lpClass: ?[*:0]const u16, dwOptions: u32, samDesired: u32, lpSecurityAttributes: ?*anyopaque, phkResult: ?*usize, lpdwDisposition: ?*u32) callconv(W) i32 {
+    _ = hKey; _ = lpSubKey; _ = Reserved; _ = lpClass; _ = dwOptions; _ = samDesired; _ = lpSecurityAttributes;
+    if (phkResult) |p| p.* = 0x8001;
+    if (lpdwDisposition) |p| p.* = 1;
+    return 0;
+}
+
+fn RegCloseKey(hKey: usize) callconv(W) i32 {
+    _ = hKey;
+    return 0;
+}
+
+fn RegQueryValueExW(hKey: usize, lpValueName: ?[*:0]const u16, lpReserved: ?*u32, lpType: ?*u32, lpData: ?[*]u8, lpcbData: ?*u32) callconv(W) i32 {
+    _ = hKey; _ = lpValueName; _ = lpReserved;
+    if (lpType) |t| t.* = 1;
+    if (lpData != null and lpcbData != null and lpcbData.?.* >= 2) {
+        lpData.?[0] = 0;
+        lpData.?[1] = 0;
+        lpcbData.?.* = 2;
+        return 0;
+    }
+    if (lpcbData) |s| s.* = 2;
+    return 0;
+}
+
+fn RegQueryValueExA(hKey: usize, lpValueName: ?[*:0]const u8, lpReserved: ?*u32, lpType: ?*u32, lpData: ?[*]u8, lpcbData: ?*u32) callconv(W) i32 {
+    _ = hKey; _ = lpValueName; _ = lpReserved;
+    if (lpType) |t| t.* = 1;
+    if (lpData != null and lpcbData != null and lpcbData.?.* >= 1) {
+        lpData.?[0] = 0;
+        lpcbData.?.* = 1;
+        return 0;
+    }
+    if (lpcbData) |s| s.* = 1;
+    return 0;
+}
+
+fn RegSetValueExW(hKey: usize, lpValueName: ?[*:0]const u16, Reserved: u32, dwType: u32, lpData: ?[*]const u8, cbData: u32) callconv(W) i32 {
+    _ = hKey; _ = lpValueName; _ = Reserved; _ = dwType; _ = lpData; _ = cbData;
+    return 0;
+}
+
+fn RegSetValueExA(hKey: usize, lpValueName: ?[*:0]const u8, Reserved: u32, dwType: u32, lpData: ?[*]const u8, cbData: u32) callconv(W) i32 {
+    _ = hKey; _ = lpValueName; _ = Reserved; _ = dwType; _ = lpData; _ = cbData;
+    return 0;
+}
+
 pub fn lookupAdvapi32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "RegOpenKeyExW")) return @intFromPtr(&RegOpenKeyExW);
+    if (std.mem.eql(u8, name, "RegOpenKeyExA")) return @intFromPtr(&RegOpenKeyExA);
+    if (std.mem.eql(u8, name, "RegCreateKeyExW")) return @intFromPtr(&RegCreateKeyExW);
+    if (std.mem.eql(u8, name, "RegCloseKey")) return @intFromPtr(&RegCloseKey);
+    if (std.mem.eql(u8, name, "RegQueryValueExW")) return @intFromPtr(&RegQueryValueExW);
+    if (std.mem.eql(u8, name, "RegQueryValueExA")) return @intFromPtr(&RegQueryValueExA);
+    if (std.mem.eql(u8, name, "RegSetValueExW")) return @intFromPtr(&RegSetValueExW);
+    if (std.mem.eql(u8, name, "RegSetValueExA")) return @intFromPtr(&RegSetValueExA);
     if (std.mem.eql(u8, name, "AccessCheck")) return @intFromPtr(&AccessCheck);
     if (std.mem.eql(u8, name, "CheckTokenMembership")) return @intFromPtr(&CheckTokenMembership);
     if (std.mem.eql(u8, name, "CryptAcquireContextA")) return @intFromPtr(&CryptAcquireContextA);
@@ -689,7 +756,18 @@ fn PathRemoveFileSpecW(pszPath: ?[*]u16) callconv(W) i32 {
     return 0;
 }
 
+fn PathCanonicalizeW(pszBuf: ?[*]u16, pszPath: ?[*:0]const u16) callconv(W) i32 {
+    if (pszBuf == null or pszPath == null) return 0;
+    var i: usize = 0;
+    while (pszPath.?[i] != 0 and i < 260) : (i += 1) {
+        pszBuf.?[i] = pszPath.?[i];
+    }
+    pszBuf.?[i] = 0;
+    return 1;
+}
+
 pub fn lookupShlwapi(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "PathCanonicalizeW")) return @intFromPtr(&PathCanonicalizeW);
     if (std.mem.eql(u8, name, "PathFileExistsW")) return @intFromPtr(&PathFileExistsW);
     if (std.mem.eql(u8, name, "PathFileExistsA")) return @intFromPtr(&PathFileExistsA);
     if (std.mem.eql(u8, name, "PathIsDirectoryW")) return @intFromPtr(&PathIsDirectoryW);
@@ -727,7 +805,13 @@ fn SHFileOperationW(lpFileOp: ?*anyopaque) callconv(W) i32 {
     return 0; // ERROR_SUCCESS
 }
 
+fn ShellExecuteExA(pExecInfo: ?*anyopaque) callconv(W) i32 {
+    _ = pExecInfo;
+    return 1;
+}
+
 pub fn lookupShell32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "ShellExecuteExA")) return @intFromPtr(&ShellExecuteExA);
     if (std.mem.eql(u8, name, "ShellExecuteW")) return @intFromPtr(&ShellExecuteW);
     if (std.mem.eql(u8, name, "SHGetFolderPathW")) return @intFromPtr(&SHGetFolderPathW);
     if (std.mem.eql(u8, name, "SHCreateDirectoryExW")) return @intFromPtr(&SHCreateDirectoryExW);

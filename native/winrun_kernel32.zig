@@ -1932,7 +1932,57 @@ fn SetFileInformationByHandle(h: usize, class: u32, buf: ?*const anyopaque, sz: 
 // 8. Lookup Dispatch Table
 // ---------------------------------------------------------------------------
 
+fn GlobalAlloc(uFlags: u32, dwBytes: usize) callconv(W) ?*anyopaque {
+    _ = uFlags;
+    return HeapAlloc(HEAP_COOKIE, 0, dwBytes);
+}
+
+fn GlobalLock(hMem: ?*anyopaque) callconv(W) ?*anyopaque {
+    return hMem;
+}
+
+fn GlobalUnlock(hMem: ?*anyopaque) callconv(W) i32 {
+    _ = hMem;
+    return 1;
+}
+
+fn GlobalFree(hMem: ?*anyopaque) callconv(W) ?*anyopaque {
+    _ = HeapFree(HEAP_COOKIE, 0, if (hMem) |p| @ptrCast(p) else null);
+    return null;
+}
+
+fn CopyFileW(lpExisting: ?[*:0]const u16, lpNew: ?[*:0]const u16, bFailIfExists: u32) callconv(W) u32 {
+    _ = lpExisting; _ = lpNew; _ = bFailIfExists;
+    return 1;
+}
+
+fn ReleaseMutex(hMutex: usize) callconv(W) u32 {
+    _ = hMutex;
+    return 1;
+}
+
+fn CreateIoCompletionPort(FileHandle: usize, ExistingCompletionPort: usize, CompletionKey: usize, NumberOfConcurrentThreads: u32) callconv(W) usize {
+    _ = FileHandle; _ = ExistingCompletionPort; _ = CompletionKey; _ = NumberOfConcurrentThreads;
+    return 0x9001;
+}
+
+fn GetQueuedCompletionStatus(CompletionPort: usize, lpNumberOfBytesTransferred: ?*u32, lpCompletionKey: ?*usize, lpOverlapped: ?*?*anyopaque, dwMilliseconds: u32) callconv(W) u32 {
+    _ = CompletionPort; _ = dwMilliseconds;
+    if (lpNumberOfBytesTransferred) |p| p.* = 0;
+    if (lpCompletionKey) |p| p.* = 0;
+    if (lpOverlapped) |p| p.* = null;
+    return 0;
+}
+
 pub fn lookup(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "GlobalAlloc")) return @intFromPtr(&GlobalAlloc);
+    if (std.mem.eql(u8, name, "GlobalLock")) return @intFromPtr(&GlobalLock);
+    if (std.mem.eql(u8, name, "GlobalUnlock")) return @intFromPtr(&GlobalUnlock);
+    if (std.mem.eql(u8, name, "GlobalFree")) return @intFromPtr(&GlobalFree);
+    if (std.mem.eql(u8, name, "CopyFileW")) return @intFromPtr(&CopyFileW);
+    if (std.mem.eql(u8, name, "ReleaseMutex")) return @intFromPtr(&ReleaseMutex);
+    if (std.mem.eql(u8, name, "CreateIoCompletionPort")) return @intFromPtr(&CreateIoCompletionPort);
+    if (std.mem.eql(u8, name, "GetQueuedCompletionStatus")) return @intFromPtr(&GetQueuedCompletionStatus);
     // Process / Thread / Diagnostics
     if (std.mem.eql(u8, name, "GetCurrentProcess")) return @intFromPtr(&GetCurrentProcess);
     if (std.mem.eql(u8, name, "GetCurrentThread")) return @intFromPtr(&GetCurrentThread);
