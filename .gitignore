@@ -3,6 +3,7 @@
 
 # Binaries & packages
 bin/wins-fuzz
+bin/winrun32
 native/winrun
 native/winrun_gui
 native/wins_fuzzer
