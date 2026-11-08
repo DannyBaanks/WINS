@@ -11,7 +11,8 @@
 //!
 //! Scope of v0 (everything else is refused, not guessed): PE32+ x86-64, console
 //! subsystem, DIR64 relocations, imports by name from kernel32 only
-//! (GetStdHandle, WriteFile, ReadFile, GetLastError, SetLastError, ExitProcess),
+//! (GetStdHandle, WriteFile, ReadFile, GetLastError, SetLastError, ExitProcess,
+//! GetCurrentProcessId),
 //! no TLS, no exception handlers (unwind data without handlers is tolerated but
 //! never registered), no TEB/PEB (code touching GS will fault), no DLLs, no delay
 //! imports, no CLR, no writable+executable sections. Windows exit codes are
@@ -29,7 +30,7 @@ const linux = std.os.linux;
 const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
 
 /// Deliberate defects for the negative controls (winrun_bad_*.zig).
-pub const Bug = enum { none, skip_relocs, exit_off_by_one, short_write_count, zero_read_error };
+pub const Bug = enum { none, skip_relocs, exit_off_by_one, short_write_count, zero_read_error, zero_pid };
 
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
@@ -78,6 +79,11 @@ pub fn Impl(comptime bug: Bug) type {
         }
         fn SetLastError(v: u32) callconv(W) void {
             last_error = v;
+        }
+        // The ID is meaningful only in the runner's Linux PID namespace. No
+        // cross-process Win32 ID mapping is implemented.
+        fn GetCurrentProcessId() callconv(W) u32 {
+            return if (bug == .zero_pid) 0 else @intCast(linux.getpid());
         }
         fn GetStdHandle(n: u32) callconv(W) usize {
             return switch (n) {
@@ -143,7 +149,7 @@ pub fn Impl(comptime bug: Bug) type {
         }
 
         const Export = struct { name: []const u8, addr: usize };
-        fn exports() [6]Export {
+        fn exports() [7]Export {
             return .{
                 .{ .name = "GetLastError", .addr = @intFromPtr(&GetLastError) },
                 .{ .name = "SetLastError", .addr = @intFromPtr(&SetLastError) },
@@ -151,6 +157,7 @@ pub fn Impl(comptime bug: Bug) type {
                 .{ .name = "WriteFile", .addr = @intFromPtr(&WriteFile) },
                 .{ .name = "ReadFile", .addr = @intFromPtr(&ReadFile) },
                 .{ .name = "ExitProcess", .addr = @intFromPtr(&ExitProcess) },
+                .{ .name = "GetCurrentProcessId", .addr = @intFromPtr(&GetCurrentProcessId) },
             };
         }
 

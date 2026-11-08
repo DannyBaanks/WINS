@@ -1,6 +1,6 @@
 //! Probe program for winrun (step 1). The SAME logic is compiled twice:
 //!   * x86_64-windows-gnu PE (imports only kernel32: GetStdHandle, ReadFile,
-//!     WriteFile, GetLastError, SetLastError, ExitProcess), run by winrun;
+//!     WriteFile, GetLastError, SetLastError, ExitProcess, GetCurrentProcessId), run by winrun;
 //!   * x86_64-linux ELF, whose tiny OS layer below maps those calls to syscalls.
 //! The Linux build is the reference for the differential fuzzer (fuzz_winrun.zig).
 //!
@@ -28,6 +28,7 @@ const os = if (is_windows) struct {
     extern "kernel32" fn WriteFile(h: usize, buf: [*]const u8, n: u32, written: *u32, ov: ?*anyopaque) callconv(W) i32;
     extern "kernel32" fn GetLastError() callconv(W) u32;
     extern "kernel32" fn SetLastError(v: u32) callconv(W) void;
+    extern "kernel32" fn GetCurrentProcessId() callconv(W) u32;
     extern "kernel32" fn ExitProcess(code: u32) callconv(W) noreturn;
 } else struct {
     // Reference layer: the documented Windows behaviour for the subset used here.
@@ -68,6 +69,9 @@ const os = if (is_windows) struct {
     }
     fn SetLastError(v: u32) void {
         last_error = v;
+    }
+    fn GetCurrentProcessId() u32 {
+        return @intCast(linux.getpid());
     }
     fn ExitProcess(code: u32) noreturn {
         linux.exit_group(@bitCast(code));
@@ -130,6 +134,13 @@ fn run(ret_by_return: *bool) u32 {
         len += got;
     }
     const in = inbuf[0..len];
+
+    // The two builds run in different processes, so compare invariants, not
+    // their numeric IDs. The sentinel depends on the fuzzer's input.
+    const pid_sentinel: u32 = if (len == 0) 123 else 0x200 + @as(u32, in[0]);
+    os.SetLastError(pid_sentinel);
+    const pid = os.GetCurrentProcessId();
+    if (pid == 0 or pid != os.GetCurrentProcessId() or os.GetLastError() != pid_sentinel) return 95;
 
     // Exercise the zero-byte/null-buffer edge for a subset of generated inputs.
     if (len == 0 or in[0] % 2 == 0) {

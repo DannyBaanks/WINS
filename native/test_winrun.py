@@ -45,7 +45,7 @@ class WinrunTests(unittest.TestCase):
         zig(str(ROOT/'native/testdata/winrun_readzero.zig'), *WIN, f'-femit-bin={t/"readzero.exe"}')
         zig(str(ROOT/'native/fuzz_winrun.zig'), '-O', 'ReleaseSafe', f'-femit-bin={t/"fuzz"}')
         cls.loaders = {}
-        for name in ('winrun', 'winrun_bad_norelocs', 'winrun_bad_exitcode', 'winrun_bad_writecount', 'winrun_bad_zero_read'):
+        for name in ('winrun', 'winrun_bad_norelocs', 'winrun_bad_exitcode', 'winrun_bad_writecount', 'winrun_bad_zero_read', 'winrun_bad_zero_pid'):
             zig(str(ROOT/f'native/{name}.zig'), '-O', 'ReleaseSafe', f'-femit-bin={t/name}')
             cls.loaders[name] = t/name
 
@@ -88,13 +88,18 @@ class WinrunTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('DIVERGENCE', r.stderr)
 
+    def test_control_zero_process_id_is_detected(self):
+        r = self.fuzz('winrun_bad_zero_pid', 200)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('DIVERGENCE', r.stderr)
+
     # --- fail closed -------------------------------------------------------
     def test_check_mode_resolves_without_executing(self):
         r = self.winrun(self.dir/'probe.exe', extra=['--check'], stdin=b'abc')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, b'')
         self.assertIn(b'READY', r.stderr)
-        self.assertIn(b'imports=6', r.stderr)
+        self.assertIn(b'imports=7', r.stderr)
         self.assertNotIn(b'relocs=0 ', r.stderr)
 
     def test_direct_execution_refused_before_opening_image(self):

@@ -159,7 +159,7 @@ El segundo control, `native/winluxhttp_bad_case.zig` (exclusiones sensibles a ma
 
 # winrun: cargador nativo de PE de consola (peldaño 1)
 
-Cargador Linux nativo para ejecutables de consola Windows de 64 bits (x86-64), ejecutado **únicamente** dentro del entorno de contención `bubblewrap`. Mapea la imagen en una dirección elegida por el kernel (nunca en `ImageBase`), aplica relocaciones base DIR64, resuelve una tabla mínima de imports contra funciones nativas de `kernel32` (`GetStdHandle`, `ReadFile`, `WriteFile`, `GetLastError`, `SetLastError`, `ExitProcess`) y salta al punto de entrada.
+Cargador Linux nativo para ejecutables de consola Windows de 64 bits (x86-64), ejecutado **únicamente** dentro del entorno de contención `bubblewrap`. Mapea la imagen en una dirección elegida por el kernel (nunca en `ImageBase`), aplica relocaciones base DIR64, resuelve una tabla mínima de imports contra funciones nativas de `kernel32` (`GetStdHandle`, `ReadFile`, `WriteFile`, `GetLastError`, `SetLastError`, `ExitProcess`, `GetCurrentProcessId`) y salta al punto de entrada. El identificador de proceso pertenece al espacio de nombres Linux de la caja; la correspondencia con identificadores de otros procesos Windows no está implementada.
 
 Una lectura síncrona de cero bytes con búfer nulo devuelve éxito y cero bytes sin alterar el último error. La prueba sintética coincide con Wine 9.0; la equivalencia con Windows real para este caso está **NOT_DEMONSTRATED**.
 
