@@ -16,7 +16,7 @@ def main():
     loader = args.loader.resolve(strict=True)
     image = args.image.resolve(strict=True)
     command = ['bwrap', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv',
-               '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin',
+               '--setenv', 'WINS_WINRUN_BOX', '1', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin',
                '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64',
                '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
                '--ro-bind', str(loader), '/winrun', '--ro-bind', str(image), '/image.exe',

@@ -169,6 +169,10 @@ pub fn Impl(comptime bug: Bug) type {
                 } else die(.usage, "usage: winrun --sha256 HEX [--check] IMAGE.exe", .{});
             }
             if (want_hash == null or path == null) die(.usage, "usage: winrun --sha256 HEX [--check] IMAGE.exe", .{});
+            // An accidental-use guard, not a sandbox attestation: the caller
+            // controls its environment. The wrapper supplies it inside bwrap.
+            if (!check_only and !std.mem.eql(u8, init.environ_map.get("WINS_WINRUN_BOX") orelse "", "1"))
+                die(.usage, "execution requires the boxed launcher; use winrun_box.py", .{});
 
             const file = std.Io.Dir.cwd().readFileAlloc(io, path.?, a, .limited(64 * 1024 * 1024)) catch |e|
                 die(.usage, "cannot read {s}: {s}", .{ path.?, @errorName(e) });

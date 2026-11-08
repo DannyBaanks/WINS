@@ -13,6 +13,7 @@ real Windows (the Linux reference layer models documented kernel32 behaviour).
 """
 from pathlib import Path
 import hashlib
+import os
 import struct
 import sys
 import subprocess
@@ -22,7 +23,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 WIN = ['-target', 'x86_64-windows-gnu', '-O', 'ReleaseSmall', '-fentry=wWinMainCRTStartup', '--subsystem', 'console']
 BOX = ['bwrap', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv',
-       '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib',
+       '--setenv', 'WINS_WINRUN_BOX', '1', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib',
        '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp']
 
 
@@ -88,6 +89,16 @@ class WinrunTests(unittest.TestCase):
         self.assertIn(b'READY', r.stderr)
         self.assertIn(b'imports=6', r.stderr)
         self.assertNotIn(b'relocs=0 ', r.stderr)
+
+    def test_direct_execution_refused_before_opening_image(self):
+        env = dict(os.environ)
+        env.pop('WINS_WINRUN_BOX', None)
+        missing = self.dir/'does-not-exist.exe'
+        r = subprocess.run([str(self.loaders['winrun']), '--sha256', '0' * 64, str(missing)],
+                           env=env, capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn(b'use winrun_box.py', r.stderr)
+        self.assertNotIn(b'cannot read', r.stderr)
 
     def test_box_wrapper_fails_closed_without_bubblewrap(self):
         r = subprocess.run([sys.executable, str(ROOT/'native/winrun_box.py'),

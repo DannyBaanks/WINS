@@ -193,7 +193,7 @@ python3 native/winrun_box.py --loader /tmp/winrun --sha256 "$SHA" --check /tmp/p
 printf 'hola\n' | python3 native/winrun_box.py --loader /tmp/winrun --sha256 "$SHA" /tmp/probe.exe
 ```
 
-El lanzador falla si `bubblewrap` no arranca; no reintenta fuera de la caja. El binario `winrun` es una herramienta interna que **no comprueba ni crea aislamiento por sí misma**: ejecutarlo directamente omite la caja. El hash identifica los bytes seleccionados, no certifica que sean confiables. La caja limita acceso al sistema de archivos y red mediante namespaces; no es una VM ni aplica filtros seccomp o límites de recursos, por lo que no demuestra contención integral frente a código hostil.
+El lanzador falla si `bubblewrap` no arranca; no reintenta fuera de la caja. El binario `winrun` rechaza la ejecución directa si falta la marca `WINS_WINRUN_BOX=1`; es solo una protección contra errores, ya que cualquiera puede falsificar esa variable. El binario **no crea ni verifica el aislamiento**; usa siempre el lanzador. El hash identifica los bytes seleccionados, no certifica que sean confiables. La caja limita acceso al sistema de archivos y red mediante namespaces; no es una VM ni aplica filtros seccomp o límites de recursos, por lo que no demuestra contención integral frente a código hostil.
 
 La validación rechaza directorios de relocaciones truncados, descriptores de imports fuera del tamaño declarado y solapamientos de las áreas virtuales o de tamaño bruto de las secciones. Estas comprobaciones no prueban que se rechace toda imagen malformada.
 
@@ -208,7 +208,7 @@ SHA=$(sha256sum /tmp/probe.exe | cut -d' ' -f1)
 Comprueba la imagen sin ejecutar código:
 
 ```sh
-bwrap --unshare-all --die-with-parent --new-session --clearenv \
+bwrap --unshare-all --die-with-parent --new-session --clearenv --setenv WINS_WINRUN_BOX 1 \
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
   --proc /proc --dev /dev --tmpfs /tmp \
   --ro-bind /tmp/winrun /winrun --ro-bind /tmp/probe.exe /probe.exe \
@@ -224,7 +224,7 @@ winrun: READY sha256=c66cf216e609e72df933d08f059a16fd9512ee635063e1801fd014fbf65
 ## Ejecución en la caja limpia
 
 ```sh
-printf 'hola mundo, esto es una prueba de winrun\n' | bwrap --unshare-all --die-with-parent --new-session --clearenv \
+printf 'hola mundo, esto es una prueba de winrun\n' | bwrap --unshare-all --die-with-parent --new-session --clearenv --setenv WINS_WINRUN_BOX 1 \
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
   --proc /proc --dev /dev --tmpfs /tmp \
   --ro-bind /tmp/winrun /winrun --ro-bind /tmp/probe.exe /probe.exe \
@@ -254,7 +254,7 @@ zig build-exe native/winrun_bad_writecount.zig -O ReleaseSafe -femit-bin=/tmp/wi
 Ejecuta 2 000 entradas aleatorias comparando `probe.exe` bajo `winrun` contra `probe-linux` nativo:
 
 ```sh
-bwrap --unshare-all --die-with-parent --new-session --clearenv \
+bwrap --unshare-all --die-with-parent --new-session --clearenv --setenv WINS_WINRUN_BOX 1 \
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
   --proc /proc --dev /dev --tmpfs /tmp \
   --ro-bind /tmp/fuzz_winrun /runner --ro-bind /tmp/winrun /winrun \
@@ -273,7 +273,7 @@ Los tres controles negativos fallan en la iteración 0:
 2. `winrun_bad_exitcode` (desplaza el código de salida): genera `DIVERGENCE winrun term=.{.exited = 45} native term=.{.exited = 44}`.
 3. `winrun_bad_writecount` (reporta 1 byte menos escrito): la sonda detecta el recuento erróneo y retorna 93 en vez de 44.
 
-Pruebas automatizadas: `python3 -m unittest native.test_winrun` (8 pruebas pasan).
+Pruebas automatizadas: `python3 -m unittest native.test_winrun -v`.
 
 **Límites (NOT_DEMONSTRATED):** solo x86-64 y consola. No soporta DLLs externas, llamadas a la API de Windows fuera de las 6 funciones mínimas de `kernel32`, SEH / desenrollado de excepciones con manejadores, TLS, TEB/PEB ni interfaz gráfica. El código de salida de Windows se trunca a 8 bits por el kernel de Linux.
 
