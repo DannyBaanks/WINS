@@ -21,6 +21,7 @@ from core.recipes.dotnet import DotNetRecipe
 from core.recipes.transpiler import TranspilerRecipe
 from core.tester import CleanroomTester
 from core.transpiler.harvester import BinaryHarvester
+from core.transpiler.fallout_pipeline import detect_fallout_nv, FalloutPipeline
 
 RECIPES = [
     ElectronRecipe(),
@@ -184,6 +185,34 @@ def cmd_corpus_attack(args):
         sys.exit(res.returncode)
 
 
+def cmd_fallout(args):
+    install = detect_fallout_nv(args.path)
+    if not install:
+        print(f"[ERROR] Could not locate FalloutNV.esm at: {args.path}", file=sys.stderr)
+        sys.exit(1)
+
+    pipe = FalloutPipeline(install)
+    if args.audit or args.json:
+        stats = pipe.audit()
+        print(json.dumps(stats, indent=2))
+        return
+
+    if args.openmw_cfg:
+        cfg = pipe.generate_openmw_config(args.openmw_cfg)
+        print(f"[WINS] Generated native OpenMW config at {args.openmw_cfg}")
+        print(cfg)
+        return
+
+    # Default summary
+    stats = pipe.audit()
+    print(f"\n[WINS: FALLOUT NEW VEGAS NATIVE ASSET ENGINE]")
+    print(f"  Master File:     {stats['esm']['file']} ({stats['esm']['size_mb']} MB, {stats['esm']['top_groups']} top groups)")
+    print(f"  Worldspaces:     {stats['esm']['worldspaces_count']} worlds (Mojave Wasteland, Freeside, The Strip, Lucky 38...)")
+    print(f"  Static 3D Meshes:{stats['esm']['static_meshes_count']} models")
+    print(f"  BSA Archives:    {len(stats['bsas'])} indexed archives ({sum(b['file_count'] for b in stats['bsas'].values() if 'file_count' in b)} total assets)")
+    print(f"  D3D9 Shaders:    {stats['shaders']['total_compiled_shaders']} compiled bytecode shaders across {stats['shaders']['packages_count']} packages")
+    print("")
+
 def cmd_list(args):
     print("\nAvailable WINS Transmutation Recipes:")
     for r in RECIPES:
@@ -242,6 +271,14 @@ def main():
     p_corpus.add_argument("--corpus", help="Path to corpus directory (default: <repo>/corpus)")
     p_corpus.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
     p_corpus.set_defaults(func=cmd_corpus_attack)
+
+    # fallout
+    p_fallout = subparsers.add_parser("fallout", help="Inspect and stage Fallout New Vegas assets natively (Zero Wine)")
+    p_fallout.add_argument("path", help="Path to Fallout New Vegas root or Data folder")
+    p_fallout.add_argument("--audit", action="store_true", help="Output full JSON audit")
+    p_fallout.add_argument("--openmw-cfg", help="Path to generate openmw.cfg")
+    p_fallout.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    p_fallout.set_defaults(func=cmd_fallout)
 
     # list
     p_list = subparsers.add_parser("list", help="List available transmutation recipes")
