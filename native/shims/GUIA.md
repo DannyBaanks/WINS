@@ -161,6 +161,8 @@ El segundo control, `native/winluxhttp_bad_case.zig` (exclusiones sensibles a ma
 
 Cargador Linux nativo para ejecutables de consola Windows de 64 bits (x86-64), ejecutado **únicamente** dentro del entorno de contención `bubblewrap`. Mapea la imagen en una dirección elegida por el kernel (nunca en `ImageBase`), aplica relocaciones base DIR64, resuelve una tabla mínima de imports contra funciones nativas de `kernel32` (`GetStdHandle`, `ReadFile`, `WriteFile`, `GetLastError`, `SetLastError`, `ExitProcess`) y salta al punto de entrada.
 
+Una lectura síncrona de cero bytes con búfer nulo devuelve éxito y cero bytes sin alterar el último error. La prueba sintética coincide con Wine 9.0; la equivalencia con Windows real para este caso está **NOT_DEMONSTRATED**.
+
 **Regla de seguridad estricta:**
 - Exige `--sha256 HASH_HEX`; si el digest SHA-256 no coincide exactamente con el archivo, no se ejecuta nada (código de salida 3).
 - Si algún import no está resuelto, se listan los símbolos faltantes y **no se ejecuta ninguna instrucción** del binario (código de salida 4).

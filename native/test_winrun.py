@@ -42,6 +42,7 @@ class WinrunTests(unittest.TestCase):
         zig(str(ROOT/'native/testdata/winrun_probe.zig'), *WIN, f'-femit-bin={t/"probe.exe"}')
         zig(str(ROOT/'native/testdata/winrun_probe.zig'), '-target', 'x86_64-linux', '-O', 'ReleaseSmall', f'-femit-bin={t/"probe-linux"}')
         zig(str(ROOT/'native/testdata/winrun_unresolved.zig'), *WIN, '-luser32', f'-femit-bin={t/"unresolved.exe"}')
+        zig(str(ROOT/'native/testdata/winrun_readzero.zig'), *WIN, f'-femit-bin={t/"readzero.exe"}')
         zig(str(ROOT/'native/fuzz_winrun.zig'), '-O', 'ReleaseSafe', f'-femit-bin={t/"fuzz"}')
         cls.loaders = {}
         for name in ('winrun', 'winrun_bad_norelocs', 'winrun_bad_exitcode', 'winrun_bad_writecount'):
@@ -116,6 +117,12 @@ class WinrunTests(unittest.TestCase):
                                           '--', '/probe-linux'], input=data, capture_output=True, timeout=60)
         self.assertEqual((got.returncode, got.stdout, got.stderr),
                          (reference.returncode, reference.stdout, reference.stderr))
+
+    def test_zero_length_read_with_null_buffer(self):
+        # Wine 9.0 returns success, zero bytes and preserves last error for
+        # this synthetic probe; this does not establish Windows equivalence.
+        got = self.winrun(self.dir/'readzero.exe')
+        self.assertEqual(got.returncode, 41, got.stderr)
 
     def test_wrong_hash_is_refused(self):
         r = self.winrun(self.dir/'probe.exe', digest='0' * 64, stdin=b'abc')

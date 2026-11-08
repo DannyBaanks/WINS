@@ -114,6 +114,12 @@ pub fn Impl(comptime bug: Bug) type {
                 if (read) |r| r.* = 0;
                 return 0;
             }
+            // A zero-byte request does not dereference the buffer. In particular,
+            // a null buffer must not trigger Zig's optional-pointer trap.
+            if (n == 0) {
+                if (read) |r| r.* = 0;
+                return 1;
+            }
             const rc = linux.read(0, buf.?, n);
             if (linux.errno(rc) != .SUCCESS) {
                 if (read) |r| r.* = 0;
