@@ -157,6 +157,24 @@ DIVERGENCE iter=0 relation=R3: status 0, expected 1
 
 El segundo control, `native/winluxhttp_bad_case.zig` (exclusiones sensibles a mayúsculas), falla en la relación R6. **Límites:** cuando la documentación no fija un comportamiento (p. ej. si `*.dominio` coincide con el dominio desnudo, el orden entre entradas con alcance y sin él, o `<local>` con direcciones IPv6) este candidato toma una decisión propia; eso es una suposición y NO está demostrado frente a un Windows real. `relation_checks_nominal` es 31 por iteración, no un contador medido.
 
+## Prueba aislada de ventana X11
+
+Desde la raíz de WINS:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 XDG_CACHE_HOME=/tmp/wins-x11-cache python3 -m unittest native.test_x11_window -v
+```
+
+Salida real, abreviada:
+
+```text
+test_unavailable_display_fails ... ok
+test_window_round_trip_and_zero_size_rejection ... ok
+OK
+```
+
+Requiere Zig, bibliotecas de desarrollo X11, `bubblewrap` y `Xvfb`. La prueba crea su propio servidor sin red dentro de la caja; no conecta al escritorio. Desactiva GLX y DRI3 porque en este host Xvfb falló al intentar cargar el controlador gráfico. Compara dimensiones solicitadas con la respuesta del servidor y comprueba casos negativos. Esta base X11 es independiente de `winrun`: **no implementa USER32, no ejecuta programas gráficos de Windows y no demuestra que Notepad++ funcione**.
+
 # winrun: cargador nativo de PE de consola (peldaño 1)
 
 Cargador Linux nativo para ejecutables de consola Windows de 64 bits (x86-64), ejecutado **únicamente** dentro del entorno de contención `bubblewrap`. Mapea la imagen en una dirección elegida por el kernel (nunca en `ImageBase`), aplica relocaciones base DIR64, resuelve una tabla mínima de imports contra funciones nativas de `kernel32` (`GetStdHandle`, `ReadFile`, `WriteFile`, `GetLastError`, `SetLastError`, `ExitProcess`, `GetCurrentProcessId`) y salta al punto de entrada. El identificador de proceso pertenece al espacio de nombres Linux de la caja; la correspondencia con identificadores de otros procesos Windows no está implementada.
