@@ -22,7 +22,7 @@ const CP_UTF8: u32 = 65001;
 const STD_INPUT_HANDLE: u32 = @bitCast(@as(i32, -10));
 const STD_OUTPUT_HANDLE: u32 = @bitCast(@as(i32, -11));
 
-var in_storage: [1 << 20]u8 = undefined;
+var in_storage: [1 << 20]u8 align(2) = undefined;
 var dst_u16: [1 << 19]u16 = undefined;
 var dst_u8: [1 << 20]u8 = undefined;
 
@@ -68,6 +68,25 @@ pub export fn wWinMainCRTStartup() callconv(W) noreturn {
         if (nbytes > in_storage.len) ExitProcess(2);
         if (nbytes > 0 and !readExact(hin, in_storage[0..nbytes])) break;
 
+        // Keep intentionally invalid API parameters testable without allowing a
+        // request to address memory outside the buffers behind those parameters.
+        if (mode > 1) ExitProcess(3);
+        const width: usize = if (mode == 0) 1 else 2;
+        const capacity: usize = if (mode == 0) dst_u16.len else dst_u8.len;
+        if (size > 0 and @as(usize, @intCast(size)) > capacity) ExitProcess(2);
+        if (len > 0 and @as(u64, @intCast(len)) * width > nbytes) ExitProcess(2);
+        if (len == -1 and nbytes > 0) {
+            var found = false;
+            var pos: usize = 0;
+            while (pos + width <= nbytes) : (pos += width) {
+                if (in_storage[pos] == 0 and (width == 1 or in_storage[pos + 1] == 0)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) ExitProcess(2);
+        }
+
         SetLastError(0);
         var ret: i32 = 0;
         var nout: u32 = 0;
@@ -77,7 +96,7 @@ pub export fn wWinMainCRTStartup() callconv(W) noreturn {
             const src = if (nbytes > 0) in_storage[0..nbytes].ptr else null;
             const d = if (dst_null) null else dst_u16[0..@min(dst_u16.len, @as(usize, @intCast(@max(size, 0))))].ptr;
             ret = MultiByteToWideChar(CP_UTF8, flags, src, len, d, size);
-            if (ret > 0 and !dst_null) {
+            if (ret > 0 and !dst_null and size > 0) {
                 nout = @intCast(@as(usize, @intCast(ret)) * 2);
                 out_bytes = std.mem.sliceAsBytes(dst_u16[0..@intCast(ret)]);
             }
@@ -85,7 +104,7 @@ pub export fn wWinMainCRTStartup() callconv(W) noreturn {
             const src: ?[*]const u16 = if (nbytes >= 2) @ptrCast(@alignCast(in_storage[0..nbytes].ptr)) else null;
             const d = if (dst_null) null else dst_u8[0..@min(dst_u8.len, @as(usize, @intCast(@max(size, 0))))].ptr;
             ret = WideCharToMultiByte(CP_UTF8, flags, src, len, d, size, null, null);
-            if (ret > 0 and !dst_null) {
+            if (ret > 0 and !dst_null and size > 0) {
                 nout = @intCast(ret);
                 out_bytes = dst_u8[0..@intCast(ret)];
             }

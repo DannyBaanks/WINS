@@ -14,6 +14,7 @@ real Windows (the Linux reference layer models documented kernel32 behaviour).
 from pathlib import Path
 import hashlib
 import struct
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -54,8 +55,8 @@ class WinrunTests(unittest.TestCase):
                               capture_output=True, text=True, timeout=600)
 
     def winrun(self, image, digest=None, extra=(), stdin=b''):
-        return subprocess.run(BOX + ['--ro-bind', str(self.loaders['winrun']), '/winrun', '--ro-bind', str(image), '/image.exe',
-                                     '--', '/winrun', '--sha256', digest or sha(image), *extra, '/image.exe'],
+        return subprocess.run([sys.executable, str(ROOT/'native/winrun_box.py'), '--loader', str(self.loaders['winrun']),
+                               '--sha256', digest or sha(image), *extra, str(image)],
                               input=stdin, capture_output=True, timeout=60)
 
     # --- differential fuzz -------------------------------------------------
@@ -88,6 +89,23 @@ class WinrunTests(unittest.TestCase):
         self.assertIn(b'imports=6', r.stderr)
         self.assertNotIn(b'relocs=0 ', r.stderr)
 
+    def test_box_wrapper_fails_closed_without_bubblewrap(self):
+        r = subprocess.run([sys.executable, str(ROOT/'native/winrun_box.py'),
+                            '--loader', str(self.loaders['winrun']), '--sha256', sha(self.dir/'probe.exe'),
+                            str(self.dir/'probe.exe')], env={'PATH': '/nonexistent'},
+                           capture_output=True, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, b'')
+        self.assertIn(b'cannot start bubblewrap', r.stderr)
+
+    def test_box_wrapper_executes_probe(self):
+        data = b'hello from the boxed runner\n'
+        got = self.winrun(self.dir/'probe.exe', stdin=data)
+        reference = subprocess.run(BOX + ['--ro-bind', str(self.dir/'probe-linux'), '/probe-linux',
+                                          '--', '/probe-linux'], input=data, capture_output=True, timeout=60)
+        self.assertEqual((got.returncode, got.stdout, got.stderr),
+                         (reference.returncode, reference.stdout, reference.stderr))
+
     def test_wrong_hash_is_refused(self):
         r = self.winrun(self.dir/'probe.exe', digest='0' * 64, stdin=b'abc')
         self.assertEqual(r.returncode, 3)
@@ -110,6 +128,22 @@ class WinrunTests(unittest.TestCase):
         p = self.dir/f'mut-{name}.exe'
         p.write_bytes(bytes(b))
         return p
+
+    def test_truncated_directories_are_rejected(self):
+        for index in (1, 5):
+            with self.subTest(directory=index):
+                def truncate(b, pe, opt, sec):
+                    struct.pack_into('<I', b, opt + 112 + index * 8 + 4, 1)
+                r = self.winrun(self.mutate(f'dir-{index}', truncate), extra=['--check'])
+                self.assertEqual(r.returncode, 5, r.stderr)
+                self.assertNotIn(b'READY', r.stderr)
+
+    def test_overlapping_raw_section_span_is_rejected(self):
+        def overlap(b, pe, opt, sec):
+            struct.pack_into('<II', b, sec + 16, 0x1100, 0)
+        r = self.winrun(self.mutate('overlap', overlap), extra=['--check'])
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self.assertNotIn(b'READY', r.stderr)
 
     def test_out_of_scope_images_are_refused_before_execution(self):
         def gui(b, pe, opt, sec): struct.pack_into('<H', b, opt + 68, 2)

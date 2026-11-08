@@ -236,7 +236,7 @@ pub fn Impl(comptime bug: Bug) type {
                 const span = @max(s.vsize, s.raw_size);
                 if (@as(u64, s.va) + span > size_of_image) die(.bad_image, "section {s} beyond SizeOfImage", .{nm});
                 if (s.raw_size != 0 and @as(u64, s.raw_ptr) + s.raw_size > file.len) die(.bad_image, "section {s} raw data beyond file", .{nm});
-                if (k > 0 and s.va < secs[k - 1].va + std.mem.alignForward(u32, @max(secs[k - 1].vsize, 1), 4096)) die(.bad_image, "section {s} overlaps", .{nm});
+                if (k > 0 and s.va < secs[k - 1].va + std.mem.alignForward(u32, @max(@max(secs[k - 1].vsize, secs[k - 1].raw_size), 1), 4096)) die(.bad_image, "section {s} overlaps", .{nm});
             }
 
             // 4. Map read-write at a kernel-chosen address (never ImageBase).
@@ -284,6 +284,7 @@ pub fn Impl(comptime bug: Bug) type {
                     }
                     p += bsize;
                 }
+                if (p != end) die(.bad_image, "truncated relocation block", .{});
             } else die(.refused, "no relocation directory; winrun never maps at ImageBase", .{});
 
             // 6. Exception data: tolerate unwind info, refuse handlers (nothing would dispatch them).
@@ -310,8 +311,11 @@ pub fn Impl(comptime bug: Bug) type {
             var n_imports: usize = 0;
             var missing: std.ArrayList(u8) = .empty;
             if (dirs[1].size != 0) {
+                if (@as(u64, dirs[1].rva) + dirs[1].size > size_of_image) die(.bad_image, "import directory beyond image", .{});
                 var d: usize = dirs[1].rva;
+                const end: usize = d + dirs[1].size;
                 while (true) : (d += 20) {
+                    if (d > end or end - d < 20) die(.bad_image, "truncated import directory", .{});
                     const oft = need(u32, img, d, "import OFT");
                     const name_rva = need(u32, img, d + 12, "import name");
                     const ft = need(u32, img, d + 16, "import FT");

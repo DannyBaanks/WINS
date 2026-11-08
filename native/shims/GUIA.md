@@ -183,6 +183,20 @@ zig build-exe native/winrun.zig -O ReleaseSafe -femit-bin=/tmp/winrun
 
 Salida real: ninguna.
 
+## Entrada recomendada: caja automática
+
+Después de compilar `winrun`, usa el lanzador que prepara la caja antes de invocar el cargador:
+
+```sh
+SHA=$(sha256sum /tmp/probe.exe | cut -d' ' -f1)
+python3 native/winrun_box.py --loader /tmp/winrun --sha256 "$SHA" --check /tmp/probe.exe
+printf 'hola\n' | python3 native/winrun_box.py --loader /tmp/winrun --sha256 "$SHA" /tmp/probe.exe
+```
+
+El lanzador falla si `bubblewrap` no arranca; no reintenta fuera de la caja. El binario `winrun` es una herramienta interna que **no comprueba ni crea aislamiento por sí misma**: ejecutarlo directamente omite la caja. El hash identifica los bytes seleccionados, no certifica que sean confiables. La caja limita acceso al sistema de archivos y red mediante namespaces; no es una VM ni aplica filtros seccomp o límites de recursos, por lo que no demuestra contención integral frente a código hostil.
+
+La validación rechaza directorios de relocaciones truncados, descriptores de imports fuera del tamaño declarado y solapamientos de las áreas virtuales o de tamaño bruto de las secciones. Estas comprobaciones no prueban que se rechace toda imagen malformada.
+
 ## Verificación estática con `--check`
 
 Calcula el hash del PE:
