@@ -156,3 +156,110 @@ DIVERGENCE iter=0 relation=R3: status 0, expected 1
 ```
 
 El segundo control, `native/winluxhttp_bad_case.zig` (exclusiones sensibles a mayúsculas), falla en la relación R6. **Límites:** cuando la documentación no fija un comportamiento (p. ej. si `*.dominio` coincide con el dominio desnudo, el orden entre entradas con alcance y sin él, o `<local>` con direcciones IPv6) este candidato toma una decisión propia; eso es una suposición y NO está demostrado frente a un Windows real. `relation_checks_nominal` es 31 por iteración, no un contador medido.
+
+# winrun: cargador nativo de PE de consola (peldaño 1)
+
+Cargador Linux nativo para ejecutables de consola Windows de 64 bits (x86-64), ejecutado **únicamente** dentro del entorno de contención `bubblewrap`. Mapea la imagen en una dirección elegida por el kernel (nunca en `ImageBase`), aplica relocaciones base DIR64, resuelve una tabla mínima de imports contra funciones nativas de `kernel32` (`GetStdHandle`, `ReadFile`, `WriteFile`, `GetLastError`, `SetLastError`, `ExitProcess`) y salta al punto de entrada.
+
+**Regla de seguridad estricta:**
+- Exige `--sha256 HASH_HEX`; si el digest SHA-256 no coincide exactamente con el archivo, no se ejecuta nada (código de salida 3).
+- Si algún import no está resuelto, se listan los símbolos faltantes y **no se ejecuta ninguna instrucción** del binario (código de salida 4).
+- Se rechazan antes de mapear imágenes con TLS, DLLs, imports diferidos, CLR (.NET), secciones escribibles y ejecutables a la vez, o subsistemas distintos de consola (3).
+
+## Compilación del ejecutable de prueba y de winrun
+
+Compila la sonda de prueba en formato Windows PE (con relocaciones DIR64 forzadas y tabla de punteros) y en ELF nativo de Linux (la referencia con syscalls directas):
+
+```sh
+zig build-exe native/testdata/winrun_probe.zig -target x86_64-windows-gnu -O ReleaseSmall -fentry=wWinMainCRTStartup --subsystem console -femit-bin=/tmp/probe.exe
+zig build-exe native/testdata/winrun_probe.zig -target x86_64-linux -O ReleaseSmall -femit-bin=/tmp/probe-linux
+```
+
+Compila el cargador `winrun`:
+
+```sh
+zig build-exe native/winrun.zig -O ReleaseSafe -femit-bin=/tmp/winrun
+```
+
+Salida real: ninguna.
+
+## Verificación estática con `--check`
+
+Calcula el hash del PE:
+
+```sh
+SHA=$(sha256sum /tmp/probe.exe | cut -d' ' -f1)
+```
+
+Comprueba la imagen sin ejecutar código:
+
+```sh
+bwrap --unshare-all --die-with-parent --new-session --clearenv \
+  --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --ro-bind /tmp/winrun /winrun --ro-bind /tmp/probe.exe /probe.exe \
+  -- /winrun --sha256 $SHA --check /probe.exe
+```
+
+Salida real (código 0, stdout vacío):
+
+```text
+winrun: READY sha256=c66cf216e609e72df933d08f059a16fd9512ee635063e1801fd014fbf65316e2 relocs=11 imports=6 base=0x79d073126000 (not executed: --check)
+```
+
+## Ejecución en la caja limpia
+
+```sh
+printf 'hola mundo, esto es una prueba de winrun\n' | bwrap --unshare-all --die-with-parent --new-session --clearenv \
+  --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --ro-bind /tmp/winrun /winrun --ro-bind /tmp/probe.exe /probe.exe \
+  -- /winrun --sha256 $SHA /probe.exe
+```
+
+Salida real (idéntica a `./probe-linux`, código de salida 48):
+
+```text
+uoyA MUeqo, Esgo alpha
+ Es UeA c2UE2A q zeta
+E wIe2Uea
+len=00000029 fnv=a3b24b30 le=a3b24b30
+```
+
+## Fuzzing diferencial y controles negativos
+
+Compila el fuzzer diferencial y los 3 cargadores deliberadamente defectuosos:
+
+```sh
+zig build-exe native/fuzz_winrun.zig -O ReleaseSafe -femit-bin=/tmp/fuzz_winrun
+zig build-exe native/winrun_bad_norelocs.zig -O ReleaseSafe -femit-bin=/tmp/winrun_bad_norelocs
+zig build-exe native/winrun_bad_exitcode.zig -O ReleaseSafe -femit-bin=/tmp/winrun_bad_exitcode
+zig build-exe native/winrun_bad_writecount.zig -O ReleaseSafe -femit-bin=/tmp/winrun_bad_writecount
+```
+
+Ejecuta 2 000 entradas aleatorias comparando `probe.exe` bajo `winrun` contra `probe-linux` nativo:
+
+```sh
+bwrap --unshare-all --die-with-parent --new-session --clearenv \
+  --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --ro-bind /tmp/fuzz_winrun /runner --ro-bind /tmp/winrun /winrun \
+  --ro-bind /tmp/probe.exe /probe.exe --ro-bind /tmp/probe-linux /probe-linux \
+  -- /runner /winrun /probe.exe $SHA /probe-linux 2000
+```
+
+Salida real:
+
+```text
+MATCHED iterations=2000 seed=0x77696e72756e exit_paths[return=452 ExitProcess=1548] oversized_inputs=217 stdout_bytes=26827647; this probe only, not a general PE loader
+```
+
+Los tres controles negativos fallan en la iteración 0:
+1. `winrun_bad_norelocs` (omite relocaciones): produce un fallo de segmentación inmediato en `0x1400012a9` al saltar a través de la tabla de punteros no reubicada.
+2. `winrun_bad_exitcode` (desplaza el código de salida): genera `DIVERGENCE winrun term=.{.exited = 45} native term=.{.exited = 44}`.
+3. `winrun_bad_writecount` (reporta 1 byte menos escrito): la sonda detecta el recuento erróneo y retorna 93 en vez de 44.
+
+Pruebas automatizadas: `python3 -m unittest native.test_winrun` (8 pruebas pasan).
+
+**Límites (NOT_DEMONSTRATED):** solo x86-64 y consola. No soporta DLLs externas, llamadas a la API de Windows fuera de las 6 funciones mínimas de `kernel32`, SEH / desenrollado de excepciones con manejadores, TLS, TEB/PEB ni interfaz gráfica. El código de salida de Windows se trunca a 8 bits por el kernel de Linux.
+
