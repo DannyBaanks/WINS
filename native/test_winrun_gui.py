@@ -41,6 +41,10 @@ class WinrunGuiTests(unittest.TestCase):
         cls.directory = Path(tempfile.mkdtemp(prefix='wins-gui-'))
         cls.wine_pfx = cls.directory / 'pfx'
         cls.wine_pfx.mkdir(parents=True, exist_ok=True)
+        default_wine = Path.home() / '.wine'
+        if default_wine.is_dir():
+            subprocess.run(['cp', '-al', str(default_wine / '.'), str(cls.wine_pfx)],
+                           check=False, capture_output=True)
         cls.probe = cls.directory / 'probe.exe'
         cls.unresolved = cls.directory / 'unresolved.exe'
         cls.loader = cls.directory / 'loader'

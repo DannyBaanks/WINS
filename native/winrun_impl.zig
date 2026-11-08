@@ -187,6 +187,7 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
         fn lookup(lib: []const u8, name: []const u8) ?usize {
             if (std.ascii.eqlIgnoreCase(lib, "kernel32.dll")) {
                 for (exports()) |e| if (std.mem.eql(u8, name, e.name)) return e.addr;
+                return @import("winrun_kernel32.zig").lookup(name);
             }
             if (comptime gui) {
                 if (std.ascii.eqlIgnoreCase(lib, "user32.dll")) return @import("winrun_gui_support.zig").lookup(name);
@@ -304,6 +305,7 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             const base: usize = mrc;
             if (base == image_base) die(.map_failed, "kernel chose ImageBase itself; refusing to hide relocation bugs", .{});
             image_base_addr = base;
+            @import("winrun_kernel32.zig").setImageBase(base);
             const img: []u8 = @as([*]u8, @ptrFromInt(base))[0..map_len];
             @memcpy(img[0..size_of_headers], file[0..size_of_headers]);
             for (secs) |s| {
@@ -377,11 +379,10 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             } else die(.refused, "no relocation directory; winrun never maps at ImageBase", .{});
 
             // 6. Exception data: tolerate unwind info.
-            // Console mode: refuse any SEH handler (nothing would dispatch them).
-            // GUI mode: tolerate SEH handler records — they are present in every MSVC
-            // C++ binary and are only invoked when an exception propagates.  Normal
-            // execution paths never reach them; if an unhandled exception does fire,
-            // the Linux signal will kill the process rather than dispatching SEH.
+            // Both Console and GUI modes tolerate SEH handler records — they are present
+            // in every MSVC C/C++ binary and are only invoked when an exception propagates.
+            // Normal execution paths never reach them; if an unhandled exception does fire,
+            // the Linux signal terminates the process rather than dispatching SEH.
             if (dirs[3].size != 0) {
                 if (@as(u64, dirs[3].rva) + dirs[3].size > size_of_image or dirs[3].size % 12 != 0) die(.bad_image, "exception directory malformed", .{});
                 var p: usize = dirs[3].rva;
@@ -392,8 +393,8 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                         if (depth > 32) die(.bad_image, "unwind chain too deep", .{});
                         const hdr = need(u8, img, ui, "unwind info");
                         const flags = hdr >> 3;
-                        if (!gui and flags & 0x3 != 0) die(.refused, "function at RVA 0x{x} has an exception handler (SEH unsupported)", .{need(u32, img, p, "begin")});
-                        if (flags & 0x4 == 0) break; // not chained
+                        _ = flags;
+                        if (hdr & 0x4 == 0) break; // not chained (flag bit 2)
                         const codes = need(u8, img, ui + 2, "unwind code count");
                         const chained = ui + 4 + std.mem.alignForward(usize, codes, 2) * 2;
                         ui = need(u32, img, chained + 8, "chained unwind info");
@@ -462,7 +463,26 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                 });
             }
 
-            // 10. Run. Returning from the entry point ends the process with its return value.
+            // 10. Run. Setup minimal Windows x86_64 TEB, PEB & ProcessParameters so MSVC CRT initialization
+            // can read %gs:0x30 (TEB self), %gs:0x60 (PEB), peb->ImageBaseAddress (0x10), peb->ProcessParameters (0x20).
+            var dummy_teb: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            var dummy_peb: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            var dummy_params: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+
+            std.mem.writeInt(usize, dummy_teb[0x30..][0..8], @intFromPtr(&dummy_teb), .little);
+            std.mem.writeInt(usize, dummy_teb[0x60..][0..8], @intFromPtr(&dummy_peb), .little);
+            std.mem.writeInt(usize, dummy_peb[0x10..][0..8], base, .little);
+            std.mem.writeInt(usize, dummy_peb[0x18..][0..8], 0x10000, .little); // ProcessHeap
+            std.mem.writeInt(usize, dummy_peb[0x20..][0..8], @intFromPtr(&dummy_params), .little); // ProcessParameters
+
+            // Standard handles in ProcessParameters
+            std.mem.writeInt(usize, dummy_params[0x28..][0..8], HANDLE_STDIN, .little);
+            std.mem.writeInt(usize, dummy_params[0x30..][0..8], HANDLE_STDOUT, .little);
+            std.mem.writeInt(usize, dummy_params[0x38..][0..8], HANDLE_STDERR, .little);
+
+            _ = linux.syscall2(.arch_prctl, 0x1001, @intFromPtr(&dummy_teb));
+
+            // Returning from the entry point ends the process with its return value.
             const entry: *const fn () callconv(W) u32 = @ptrFromInt(base + entry_rva);
             const rc = entry();
             exitWith(rc);

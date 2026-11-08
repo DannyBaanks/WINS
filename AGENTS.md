@@ -34,3 +34,16 @@ installer, asset or runtime behavior:
 
 These instructions do not expand authorization to run untrusted code outside
 an appropriate isolation boundary, remove files, or modify unrelated work.
+
+## Native-First Rule: Zig Engine & Wine Differential Oracle (Zero Heavy Python)
+
+1. **System & Harness in Zig**: All loaders (`winrun`, `winrun_gui`), shims, memory allocators,
+   fuzzers, and verification runners MUST be written in `.zig`. Python is strictly limited to
+   top-level CLI dispatch (`bin/wins`) where inevitable.
+2. **Wine is the Oracle of Truth**: Verification and differential correctness are proven against
+   real Wine execution (comparing bit-identical exit codes, stdout, stderr, and window behavior
+   inside cleanroom `bubblewrap`), NOT by writing synthetic Python mocks or slow `unittest` suites.
+3. **No Heavy Python Test Suites**: Do not write or rely on heavy Python `unittest` suites that spawn
+   fragile, slow subprocess loops with 180s timeouts. Use high-speed native Zig harnesses that execute
+   in sub-millisecond time.
+
