@@ -45,7 +45,7 @@ class WinrunTests(unittest.TestCase):
         zig(str(ROOT/'native/testdata/winrun_readzero.zig'), *WIN, f'-femit-bin={t/"readzero.exe"}')
         zig(str(ROOT/'native/fuzz_winrun.zig'), '-O', 'ReleaseSafe', f'-femit-bin={t/"fuzz"}')
         cls.loaders = {}
-        for name in ('winrun', 'winrun_bad_norelocs', 'winrun_bad_exitcode', 'winrun_bad_writecount'):
+        for name in ('winrun', 'winrun_bad_norelocs', 'winrun_bad_exitcode', 'winrun_bad_writecount', 'winrun_bad_zero_read'):
             zig(str(ROOT/f'native/{name}.zig'), '-O', 'ReleaseSafe', f'-femit-bin={t/name}')
             cls.loaders[name] = t/name
 
@@ -66,6 +66,7 @@ class WinrunTests(unittest.TestCase):
         r = self.fuzz('winrun', 2000)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('MATCHED iterations=2000', r.stderr)
+        self.assertRegex(r.stderr, r'zero_reads=[1-9]\d*')
 
     def test_control_without_relocations_is_detected(self):
         r = self.fuzz('winrun_bad_norelocs', 200)
@@ -79,6 +80,11 @@ class WinrunTests(unittest.TestCase):
 
     def test_control_short_write_count_is_detected(self):
         r = self.fuzz('winrun_bad_writecount', 200)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('DIVERGENCE', r.stderr)
+
+    def test_control_zero_read_error_is_detected(self):
+        r = self.fuzz('winrun_bad_zero_read', 200)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('DIVERGENCE', r.stderr)
 

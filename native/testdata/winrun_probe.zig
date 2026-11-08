@@ -24,7 +24,7 @@ const STD_OUTPUT_HANDLE: u32 = @bitCast(@as(i32, -11));
 
 const os = if (is_windows) struct {
     extern "kernel32" fn GetStdHandle(n: u32) callconv(W) usize;
-    extern "kernel32" fn ReadFile(h: usize, buf: [*]u8, n: u32, read: *u32, ov: ?*anyopaque) callconv(W) i32;
+    extern "kernel32" fn ReadFile(h: usize, buf: ?[*]u8, n: u32, read: *u32, ov: ?*anyopaque) callconv(W) i32;
     extern "kernel32" fn WriteFile(h: usize, buf: [*]const u8, n: u32, written: *u32, ov: ?*anyopaque) callconv(W) i32;
     extern "kernel32" fn GetLastError() callconv(W) u32;
     extern "kernel32" fn SetLastError(v: u32) callconv(W) void;
@@ -36,10 +36,14 @@ const os = if (is_windows) struct {
     fn GetStdHandle(n: u32) usize {
         return if (n == STD_INPUT_HANDLE) 0x1000 else 0x1001;
     }
-    fn ReadFile(h: usize, buf: [*]u8, n: u32, read: *u32, ov: ?*anyopaque) i32 {
+    fn ReadFile(h: usize, buf: ?[*]u8, n: u32, read: *u32, ov: ?*anyopaque) i32 {
         _ = h;
         _ = ov;
-        const rc = linux.read(0, buf, n);
+        if (n == 0) {
+            read.* = 0;
+            return 1;
+        }
+        const rc = linux.read(0, buf.?, n);
         if (linux.errno(rc) != .SUCCESS) {
             read.* = 0;
             return 0;
@@ -126,6 +130,14 @@ fn run(ret_by_return: *bool) u32 {
         len += got;
     }
     const in = inbuf[0..len];
+
+    // Exercise the zero-byte/null-buffer edge for a subset of generated inputs.
+    if (len == 0 or in[0] % 2 == 0) {
+        const sentinel: u32 = if (len == 0) 123 else 0x100 + @as(u32, in[0]);
+        var got: u32 = 0xdeadbeef;
+        os.SetLastError(sentinel);
+        if (os.ReadFile(hin, null, 0, &got, null) != 1 or got != 0 or os.GetLastError() != sentinel) return 94;
+    }
 
     var n: usize = 0;
     var sum: u32 = 0x811c9dc5;

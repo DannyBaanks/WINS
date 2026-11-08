@@ -4,6 +4,8 @@
 //! (testdata/winrun_probe.zig) is compiled twice: as a Windows PE, run through
 //! winrun, and as a Linux ELF, the reference. For random stdin inputs both must
 //! produce identical stdout, stderr and termination (exit code or signal).
+//! Some inputs also exercise a zero-byte ReadFile with a null buffer and check
+//! its return value, byte count and last-error preservation.
 //!   usage: fuzz_winrun WINRUN PE SHA256 REFERENCE ITERATIONS [SEED]
 //! What this demonstrates is narrow: winrun maps, relocates, binds and runs THIS
 //! probe like a native build does. It says nothing about other PEs, about real
@@ -79,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
     var by_return: usize = 0;
     var by_exitprocess: usize = 0;
     var oversized: usize = 0;
+    var zero_reads: usize = 0;
     var bytes_out: usize = 0;
     const d = std.debug;
 
@@ -104,7 +107,8 @@ pub fn main(init: std.process.Init) !void {
         }
         if (input.len > 1 and input[1] % 5 == 0) by_return += 1 else by_exitprocess += 1;
         if (input.len > 65536) oversized += 1;
+        if (input.len == 0 or input[0] % 2 == 0) zero_reads += 1;
         bytes_out += got.out.len;
     }
-    d.print("MATCHED iterations={d} seed=0x{x} exit_paths[return={d} ExitProcess={d}] oversized_inputs={d} stdout_bytes={d}; this probe only, not a general PE loader\n", .{ iterations, seed, by_return, by_exitprocess, oversized, bytes_out });
+    d.print("MATCHED iterations={d} seed=0x{x} exit_paths[return={d} ExitProcess={d}] oversized_inputs={d} zero_reads={d} stdout_bytes={d}; this probe only, not a general PE loader\n", .{ iterations, seed, by_return, by_exitprocess, oversized, zero_reads, bytes_out });
 }

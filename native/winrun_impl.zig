@@ -29,7 +29,7 @@ const linux = std.os.linux;
 const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
 
 /// Deliberate defects for the negative controls (winrun_bad_*.zig).
-pub const Bug = enum { none, skip_relocs, exit_off_by_one, short_write_count };
+pub const Bug = enum { none, skip_relocs, exit_off_by_one, short_write_count, zero_read_error };
 
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
@@ -117,6 +117,11 @@ pub fn Impl(comptime bug: Bug) type {
             // A zero-byte request does not dereference the buffer. In particular,
             // a null buffer must not trigger Zig's optional-pointer trap.
             if (n == 0) {
+                if (bug == .zero_read_error) {
+                    last_error = ERROR_INVALID_PARAMETER;
+                    if (read) |r| r.* = 0;
+                    return 0;
+                }
                 if (read) |r| r.* = 0;
                 return 1;
             }
