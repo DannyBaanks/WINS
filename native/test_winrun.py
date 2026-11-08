@@ -145,8 +145,8 @@ class WinrunTests(unittest.TestCase):
         r = self.winrun(self.dir/'unresolved.exe')
         self.assertEqual(r.returncode, 4, r.stderr)
         self.assertEqual(r.stdout, b'')  # "EXECUTED" would appear if the entry point ran
-        self.assertIn(b'GetTickCount', r.stderr)
-        self.assertIn(b'MessageBoxA', r.stderr)
+        self.assertIn(b'USER32.dll!MessageBoxA', r.stderr)
+        self.assertNotIn(b'GetTickCount', r.stderr)  # implemented in winrun_kernel32.zig
         self.assertNotIn(b'WriteFile', r.stderr)  # implemented ones are not reported
 
     def mutate(self, name, fn):
@@ -189,6 +189,18 @@ class WinrunTests(unittest.TestCase):
                 self.assertEqual(r.returncode, 3, r.stderr)
                 self.assertEqual(r.stdout, b'')
                 self.assertIn(msg, r.stderr)
+
+    def test_calcbolge_corpus_check_and_tls_crt_execution(self):
+        calc = ROOT / 'corpus' / 'calcbolge.exe'
+        if not calc.is_file():
+            self.skipTest('corpus/calcbolge.exe not present')
+        chk = self.winrun(calc, extra=['--check'])
+        self.assertEqual(chk.returncode, 0, chk.stderr)
+        self.assertIn(b'READY', chk.stderr)
+        self.assertIn(b'imports=66', chk.stderr)
+        run_no_mb = self.winrun(calc, stdin=b'quit\n')
+        self.assertEqual(run_no_mb.returncode, 1, run_no_mb.stderr)
+        self.assertIn(b"Error: No se pudo localizar 'mbir_alu.mb'.", run_no_mb.stderr)
 
 
 if __name__ == '__main__':

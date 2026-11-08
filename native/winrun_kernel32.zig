@@ -1280,6 +1280,45 @@ fn SetEnvironmentVariableW(name: ?[*:0]const u16, val: ?[*:0]const u16) callconv
 
 fn DebugBreak() callconv(W) void {}
 
+fn IsDBCSLeadByteEx(cp: u32, test_char: u8) callconv(W) i32 {
+    _ = cp;
+    _ = test_char;
+    return 0;
+}
+
+fn VirtualQuery(addr: ?*const anyopaque, buf: ?[*]u8, len: usize) callconv(W) usize {
+    if (buf == null or len < 48) return 0;
+    const raw_addr: usize = if (addr) |p| @intFromPtr(p) else image_base_addr;
+    const base_page = raw_addr & ~@as(usize, 0xFFF);
+    const alloc_base = if (image_base_addr != 0) image_base_addr else base_page;
+    @memset(buf.?[0..48], 0);
+    std.mem.writeInt(u64, buf.?[0..8], base_page, .little); // BaseAddress
+    std.mem.writeInt(u64, buf.?[8..16], alloc_base, .little); // AllocationBase
+    std.mem.writeInt(u32, buf.?[16..20], 0x04, .little); // AllocationProtect = PAGE_READWRITE
+    std.mem.writeInt(u64, buf.?[24..32], 0x10000, .little); // RegionSize
+    std.mem.writeInt(u32, buf.?[32..36], 0x1000, .little); // State = MEM_COMMIT
+    std.mem.writeInt(u32, buf.?[36..40], 0x04, .little); // Protect = PAGE_READWRITE
+    std.mem.writeInt(u32, buf.?[40..44], 0x1000000, .little); // Type = MEM_IMAGE
+    return 48;
+}
+
+fn VirtualProtect(addr: ?*anyopaque, sz: usize, new_prot: u32, old_prot: ?*u32) callconv(W) i32 {
+    if (old_prot) |p| p.* = 0x04; // PAGE_READWRITE
+    if (addr != null and sz > 0) {
+        const raw = @intFromPtr(addr.?);
+        const page_start = raw & ~@as(usize, 0xFFF);
+        const page_end = std.mem.alignForward(usize, raw + sz, 4096);
+        const exec = (new_prot & 0xF0) != 0;
+        const write = (new_prot & 0xCC) != 0;
+        _ = linux.mprotect(@ptrFromInt(page_start), page_end - page_start, .{
+            .READ = true,
+            .WRITE = write or !exec,
+            .EXEC = exec,
+        });
+    }
+    return 1;
+}
+
 // ---------------------------------------------------------------------------
 // 8. Lookup Dispatch Table
 // ---------------------------------------------------------------------------
@@ -1462,6 +1501,9 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "GetEnvironmentVariableA")) return @intFromPtr(&GetEnvironmentVariableA);
     if (std.mem.eql(u8, name, "SetEnvironmentVariableW")) return @intFromPtr(&SetEnvironmentVariableW);
     if (std.mem.eql(u8, name, "DebugBreak")) return @intFromPtr(&DebugBreak);
+    if (std.mem.eql(u8, name, "IsDBCSLeadByteEx")) return @intFromPtr(&IsDBCSLeadByteEx);
+    if (std.mem.eql(u8, name, "VirtualQuery")) return @intFromPtr(&VirtualQuery);
+    if (std.mem.eql(u8, name, "VirtualProtect")) return @intFromPtr(&VirtualProtect);
 
     return null;
 }

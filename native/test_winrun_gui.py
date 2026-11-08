@@ -123,25 +123,24 @@ class WinrunGuiTests(unittest.TestCase):
         result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 41, result.stderr)
 
-    def test_tls_with_callbacks_is_refused(self):
-        """GUI loader must refuse a PE with TLS callbacks before execution."""
+    def test_tls_with_callbacks_executes_before_entry(self):
+        """GUI loader must execute PIMAGE_TLS_CALLBACK before entry point and reach entry (exits 41)."""
         digest = hashlib.sha256(self.tls_withcb.read_bytes()).hexdigest()
         argv = BOX + ['--ro-bind', str(self.tls_withcb), '/probe.exe',
                       '--ro-bind', str(self.loader), '/loader',
                       '--', '/loader', '--sha256', digest, '/probe.exe']
         result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertIn('TLS callbacks present (unsupported)', result.stderr)
+        self.assertEqual(result.returncode, 41, result.stderr)
 
-    def test_console_loader_still_refuses_tls(self):
-        """Console loader must refuse any PE with a TLS directory."""
+    def test_console_loader_accepts_tls(self):
+        """Console loader must accept and execute a PE with a valid TLS directory."""
         digest = hashlib.sha256(self.tls_nocb.read_bytes()).hexdigest()
         argv = BOX + ['--ro-bind', str(self.tls_nocb), '/probe.exe',
                       '--ro-bind', str(self.console_loader), '/loader',
                       '--', '/loader', '--sha256', digest, '--check', '/probe.exe']
         result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertIn('TLS directory present (unsupported)', result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('READY', result.stderr)
 
     def test_same_probe_with_wine_when_available(self):
         if not shutil.which('wine'):

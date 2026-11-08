@@ -189,6 +189,9 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                 for (exports()) |e| if (std.mem.eql(u8, name, e.name)) return e.addr;
                 return @import("winrun_kernel32.zig").lookup(name);
             }
+            if (std.ascii.eqlIgnoreCase(lib, "msvcrt.dll") or std.ascii.eqlIgnoreCase(lib, "ucrtbase.dll")) {
+                return @import("winrun_msvcrt.zig").lookup(name);
+            }
             if (comptime gui) {
                 if (std.ascii.eqlIgnoreCase(lib, "user32.dll")) return @import("winrun_gui_support.zig").lookup(name);
             }
@@ -260,19 +263,17 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             const Dir = struct { rva: u32, size: u32 };
             var dirs: [16]Dir = undefined;
             for (&dirs, 0..) |*d, k| d.* = .{ .rva = need(u32, file, opt + 112 + k * 8, "dir"), .size = need(u32, file, opt + 116 + k * 8, "dir") };
-            if (!gui and dirs[9].size != 0) die(.refused, "TLS directory present (unsupported)", .{});
             if (dirs[13].size != 0) die(.refused, "delay-import directory present (unsupported)", .{});
             if (dirs[14].size != 0) die(.refused, "CLR header present (managed code unsupported)", .{});
             if (dirs[11].size != 0) die(.refused, "bound-import directory present (unsupported)", .{});
 
-            // TLS: data-only allowed in GUI mode (no callbacks).
-            // We read the directory early so we know the template bounds; we apply it
-            // after the image is mapped (step 4) in a separate block below.
-            const tls_present: bool = gui and dirs[9].size != 0;
+            // TLS: supported in both console and GUI modes (including PIMAGE_TLS_CALLBACK).
+            // We validate the directory bounds here and inspect template/callbacks in step 4b.
+            const tls_present: bool = dirs[9].size != 0;
             // PE32+ TLS directory is 40 bytes: start_va(8) end_va(8) index_va(8) callbacks_va(8) zero_fill(4) characteristics(4)
             const tls_min_size: u32 = 40;
             if (tls_present and dirs[9].size < tls_min_size) die(.bad_image, "TLS directory too small ({d})", .{dirs[9].size});
-            if (tls_present and @as(u64, dirs[9].rva) + dirs[9].size > size_of_image) die(.bad_image, "TLS directory beyond image", .{});
+            if (tls_present and @as(u64, dirs[9].rva) + tls_min_size > size_of_image) die(.bad_image, "TLS directory beyond image", .{});
 
             // 3. Sections.
             const sec_off = opt + opt_size;
@@ -313,34 +314,61 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                 if (n != 0) @memcpy(img[s.va..][0..n], file[s.raw_ptr..][0..n]);
             }
 
-            // 4b. TLS data-only setup (GUI mode, no callbacks).
-            // After sections are copied, patch the TLS index slot so thread_local
-            // statics in the program see slot 0.  We allocate a single TLS block
-            // from the anonymous mapping (the template bytes are already there
-            // because they lived in a data section that was copied above).
-            // This is single-threaded; there is no TLS expansion array.
+            // 4b. TLS directory setup & callback discovery (pre-relocation VAs).
+            // After sections are copied, validate the TLS directory, patch the TLS
+            // index slot to 0, copy the TLS template into a dedicated thread block,
+            // and collect any PIMAGE_TLS_CALLBACK RVAs to run before entry().
+            var tls_template_rva: u32 = 0;
+            var tls_template_len: usize = 0;
+            var tls_zero_fill: usize = 0;
+            var tls_cb_rvas: [64]u32 = undefined;
+            var n_tls_cbs: usize = 0;
             if (tls_present) {
-                const td = dirs[9].rva; // TLS directory RVA (in image, post-copy)
+                const td = dirs[9].rva; // TLS directory RVA (in image, post-copy, pre-relocation)
                 const start_va = need(u64, img, td + 0, "TLS.StartAddressOfRawData");
                 const end_va = need(u64, img, td + 8, "TLS.EndAddressOfRawData");
                 const index_va = need(u64, img, td + 16, "TLS.AddressOfIndex");
                 const cb_va = need(u64, img, td + 24, "TLS.AddressOfCallBacks");
-                if (start_va > end_va) die(.bad_image, "TLS start_va > end_va", .{});
-                if (end_va - start_va > 1024 * 1024) die(.refused, "TLS template too large ({})", .{end_va - start_va});
-                // Callbacks must be an array starting with a null pointer (empty).
-                if (cb_va != 0) {
-                    const cb_rva = cb_va -% image_base;
-                    if (cb_rva >= size_of_image or cb_rva + 8 > size_of_image) die(.bad_image, "TLS callbacks VA out of image", .{});
-                    const first_cb = need(u64, img, @intCast(cb_rva), "TLS.Callbacks[0]");
-                    if (first_cb != 0) die(.refused, "TLS callbacks present (unsupported)", .{});
+                const zfill = need(u32, img, td + 32, "TLS.SizeOfZeroFill");
+                if (start_va > end_va) die(.refused, "TLS start_va > end_va", .{});
+                if (end_va - start_va > 1024 * 1024 or zfill > 1024 * 1024)
+                    die(.refused, "TLS template too large ({d})", .{end_va - start_va});
+                if (start_va != 0) {
+                    const start_rva = start_va -% image_base;
+                    const tlen = end_va - start_va;
+                    if (start_rva >= size_of_image or start_rva + tlen > size_of_image)
+                        die(.refused, "TLS template VA out of image", .{});
+                    tls_template_rva = @intCast(start_rva);
+                    tls_template_len = @intCast(tlen);
                 }
-                // Patch AddressOfIndex with the relocated VA of the slot.
-                // The TLS index storage lives in the image's .tls section which is
-                // already writable (data section).  We just write 0 there directly.
+                tls_zero_fill = zfill;
+
                 const index_rva = index_va -% image_base;
-                if (index_rva >= size_of_image or index_rva + 4 > size_of_image) die(.bad_image, "TLS index VA out of image", .{});
+                if (index_rva >= size_of_image or index_rva + 4 > size_of_image)
+                    die(.refused, "TLS index VA out of image", .{});
                 std.mem.writeInt(u32, img[@intCast(index_rva)..][0..4], 0, .little);
-                // start_va used above in size check; template already in image.
+
+                if (cb_va != 0) {
+                    var cb_rva = cb_va -% image_base;
+                    if (cb_rva >= size_of_image or cb_rva + 8 > size_of_image)
+                        die(.refused, "TLS callbacks VA out of image", .{});
+                    while (true) : (cb_rva += 8) {
+                        if (cb_rva + 8 > size_of_image) die(.refused, "TLS callback table truncated", .{});
+                        const fn_va = need(u64, img, @intCast(cb_rva), "TLS.Callback");
+                        if (fn_va == 0) break;
+                        const fn_rva = fn_va -% image_base;
+                        var cb_exec_ok = false;
+                        for (secs) |s| {
+                            if (s.chars & SCN_EXEC != 0 and fn_rva >= s.va and fn_rva < s.va + @max(s.vsize, s.raw_size)) {
+                                cb_exec_ok = true;
+                            }
+                        }
+                        if (!cb_exec_ok) die(.refused, "TLS callback 0x{x} not in executable section", .{fn_va});
+                        if (n_tls_cbs >= tls_cb_rvas.len) die(.refused, "too many TLS callbacks", .{});
+                        tls_cb_rvas[n_tls_cbs] = @intCast(fn_rva);
+                        n_tls_cbs += 1;
+                    }
+                }
             }
 
             // 5. Base relocations.
@@ -463,14 +491,31 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                 });
             }
 
-            // 10. Run. Setup minimal Windows x86_64 TEB, PEB & ProcessParameters so MSVC CRT initialization
-            // can read %gs:0x30 (TEB self), %gs:0x60 (PEB), peb->ImageBaseAddress (0x10), peb->ProcessParameters (0x20).
+            // 10. Run. Setup minimal Windows x86_64 TEB, PEB & ProcessParameters so MSVC/MinGW CRT initialization
+            // can read %gs:0x08 (StackBase), %gs:0x10 (StackLimit), %gs:0x30 (TEB self), %gs:0x58 (ThreadLocalStoragePointer),
+            // %gs:0x60 (PEB), peb->ImageBaseAddress (0x10), peb->ProcessParameters (0x20).
+            @import("winrun_msvcrt.zig").setArgs(&.{path.?});
+
             var dummy_teb: [4096]u8 align(4096) = [_]u8{0} ** 4096;
             var dummy_peb: [4096]u8 align(4096) = [_]u8{0} ** 4096;
             var dummy_params: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            var tls_array: [64]usize align(16) = [_]usize{0} ** 64;
 
-            std.mem.writeInt(usize, dummy_teb[0x30..][0..8], @intFromPtr(&dummy_teb), .little);
-            std.mem.writeInt(usize, dummy_teb[0x60..][0..8], @intFromPtr(&dummy_peb), .little);
+            if (tls_present) {
+                const total_tls = @max(tls_template_len + tls_zero_fill, 64);
+                const tls_block = try a.alloc(u8, total_tls);
+                @memset(tls_block, 0);
+                if (tls_template_len > 0) {
+                    @memcpy(tls_block[0..tls_template_len], img[tls_template_rva..][0..tls_template_len]);
+                }
+                tls_array[0] = @intFromPtr(tls_block.ptr);
+            }
+
+            std.mem.writeInt(usize, dummy_teb[0x08..][0..8], @intFromPtr(&dummy_teb) + 4096, .little); // StackBase (non-zero for MinGW lock)
+            std.mem.writeInt(usize, dummy_teb[0x10..][0..8], @intFromPtr(&dummy_teb), .little); // StackLimit
+            std.mem.writeInt(usize, dummy_teb[0x30..][0..8], @intFromPtr(&dummy_teb), .little); // NtCurrentTeb()
+            std.mem.writeInt(usize, dummy_teb[0x58..][0..8], @intFromPtr(&tls_array), .little); // ThreadLocalStoragePointer
+            std.mem.writeInt(usize, dummy_teb[0x60..][0..8], @intFromPtr(&dummy_peb), .little); // ProcessEnvironmentBlock
             std.mem.writeInt(usize, dummy_peb[0x10..][0..8], base, .little);
             std.mem.writeInt(usize, dummy_peb[0x18..][0..8], 0x10000, .little); // ProcessHeap
             std.mem.writeInt(usize, dummy_peb[0x20..][0..8], @intFromPtr(&dummy_params), .little); // ProcessParameters
@@ -481,6 +526,13 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             std.mem.writeInt(usize, dummy_params[0x38..][0..8], HANDLE_STDERR, .little);
 
             _ = linux.syscall2(.arch_prctl, 0x1001, @intFromPtr(&dummy_teb));
+
+            // Execute TLS callbacks (DLL_PROCESS_ATTACH = 1) before main entry point.
+            const TlsCallback = *const fn (usize, u32, usize) callconv(W) void;
+            for (tls_cb_rvas[0..n_tls_cbs]) |cb_rva| {
+                const cb: TlsCallback = @ptrFromInt(base + cb_rva);
+                cb(base, 1, 0);
+            }
 
             // Returning from the entry point ends the process with its return value.
             const entry: *const fn () callconv(W) u32 = @ptrFromInt(base + entry_rva);
