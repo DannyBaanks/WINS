@@ -465,6 +465,12 @@ fn GetDlgItemTextW(hDlg: usize, nIDDlgItem: i32, lpString: ?[*]u16, cchMax: i32)
     return 0;
 }
 
+fn GetDlgItemTextA(hDlg: usize, nIDDlgItem: i32, lpString: ?[*]u8, cchMax: i32) callconv(W) i32 {
+    _ = hDlg; _ = nIDDlgItem;
+    if (lpString != null and cchMax > 0) lpString.?[0] = 0;
+    return 0;
+}
+
 fn SendDlgItemMessageW(hDlg: usize, nIDDlgItem: i32, msg: u32, wParam: usize, lParam: usize) callconv(W) usize {
     _ = hDlg; _ = nIDDlgItem; _ = msg; _ = wParam; _ = lParam;
     return 0;
@@ -612,6 +618,304 @@ fn GetStockObject(i: i32) callconv(W) usize {
     return 0xB005;
 }
 
+fn CreateFontIndirectW(lplf: ?*const anyopaque) callconv(W) usize {
+    _ = lplf;
+    return 0xF0002;
+}
+
+fn CreateSolidBrush(color: u32) callconv(W) usize {
+    _ = color;
+    return 0xB006;
+}
+
+fn CreatePen(iStyle: i32, cWidth: i32, color: u32) callconv(W) usize {
+    _ = iStyle; _ = cWidth; _ = color;
+    return 0xB007;
+}
+
+fn CreatePatternBrush(hbm: usize) callconv(W) usize {
+    _ = hbm;
+    return 0xB008;
+}
+
+fn CreateHatchBrush(iHatch: i32, color: u32) callconv(W) usize {
+    _ = iHatch; _ = color;
+    return 0xB009;
+}
+
+fn ExtCreatePen(iPenStyle: u32, cWidth: u32, plbrush: ?*const anyopaque, cStyle: u32, pstyle: ?*const anyopaque) callconv(W) usize {
+    _ = iPenStyle; _ = cWidth; _ = plbrush; _ = cStyle; _ = pstyle;
+    return 0xB00A;
+}
+
+fn DeleteDC(hdc: usize) callconv(W) i32 {
+    _ = hdc;
+    return 1;
+}
+
+fn SaveDC(hdc: usize) callconv(W) i32 {
+    _ = hdc;
+    return 1;
+}
+
+fn RestoreDC(hdc: usize, nSavedDC: i32) callconv(W) i32 {
+    _ = hdc; _ = nSavedDC;
+    return 1;
+}
+
+fn GetROP2(hdc: usize) callconv(W) i32 {
+    _ = hdc;
+    return 13;
+}
+
+fn SetROP2(hdc: usize, rop2: i32) callconv(W) i32 {
+    _ = hdc; _ = rop2;
+    return 13;
+}
+
+fn SetBkColor(hdc: usize, color: u32) callconv(W) u32 {
+    _ = hdc;
+    return color;
+}
+
+fn SetBkMode(hdc: usize, mode: i32) callconv(W) i32 {
+    _ = hdc;
+    return mode;
+}
+
+fn SetTextColor(hdc: usize, color: u32) callconv(W) u32 {
+    _ = hdc;
+    return color;
+}
+
+fn CreateRectRgn(x1: i32, y1: i32, x2: i32, y2: i32) callconv(W) usize {
+    _ = x1; _ = y1; _ = x2; _ = y2;
+    return 0xB00B;
+}
+
+fn CreateRectRgnIndirect(lprect: ?*const anyopaque) callconv(W) usize {
+    _ = lprect;
+    return 0xB00C;
+}
+
+fn CombineRgn(hrgnDst: usize, hrgnSrc1: usize, hrgnSrc2: usize, iMode: i32) callconv(W) i32 {
+    _ = hrgnDst; _ = hrgnSrc1; _ = hrgnSrc2; _ = iMode;
+    return 2;
+}
+
+fn SelectClipRgn(hdc: usize, hrgn: usize) callconv(W) i32 {
+    _ = hdc; _ = hrgn;
+    return 2;
+}
+
+fn ExcludeClipRect(hdc: usize, left: i32, top: i32, right: i32, bottom: i32) callconv(W) i32 {
+    _ = hdc; _ = left; _ = top; _ = right; _ = bottom;
+    return 2;
+}
+
+fn IntersectClipRect(hdc: usize, left: i32, top: i32, right: i32, bottom: i32) callconv(W) i32 {
+    _ = hdc; _ = left; _ = top; _ = right; _ = bottom;
+    return 2;
+}
+
+fn GetClipRgn(hdc: usize, hrgn: usize) callconv(W) i32 {
+    _ = hdc; _ = hrgn;
+    return 0;
+}
+
+fn MoveToEx(hdc: usize, x: i32, y: i32, lppt: ?*anyopaque) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y; _ = lppt;
+    return 1;
+}
+
+fn LineTo(hdc: usize, x: i32, y: i32) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y;
+    return 1;
+}
+
+fn Polyline(hdc: usize, apt: ?*const anyopaque, cpt: i32) callconv(W) i32 {
+    _ = hdc; _ = apt; _ = cpt;
+    return 1;
+}
+
+fn Polygon(hdc: usize, apt: ?*const anyopaque, cpt: i32) callconv(W) i32 {
+    _ = hdc; _ = apt; _ = cpt;
+    return 1;
+}
+
+fn Rectangle(hdc: usize, left: i32, top: i32, right: i32, bottom: i32) callconv(W) i32 {
+    _ = hdc; _ = left; _ = top; _ = right; _ = bottom;
+    return 1;
+}
+
+fn RoundRect(hdc: usize, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(W) i32 {
+    _ = hdc; _ = left; _ = top; _ = right; _ = bottom; _ = width; _ = height;
+    return 1;
+}
+
+fn Ellipse(hdc: usize, left: i32, top: i32, right: i32, bottom: i32) callconv(W) i32 {
+    _ = hdc; _ = left; _ = top; _ = right; _ = bottom;
+    return 1;
+}
+
+fn PatBlt(hdc: usize, x: i32, y: i32, w: i32, h: i32, rop: u32) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y; _ = w; _ = h; _ = rop;
+    return 1;
+}
+
+fn StretchBlt(hdcDest: usize, xDest: i32, yDest: i32, wDest: i32, hDest: i32, hdcSrc: usize, xSrc: i32, ySrc: i32, wSrc: i32, hSrc: i32, rop: u32) callconv(W) i32 {
+    _ = hdcDest; _ = xDest; _ = yDest; _ = wDest; _ = hDest; _ = hdcSrc; _ = xSrc; _ = ySrc; _ = wSrc; _ = hSrc; _ = rop;
+    return 1;
+}
+
+fn GdiAlphaBlend(hdcDest: usize, xDest: i32, yDest: i32, wDest: i32, hDest: i32, hdcSrc: usize, xSrc: i32, ySrc: i32, wSrc: i32, hSrc: i32, ftn: usize) callconv(W) i32 {
+    _ = hdcDest; _ = xDest; _ = yDest; _ = wDest; _ = hDest; _ = hdcSrc; _ = xSrc; _ = ySrc; _ = wSrc; _ = hSrc; _ = ftn;
+    return 1;
+}
+
+fn GetTextExtentPoint32W(hdc: usize, lpString: ?[*:0]const u16, c: i32, lpSize: ?*anyopaque) callconv(W) i32 {
+    _ = hdc; _ = lpString;
+    if (lpSize) |s| {
+        const ptr: *[2]i32 = @ptrCast(@alignCast(s));
+        ptr[0] = c * 8;
+        ptr[1] = 16;
+    }
+    return 1;
+}
+
+fn GetTextExtentPoint32A(hdc: usize, lpString: ?[*:0]const u8, c: i32, lpSize: ?*anyopaque) callconv(W) i32 {
+    _ = hdc; _ = lpString;
+    if (lpSize) |s| {
+        const ptr: *[2]i32 = @ptrCast(@alignCast(s));
+        ptr[0] = c * 8;
+        ptr[1] = 16;
+    }
+    return 1;
+}
+
+fn GetTextExtentPointW(hdc: usize, lpString: ?[*:0]const u16, c: i32, lpSize: ?*anyopaque) callconv(W) i32 {
+    return GetTextExtentPoint32W(hdc, lpString, c, lpSize);
+}
+
+fn GetTextExtentExPointA(hdc: usize, lpszStr: ?[*:0]const u8, cchString: i32, nMaxExtent: i32, lpnFit: ?*i32, alpDx: ?*i32, lpSize: ?*anyopaque) callconv(W) i32 {
+    _ = nMaxExtent; _ = alpDx;
+    if (lpnFit) |fit| fit.* = cchString;
+    return GetTextExtentPoint32A(hdc, lpszStr, cchString, lpSize);
+}
+
+fn GetTextExtentExPointW(hdc: usize, lpszStr: ?[*:0]const u16, cchString: i32, nMaxExtent: i32, lpnFit: ?*i32, alpDx: ?*i32, lpSize: ?*anyopaque) callconv(W) i32 {
+    _ = nMaxExtent; _ = alpDx;
+    if (lpnFit) |fit| fit.* = cchString;
+    return GetTextExtentPoint32W(hdc, lpszStr, cchString, lpSize);
+}
+
+fn GetTextMetricsW(hdc: usize, lptm: ?*anyopaque) callconv(W) i32 {
+    _ = hdc;
+    if (lptm) |tm| {
+        const bytes: [*]u8 = @ptrCast(tm);
+        @memset(bytes[0..56], 0);
+        const i32_ptr: *[14]i32 = @ptrCast(@alignCast(tm));
+        i32_ptr[0] = 16;
+        i32_ptr[7] = 8;
+    }
+    return 1;
+}
+
+fn ExtTextOutW(hdc: usize, x: i32, y: i32, options: u32, lprect: ?*const anyopaque, lpString: ?[*:0]const u16, c: u32, lpDx: ?*const i32) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y; _ = options; _ = lprect; _ = lpString; _ = c; _ = lpDx;
+    return 1;
+}
+
+fn ExtTextOutA(hdc: usize, x: i32, y: i32, options: u32, lprect: ?*const anyopaque, lpString: ?[*:0]const u8, c: u32, lpDx: ?*const i32) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y; _ = options; _ = lprect; _ = lpString; _ = c; _ = lpDx;
+    return 1;
+}
+
+fn SetTextAlign(hdc: usize, align_flags: u32) callconv(W) u32 {
+    _ = hdc;
+    return align_flags;
+}
+
+fn SetWindowOrgEx(hdc: usize, x: i32, y: i32, lppt: ?*anyopaque) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y; _ = lppt;
+    return 1;
+}
+
+fn OffsetWindowOrgEx(hdc: usize, x: i32, y: i32, lppt: ?*anyopaque) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y; _ = lppt;
+    return 1;
+}
+
+fn SetBrushOrgEx(hdc: usize, x: i32, y: i32, lppt: ?*anyopaque) callconv(W) i32 {
+    _ = hdc; _ = x; _ = y; _ = lppt;
+    return 1;
+}
+
+fn SetDIBits(hdc: usize, hbm: usize, start: u32, cLines: u32, lpBits: ?*const anyopaque, pbmi: ?*const anyopaque, ColorUse: u32) callconv(W) i32 {
+    _ = hdc; _ = hbm; _ = start; _ = lpBits; _ = pbmi; _ = ColorUse;
+    return @intCast(cLines);
+}
+
+fn GetDIBits(hdc: usize, hbm: usize, start: u32, cLines: u32, lpvBits: ?*anyopaque, pbmi: ?*anyopaque, usage: u32) callconv(W) i32 {
+    _ = hdc; _ = hbm; _ = start; _ = lpvBits; _ = pbmi; _ = usage;
+    return @intCast(cLines);
+}
+
+fn StretchDIBits(hdc: usize, xDest: i32, yDest: i32, DestWidth: i32, DestHeight: i32, xSrc: i32, ySrc: i32, SrcWidth: i32, SrcHeight: i32, lpBits: ?*const anyopaque, lpbmi: ?*const anyopaque, iUsage: u32, rop: u32) callconv(W) i32 {
+    _ = hdc; _ = xDest; _ = yDest; _ = DestWidth; _ = xSrc; _ = ySrc; _ = SrcWidth; _ = SrcHeight; _ = lpBits; _ = lpbmi; _ = iUsage; _ = rop;
+    return DestHeight;
+}
+
+fn GetPixel(hdc: usize, x: i32, y: i32) callconv(W) u32 {
+    _ = hdc; _ = x; _ = y;
+    return 0;
+}
+
+fn SetPixel(hdc: usize, x: i32, y: i32, color: u32) callconv(W) u32 {
+    _ = hdc; _ = x; _ = y;
+    return color;
+}
+
+fn SetStretchBltMode(hdc: usize, mode: i32) callconv(W) i32 {
+    _ = hdc;
+    return mode;
+}
+
+fn RectVisible(hdc: usize, lprect: ?*const anyopaque) callconv(W) i32 {
+    _ = hdc; _ = lprect;
+    return 1;
+}
+
+fn DPtoLP(hdc: usize, lppt: ?*anyopaque, c: i32) callconv(W) i32 {
+    _ = hdc; _ = lppt; _ = c;
+    return 1;
+}
+
+fn EnumFontFamiliesExW(hdc: usize, lpLogfont: ?*anyopaque, lpProc: ?*anyopaque, lParam: usize, dwFlags: u32) callconv(W) i32 {
+    _ = hdc; _ = lpLogfont; _ = lpProc; _ = lParam; _ = dwFlags;
+    return 1;
+}
+
+fn StartDocW(hdc: usize, lpdi: ?*const anyopaque) callconv(W) i32 {
+    _ = hdc; _ = lpdi;
+    return 1;
+}
+
+fn EndDoc(hdc: usize) callconv(W) i32 {
+    _ = hdc;
+    return 1;
+}
+
+fn StartPage(hdc: usize) callconv(W) i32 {
+    _ = hdc;
+    return 1;
+}
+
+fn EndPage(hdc: usize) callconv(W) i32 {
+    _ = hdc;
+    return 1;
+}
+
 pub fn lookupGdi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "BitBlt")) return @intFromPtr(&BitBlt);
     if (std.mem.eql(u8, name, "SelectObject")) return @intFromPtr(&SelectObject);
@@ -623,6 +927,62 @@ pub fn lookupGdi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "GetStockObject")) return @intFromPtr(&GetStockObject);
     if (std.mem.eql(u8, name, "GetDeviceCaps")) return @intFromPtr(&GetDeviceCaps);
     if (std.mem.eql(u8, name, "CreateFontW")) return @intFromPtr(&CreateFontW);
+    if (std.mem.eql(u8, name, "CreateFontIndirectW")) return @intFromPtr(&CreateFontIndirectW);
+    if (std.mem.eql(u8, name, "CreateSolidBrush")) return @intFromPtr(&CreateSolidBrush);
+    if (std.mem.eql(u8, name, "CreatePen")) return @intFromPtr(&CreatePen);
+    if (std.mem.eql(u8, name, "CreatePatternBrush")) return @intFromPtr(&CreatePatternBrush);
+    if (std.mem.eql(u8, name, "CreateHatchBrush")) return @intFromPtr(&CreateHatchBrush);
+    if (std.mem.eql(u8, name, "ExtCreatePen")) return @intFromPtr(&ExtCreatePen);
+    if (std.mem.eql(u8, name, "DeleteDC")) return @intFromPtr(&DeleteDC);
+    if (std.mem.eql(u8, name, "SaveDC")) return @intFromPtr(&SaveDC);
+    if (std.mem.eql(u8, name, "RestoreDC")) return @intFromPtr(&RestoreDC);
+    if (std.mem.eql(u8, name, "GetROP2")) return @intFromPtr(&GetROP2);
+    if (std.mem.eql(u8, name, "SetROP2")) return @intFromPtr(&SetROP2);
+    if (std.mem.eql(u8, name, "SetBkColor")) return @intFromPtr(&SetBkColor);
+    if (std.mem.eql(u8, name, "SetBkMode")) return @intFromPtr(&SetBkMode);
+    if (std.mem.eql(u8, name, "SetTextColor")) return @intFromPtr(&SetTextColor);
+    if (std.mem.eql(u8, name, "CreateRectRgn")) return @intFromPtr(&CreateRectRgn);
+    if (std.mem.eql(u8, name, "CreateRectRgnIndirect")) return @intFromPtr(&CreateRectRgnIndirect);
+    if (std.mem.eql(u8, name, "CombineRgn")) return @intFromPtr(&CombineRgn);
+    if (std.mem.eql(u8, name, "SelectClipRgn")) return @intFromPtr(&SelectClipRgn);
+    if (std.mem.eql(u8, name, "ExcludeClipRect")) return @intFromPtr(&ExcludeClipRect);
+    if (std.mem.eql(u8, name, "IntersectClipRect")) return @intFromPtr(&IntersectClipRect);
+    if (std.mem.eql(u8, name, "GetClipRgn")) return @intFromPtr(&GetClipRgn);
+    if (std.mem.eql(u8, name, "MoveToEx")) return @intFromPtr(&MoveToEx);
+    if (std.mem.eql(u8, name, "LineTo")) return @intFromPtr(&LineTo);
+    if (std.mem.eql(u8, name, "Polyline")) return @intFromPtr(&Polyline);
+    if (std.mem.eql(u8, name, "Polygon")) return @intFromPtr(&Polygon);
+    if (std.mem.eql(u8, name, "Rectangle")) return @intFromPtr(&Rectangle);
+    if (std.mem.eql(u8, name, "RoundRect")) return @intFromPtr(&RoundRect);
+    if (std.mem.eql(u8, name, "Ellipse")) return @intFromPtr(&Ellipse);
+    if (std.mem.eql(u8, name, "PatBlt")) return @intFromPtr(&PatBlt);
+    if (std.mem.eql(u8, name, "StretchBlt")) return @intFromPtr(&StretchBlt);
+    if (std.mem.eql(u8, name, "GdiAlphaBlend")) return @intFromPtr(&GdiAlphaBlend);
+    if (std.mem.eql(u8, name, "GetTextExtentPoint32W")) return @intFromPtr(&GetTextExtentPoint32W);
+    if (std.mem.eql(u8, name, "GetTextExtentPoint32A")) return @intFromPtr(&GetTextExtentPoint32A);
+    if (std.mem.eql(u8, name, "GetTextExtentPointW")) return @intFromPtr(&GetTextExtentPointW);
+    if (std.mem.eql(u8, name, "GetTextExtentExPointA")) return @intFromPtr(&GetTextExtentExPointA);
+    if (std.mem.eql(u8, name, "GetTextExtentExPointW")) return @intFromPtr(&GetTextExtentExPointW);
+    if (std.mem.eql(u8, name, "GetTextMetricsW")) return @intFromPtr(&GetTextMetricsW);
+    if (std.mem.eql(u8, name, "ExtTextOutW")) return @intFromPtr(&ExtTextOutW);
+    if (std.mem.eql(u8, name, "ExtTextOutA")) return @intFromPtr(&ExtTextOutA);
+    if (std.mem.eql(u8, name, "SetTextAlign")) return @intFromPtr(&SetTextAlign);
+    if (std.mem.eql(u8, name, "SetWindowOrgEx")) return @intFromPtr(&SetWindowOrgEx);
+    if (std.mem.eql(u8, name, "OffsetWindowOrgEx")) return @intFromPtr(&OffsetWindowOrgEx);
+    if (std.mem.eql(u8, name, "SetBrushOrgEx")) return @intFromPtr(&SetBrushOrgEx);
+    if (std.mem.eql(u8, name, "SetDIBits")) return @intFromPtr(&SetDIBits);
+    if (std.mem.eql(u8, name, "GetDIBits")) return @intFromPtr(&GetDIBits);
+    if (std.mem.eql(u8, name, "StretchDIBits")) return @intFromPtr(&StretchDIBits);
+    if (std.mem.eql(u8, name, "GetPixel")) return @intFromPtr(&GetPixel);
+    if (std.mem.eql(u8, name, "SetPixel")) return @intFromPtr(&SetPixel);
+    if (std.mem.eql(u8, name, "SetStretchBltMode")) return @intFromPtr(&SetStretchBltMode);
+    if (std.mem.eql(u8, name, "RectVisible")) return @intFromPtr(&RectVisible);
+    if (std.mem.eql(u8, name, "DPtoLP")) return @intFromPtr(&DPtoLP);
+    if (std.mem.eql(u8, name, "EnumFontFamiliesExW")) return @intFromPtr(&EnumFontFamiliesExW);
+    if (std.mem.eql(u8, name, "StartDocW")) return @intFromPtr(&StartDocW);
+    if (std.mem.eql(u8, name, "EndDoc")) return @intFromPtr(&EndDoc);
+    if (std.mem.eql(u8, name, "StartPage")) return @intFromPtr(&StartPage);
+    if (std.mem.eql(u8, name, "EndPage")) return @intFromPtr(&EndPage);
     if (std.mem.eql(u8, name, "DeleteObject")) return @intFromPtr(&DeleteObject);
     if (std.mem.eql(u8, name, "CreateDIBSection")) return @intFromPtr(&CreateDIBSection);
     if (std.mem.eql(u8, name, "SwapBuffers")) return @intFromPtr(&SwapBuffers);
@@ -1103,6 +1463,688 @@ fn GetDesktopWindow() callconv(W) usize {
     return 0x10000;
 }
 
+fn BeginPaint(hwnd: usize, lpPaint: ?*anyopaque) callconv(W) usize {
+    _ = hwnd; _ = lpPaint;
+    return 0xB001;
+}
+
+fn EndPaint(hwnd: usize, lpPaint: ?*const anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = lpPaint;
+    return 1;
+}
+
+fn InvalidateRect(hwnd: usize, lpRect: ?*const anyopaque, bErase: i32) callconv(W) i32 {
+    _ = hwnd; _ = lpRect; _ = bErase;
+    return 1;
+}
+
+fn RedrawWindow(hwnd: usize, lprcUpdate: ?*const anyopaque, hrgnUpdate: usize, flags: u32) callconv(W) i32 {
+    _ = hwnd; _ = lprcUpdate; _ = hrgnUpdate; _ = flags;
+    return 1;
+}
+
+fn FillRect(hdc: usize, lprc: ?*const anyopaque, hbr: usize) callconv(W) i32 {
+    _ = hdc; _ = lprc; _ = hbr;
+    return 1;
+}
+
+fn FrameRect(hdc: usize, lprc: ?*const anyopaque, hbr: usize) callconv(W) i32 {
+    _ = hdc; _ = lprc; _ = hbr;
+    return 1;
+}
+
+fn DrawEdge(hdc: usize, qrc: ?*anyopaque, edge: u32, grfFlags: u32) callconv(W) i32 {
+    _ = hdc; _ = qrc; _ = edge; _ = grfFlags;
+    return 1;
+}
+
+fn DrawFrameControl(hdc: usize, lprc: ?*anyopaque, uType: u32, uState: u32) callconv(W) i32 {
+    _ = hdc; _ = lprc; _ = uType; _ = uState;
+    return 1;
+}
+
+fn DrawFocusRect(hdc: usize, lprc: ?*const anyopaque) callconv(W) i32 {
+    _ = hdc; _ = lprc;
+    return 1;
+}
+
+fn DrawIconEx(hdc: usize, xLeft: i32, yTop: i32, hIcon: usize, cxWidth: i32, cyWidth: i32, istepIfAniCur: u32, hbrFlickerFreeDraw: usize, diFlags: u32) callconv(W) i32 {
+    _ = hdc; _ = xLeft; _ = yTop; _ = hIcon; _ = cxWidth; _ = cyWidth; _ = istepIfAniCur; _ = hbrFlickerFreeDraw; _ = diFlags;
+    return 1;
+}
+
+fn DrawTextW(hdc: usize, lpchText: ?[*:0]const u16, cchText: i32, lprc: ?*anyopaque, format: u32) callconv(W) i32 {
+    _ = hdc; _ = lpchText; _ = cchText; _ = lprc; _ = format;
+    return 16;
+}
+
+fn DrawTextExW(hdc: usize, lpchText: ?[*:0]const u16, cchText: i32, lprc: ?*anyopaque, format: u32, lpdtp: ?*anyopaque) callconv(W) i32 {
+    _ = hdc; _ = lpchText; _ = cchText; _ = lprc; _ = format; _ = lpdtp;
+    return 16;
+}
+
+fn CreateMenu() callconv(W) usize {
+    return 0x90001;
+}
+
+fn CreatePopupMenu() callconv(W) usize {
+    return 0x90002;
+}
+
+fn DestroyMenu(hMenu: usize) callconv(W) i32 {
+    _ = hMenu;
+    return 1;
+}
+
+fn GetMenu(hWnd: usize) callconv(W) usize {
+    _ = hWnd;
+    return 0x90001;
+}
+
+fn SetMenu(hWnd: usize, hMenu: usize) callconv(W) i32 {
+    _ = hWnd; _ = hMenu;
+    return 1;
+}
+
+fn DrawMenuBar(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 1;
+}
+
+fn GetSubMenu(hMenu: usize, nPos: i32) callconv(W) usize {
+    _ = hMenu; _ = nPos;
+    return 0x90002;
+}
+
+fn GetMenuItemCount(hMenu: usize) callconv(W) i32 {
+    _ = hMenu;
+    return 1;
+}
+
+fn GetMenuItemID(hMenu: usize, nPos: i32) callconv(W) u32 {
+    _ = hMenu;
+    return @intCast(nPos);
+}
+
+fn GetMenuItemInfoW(hmenu: usize, item: u32, fByPosition: i32, lpmii: ?*anyopaque) callconv(W) i32 {
+    _ = hmenu; _ = item; _ = fByPosition; _ = lpmii;
+    return 1;
+}
+
+fn SetMenuItemInfoW(hmenu: usize, item: u32, fByPosition: i32, lpmii: ?*const anyopaque) callconv(W) i32 {
+    _ = hmenu; _ = item; _ = fByPosition; _ = lpmii;
+    return 1;
+}
+
+fn GetMenuStringW(hMenu: usize, uIDItem: u32, lpString: ?[*:0]u16, cchMax: i32, flags: u32) callconv(W) i32 {
+    _ = hMenu; _ = uIDItem; _ = flags;
+    if (lpString) |s| {
+        if (cchMax > 0) s[0] = 0;
+    }
+    return 0;
+}
+
+fn GetMenuState(hMenu: usize, uId: u32, uFlags: u32) callconv(W) u32 {
+    _ = hMenu; _ = uId; _ = uFlags;
+    return 0;
+}
+
+fn InsertMenuW(hMenu: usize, uPosition: u32, uFlags: u32, uIDNewItem: usize, lpNewItem: ?*const anyopaque) callconv(W) i32 {
+    _ = hMenu; _ = uPosition; _ = uFlags; _ = uIDNewItem; _ = lpNewItem;
+    return 1;
+}
+
+fn InsertMenuItemW(hmenu: usize, item: u32, fByPosition: i32, lpmi: ?*const anyopaque) callconv(W) i32 {
+    _ = hmenu; _ = item; _ = fByPosition; _ = lpmi;
+    return 1;
+}
+
+fn AppendMenuW(hMenu: usize, uFlags: u32, uIDNewItem: usize, lpNewItem: ?*const anyopaque) callconv(W) i32 {
+    _ = hMenu; _ = uFlags; _ = uIDNewItem; _ = lpNewItem;
+    return 1;
+}
+
+fn AppendMenuA(hMenu: usize, uFlags: u32, uIDNewItem: usize, lpNewItem: ?*const anyopaque) callconv(W) i32 {
+    _ = hMenu; _ = uFlags; _ = uIDNewItem; _ = lpNewItem;
+    return 1;
+}
+
+fn ModifyMenuW(hMnu: usize, uPosition: u32, uFlags: u32, uIDNewItem: usize, lpNewItem: ?*const anyopaque) callconv(W) i32 {
+    _ = hMnu; _ = uPosition; _ = uFlags; _ = uIDNewItem; _ = lpNewItem;
+    return 1;
+}
+
+fn DeleteMenu(hMenu: usize, uPosition: u32, uFlags: u32) callconv(W) i32 {
+    _ = hMenu; _ = uPosition; _ = uFlags;
+    return 1;
+}
+
+fn RemoveMenu(hMenu: usize, uPosition: u32, uFlags: u32) callconv(W) i32 {
+    _ = hMenu; _ = uPosition; _ = uFlags;
+    return 1;
+}
+
+fn EnableMenuItem(hMenu: usize, uIDEnableItem: u32, uEnable: u32) callconv(W) i32 {
+    _ = hMenu; _ = uIDEnableItem; _ = uEnable;
+    return 0;
+}
+
+fn CheckMenuItem(hMenu: usize, uIDCheckItem: u32, uCheck: u32) callconv(W) i32 {
+    _ = hMenu; _ = uIDCheckItem; _ = uCheck;
+    return 0;
+}
+
+fn CheckMenuRadioItem(hmenu: usize, first: u32, last: u32, check: u32, flags: u32) callconv(W) i32 {
+    _ = hmenu; _ = first; _ = last; _ = check; _ = flags;
+    return 1;
+}
+
+fn SetMenuItemBitmaps(hMenu: usize, uPosition: u32, uFlags: u32, hBitmapUnchecked: usize, hBitmapChecked: usize) callconv(W) i32 {
+    _ = hMenu; _ = uPosition; _ = uFlags; _ = hBitmapUnchecked; _ = hBitmapChecked;
+    return 1;
+}
+
+fn TrackPopupMenu(hMenu: usize, uFlags: u32, x: i32, y: i32, nReserved: i32, hWnd: usize, prcRect: ?*const anyopaque) callconv(W) i32 {
+    _ = hMenu; _ = uFlags; _ = x; _ = y; _ = nReserved; _ = hWnd; _ = prcRect;
+    return 1;
+}
+
+fn TrackPopupMenuEx(hMenu: usize, uFlags: u32, x: i32, y: i32, hwnd: usize, lptpm: ?*anyopaque) callconv(W) i32 {
+    _ = hMenu; _ = uFlags; _ = x; _ = y; _ = hwnd; _ = lptpm;
+    return 1;
+}
+
+fn GetMenuBarInfo(hwnd: usize, idObject: i32, idItem: i32, pmbi: ?*anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = idObject; _ = idItem; _ = pmbi;
+    return 1;
+}
+
+fn CreateCaret(hWnd: usize, hBitmap: usize, nWidth: i32, nHeight: i32) callconv(W) i32 {
+    _ = hWnd; _ = hBitmap; _ = nWidth; _ = nHeight;
+    return 1;
+}
+
+fn DestroyCaret() callconv(W) i32 {
+    return 1;
+}
+
+fn ShowCaret(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 1;
+}
+
+fn HideCaret(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 1;
+}
+
+fn SetCaretPos(X: i32, Y: i32) callconv(W) i32 {
+    _ = X; _ = Y;
+    return 1;
+}
+
+fn GetWindowTextW(hWnd: usize, lpString: ?[*:0]u16, nMaxCount: i32) callconv(W) i32 {
+    _ = hWnd;
+    if (lpString) |s| {
+        if (nMaxCount > 0) s[0] = 0;
+    }
+    return 0;
+}
+
+fn GetWindowTextA(hWnd: usize, lpString: ?[*:0]u8, nMaxCount: i32) callconv(W) i32 {
+    _ = hWnd;
+    if (lpString) |s| {
+        if (nMaxCount > 0) s[0] = 0;
+    }
+    return 0;
+}
+
+fn GetWindowTextLengthW(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 0;
+}
+
+fn IsWindow(hWnd: usize) callconv(W) i32 {
+    return if (hWnd != 0) 1 else 0;
+}
+
+fn IsWindowEnabled(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 1;
+}
+
+fn IsWindowVisible(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 1;
+}
+
+fn IsIconic(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 0;
+}
+
+fn IsZoomed(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 0;
+}
+
+fn IsChild(hWndParent: usize, hWnd: usize) callconv(W) i32 {
+    _ = hWndParent; _ = hWnd;
+    return 0;
+}
+
+fn SetParent(hWndChild: usize, hWndNewParent: usize) callconv(W) usize {
+    _ = hWndChild;
+    return hWndNewParent;
+}
+
+fn MoveWindow(hWnd: usize, X: i32, Y: i32, nWidth: i32, nHeight: i32, bRepaint: i32) callconv(W) i32 {
+    _ = hWnd; _ = X; _ = Y; _ = nWidth; _ = nHeight; _ = bRepaint;
+    return 1;
+}
+
+fn BringWindowToTop(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 1;
+}
+
+fn GetLastActivePopup(hWnd: usize) callconv(W) usize {
+    return hWnd;
+}
+
+fn FindWindowW(lpClassName: ?[*:0]const u16, lpWindowName: ?[*:0]const u16) callconv(W) usize {
+    _ = lpClassName; _ = lpWindowName;
+    return 0;
+}
+
+fn GetWindowThreadProcessId(hWnd: usize, lpdwProcessId: ?*u32) callconv(W) u32 {
+    _ = hWnd;
+    if (lpdwProcessId) |pid| pid.* = 1000;
+    return 1001;
+}
+
+fn GetClassNameW(hWnd: usize, lpClassName: ?[*:0]u16, nMaxCount: i32) callconv(W) i32 {
+    _ = hWnd;
+    if (lpClassName) |s| {
+        if (nMaxCount > 0) s[0] = 0;
+    }
+    return 0;
+}
+
+fn GetClassNameA(hWnd: usize, lpClassName: ?[*:0]u8, nMaxCount: i32) callconv(W) i32 {
+    _ = hWnd;
+    if (lpClassName) |s| {
+        if (nMaxCount > 0) s[0] = 0;
+    }
+    return 0;
+}
+
+fn GetDlgCtrlID(hWnd: usize) callconv(W) i32 {
+    _ = hWnd;
+    return 1;
+}
+
+fn GetSysColor(nIndex: i32) callconv(W) u32 {
+    return switch (nIndex) {
+        5 => 0xFFFFFF,
+        8 => 0x000000,
+        15 => 0xF0F0F0,
+        else => 0xFFFFFF,
+    };
+}
+
+fn GetSysColorBrush(nIndex: i32) callconv(W) usize {
+    _ = nIndex;
+    return 0xB005;
+}
+
+fn SetPropW(hWnd: usize, lpString: ?[*:0]const u16, hData: usize) callconv(W) i32 {
+    _ = hWnd; _ = lpString; _ = hData;
+    return 1;
+}
+
+fn GetPropW(hWnd: usize, lpString: ?[*:0]const u16) callconv(W) usize {
+    _ = hWnd; _ = lpString;
+    return 0;
+}
+
+fn RemovePropW(hWnd: usize, lpString: ?[*:0]const u16) callconv(W) usize {
+    _ = hWnd; _ = lpString;
+    return 0;
+}
+
+fn SetLayeredWindowAttributes(hwnd: usize, crKey: u32, bAlpha: u8, dwFlags: u32) callconv(W) i32 {
+    _ = hwnd; _ = crKey; _ = bAlpha; _ = dwFlags;
+    return 1;
+}
+
+fn GetWindowDC(hWnd: usize) callconv(W) usize {
+    _ = hWnd;
+    return 0xB001;
+}
+
+fn GetDCEx(hWnd: usize, hrgnClip: usize, flags: u32) callconv(W) usize {
+    _ = hWnd; _ = hrgnClip; _ = flags;
+    return 0xB001;
+}
+
+fn MapWindowPoints(hWndFrom: usize, hWndTo: usize, lpPoints: ?*anyopaque, cPoints: u32) callconv(W) i32 {
+    _ = hWndFrom; _ = hWndTo; _ = lpPoints; _ = cPoints;
+    return 0;
+}
+
+fn InflateRect(lprc: ?*anyopaque, dx: i32, dy: i32) callconv(W) i32 {
+    _ = dx; _ = dy;
+    if (lprc == null) return 0;
+    return 1;
+}
+
+fn EqualRect(lprc1: ?*const anyopaque, lprc2: ?*const anyopaque) callconv(W) i32 {
+    _ = lprc1; _ = lprc2;
+    return 1;
+}
+
+fn IntersectRect(lprcDst: ?*anyopaque, lprcSrc1: ?*const anyopaque, lprcSrc2: ?*const anyopaque) callconv(W) i32 {
+    _ = lprcDst; _ = lprcSrc1; _ = lprcSrc2;
+    return 1;
+}
+
+fn SetRectEmpty(lprc: ?*anyopaque) callconv(W) i32 {
+    if (lprc) |r| {
+        const ptr: *[4]i32 = @ptrCast(@alignCast(r));
+        ptr.* = .{ 0, 0, 0, 0 };
+    }
+    return 1;
+}
+
+fn EnumChildWindows(hWndParent: usize, lpEnumFunc: ?*anyopaque, lParam: usize) callconv(W) i32 {
+    _ = hWndParent; _ = lpEnumFunc; _ = lParam;
+    return 1;
+}
+
+fn EnumThreadWindows(dwThreadId: u32, lpfn: ?*anyopaque, lParam: usize) callconv(W) i32 {
+    _ = dwThreadId; _ = lpfn; _ = lParam;
+    return 1;
+}
+
+fn GetComboBoxInfo(hwndCombo: usize, pcbi: ?*anyopaque) callconv(W) i32 {
+    _ = hwndCombo; _ = pcbi;
+    return 1;
+}
+
+fn GetIconInfo(hIcon: usize, piconinfo: ?*anyopaque) callconv(W) i32 {
+    _ = hIcon; _ = piconinfo;
+    return 1;
+}
+
+fn wsprintfW(buf: ?[*:0]u16, fmt: ?[*:0]const u16) callconv(W) i32 {
+    _ = buf; _ = fmt;
+    return 0;
+}
+
+fn GetScrollPos(hWnd: usize, nBar: i32) callconv(W) i32 {
+    _ = hWnd; _ = nBar;
+    return 0;
+}
+
+fn SetScrollPos(hWnd: usize, nBar: i32, nPos: i32, bRedraw: i32) callconv(W) i32 {
+    _ = hWnd; _ = nBar; _ = bRedraw;
+    return nPos;
+}
+
+fn GetScrollRange(hWnd: usize, nBar: i32, lpMinPos: ?*i32, lpMaxPos: ?*i32) callconv(W) i32 {
+    _ = hWnd; _ = nBar;
+    if (lpMinPos) |min| min.* = 0;
+    if (lpMaxPos) |max| max.* = 100;
+    return 1;
+}
+
+fn SetScrollRange(hWnd: usize, nBar: i32, nMinPos: i32, nMaxPos: i32, bRedraw: i32) callconv(W) i32 {
+    _ = hWnd; _ = nBar; _ = nMinPos; _ = nMaxPos; _ = bRedraw;
+    return 1;
+}
+
+fn GetScrollInfo(hwnd: usize, nBar: i32, lpsi: ?*anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = nBar; _ = lpsi;
+    return 1;
+}
+
+fn SetScrollInfo(hwnd: usize, nBar: i32, lpsi: ?*const anyopaque, redraw: i32) callconv(W) i32 {
+    _ = hwnd; _ = nBar; _ = lpsi; _ = redraw;
+    return 0;
+}
+
+fn ScrollWindow(hWnd: usize, XAmount: i32, YAmount: i32, lpRect: ?*const anyopaque, lpClipRect: ?*const anyopaque) callconv(W) i32 {
+    _ = hWnd; _ = XAmount; _ = YAmount; _ = lpRect; _ = lpClipRect;
+    return 1;
+}
+
+fn ShowScrollBar(hWnd: usize, wBar: i32, bShow: i32) callconv(W) i32 {
+    _ = hWnd; _ = wBar; _ = bShow;
+    return 1;
+}
+
+fn RegisterClipboardFormatW(lpszFormat: ?[*:0]const u16) callconv(W) u32 {
+    _ = lpszFormat;
+    return 0xC001;
+}
+
+fn AddClipboardFormatListener(hwnd: usize) callconv(W) i32 {
+    _ = hwnd;
+    return 1;
+}
+
+fn RemoveClipboardFormatListener(hwnd: usize) callconv(W) i32 {
+    _ = hwnd;
+    return 1;
+}
+
+fn SetClipboardViewer(hWndNewViewer: usize) callconv(W) usize {
+    _ = hWndNewViewer;
+    return 0;
+}
+
+fn ChangeClipboardChain(hWndRemove: usize, hWndNewNext: usize) callconv(W) i32 {
+    _ = hWndRemove; _ = hWndNewNext;
+    return 1;
+}
+
+fn CreateAcceleratorTableW(paccel: ?*anyopaque, cAccel: i32) callconv(W) usize {
+    _ = paccel; _ = cAccel;
+    return 0xA001;
+}
+
+fn DestroyAcceleratorTable(hAccel: usize) callconv(W) i32 {
+    _ = hAccel;
+    return 1;
+}
+
+fn TranslateAcceleratorW(hWnd: usize, hAccTable: usize, lpMsg: ?*anyopaque) callconv(W) i32 {
+    _ = hWnd; _ = hAccTable; _ = lpMsg;
+    return 0;
+}
+
+fn RegisterWindowMessageW(lpString: ?[*:0]const u16) callconv(W) u32 {
+    _ = lpString;
+    return 0xC002;
+}
+
+fn FlashWindowEx(pfwi: ?*anyopaque) callconv(W) i32 {
+    _ = pfwi;
+    return 1;
+}
+
+fn LockWindowUpdate(hWndLock: usize) callconv(W) i32 {
+    _ = hWndLock;
+    return 1;
+}
+
+fn BeginDeferWindowPos(nNumWindows: i32) callconv(W) usize {
+    _ = nNumWindows;
+    return 0xD001;
+}
+
+fn DeferWindowPos(hWinPosInfo: usize, hWnd: usize, hWndInsertAfter: usize, x: i32, y: i32, cx: i32, cy: i32, uFlags: u32) callconv(W) usize {
+    _ = hWnd; _ = hWndInsertAfter; _ = x; _ = y; _ = cx; _ = cy; _ = uFlags;
+    return hWinPosInfo;
+}
+
+fn EndDeferWindowPos(hWinPosInfo: usize) callconv(W) i32 {
+    _ = hWinPosInfo;
+    return 1;
+}
+
+fn WindowFromPoint(point: usize) callconv(W) usize {
+    _ = point;
+    return 0;
+}
+
+fn ChildWindowFromPointEx(hwnd: usize, pt: usize, flags: u32) callconv(W) usize {
+    _ = hwnd; _ = pt; _ = flags;
+    return 0;
+}
+
+fn CreateDialogIndirectParamW(hInstance: usize, lpTemplate: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*anyopaque, dwInitParam: usize) callconv(W) usize {
+    _ = hInstance; _ = lpTemplate; _ = hWndParent; _ = lpDialogFunc; _ = dwInitParam;
+    return 0x10001;
+}
+
+fn DialogBoxIndirectParamW(hInstance: usize, hDialogTemplate: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*anyopaque, dwInitParam: usize) callconv(W) isize {
+    _ = hInstance; _ = hDialogTemplate; _ = hWndParent; _ = lpDialogFunc; _ = dwInitParam;
+    return 1;
+}
+
+fn mouse_event(dwFlags: u32, dx: u32, dy: u32, dwData: u32, dwExtraInfo: usize) callconv(W) void {
+    _ = dwFlags; _ = dx; _ = dy; _ = dwData; _ = dwExtraInfo;
+}
+
+fn GetKeyboardState(lpKeyState: ?[*]u8) callconv(W) i32 {
+    if (lpKeyState) |s| @memset(s[0..256], 0);
+    return 1;
+}
+
+fn MapVirtualKeyW(uCode: u32, uMapType: u32) callconv(W) u32 {
+    _ = uMapType;
+    return uCode;
+}
+
+fn GetKeyboardLayout(idThread: u32) callconv(W) usize {
+    _ = idThread;
+    return 0x04090409;
+}
+
+fn ToAscii(uVirtKey: u32, uScanCode: u32, lpKeyState: ?*const u8, lpChar: ?*u16, uFlags: u32) callconv(W) i32 {
+    _ = uScanCode; _ = lpKeyState; _ = uFlags;
+    if (lpChar) |c| c.* = @intCast(uVirtKey & 0xFF);
+    return 1;
+}
+
+fn IsCharLowerW(ch: u16) callconv(W) i32 {
+    return if (ch >= 'a' and ch <= 'z') 1 else 0;
+}
+
+fn CharUpperW(lpsz: ?[*:0]u16) callconv(W) ?[*:0]u16 {
+    if (lpsz) |s| {
+        var i: usize = 0;
+        while (s[i] != 0) : (i += 1) {
+            if (s[i] >= 'a' and s[i] <= 'z') s[i] -= 32;
+        }
+    }
+    return lpsz;
+}
+
+fn CharLowerW(lpsz: ?[*:0]u16) callconv(W) ?[*:0]u16 {
+    if (lpsz) |s| {
+        var i: usize = 0;
+        while (s[i] != 0) : (i += 1) {
+            if (s[i] >= 'A' and s[i] <= 'Z') s[i] += 32;
+        }
+    }
+    return lpsz;
+}
+
+fn IsCharAlphaNumericW(ch: u16) callconv(W) i32 {
+    return if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9')) 1 else 0;
+}
+
+fn IsCharAlphaW(ch: u16) callconv(W) i32 {
+    return if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) 1 else 0;
+}
+
+fn LoadCursorW(hInstance: usize, lpCursorName: ?[*:0]const u16) callconv(W) usize {
+    _ = hInstance; _ = lpCursorName;
+    return 0x50001;
+}
+
+fn LoadMenuW(hInstance: usize, lpMenuName: ?[*:0]const u16) callconv(W) usize {
+    _ = hInstance; _ = lpMenuName;
+    return 0x90001;
+}
+
+fn LoadBitmapW(hInstance: usize, lpBitmapName: ?[*:0]const u16) callconv(W) usize {
+    _ = hInstance; _ = lpBitmapName;
+    return 0xB003;
+}
+
+fn LoadIconW(hInstance: usize, lpIconName: ?[*:0]const u16) callconv(W) usize {
+    _ = hInstance; _ = lpIconName;
+    return 0x40001;
+}
+
+fn LoadStringA(hInstance: usize, uID: u32, lpBuffer: ?[*:0]u8, cchBufferMax: i32) callconv(W) i32 {
+    _ = hInstance; _ = uID;
+    if (lpBuffer) |b| {
+        if (cchBufferMax > 0) b[0] = 0;
+    }
+    return 0;
+}
+
+fn LoadStringW(hInstance: usize, uID: u32, lpBuffer: ?[*:0]u16, cchBufferMax: i32) callconv(W) i32 {
+    _ = hInstance; _ = uID;
+    if (lpBuffer) |b| {
+        if (cchBufferMax > 0) b[0] = 0;
+    }
+    return 0;
+}
+
+fn MessageBeep(uType: u32) callconv(W) i32 {
+    _ = uType;
+    return 1;
+}
+
+fn GetUpdateRgn(hWnd: usize, hRgn: usize, bErase: i32) callconv(W) i32 {
+    _ = hWnd; _ = hRgn; _ = bErase;
+    return 0;
+}
+
+fn GetWindow(hWnd: usize, uCmd: u32) callconv(W) usize {
+    _ = hWnd; _ = uCmd;
+    return 0;
+}
+
+fn MsgWaitForMultipleObjects(nCount: u32, pHandles: ?*const usize, fWaitAll: i32, dwMilliseconds: u32, dwWakeMask: u32) callconv(W) u32 {
+    _ = nCount; _ = pHandles; _ = fWaitAll; _ = dwMilliseconds; _ = dwWakeMask;
+    return 0;
+}
+
+fn NotifyWinEvent(event: u32, hwnd: usize, idObject: i32, idChild: i32) callconv(W) void {
+    _ = event; _ = hwnd; _ = idObject; _ = idChild;
+}
+
+fn CallWindowProcW(lpPrevWndFunc: ?*anyopaque, hWnd: usize, Msg: u32, wParam: usize, lParam: usize) callconv(W) isize {
+    _ = lpPrevWndFunc; _ = hWnd; _ = Msg; _ = wParam; _ = lParam;
+    return 0;
+}
+
+fn GetDoubleClickTime() callconv(W) u32 {
+    return 500;
+}
+
+fn SystemParametersInfoA(uiAction: u32, uiParam: u32, pvParam: ?*anyopaque, fWinIni: u32) callconv(W) i32 {
+    _ = uiAction; _ = uiParam; _ = pvParam; _ = fWinIni;
+    return 1;
+}
+
 pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "GetCursorPos")) return @intFromPtr(&GetCursorPos);
     if (std.mem.eql(u8, name, "GetMonitorInfoW")) return @intFromPtr(&GetMonitorInfoW);
@@ -1219,6 +2261,7 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "SetWindowTextW")) return @intFromPtr(&SetWindowTextW);
     if (std.mem.eql(u8, name, "SetDlgItemTextW")) return @intFromPtr(&SetDlgItemTextW);
     if (std.mem.eql(u8, name, "GetDlgItemTextW")) return @intFromPtr(&GetDlgItemTextW);
+    if (std.mem.eql(u8, name, "GetDlgItemTextA")) return @intFromPtr(&GetDlgItemTextA);
     if (std.mem.eql(u8, name, "SendDlgItemMessageW")) return @intFromPtr(&SendDlgItemMessageW);
     if (std.mem.eql(u8, name, "GetDlgItem")) return @intFromPtr(&GetDlgItem);
     if (std.mem.eql(u8, name, "GetDlgItemInt")) return @intFromPtr(&GetDlgItemInt);
@@ -1232,5 +2275,135 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "SetWindowsHookExW")) return @intFromPtr(&SetWindowsHookExW);
     if (std.mem.eql(u8, name, "UnhookWindowsHookEx")) return @intFromPtr(&UnhookWindowsHookEx);
     if (std.mem.eql(u8, name, "CallNextHookEx")) return @intFromPtr(&CallNextHookEx);
+    if (std.mem.eql(u8, name, "BeginPaint")) return @intFromPtr(&BeginPaint);
+    if (std.mem.eql(u8, name, "EndPaint")) return @intFromPtr(&EndPaint);
+    if (std.mem.eql(u8, name, "InvalidateRect")) return @intFromPtr(&InvalidateRect);
+    if (std.mem.eql(u8, name, "RedrawWindow")) return @intFromPtr(&RedrawWindow);
+    if (std.mem.eql(u8, name, "FillRect")) return @intFromPtr(&FillRect);
+    if (std.mem.eql(u8, name, "FrameRect")) return @intFromPtr(&FrameRect);
+    if (std.mem.eql(u8, name, "DrawEdge")) return @intFromPtr(&DrawEdge);
+    if (std.mem.eql(u8, name, "DrawFrameControl")) return @intFromPtr(&DrawFrameControl);
+    if (std.mem.eql(u8, name, "DrawFocusRect")) return @intFromPtr(&DrawFocusRect);
+    if (std.mem.eql(u8, name, "DrawIconEx")) return @intFromPtr(&DrawIconEx);
+    if (std.mem.eql(u8, name, "DrawTextW")) return @intFromPtr(&DrawTextW);
+    if (std.mem.eql(u8, name, "DrawTextExW")) return @intFromPtr(&DrawTextExW);
+    if (std.mem.eql(u8, name, "CreateMenu")) return @intFromPtr(&CreateMenu);
+    if (std.mem.eql(u8, name, "CreatePopupMenu")) return @intFromPtr(&CreatePopupMenu);
+    if (std.mem.eql(u8, name, "DestroyMenu")) return @intFromPtr(&DestroyMenu);
+    if (std.mem.eql(u8, name, "GetMenu")) return @intFromPtr(&GetMenu);
+    if (std.mem.eql(u8, name, "SetMenu")) return @intFromPtr(&SetMenu);
+    if (std.mem.eql(u8, name, "DrawMenuBar")) return @intFromPtr(&DrawMenuBar);
+    if (std.mem.eql(u8, name, "GetSubMenu")) return @intFromPtr(&GetSubMenu);
+    if (std.mem.eql(u8, name, "GetMenuItemCount")) return @intFromPtr(&GetMenuItemCount);
+    if (std.mem.eql(u8, name, "GetMenuItemID")) return @intFromPtr(&GetMenuItemID);
+    if (std.mem.eql(u8, name, "GetMenuItemInfoW")) return @intFromPtr(&GetMenuItemInfoW);
+    if (std.mem.eql(u8, name, "SetMenuItemInfoW")) return @intFromPtr(&SetMenuItemInfoW);
+    if (std.mem.eql(u8, name, "GetMenuStringW")) return @intFromPtr(&GetMenuStringW);
+    if (std.mem.eql(u8, name, "GetMenuState")) return @intFromPtr(&GetMenuState);
+    if (std.mem.eql(u8, name, "InsertMenuW")) return @intFromPtr(&InsertMenuW);
+    if (std.mem.eql(u8, name, "InsertMenuItemW")) return @intFromPtr(&InsertMenuItemW);
+    if (std.mem.eql(u8, name, "AppendMenuW")) return @intFromPtr(&AppendMenuW);
+    if (std.mem.eql(u8, name, "AppendMenuA")) return @intFromPtr(&AppendMenuA);
+    if (std.mem.eql(u8, name, "ModifyMenuW")) return @intFromPtr(&ModifyMenuW);
+    if (std.mem.eql(u8, name, "DeleteMenu")) return @intFromPtr(&DeleteMenu);
+    if (std.mem.eql(u8, name, "RemoveMenu")) return @intFromPtr(&RemoveMenu);
+    if (std.mem.eql(u8, name, "EnableMenuItem")) return @intFromPtr(&EnableMenuItem);
+    if (std.mem.eql(u8, name, "CheckMenuItem")) return @intFromPtr(&CheckMenuItem);
+    if (std.mem.eql(u8, name, "CheckMenuRadioItem")) return @intFromPtr(&CheckMenuRadioItem);
+    if (std.mem.eql(u8, name, "SetMenuItemBitmaps")) return @intFromPtr(&SetMenuItemBitmaps);
+    if (std.mem.eql(u8, name, "TrackPopupMenu")) return @intFromPtr(&TrackPopupMenu);
+    if (std.mem.eql(u8, name, "TrackPopupMenuEx")) return @intFromPtr(&TrackPopupMenuEx);
+    if (std.mem.eql(u8, name, "GetMenuBarInfo")) return @intFromPtr(&GetMenuBarInfo);
+    if (std.mem.eql(u8, name, "CreateCaret")) return @intFromPtr(&CreateCaret);
+    if (std.mem.eql(u8, name, "DestroyCaret")) return @intFromPtr(&DestroyCaret);
+    if (std.mem.eql(u8, name, "ShowCaret")) return @intFromPtr(&ShowCaret);
+    if (std.mem.eql(u8, name, "HideCaret")) return @intFromPtr(&HideCaret);
+    if (std.mem.eql(u8, name, "SetCaretPos")) return @intFromPtr(&SetCaretPos);
+    if (std.mem.eql(u8, name, "GetWindowTextW")) return @intFromPtr(&GetWindowTextW);
+    if (std.mem.eql(u8, name, "GetWindowTextA")) return @intFromPtr(&GetWindowTextA);
+    if (std.mem.eql(u8, name, "GetWindowTextLengthW")) return @intFromPtr(&GetWindowTextLengthW);
+    if (std.mem.eql(u8, name, "IsWindow")) return @intFromPtr(&IsWindow);
+    if (std.mem.eql(u8, name, "IsWindowEnabled")) return @intFromPtr(&IsWindowEnabled);
+    if (std.mem.eql(u8, name, "IsWindowVisible")) return @intFromPtr(&IsWindowVisible);
+    if (std.mem.eql(u8, name, "IsIconic")) return @intFromPtr(&IsIconic);
+    if (std.mem.eql(u8, name, "IsZoomed")) return @intFromPtr(&IsZoomed);
+    if (std.mem.eql(u8, name, "IsChild")) return @intFromPtr(&IsChild);
+    if (std.mem.eql(u8, name, "SetParent")) return @intFromPtr(&SetParent);
+    if (std.mem.eql(u8, name, "MoveWindow")) return @intFromPtr(&MoveWindow);
+    if (std.mem.eql(u8, name, "BringWindowToTop")) return @intFromPtr(&BringWindowToTop);
+    if (std.mem.eql(u8, name, "GetLastActivePopup")) return @intFromPtr(&GetLastActivePopup);
+    if (std.mem.eql(u8, name, "FindWindowW")) return @intFromPtr(&FindWindowW);
+    if (std.mem.eql(u8, name, "GetWindowThreadProcessId")) return @intFromPtr(&GetWindowThreadProcessId);
+    if (std.mem.eql(u8, name, "GetClassNameW")) return @intFromPtr(&GetClassNameW);
+    if (std.mem.eql(u8, name, "GetClassNameA")) return @intFromPtr(&GetClassNameA);
+    if (std.mem.eql(u8, name, "GetDlgCtrlID")) return @intFromPtr(&GetDlgCtrlID);
+    if (std.mem.eql(u8, name, "GetSysColor")) return @intFromPtr(&GetSysColor);
+    if (std.mem.eql(u8, name, "GetSysColorBrush")) return @intFromPtr(&GetSysColorBrush);
+    if (std.mem.eql(u8, name, "SetPropW")) return @intFromPtr(&SetPropW);
+    if (std.mem.eql(u8, name, "GetPropW")) return @intFromPtr(&GetPropW);
+    if (std.mem.eql(u8, name, "RemovePropW")) return @intFromPtr(&RemovePropW);
+    if (std.mem.eql(u8, name, "SetLayeredWindowAttributes")) return @intFromPtr(&SetLayeredWindowAttributes);
+    if (std.mem.eql(u8, name, "GetWindowDC")) return @intFromPtr(&GetWindowDC);
+    if (std.mem.eql(u8, name, "GetDCEx")) return @intFromPtr(&GetDCEx);
+    if (std.mem.eql(u8, name, "MapWindowPoints")) return @intFromPtr(&MapWindowPoints);
+    if (std.mem.eql(u8, name, "InflateRect")) return @intFromPtr(&InflateRect);
+    if (std.mem.eql(u8, name, "EqualRect")) return @intFromPtr(&EqualRect);
+    if (std.mem.eql(u8, name, "IntersectRect")) return @intFromPtr(&IntersectRect);
+    if (std.mem.eql(u8, name, "SetRectEmpty")) return @intFromPtr(&SetRectEmpty);
+    if (std.mem.eql(u8, name, "EnumChildWindows")) return @intFromPtr(&EnumChildWindows);
+    if (std.mem.eql(u8, name, "EnumThreadWindows")) return @intFromPtr(&EnumThreadWindows);
+    if (std.mem.eql(u8, name, "GetComboBoxInfo")) return @intFromPtr(&GetComboBoxInfo);
+    if (std.mem.eql(u8, name, "GetIconInfo")) return @intFromPtr(&GetIconInfo);
+    if (std.mem.eql(u8, name, "wsprintfW")) return @intFromPtr(&wsprintfW);
+    if (std.mem.eql(u8, name, "GetScrollPos")) return @intFromPtr(&GetScrollPos);
+    if (std.mem.eql(u8, name, "SetScrollPos")) return @intFromPtr(&SetScrollPos);
+    if (std.mem.eql(u8, name, "GetScrollRange")) return @intFromPtr(&GetScrollRange);
+    if (std.mem.eql(u8, name, "SetScrollRange")) return @intFromPtr(&SetScrollRange);
+    if (std.mem.eql(u8, name, "GetScrollInfo")) return @intFromPtr(&GetScrollInfo);
+    if (std.mem.eql(u8, name, "SetScrollInfo")) return @intFromPtr(&SetScrollInfo);
+    if (std.mem.eql(u8, name, "ScrollWindow")) return @intFromPtr(&ScrollWindow);
+    if (std.mem.eql(u8, name, "ShowScrollBar")) return @intFromPtr(&ShowScrollBar);
+    if (std.mem.eql(u8, name, "RegisterClipboardFormatW")) return @intFromPtr(&RegisterClipboardFormatW);
+    if (std.mem.eql(u8, name, "AddClipboardFormatListener")) return @intFromPtr(&AddClipboardFormatListener);
+    if (std.mem.eql(u8, name, "RemoveClipboardFormatListener")) return @intFromPtr(&RemoveClipboardFormatListener);
+    if (std.mem.eql(u8, name, "SetClipboardViewer")) return @intFromPtr(&SetClipboardViewer);
+    if (std.mem.eql(u8, name, "ChangeClipboardChain")) return @intFromPtr(&ChangeClipboardChain);
+    if (std.mem.eql(u8, name, "CreateAcceleratorTableW")) return @intFromPtr(&CreateAcceleratorTableW);
+    if (std.mem.eql(u8, name, "DestroyAcceleratorTable")) return @intFromPtr(&DestroyAcceleratorTable);
+    if (std.mem.eql(u8, name, "TranslateAcceleratorW")) return @intFromPtr(&TranslateAcceleratorW);
+    if (std.mem.eql(u8, name, "RegisterWindowMessageW")) return @intFromPtr(&RegisterWindowMessageW);
+    if (std.mem.eql(u8, name, "FlashWindowEx")) return @intFromPtr(&FlashWindowEx);
+    if (std.mem.eql(u8, name, "LockWindowUpdate")) return @intFromPtr(&LockWindowUpdate);
+    if (std.mem.eql(u8, name, "BeginDeferWindowPos")) return @intFromPtr(&BeginDeferWindowPos);
+    if (std.mem.eql(u8, name, "DeferWindowPos")) return @intFromPtr(&DeferWindowPos);
+    if (std.mem.eql(u8, name, "EndDeferWindowPos")) return @intFromPtr(&EndDeferWindowPos);
+    if (std.mem.eql(u8, name, "WindowFromPoint")) return @intFromPtr(&WindowFromPoint);
+    if (std.mem.eql(u8, name, "ChildWindowFromPointEx")) return @intFromPtr(&ChildWindowFromPointEx);
+    if (std.mem.eql(u8, name, "CreateDialogIndirectParamW")) return @intFromPtr(&CreateDialogIndirectParamW);
+    if (std.mem.eql(u8, name, "DialogBoxIndirectParamW")) return @intFromPtr(&DialogBoxIndirectParamW);
+    if (std.mem.eql(u8, name, "mouse_event")) return @intFromPtr(&mouse_event);
+    if (std.mem.eql(u8, name, "GetKeyboardState")) return @intFromPtr(&GetKeyboardState);
+    if (std.mem.eql(u8, name, "MapVirtualKeyW")) return @intFromPtr(&MapVirtualKeyW);
+    if (std.mem.eql(u8, name, "GetKeyboardLayout")) return @intFromPtr(&GetKeyboardLayout);
+    if (std.mem.eql(u8, name, "ToAscii")) return @intFromPtr(&ToAscii);
+    if (std.mem.eql(u8, name, "IsCharLowerW")) return @intFromPtr(&IsCharLowerW);
+    if (std.mem.eql(u8, name, "CharUpperW")) return @intFromPtr(&CharUpperW);
+    if (std.mem.eql(u8, name, "CharLowerW")) return @intFromPtr(&CharLowerW);
+    if (std.mem.eql(u8, name, "IsCharAlphaNumericW")) return @intFromPtr(&IsCharAlphaNumericW);
+    if (std.mem.eql(u8, name, "IsCharAlphaW")) return @intFromPtr(&IsCharAlphaW);
+    if (std.mem.eql(u8, name, "LoadCursorW")) return @intFromPtr(&LoadCursorW);
+    if (std.mem.eql(u8, name, "LoadMenuW")) return @intFromPtr(&LoadMenuW);
+    if (std.mem.eql(u8, name, "LoadBitmapW")) return @intFromPtr(&LoadBitmapW);
+    if (std.mem.eql(u8, name, "LoadIconW")) return @intFromPtr(&LoadIconW);
+    if (std.mem.eql(u8, name, "LoadStringA")) return @intFromPtr(&LoadStringA);
+    if (std.mem.eql(u8, name, "LoadStringW")) return @intFromPtr(&LoadStringW);
+    if (std.mem.eql(u8, name, "MessageBeep")) return @intFromPtr(&MessageBeep);
+    if (std.mem.eql(u8, name, "GetUpdateRgn")) return @intFromPtr(&GetUpdateRgn);
+    if (std.mem.eql(u8, name, "GetWindow")) return @intFromPtr(&GetWindow);
+    if (std.mem.eql(u8, name, "MsgWaitForMultipleObjects")) return @intFromPtr(&MsgWaitForMultipleObjects);
+    if (std.mem.eql(u8, name, "NotifyWinEvent")) return @intFromPtr(&NotifyWinEvent);
+    if (std.mem.eql(u8, name, "CallWindowProcW")) return @intFromPtr(&CallWindowProcW);
+    if (std.mem.eql(u8, name, "GetDoubleClickTime")) return @intFromPtr(&GetDoubleClickTime);
+    if (std.mem.eql(u8, name, "SystemParametersInfoA")) return @intFromPtr(&SystemParametersInfoA);
     return null;
 }

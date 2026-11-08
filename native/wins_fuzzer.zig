@@ -80,9 +80,32 @@ fn resolveImport(dll: []const u8, sym: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(dll, "ncrypt.dll") or std.ascii.eqlIgnoreCase(dll, "bcrypt.dll")) {
         return extra.lookupNcrypt(sym) != null;
     }
+    if (std.ascii.eqlIgnoreCase(dll, "msimg32.dll")) {
+        return user32.lookupGdi32("GdiAlphaBlend") != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "comctl32.dll")) {
+        return extra.lookupComctl32(sym) != null or extra.lookupMisc(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "comdlg32.dll")) {
+        return extra.lookupComdlg32(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "uxtheme.dll")) {
+        return extra.lookupUxtheme(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "dwmapi.dll")) {
+        return extra.lookupDwmapi(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "dbghelp.dll")) {
+        return extra.lookupDbghelp(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "wininet.dll")) {
+        return extra.lookupWininet(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "imm32.dll")) {
+        return extra.lookupImm32(sym) != null or directx.lookupDirectX(sym) != null;
+    }
     if (std.ascii.eqlIgnoreCase(dll, "sensapi.dll") or
         std.ascii.eqlIgnoreCase(dll, "secur32.dll") or
-        std.ascii.eqlIgnoreCase(dll, "comctl32.dll") or
         std.ascii.eqlIgnoreCase(dll, "wintrust.dll") or
         std.ascii.eqlIgnoreCase(dll, "iphlpapi.dll") or
         std.ascii.eqlIgnoreCase(dll, "dnsapi.dll") or

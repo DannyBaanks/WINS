@@ -221,6 +221,26 @@ class WinrunGuiTests(unittest.TestCase):
         self.assertEqual(unity_entry['resolved'], 486)
         self.assertEqual(unity_entry['readiness_pct'], 100.0)
 
+    def test_notepad_corpus_resolution(self):
+        """notepad++.exe (Win64 text editor) must achieve 100.0% import resolution (624/624)."""
+        npp = ROOT / 'corpus' / 'notepad++.exe'
+        if not npp.is_file():
+            self.skipTest('corpus/notepad++.exe not present')
+        fuzzer_bin = Path('/tmp/wins_fuzzer')
+        if not fuzzer_bin.is_file():
+            subprocess.run(['zig', 'build-exe', str(ROOT / 'native' / 'wins_fuzzer.zig'),
+                            '-O', 'Debug', '-lc', '-lX11', '-fPIC', f'-femit-bin={fuzzer_bin}'],
+                           check=True, capture_output=True)
+        res = subprocess.run([str(fuzzer_bin), str(ROOT / 'corpus'), '--json'],
+                             capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        npp_entry = next((b for b in data['binaries'] if b['name'] == 'notepad++.exe'), None)
+        self.assertIsNotNone(npp_entry)
+        self.assertEqual(npp_entry['missing'], 0, f"Missing imports in notepad++: {npp_entry}")
+        self.assertEqual(npp_entry['resolved'], 624)
+        self.assertEqual(npp_entry['readiness_pct'], 100.0)
+
+
 
 if __name__ == '__main__':
     unittest.main()

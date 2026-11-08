@@ -300,7 +300,60 @@ fn RegCreateKeyA(hKey: usize, lpSubKey: ?[*:0]const u8, phkResult: ?*usize) call
     return 0;
 }
 
+fn AllocateAndInitializeSid(pIdentifierAuthority: ?*anyopaque, nSubAuthorityCount: u8, nSubAuthority0: u32, nSubAuthority1: u32, nSubAuthority2: u32, nSubAuthority3: u32, nSubAuthority4: u32, nSubAuthority5: u32, nSubAuthority6: u32, nSubAuthority7: u32, pSid: ?*?*anyopaque) callconv(W) i32 {
+    _ = pIdentifierAuthority; _ = nSubAuthorityCount; _ = nSubAuthority0; _ = nSubAuthority1; _ = nSubAuthority2; _ = nSubAuthority3; _ = nSubAuthority4; _ = nSubAuthority5; _ = nSubAuthority6; _ = nSubAuthority7;
+    if (pSid) |p| p.* = @ptrFromInt(0x5000);
+    return 1;
+}
+
+fn FreeSid(pSid: ?*anyopaque) callconv(W) ?*anyopaque {
+    _ = pSid;
+    return null;
+}
+
+fn IsTextUnicode(lpv: ?*const anyopaque, iSize: i32, lpiResult: ?*i32) callconv(W) i32 {
+    _ = lpv; _ = iSize; _ = lpiResult;
+    return 1;
+}
+
+fn RegDeleteKeyW(hKey: usize, lpSubKey: ?*const u16) callconv(W) i32 {
+    _ = hKey; _ = lpSubKey;
+    return 0;
+}
+
+fn RegGetValueW(hkey: usize, lpSubKey: ?*const u16, lpValue: ?*const u16, dwFlags: u32, pdwType: ?*u32, pvData: ?*anyopaque, pcbData: ?*u32) callconv(W) i32 {
+    _ = hkey; _ = lpSubKey; _ = lpValue; _ = dwFlags; _ = pdwType; _ = pvData;
+    if (pcbData) |s| s.* = 0;
+    return 2;
+}
+
+fn RegQueryInfoKeyW(hKey: usize, lpClass: ?*u16, lpcchClass: ?*u32, lpReserved: ?*u32, lpcSubKeys: ?*u32, lpcbMaxSubKeyLen: ?*u32, lpcbMaxClassLen: ?*u32, lpcValues: ?*u32, lpcbMaxValueNameLen: ?*u32, lpcbMaxValueLen: ?*u32, lpcbSecurityDescriptor: ?*u32, lpftLastWriteTime: ?*anyopaque) callconv(W) i32 {
+    _ = hKey; _ = lpClass; _ = lpcchClass; _ = lpReserved; _ = lpftLastWriteTime;
+    if (lpcSubKeys) |k| k.* = 0;
+    if (lpcbMaxSubKeyLen) |l| l.* = 0;
+    if (lpcbMaxClassLen) |l| l.* = 0;
+    if (lpcValues) |v| v.* = 0;
+    if (lpcbMaxValueNameLen) |l| l.* = 0;
+    if (lpcbMaxValueLen) |l| l.* = 0;
+    if (lpcbSecurityDescriptor) |s| s.* = 0;
+    return 0;
+}
+
+fn RegEnumKeyExW(hKey: usize, dwIndex: u32, lpName: ?[*:0]u16, lpcchName: ?*u32, lpReserved: ?*u32, lpClass: ?*u16, lpcchClass: ?*u32, lpftLastWriteTime: ?*anyopaque) callconv(W) i32 {
+    _ = hKey; _ = dwIndex; _ = lpReserved; _ = lpClass; _ = lpcchClass; _ = lpftLastWriteTime;
+    if (lpName) |s| s[0] = 0;
+    if (lpcchName) |c| c.* = 0;
+    return 259;
+}
+
 pub fn lookupAdvapi32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "RegDeleteKeyW")) return @intFromPtr(&RegDeleteKeyW);
+    if (std.mem.eql(u8, name, "RegGetValueW")) return @intFromPtr(&RegGetValueW);
+    if (std.mem.eql(u8, name, "RegQueryInfoKeyW")) return @intFromPtr(&RegQueryInfoKeyW);
+    if (std.mem.eql(u8, name, "RegEnumKeyExW")) return @intFromPtr(&RegEnumKeyExW);
+    if (std.mem.eql(u8, name, "AllocateAndInitializeSid")) return @intFromPtr(&AllocateAndInitializeSid);
+    if (std.mem.eql(u8, name, "FreeSid")) return @intFromPtr(&FreeSid);
+    if (std.mem.eql(u8, name, "IsTextUnicode")) return @intFromPtr(&IsTextUnicode);
     if (std.mem.eql(u8, name, "GetSidSubAuthority")) return @intFromPtr(&GetSidSubAuthority);
     if (std.mem.eql(u8, name, "GetSidSubAuthorityCount")) return @intFromPtr(&GetSidSubAuthorityCount);
     if (std.mem.eql(u8, name, "IsValidSid")) return @intFromPtr(&IsValidSid);
@@ -873,7 +926,95 @@ fn SHDeleteKeyW(hKey: usize, pszSubKey: ?*const u16) callconv(W) i32 {
     return 0;
 }
 
+fn PathCreateFromUrlW(pszUrl: ?*const u16, pszPath: ?[*]u16, pcchPath: ?*u32, dwFlags: u32) callconv(W) i32 {
+    _ = pszUrl; _ = pszPath; _ = dwFlags;
+    if (pcchPath) |p| p.* = 0;
+    return 0;
+}
+
+fn PathCombineW(pszDest: ?[*]u16, pszDir: ?*const u16, pszFile: ?*const u16) callconv(W) ?[*]u16 {
+    _ = pszDir; _ = pszFile;
+    if (pszDest) |d| d[0] = 0;
+    return pszDest;
+}
+
+fn AssocQueryStringW(flags: u32, str: u32, pszAssoc: ?*const u16, pszExtra: ?*const u16, pszOut: ?[*]u16, pcchOut: ?*u32) callconv(W) i32 {
+    _ = flags; _ = str; _ = pszAssoc; _ = pszExtra; _ = pszOut;
+    if (pcchOut) |p| p.* = 0;
+    return -2147467259;
+}
+
+fn PathGetDriveNumberW(pszPath: ?*const u16) callconv(W) i32 {
+    _ = pszPath;
+    return 2;
+}
+
+fn ColorAdjustLuma(clrRGB: u32, n: i32, fScale: i32) callconv(W) u32 {
+    _ = n; _ = fScale;
+    return clrRGB;
+}
+
+fn PathAppendW(pszPath: ?[*]u16, pszMore: ?*const u16) callconv(W) i32 {
+    _ = pszPath; _ = pszMore;
+    return 1;
+}
+
+fn PathMatchSpecW(pszFile: ?*const u16, pszSpec: ?*const u16) callconv(W) i32 {
+    _ = pszFile; _ = pszSpec;
+    return 1;
+}
+
+fn PathIsNetworkPathW(pszPath: ?*const u16) callconv(W) i32 {
+    _ = pszPath;
+    return 0;
+}
+
+fn PathCompactPathExW(pszOut: ?[*]u16, pszSrc: ?*const u16, cchMax: u32, dwFlags: u32) callconv(W) i32 {
+    _ = pszSrc; _ = cchMax; _ = dwFlags;
+    if (pszOut) |p| p[0] = 0;
+    return 1;
+}
+
+fn ColorHLSToRGB(wHue: u16, wLuminance: u16, wSaturation: u16) callconv(W) u32 {
+    _ = wHue; _ = wLuminance; _ = wSaturation;
+    return 0x00FFFFFF;
+}
+
+fn ColorRGBToHLS(clrRGB: u32, pwHue: ?*u16, pwLuminance: ?*u16, pwSaturation: ?*u16) callconv(W) void {
+    _ = clrRGB;
+    if (pwHue) |h| h.* = 0;
+    if (pwLuminance) |l| l.* = 240;
+    if (pwSaturation) |s| s.* = 0;
+}
+
+fn PathStripPathW(pszPath: ?[*]u16) callconv(W) void {
+    _ = pszPath;
+}
+
+fn PathIsRelativeW(pszPath: ?*const u16) callconv(W) i32 {
+    _ = pszPath;
+    return 0;
+}
+
+fn PathRemoveExtensionW(pszPath: ?[*]u16) callconv(W) void {
+    _ = pszPath;
+}
+
 pub fn lookupShlwapi(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "PathCreateFromUrlW")) return @intFromPtr(&PathCreateFromUrlW);
+    if (std.mem.eql(u8, name, "PathCombineW")) return @intFromPtr(&PathCombineW);
+    if (std.mem.eql(u8, name, "AssocQueryStringW")) return @intFromPtr(&AssocQueryStringW);
+    if (std.mem.eql(u8, name, "PathGetDriveNumberW")) return @intFromPtr(&PathGetDriveNumberW);
+    if (std.mem.eql(u8, name, "ColorAdjustLuma")) return @intFromPtr(&ColorAdjustLuma);
+    if (std.mem.eql(u8, name, "PathAppendW")) return @intFromPtr(&PathAppendW);
+    if (std.mem.eql(u8, name, "PathMatchSpecW")) return @intFromPtr(&PathMatchSpecW);
+    if (std.mem.eql(u8, name, "PathIsNetworkPathW")) return @intFromPtr(&PathIsNetworkPathW);
+    if (std.mem.eql(u8, name, "PathCompactPathExW")) return @intFromPtr(&PathCompactPathExW);
+    if (std.mem.eql(u8, name, "ColorHLSToRGB")) return @intFromPtr(&ColorHLSToRGB);
+    if (std.mem.eql(u8, name, "ColorRGBToHLS")) return @intFromPtr(&ColorRGBToHLS);
+    if (std.mem.eql(u8, name, "PathStripPathW")) return @intFromPtr(&PathStripPathW);
+    if (std.mem.eql(u8, name, "PathIsRelativeW")) return @intFromPtr(&PathIsRelativeW);
+    if (std.mem.eql(u8, name, "PathRemoveExtensionW")) return @intFromPtr(&PathRemoveExtensionW);
     if (std.mem.eql(u8, name, "SHDeleteKeyW")) return @intFromPtr(&SHDeleteKeyW);
     if (std.mem.eql(u8, name, "PathCanonicalizeW")) return @intFromPtr(&PathCanonicalizeW);
     if (std.mem.eql(u8, name, "PathFileExistsW")) return @intFromPtr(&PathFileExistsW);
@@ -918,6 +1059,48 @@ fn ShellExecuteExA(pExecInfo: ?*anyopaque) callconv(W) i32 {
     return 1;
 }
 
+fn ShellExecuteExW(pExecInfo: ?*anyopaque) callconv(W) i32 {
+    _ = pExecInfo;
+    return 1;
+}
+
+fn SHCreateItemFromParsingName(pszPath: ?*const u16, pbc: ?*anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) i32 {
+    _ = pszPath; _ = pbc; _ = riid;
+    if (ppv) |p| p.* = null;
+    return -2147467259;
+}
+
+fn SHParseDisplayName(pszName: ?*const u16, pbc: ?*anyopaque, ppidl: ?*?*anyopaque, sfgaoIn: u32, psfgaoOut: ?*u32) callconv(W) i32 {
+    _ = pszName; _ = pbc; _ = sfgaoIn;
+    if (ppidl) |p| p.* = null;
+    if (psfgaoOut) |s| s.* = 0;
+    return -2147467259;
+}
+
+fn SHOpenFolderAndSelectItems(pidlFolder: ?*const anyopaque, cidl: u32, apidl: ?*const anyopaque, dwFlags: u32) callconv(W) i32 {
+    _ = pidlFolder; _ = cidl; _ = apidl; _ = dwFlags;
+    return 0;
+}
+
+fn DragQueryPoint(hDrop: usize, ppt: ?*anyopaque) callconv(W) i32 {
+    _ = hDrop; _ = ppt;
+    return 1;
+}
+
+fn Shell_NotifyIconW(dwMessage: u32, lpData: ?*anyopaque) callconv(W) i32 {
+    _ = dwMessage; _ = lpData;
+    return 1;
+}
+
+fn DragQueryFileW(hDrop: usize, iFile: u32, lpszFile: ?[*]u16, cch: u32) callconv(W) u32 {
+    _ = hDrop; _ = iFile; _ = lpszFile; _ = cch;
+    return 0;
+}
+
+fn DragFinish(hDrop: usize) callconv(W) void {
+    _ = hDrop;
+}
+
 var argv_ptrs: [8]?[*]u16 = undefined;
 var dummy_cmd_arg: [2]u16 = .{ 'w', 0 };
 
@@ -931,10 +1114,18 @@ fn CommandLineToArgvW(lpCmdLine: ?*const u16, pNumArgs: ?*i32) callconv(W) ?[*]?
 pub fn lookupShell32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "CommandLineToArgvW")) return @intFromPtr(&CommandLineToArgvW);
     if (std.mem.eql(u8, name, "ShellExecuteExA")) return @intFromPtr(&ShellExecuteExA);
+    if (std.mem.eql(u8, name, "ShellExecuteExW")) return @intFromPtr(&ShellExecuteExW);
     if (std.mem.eql(u8, name, "ShellExecuteW")) return @intFromPtr(&ShellExecuteW);
     if (std.mem.eql(u8, name, "SHGetFolderPathW")) return @intFromPtr(&SHGetFolderPathW);
     if (std.mem.eql(u8, name, "SHCreateDirectoryExW")) return @intFromPtr(&SHCreateDirectoryExW);
     if (std.mem.eql(u8, name, "SHFileOperationW")) return @intFromPtr(&SHFileOperationW);
+    if (std.mem.eql(u8, name, "SHCreateItemFromParsingName")) return @intFromPtr(&SHCreateItemFromParsingName);
+    if (std.mem.eql(u8, name, "SHParseDisplayName")) return @intFromPtr(&SHParseDisplayName);
+    if (std.mem.eql(u8, name, "SHOpenFolderAndSelectItems")) return @intFromPtr(&SHOpenFolderAndSelectItems);
+    if (std.mem.eql(u8, name, "DragQueryPoint")) return @intFromPtr(&DragQueryPoint);
+    if (std.mem.eql(u8, name, "Shell_NotifyIconW")) return @intFromPtr(&Shell_NotifyIconW);
+    if (std.mem.eql(u8, name, "DragQueryFileW")) return @intFromPtr(&DragQueryFileW);
+    if (std.mem.eql(u8, name, "DragFinish")) return @intFromPtr(&DragFinish);
     return null;
 }
 
@@ -1087,7 +1278,46 @@ fn StringFromGUID2(rguid: ?*const anyopaque, lpsz: ?[*]u16, cchMax: i32) callcon
     return 39;
 }
 
+fn RegisterDragDrop(hwnd: usize, pDropTarget: ?*anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = pDropTarget;
+    return 0;
+}
+
+fn RevokeDragDrop(hwnd: usize) callconv(W) i32 {
+    _ = hwnd;
+    return 0;
+}
+
+fn DoDragDrop(pDataObj: ?*anyopaque, pDropSource: ?*anyopaque, dwOKEffects: u32, pdwEffect: ?*u32) callconv(W) i32 {
+    _ = pDataObj; _ = pDropSource; _ = dwOKEffects;
+    if (pdwEffect) |e| e.* = 0;
+    return 0x00040100;
+}
+
+fn OleInitialize(pvReserved: ?*anyopaque) callconv(W) i32 {
+    _ = pvReserved;
+    return 0;
+}
+
+fn OleUninitialize() callconv(W) void {}
+
+fn ReleaseStgMedium(pmedium: ?*anyopaque) callconv(W) void {
+    _ = pmedium;
+}
+
+fn CLSIDFromProgID(lpszProgID: ?[*:0]const u16, lpclsid: ?*anyopaque) callconv(W) i32 {
+    _ = lpszProgID; _ = lpclsid;
+    return 0;
+}
+
 pub fn lookupOle32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "RegisterDragDrop")) return @intFromPtr(&RegisterDragDrop);
+    if (std.mem.eql(u8, name, "RevokeDragDrop")) return @intFromPtr(&RevokeDragDrop);
+    if (std.mem.eql(u8, name, "DoDragDrop")) return @intFromPtr(&DoDragDrop);
+    if (std.mem.eql(u8, name, "OleInitialize")) return @intFromPtr(&OleInitialize);
+    if (std.mem.eql(u8, name, "OleUninitialize")) return @intFromPtr(&OleUninitialize);
+    if (std.mem.eql(u8, name, "ReleaseStgMedium")) return @intFromPtr(&ReleaseStgMedium);
+    if (std.mem.eql(u8, name, "CLSIDFromProgID")) return @intFromPtr(&CLSIDFromProgID);
     if (std.mem.eql(u8, name, "CoInitialize")) return @intFromPtr(&CoInitialize);
     if (std.mem.eql(u8, name, "CoTaskMemFree")) return @intFromPtr(&CoTaskMemFree);
     if (std.mem.eql(u8, name, "CoTaskMemAlloc")) return @intFromPtr(&CoTaskMemAlloc);
@@ -1194,5 +1424,400 @@ pub fn lookupMisc(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "IsNetworkAlive")) return @intFromPtr(&IsNetworkAlive);
     if (std.mem.eql(u8, name, "WinVerifyTrust")) return @intFromPtr(&WinVerifyTrust);
     if (std.mem.eql(u8, name, "if_nametoindex")) return @intFromPtr(&if_nametoindex);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// COMCTL32.dll (ImageList, Subclassing, TaskDialog)
+// ---------------------------------------------------------------------------
+
+fn ImageList_Create(cx: i32, cy: i32, flags: u32, cInitial: i32, cGrow: i32) callconv(W) usize {
+    _ = cx; _ = cy; _ = flags; _ = cInitial; _ = cGrow;
+    return 0xE0001;
+}
+
+fn ImageList_Destroy(himl: usize) callconv(W) i32 {
+    _ = himl;
+    return 1;
+}
+
+fn ImageList_AddMasked(himl: usize, hbmImage: usize, crMask: u32) callconv(W) i32 {
+    _ = himl; _ = hbmImage; _ = crMask;
+    return 0;
+}
+
+fn ImageList_ReplaceIcon(himl: usize, i: i32, hicon: usize) callconv(W) i32 {
+    _ = himl; _ = i; _ = hicon;
+    return 0;
+}
+
+fn ImageList_Draw(himl: usize, i: i32, hdcDst: usize, x: i32, y: i32, fStyle: u32) callconv(W) i32 {
+    _ = himl; _ = i; _ = hdcDst; _ = x; _ = y; _ = fStyle;
+    return 1;
+}
+
+fn ImageList_GetIcon(himl: usize, i: i32, flags: u32) callconv(W) usize {
+    _ = himl; _ = i; _ = flags;
+    return 0x40001;
+}
+
+fn ImageList_GetIconSize(himl: usize, cx: ?*i32, cy: ?*i32) callconv(W) i32 {
+    _ = himl;
+    if (cx) |x| x.* = 16;
+    if (cy) |y| y.* = 16;
+    return 1;
+}
+
+fn ImageList_GetImageInfo(himl: usize, i: i32, pImageInfo: ?*anyopaque) callconv(W) i32 {
+    _ = himl; _ = i; _ = pImageInfo;
+    return 1;
+}
+
+fn ImageList_Remove(himl: usize, i: i32) callconv(W) i32 {
+    _ = himl; _ = i;
+    return 1;
+}
+
+fn ImageList_SetIconSize(himl: usize, cx: i32, cy: i32) callconv(W) i32 {
+    _ = himl; _ = cx; _ = cy;
+    return 1;
+}
+
+fn ImageList_BeginDrag(himlTrack: usize, iTrack: i32, dxHotspot: i32, dyHotspot: i32) callconv(W) i32 {
+    _ = himlTrack; _ = iTrack; _ = dxHotspot; _ = dyHotspot;
+    return 1;
+}
+
+fn ImageList_EndDrag() callconv(W) void {}
+
+fn ImageList_DragEnter(hwndLock: usize, x: i32, y: i32) callconv(W) i32 {
+    _ = hwndLock; _ = x; _ = y;
+    return 1;
+}
+
+fn ImageList_DragLeave(hwndLock: usize) callconv(W) i32 {
+    _ = hwndLock;
+    return 1;
+}
+
+fn ImageList_DragMove(x: i32, y: i32) callconv(W) i32 {
+    _ = x; _ = y;
+    return 1;
+}
+
+fn ImageList_DragShowNolock(fShow: i32) callconv(W) i32 {
+    _ = fShow;
+    return 1;
+}
+
+fn _TrackMouseEvent(lpEventTrack: ?*anyopaque) callconv(W) i32 {
+    _ = lpEventTrack;
+    return 1;
+}
+
+fn SetWindowSubclass(hWnd: usize, pfnSubclass: ?*anyopaque, uIdSubclass: usize, dwRefData: usize) callconv(W) i32 {
+    _ = hWnd; _ = pfnSubclass; _ = uIdSubclass; _ = dwRefData;
+    return 1;
+}
+
+fn RemoveWindowSubclass(hWnd: usize, pfnSubclass: ?*anyopaque, uIdSubclass: usize) callconv(W) i32 {
+    _ = hWnd; _ = pfnSubclass; _ = uIdSubclass;
+    return 1;
+}
+
+fn DefSubclassProc(hWnd: usize, uMsg: u32, wParam: usize, lParam: usize) callconv(W) isize {
+    _ = hWnd; _ = uMsg; _ = wParam; _ = lParam;
+    return 0;
+}
+
+fn TaskDialogIndirect(pTaskConfig: ?*const anyopaque, pnButton: ?*i32, pnRadioButton: ?*i32, pfVerificationFlagChecked: ?*i32) callconv(W) i32 {
+    _ = pTaskConfig;
+    if (pnButton) |b| b.* = 1;
+    if (pnRadioButton) |r| r.* = 0;
+    if (pfVerificationFlagChecked) |v| v.* = 0;
+    return 0;
+}
+
+fn TaskDialog(hWndParent: usize, hInstance: usize, pszWindowTitle: ?*const u16, pszMainInstruction: ?*const u16, pszContent: ?*const u16, dwCommonButtons: u32, pszIcon: ?*const u16, pnButton: ?*i32) callconv(W) i32 {
+    _ = hWndParent; _ = hInstance; _ = pszWindowTitle; _ = pszMainInstruction; _ = pszContent; _ = dwCommonButtons; _ = pszIcon;
+    if (pnButton) |b| b.* = 1;
+    return 0;
+}
+
+fn UnregisterClassW(lpClassName: ?[*:0]const u16, hInstance: usize) callconv(W) i32 {
+    _ = lpClassName; _ = hInstance;
+    return 1;
+}
+
+pub fn lookupComctl32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "InitCommonControlsEx")) return @intFromPtr(&InitCommonControlsEx);
+    if (std.mem.eql(u8, name, "ImageList_Create")) return @intFromPtr(&ImageList_Create);
+    if (std.mem.eql(u8, name, "ImageList_Destroy")) return @intFromPtr(&ImageList_Destroy);
+    if (std.mem.eql(u8, name, "ImageList_AddMasked")) return @intFromPtr(&ImageList_AddMasked);
+    if (std.mem.eql(u8, name, "ImageList_ReplaceIcon")) return @intFromPtr(&ImageList_ReplaceIcon);
+    if (std.mem.eql(u8, name, "ImageList_Draw")) return @intFromPtr(&ImageList_Draw);
+    if (std.mem.eql(u8, name, "ImageList_GetIcon")) return @intFromPtr(&ImageList_GetIcon);
+    if (std.mem.eql(u8, name, "ImageList_GetIconSize")) return @intFromPtr(&ImageList_GetIconSize);
+    if (std.mem.eql(u8, name, "ImageList_GetImageInfo")) return @intFromPtr(&ImageList_GetImageInfo);
+    if (std.mem.eql(u8, name, "ImageList_Remove")) return @intFromPtr(&ImageList_Remove);
+    if (std.mem.eql(u8, name, "ImageList_SetIconSize")) return @intFromPtr(&ImageList_SetIconSize);
+    if (std.mem.eql(u8, name, "ImageList_BeginDrag")) return @intFromPtr(&ImageList_BeginDrag);
+    if (std.mem.eql(u8, name, "ImageList_EndDrag")) return @intFromPtr(&ImageList_EndDrag);
+    if (std.mem.eql(u8, name, "ImageList_DragEnter")) return @intFromPtr(&ImageList_DragEnter);
+    if (std.mem.eql(u8, name, "ImageList_DragLeave")) return @intFromPtr(&ImageList_DragLeave);
+    if (std.mem.eql(u8, name, "ImageList_DragMove")) return @intFromPtr(&ImageList_DragMove);
+    if (std.mem.eql(u8, name, "ImageList_DragShowNolock")) return @intFromPtr(&ImageList_DragShowNolock);
+    if (std.mem.eql(u8, name, "_TrackMouseEvent")) return @intFromPtr(&_TrackMouseEvent);
+    if (std.mem.eql(u8, name, "SetWindowSubclass")) return @intFromPtr(&SetWindowSubclass);
+    if (std.mem.eql(u8, name, "RemoveWindowSubclass")) return @intFromPtr(&RemoveWindowSubclass);
+    if (std.mem.eql(u8, name, "DefSubclassProc")) return @intFromPtr(&DefSubclassProc);
+    if (std.mem.eql(u8, name, "TaskDialogIndirect")) return @intFromPtr(&TaskDialogIndirect);
+    if (std.mem.eql(u8, name, "TaskDialog")) return @intFromPtr(&TaskDialog);
+    if (std.mem.eql(u8, name, "UnregisterClassW")) return @intFromPtr(&UnregisterClassW);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// COMDLG32.dll
+// ---------------------------------------------------------------------------
+
+fn ChooseColorW(lpcc: ?*anyopaque) callconv(W) i32 {
+    _ = lpcc;
+    return 1;
+}
+
+fn PrintDlgW(lppd: ?*anyopaque) callconv(W) i32 {
+    _ = lppd;
+    return 1;
+}
+
+pub fn lookupComdlg32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "ChooseColorW")) return @intFromPtr(&ChooseColorW);
+    if (std.mem.eql(u8, name, "PrintDlgW")) return @intFromPtr(&PrintDlgW);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// UXTHEME.dll
+// ---------------------------------------------------------------------------
+
+fn OpenThemeData(hwnd: usize, pszClassList: ?[*:0]const u16) callconv(W) usize {
+    _ = hwnd; _ = pszClassList;
+    return 0x70001;
+}
+
+fn CloseThemeData(hTheme: usize) callconv(W) i32 {
+    _ = hTheme;
+    return 0;
+}
+
+fn DrawThemeBackground(hTheme: usize, hdc: usize, iPartId: i32, iStateId: i32, pRect: ?*const anyopaque, pClipRect: ?*const anyopaque) callconv(W) i32 {
+    _ = hTheme; _ = hdc; _ = iPartId; _ = iStateId; _ = pRect; _ = pClipRect;
+    return 0;
+}
+
+fn DrawThemeParentBackground(hwnd: usize, hdc: usize, prc: ?*const anyopaque) callconv(W) i32 {
+    _ = hwnd; _ = hdc; _ = prc;
+    return 0;
+}
+
+fn DrawThemeTextEx(hTheme: usize, hdc: usize, iPartId: i32, iStateId: i32, pszText: ?[*:0]const u16, iCharCount: i32, dwFlags: u32, pRect: ?*anyopaque, pOptions: ?*const anyopaque) callconv(W) i32 {
+    _ = hTheme; _ = hdc; _ = iPartId; _ = iStateId; _ = pszText; _ = iCharCount; _ = dwFlags; _ = pRect; _ = pOptions;
+    return 0;
+}
+
+fn EnableThemeDialogTexture(hwnd: usize, dwFlags: u32) callconv(W) i32 {
+    _ = hwnd; _ = dwFlags;
+    return 0;
+}
+
+fn GetThemeColor(hTheme: usize, iPartId: i32, iStateId: i32, iPropId: i32, pColor: ?*u32) callconv(W) i32 {
+    _ = hTheme; _ = iPartId; _ = iStateId; _ = iPropId;
+    if (pColor) |c| c.* = 0;
+    return 0;
+}
+
+fn GetThemeFont(hTheme: usize, hdc: usize, iPartId: i32, iStateId: i32, iPropId: i32, pFont: ?*anyopaque) callconv(W) i32 {
+    _ = hTheme; _ = hdc; _ = iPartId; _ = iStateId; _ = iPropId; _ = pFont;
+    return 0;
+}
+
+fn GetThemePartSize(hTheme: usize, hdc: usize, iPartId: i32, iStateId: i32, prc: ?*const anyopaque, eSize: i32, psz: ?*anyopaque) callconv(W) i32 {
+    _ = hTheme; _ = hdc; _ = iPartId; _ = iStateId; _ = prc; _ = eSize;
+    if (psz) |s| {
+        const ptr: *[2]i32 = @ptrCast(@alignCast(s));
+        ptr[0] = 16;
+        ptr[1] = 16;
+    }
+    return 0;
+}
+
+fn GetThemeBackgroundContentRect(hTheme: usize, hdc: usize, iPartId: i32, iStateId: i32, pBoundingRect: ?*const anyopaque, pContentRect: ?*anyopaque) callconv(W) i32 {
+    _ = hTheme; _ = hdc; _ = iPartId; _ = iStateId;
+    if (pBoundingRect != null and pContentRect != null) {
+        const src: *const [4]i32 = @ptrCast(@alignCast(pBoundingRect.?));
+        const dst: *[4]i32 = @ptrCast(@alignCast(pContentRect.?));
+        dst.* = src.*;
+    }
+    return 0;
+}
+
+fn GetThemeTransitionDuration(hTheme: usize, iPartId: i32, iStateIdFrom: i32, iStateIdTo: i32, iPropId: i32, pdwDuration: ?*u32) callconv(W) i32 {
+    _ = hTheme; _ = iPartId; _ = iStateIdFrom; _ = iStateIdTo; _ = iPropId;
+    if (pdwDuration) |d| d.* = 0;
+    return 0;
+}
+
+fn SetWindowTheme(hwnd: usize, pszSubAppName: ?[*:0]const u16, pszSubIdList: ?[*:0]const u16) callconv(W) i32 {
+    _ = hwnd; _ = pszSubAppName; _ = pszSubIdList;
+    return 0;
+}
+
+fn BeginBufferedAnimation(hwnd: usize, hdcTarget: usize, rcTarget: ?*const anyopaque, dwFormat: i32, pPaintParams: ?*const anyopaque, pAnimationParams: ?*const anyopaque, phdcFrom: ?*usize, phdcTo: ?*usize) callconv(W) usize {
+    _ = hwnd; _ = rcTarget; _ = dwFormat; _ = pPaintParams; _ = pAnimationParams;
+    if (phdcFrom) |f| f.* = hdcTarget;
+    if (phdcTo) |t| t.* = hdcTarget;
+    return 0x60001;
+}
+
+fn BufferedPaintRenderAnimation(hwnd: usize, hdcTarget: usize) callconv(W) i32 {
+    _ = hwnd; _ = hdcTarget;
+    return 1;
+}
+
+fn BufferedPaintStopAllAnimations(hwnd: usize) callconv(W) i32 {
+    _ = hwnd;
+    return 0;
+}
+
+fn EndBufferedAnimation(hAnimation: usize, fUpdateTarget: i32) callconv(W) i32 {
+    _ = hAnimation; _ = fUpdateTarget;
+    return 0;
+}
+
+pub fn lookupUxtheme(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "OpenThemeData")) return @intFromPtr(&OpenThemeData);
+    if (std.mem.eql(u8, name, "CloseThemeData")) return @intFromPtr(&CloseThemeData);
+    if (std.mem.eql(u8, name, "DrawThemeBackground")) return @intFromPtr(&DrawThemeBackground);
+    if (std.mem.eql(u8, name, "DrawThemeParentBackground")) return @intFromPtr(&DrawThemeParentBackground);
+    if (std.mem.eql(u8, name, "DrawThemeTextEx")) return @intFromPtr(&DrawThemeTextEx);
+    if (std.mem.eql(u8, name, "EnableThemeDialogTexture")) return @intFromPtr(&EnableThemeDialogTexture);
+    if (std.mem.eql(u8, name, "GetThemeColor")) return @intFromPtr(&GetThemeColor);
+    if (std.mem.eql(u8, name, "GetThemeFont")) return @intFromPtr(&GetThemeFont);
+    if (std.mem.eql(u8, name, "GetThemePartSize")) return @intFromPtr(&GetThemePartSize);
+    if (std.mem.eql(u8, name, "GetThemeBackgroundContentRect")) return @intFromPtr(&GetThemeBackgroundContentRect);
+    if (std.mem.eql(u8, name, "GetThemeTransitionDuration")) return @intFromPtr(&GetThemeTransitionDuration);
+    if (std.mem.eql(u8, name, "SetWindowTheme")) return @intFromPtr(&SetWindowTheme);
+    if (std.mem.eql(u8, name, "BeginBufferedAnimation")) return @intFromPtr(&BeginBufferedAnimation);
+    if (std.mem.eql(u8, name, "BufferedPaintRenderAnimation")) return @intFromPtr(&BufferedPaintRenderAnimation);
+    if (std.mem.eql(u8, name, "BufferedPaintStopAllAnimations")) return @intFromPtr(&BufferedPaintStopAllAnimations);
+    if (std.mem.eql(u8, name, "EndBufferedAnimation")) return @intFromPtr(&EndBufferedAnimation);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// DWMAPI.dll
+// ---------------------------------------------------------------------------
+
+fn DwmGetColorizationColor(pcrColorization: ?*u32, pfOpaqueBlend: ?*i32) callconv(W) i32 {
+    if (pcrColorization) |c| c.* = 0xFF0078D7;
+    if (pfOpaqueBlend) |b| b.* = 1;
+    return 0;
+}
+
+fn DwmSetWindowAttribute(hwnd: usize, dwAttribute: u32, pvAttribute: ?*const anyopaque, cbAttribute: u32) callconv(W) i32 {
+    _ = hwnd; _ = dwAttribute; _ = pvAttribute; _ = cbAttribute;
+    return 0;
+}
+
+pub fn lookupDwmapi(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "DwmGetColorizationColor")) return @intFromPtr(&DwmGetColorizationColor);
+    if (std.mem.eql(u8, name, "DwmSetWindowAttribute")) return @intFromPtr(&DwmSetWindowAttribute);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// DBGHELP.dll & WININET.dll
+// ---------------------------------------------------------------------------
+
+fn ImageNtHeader(Base: usize) callconv(W) usize {
+    _ = Base;
+    return 0;
+}
+
+pub fn lookupDbghelp(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "ImageNtHeader")) return @intFromPtr(&ImageNtHeader);
+    return null;
+}
+
+fn InternetCrackUrlW(lpszUrl: ?[*:0]const u16, dwUrlLength: u32, dwFlags: u32, lpUrlComponents: ?*anyopaque) callconv(W) i32 {
+    _ = lpszUrl; _ = dwUrlLength; _ = dwFlags; _ = lpUrlComponents;
+    return 1;
+}
+
+pub fn lookupWininet(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "InternetCrackUrlW")) return @intFromPtr(&InternetCrackUrlW);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// IMM32.dll
+// ---------------------------------------------------------------------------
+
+fn ImmGetContext(hWnd: usize) callconv(W) usize {
+    _ = hWnd;
+    return 0x30001;
+}
+
+fn ImmReleaseContext(hWnd: usize, hIMC: usize) callconv(W) i32 {
+    _ = hWnd; _ = hIMC;
+    return 1;
+}
+
+fn ImmGetCompositionStringW(hIMC: usize, dwIndex: u32, lpBuf: ?*anyopaque, dwBufLen: u32) callconv(W) i32 {
+    _ = hIMC; _ = dwIndex; _ = lpBuf; _ = dwBufLen;
+    return 0;
+}
+
+fn ImmSetCompositionWindow(hIMC: usize, lpCompForm: ?*const anyopaque) callconv(W) i32 {
+    _ = hIMC; _ = lpCompForm;
+    return 1;
+}
+
+fn ImmSetCompositionFontW(hIMC: usize, lplf: ?*const anyopaque) callconv(W) i32 {
+    _ = hIMC; _ = lplf;
+    return 1;
+}
+
+fn ImmSetCandidateWindow(hIMC: usize, lpCandidate: ?*const anyopaque) callconv(W) i32 {
+    _ = hIMC; _ = lpCandidate;
+    return 1;
+}
+
+fn ImmNotifyIME(hIMC: usize, dwAction: u32, dwIndex: u32, dwValue: u32) callconv(W) i32 {
+    _ = hIMC; _ = dwAction; _ = dwIndex; _ = dwValue;
+    return 1;
+}
+
+fn ImmEscapeW(hKL: usize, hIMC: usize, uEscape: u32, lpData: ?*anyopaque) callconv(W) usize {
+    _ = hKL; _ = hIMC; _ = uEscape; _ = lpData;
+    return 0;
+}
+
+fn ImmSetCompositionStringW(hIMC: usize, dwIndex: u32, lpComp: ?*const anyopaque, dwCompLen: u32, lpRead: ?*const anyopaque, dwReadLen: u32) callconv(W) i32 {
+    _ = hIMC; _ = dwIndex; _ = lpComp; _ = dwCompLen; _ = lpRead; _ = dwReadLen;
+    return 1;
+}
+
+pub fn lookupImm32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "ImmGetContext")) return @intFromPtr(&ImmGetContext);
+    if (std.mem.eql(u8, name, "ImmReleaseContext")) return @intFromPtr(&ImmReleaseContext);
+    if (std.mem.eql(u8, name, "ImmGetCompositionStringW")) return @intFromPtr(&ImmGetCompositionStringW);
+    if (std.mem.eql(u8, name, "ImmSetCompositionWindow")) return @intFromPtr(&ImmSetCompositionWindow);
+    if (std.mem.eql(u8, name, "ImmSetCompositionFontW")) return @intFromPtr(&ImmSetCompositionFontW);
+    if (std.mem.eql(u8, name, "ImmSetCandidateWindow")) return @intFromPtr(&ImmSetCandidateWindow);
+    if (std.mem.eql(u8, name, "ImmNotifyIME")) return @intFromPtr(&ImmNotifyIME);
+    if (std.mem.eql(u8, name, "ImmEscapeW")) return @intFromPtr(&ImmEscapeW);
+    if (std.mem.eql(u8, name, "ImmSetCompositionStringW")) return @intFromPtr(&ImmSetCompositionStringW);
     return null;
 }

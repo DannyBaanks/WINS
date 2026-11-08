@@ -2273,6 +2273,243 @@ fn lstrlenA(lpString: ?[*:0]const u8) callconv(W) i32 {
     return len;
 }
 
+fn GetProductInfo(dwOSMajorVersion: u32, dwOSMinorVersion: u32, dwSpMajorVersion: u32, dwSpMinorVersion: u32, pdwReturnedProductType: ?*u32) callconv(W) i32 {
+    _ = dwOSMajorVersion; _ = dwOSMinorVersion; _ = dwSpMajorVersion; _ = dwSpMinorVersion;
+    if (pdwReturnedProductType) |p| p.* = 0x00000030;
+    return 1;
+}
+
+fn GetTickCount64() callconv(W) u64 {
+    return 1000000;
+}
+
+fn TerminateThread(hThread: usize, dwExitCode: u32) callconv(W) i32 {
+    _ = hThread; _ = dwExitCode;
+    return 1;
+}
+
+fn lstrcmpiW(lpString1: ?[*:0]const u16, lpString2: ?[*:0]const u16) callconv(W) i32 {
+    if (lpString1 == null or lpString2 == null) return 0;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        var c1 = lpString1.?[i];
+        var c2 = lpString2.?[i];
+        if (c1 >= 'A' and c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' and c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return if (c1 < c2) -1 else 1;
+        if (c1 == 0) return 0;
+    }
+}
+
+fn lstrcmpiA(lpString1: ?[*:0]const u8, lpString2: ?[*:0]const u8) callconv(W) i32 {
+    if (lpString1 == null or lpString2 == null) return 0;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        var c1 = lpString1.?[i];
+        var c2 = lpString2.?[i];
+        if (c1 >= 'A' and c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' and c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return if (c1 < c2) -1 else 1;
+        if (c1 == 0) return 0;
+    }
+}
+
+fn lstrcpynW(lpString1: ?[*:0]u16, lpString2: ?[*:0]const u16, iMaxLength: i32) callconv(W) ?[*:0]u16 {
+    if (lpString1) |dst| {
+        if (iMaxLength > 0) {
+            var i: usize = 0;
+            const max: usize = @intCast(iMaxLength - 1);
+            if (lpString2) |src| {
+                while (i < max and src[i] != 0) : (i += 1) {
+                    dst[i] = src[i];
+                }
+            }
+            dst[i] = 0;
+        }
+    }
+    return lpString1;
+}
+
+fn lstrcpynA(lpString1: ?[*:0]u8, lpString2: ?[*:0]const u8, iMaxLength: i32) callconv(W) ?[*:0]u8 {
+    if (lpString1) |dst| {
+        if (iMaxLength > 0) {
+            var i: usize = 0;
+            const max: usize = @intCast(iMaxLength - 1);
+            if (lpString2) |src| {
+                while (i < max and src[i] != 0) : (i += 1) {
+                    dst[i] = src[i];
+                }
+            }
+            dst[i] = 0;
+        }
+    }
+    return lpString1;
+}
+
+fn GetFinalPathNameByHandleW(hFile: usize, lpszFilePath: ?[*:0]u16, cchFilePath: u32, dwFlags: u32) callconv(W) u32 {
+    _ = hFile; _ = dwFlags;
+    if (lpszFilePath) |s| {
+        if (cchFilePath > 0) s[0] = 0;
+    }
+    return 0;
+}
+
+fn FindFirstStreamW(lpFileName: ?[*:0]const u16, InfoLevel: u32, lpFindStreamData: ?*anyopaque, dwFlags: u32) callconv(W) usize {
+    _ = lpFileName; _ = InfoLevel; _ = lpFindStreamData; _ = dwFlags;
+    return ~@as(usize, 0);
+}
+
+fn FindResourceW(hModule: usize, lpName: ?*const anyopaque, lpType: ?*const anyopaque) callconv(W) usize {
+    _ = hModule; _ = lpName; _ = lpType;
+    return 0x7001;
+}
+
+fn LoadResource(hModule: usize, hResInfo: usize) callconv(W) usize {
+    _ = hModule; _ = hResInfo;
+    return 0x8001;
+}
+
+fn LockResource(hResData: usize) callconv(W) ?*anyopaque {
+    _ = hResData;
+    return @ptrFromInt(0x8000);
+}
+
+fn SizeofResource(hModule: usize, hResInfo: usize) callconv(W) u32 {
+    _ = hModule; _ = hResInfo;
+    return 64;
+}
+
+fn GetLongPathNameW(lpszShortPath: ?[*:0]const u16, lpszLongPath: ?[*:0]u16, cchBuffer: u32) callconv(W) u32 {
+    _ = cchBuffer;
+    if (lpszShortPath != null and lpszLongPath != null) {
+        var i: usize = 0;
+        while (lpszShortPath.?[i] != 0) : (i += 1) {
+            lpszLongPath.?[i] = lpszShortPath.?[i];
+        }
+        lpszLongPath.?[i] = 0;
+        return @intCast(i);
+    }
+    return 0;
+}
+
+fn GetApplicationRestartSettings(hProcess: usize, pwzCommandline: ?*?*u16, pcchSize: ?*u32, pdwFlags: ?*u32) callconv(W) i32 {
+    _ = hProcess; _ = pwzCommandline; _ = pcchSize; _ = pdwFlags;
+    return -2147023728;
+}
+
+fn RegisterApplicationRestart(pwzCommandLine: ?[*:0]const u16, dwFlags: u32) callconv(W) i32 {
+    _ = pwzCommandLine; _ = dwFlags;
+    return 0;
+}
+
+fn UnregisterApplicationRestart() callconv(W) i32 {
+    return 0;
+}
+
+fn QueryFullProcessImageNameW(hProcess: usize, dwFlags: u32, lpExeName: ?[*:0]u16, lpdwSize: ?*u32) callconv(W) i32 {
+    _ = hProcess; _ = dwFlags;
+    if (lpExeName) |s| s[0] = 0;
+    if (lpdwSize) |sz| sz.* = 0;
+    return 1;
+}
+
+fn GlobalSize(hMem: usize) callconv(W) usize {
+    _ = hMem;
+    return 4096;
+}
+
+fn CopyFileExW(lpExistingFileName: ?[*:0]const u16, lpNewFileName: ?[*:0]const u16, lpProgressRoutine: ?*anyopaque, lpData: ?*anyopaque, pbCancel: ?*i32, dwCopyFlags: u32) callconv(W) i32 {
+    _ = lpExistingFileName; _ = lpNewFileName; _ = lpProgressRoutine; _ = lpData; _ = pbCancel; _ = dwCopyFlags;
+    return 1;
+}
+
+fn CompareStringOrdinal(lpString1: ?*const u16, cchCount1: i32, lpString2: ?*const u16, cchCount2: i32, bIgnoreCase: i32) callconv(W) i32 {
+    _ = lpString1; _ = cchCount1; _ = lpString2; _ = cchCount2; _ = bIgnoreCase;
+    return 2;
+}
+
+fn CompareStringEx(lpLocaleName: ?[*:0]const u16, dwCmpFlags: u32, lpString1: ?*const u16, cchCount1: i32, lpString2: ?*const u16, cchCount2: i32, lpVersionInformation: ?*anyopaque, lpReserved: ?*anyopaque, lParam: usize) callconv(W) i32 {
+    _ = lpLocaleName; _ = dwCmpFlags; _ = lpString1; _ = cchCount1; _ = lpString2; _ = cchCount2; _ = lpVersionInformation; _ = lpReserved; _ = lParam;
+    return 2;
+}
+
+fn Process32FirstW(hSnapshot: usize, lppe: ?*anyopaque) callconv(W) i32 {
+    _ = hSnapshot; _ = lppe;
+    return 0;
+}
+
+fn Process32NextW(hSnapshot: usize, lppe: ?*anyopaque) callconv(W) i32 {
+    _ = hSnapshot; _ = lppe;
+    return 0;
+}
+
+fn QueueUserAPC(pfnAPC: ?*anyopaque, hThread: usize, dwData: usize) callconv(W) u32 {
+    _ = pfnAPC; _ = hThread; _ = dwData;
+    return 1;
+}
+
+fn GetLocaleInfoA(Locale: u32, LCType: u32, lpLCData: ?[*:0]u8, cchData: i32) callconv(W) i32 {
+    _ = Locale; _ = LCType;
+    if (lpLCData) |s| {
+        if (cchData > 0) s[0] = 0;
+    }
+    return 1;
+}
+
+fn GetStringTypeExW(Locale: u32, dwInfoType: u32, lpSrcStr: ?*const u16, cchSrc: i32, lpCharType: ?*u16) callconv(W) i32 {
+    _ = Locale; _ = dwInfoType; _ = lpSrcStr; _ = cchSrc;
+    if (lpCharType) |ct| ct.* = 0;
+    return 1;
+}
+
+fn GetStringTypeExA(Locale: u32, dwInfoType: u32, lpSrcStr: ?*const u8, cchSrc: i32, lpCharType: ?*u16) callconv(W) i32 {
+    _ = Locale; _ = dwInfoType; _ = lpSrcStr; _ = cchSrc;
+    if (lpCharType) |ct| ct.* = 0;
+    return 1;
+}
+
+fn LCMapStringA(Locale: u32, dwMapFlags: u32, lpSrcStr: ?*const u8, cchSrc: i32, lpDestStr: ?*u8, cchDest: i32) callconv(W) i32 {
+    _ = Locale; _ = dwMapFlags; _ = lpSrcStr; _ = cchSrc; _ = lpDestStr; _ = cchDest;
+    return 1;
+}
+
+fn GetNativeSystemInfo(lpSystemInfo: ?*anyopaque) callconv(W) void {
+    const ptr: ?[*]u8 = if (lpSystemInfo) |p| @ptrCast(p) else null;
+    GetSystemInfo(ptr);
+}
+
+fn CreateThreadpoolWork(pfnwk: ?*anyopaque, pv: ?*anyopaque, pcbe: ?*anyopaque) callconv(W) usize {
+    _ = pfnwk; _ = pv; _ = pcbe;
+    return 0x9001;
+}
+
+fn SubmitThreadpoolWork(pwk: usize) callconv(W) void {
+    _ = pwk;
+}
+
+fn CloseThreadpoolWork(pwk: usize) callconv(W) void {
+    _ = pwk;
+}
+
+fn FreeLibraryWhenCallbackReturns(pci: ?*anyopaque, hLibModule: usize) callconv(W) void {
+    _ = pci; _ = hLibModule;
+}
+
+fn InitOnceBeginInitialize(lpInitOnce: ?*anyopaque, dwFlags: u32, fPending: ?*i32, lpContext: ?*?*anyopaque) callconv(W) i32 {
+    _ = lpInitOnce; _ = dwFlags; _ = lpContext;
+    if (fPending) |p| p.* = 0;
+    return 1;
+}
+
+fn InitOnceComplete(lpInitOnce: ?*anyopaque, dwFlags: u32, lpContext: ?*anyopaque) callconv(W) i32 {
+    _ = lpInitOnce; _ = dwFlags; _ = lpContext;
+    return 1;
+}
+
+fn GetVersion() callconv(W) u32 {
+    return 0x00060001;
+}
+
 pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "VirtualAlloc")) return @intFromPtr(&VirtualAlloc);
     if (std.mem.eql(u8, name, "VirtualFree")) return @intFromPtr(&VirtualFree);
@@ -2594,6 +2831,43 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "LocalAlloc")) return @intFromPtr(&LocalAlloc);
     if (std.mem.eql(u8, name, "GetFileInformationByHandleEx")) return @intFromPtr(&GetFileInformationByHandleEx);
     if (std.mem.eql(u8, name, "SetFileInformationByHandle")) return @intFromPtr(&SetFileInformationByHandle);
+    if (std.mem.eql(u8, name, "GetProductInfo")) return @intFromPtr(&GetProductInfo);
+    if (std.mem.eql(u8, name, "GetTickCount64")) return @intFromPtr(&GetTickCount64);
+    if (std.mem.eql(u8, name, "TerminateThread")) return @intFromPtr(&TerminateThread);
+    if (std.mem.eql(u8, name, "lstrcmpiW")) return @intFromPtr(&lstrcmpiW);
+    if (std.mem.eql(u8, name, "lstrcmpiA")) return @intFromPtr(&lstrcmpiA);
+    if (std.mem.eql(u8, name, "lstrcpynW")) return @intFromPtr(&lstrcpynW);
+    if (std.mem.eql(u8, name, "lstrcpynA")) return @intFromPtr(&lstrcpynA);
+    if (std.mem.eql(u8, name, "GetFinalPathNameByHandleW")) return @intFromPtr(&GetFinalPathNameByHandleW);
+    if (std.mem.eql(u8, name, "FindFirstStreamW")) return @intFromPtr(&FindFirstStreamW);
+    if (std.mem.eql(u8, name, "FindResourceW")) return @intFromPtr(&FindResourceW);
+    if (std.mem.eql(u8, name, "LoadResource")) return @intFromPtr(&LoadResource);
+    if (std.mem.eql(u8, name, "LockResource")) return @intFromPtr(&LockResource);
+    if (std.mem.eql(u8, name, "SizeofResource")) return @intFromPtr(&SizeofResource);
+    if (std.mem.eql(u8, name, "GetLongPathNameW")) return @intFromPtr(&GetLongPathNameW);
+    if (std.mem.eql(u8, name, "GetApplicationRestartSettings")) return @intFromPtr(&GetApplicationRestartSettings);
+    if (std.mem.eql(u8, name, "RegisterApplicationRestart")) return @intFromPtr(&RegisterApplicationRestart);
+    if (std.mem.eql(u8, name, "UnregisterApplicationRestart")) return @intFromPtr(&UnregisterApplicationRestart);
+    if (std.mem.eql(u8, name, "QueryFullProcessImageNameW")) return @intFromPtr(&QueryFullProcessImageNameW);
+    if (std.mem.eql(u8, name, "GlobalSize")) return @intFromPtr(&GlobalSize);
+    if (std.mem.eql(u8, name, "CopyFileExW")) return @intFromPtr(&CopyFileExW);
+    if (std.mem.eql(u8, name, "CompareStringOrdinal")) return @intFromPtr(&CompareStringOrdinal);
+    if (std.mem.eql(u8, name, "CompareStringEx")) return @intFromPtr(&CompareStringEx);
+    if (std.mem.eql(u8, name, "Process32FirstW")) return @intFromPtr(&Process32FirstW);
+    if (std.mem.eql(u8, name, "Process32NextW")) return @intFromPtr(&Process32NextW);
+    if (std.mem.eql(u8, name, "QueueUserAPC")) return @intFromPtr(&QueueUserAPC);
+    if (std.mem.eql(u8, name, "GetLocaleInfoA")) return @intFromPtr(&GetLocaleInfoA);
+    if (std.mem.eql(u8, name, "GetStringTypeExW")) return @intFromPtr(&GetStringTypeExW);
+    if (std.mem.eql(u8, name, "GetStringTypeExA")) return @intFromPtr(&GetStringTypeExA);
+    if (std.mem.eql(u8, name, "LCMapStringA")) return @intFromPtr(&LCMapStringA);
+    if (std.mem.eql(u8, name, "GetNativeSystemInfo")) return @intFromPtr(&GetNativeSystemInfo);
+    if (std.mem.eql(u8, name, "CreateThreadpoolWork")) return @intFromPtr(&CreateThreadpoolWork);
+    if (std.mem.eql(u8, name, "SubmitThreadpoolWork")) return @intFromPtr(&SubmitThreadpoolWork);
+    if (std.mem.eql(u8, name, "CloseThreadpoolWork")) return @intFromPtr(&CloseThreadpoolWork);
+    if (std.mem.eql(u8, name, "FreeLibraryWhenCallbackReturns")) return @intFromPtr(&FreeLibraryWhenCallbackReturns);
+    if (std.mem.eql(u8, name, "InitOnceBeginInitialize")) return @intFromPtr(&InitOnceBeginInitialize);
+    if (std.mem.eql(u8, name, "InitOnceComplete")) return @intFromPtr(&InitOnceComplete);
+    if (std.mem.eql(u8, name, "GetVersion")) return @intFromPtr(&GetVersion);
 
     return null;
 }

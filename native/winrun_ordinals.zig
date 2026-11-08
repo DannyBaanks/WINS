@@ -60,6 +60,26 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
         };
     }
 
+    if (std.ascii.eqlIgnoreCase(dll, "comctl32.dll")) {
+        return switch (ord) {
+            17 => "_TrackMouseEvent",
+            345 => "SetWindowSubclass",
+            381 => "DefSubclassProc",
+            410 => "RemoveWindowSubclass",
+            411 => "TaskDialogIndirect",
+            412 => "TaskDialog",
+            413 => "UnregisterClassW",
+            else => null,
+        };
+    }
+
+    if (std.ascii.eqlIgnoreCase(dll, "shell32.dll")) {
+        return switch (ord) {
+            165 => "SHCreateDirectoryExW",
+            else => null,
+        };
+    }
+
     if (std.ascii.eqlIgnoreCase(dll, "wldap32.dll")) {
         return switch (ord) {
             22 => "ldap_err2string",
