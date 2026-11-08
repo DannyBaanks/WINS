@@ -5,6 +5,7 @@
 bin/wins-fuzz
 native/winrun
 native/winrun_gui
+native/wins_fuzzer
 *.o
 *.exe
 *.dll
