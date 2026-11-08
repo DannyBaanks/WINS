@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const d3d9 = @import("wins_d3d9.zig");
 
 const W: std.builtin.CallingConvention = .winapi;
 
@@ -110,7 +111,17 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (std.mem.eql(u8, name, "GetStdHandle")) return @ptrCast(&GetStdHandle);
         if (std.mem.eql(u8, name, "WriteFile")) return @ptrCast(&WriteFile);
     } else if (std.ascii.eqlIgnoreCase(dll, "d3d9.dll")) {
-        if (std.mem.eql(u8, name, "D3DPERF_SetOptions")) return @ptrCast(&D3DPERF_SetOptions);
+        if (std.mem.eql(u8, name, "Direct3DCreate9")) return @ptrCast(&d3d9.Direct3DCreate9);
+        if (std.mem.eql(u8, name, "D3DPERF_SetOptions")) return @ptrCast(&d3d9.D3DPERF_SetOptions);
+        if (std.mem.eql(u8, name, "D3DPERF_BeginEvent")) return @ptrCast(&d3d9.D3DPERF_BeginEvent);
+        if (std.mem.eql(u8, name, "D3DPERF_EndEvent")) return @ptrCast(&d3d9.D3DPERF_EndEvent);
+    } else if (std.ascii.eqlIgnoreCase(dll, "d3dx9_38.dll")) {
+        if (std.mem.eql(u8, name, "D3DXMatrixMultiply")) return @ptrCast(&d3d9.D3DXMatrixMultiply);
+        if (std.mem.eql(u8, name, "D3DXMatrixTranspose")) return @ptrCast(&d3d9.D3DXMatrixTranspose);
+        if (std.mem.eql(u8, name, "D3DXMatrixMultiplyTranspose")) return @ptrCast(&d3d9.D3DXMatrixMultiplyTranspose);
+        if (std.mem.eql(u8, name, "D3DXVec3Normalize")) return @ptrCast(&d3d9.D3DXVec3Normalize);
+        if (std.mem.eql(u8, name, "D3DXVec3TransformCoord")) return @ptrCast(&d3d9.D3DXVec3TransformCoord);
+        if (std.mem.eql(u8, name, "D3DXVec4Transform")) return @ptrCast(&d3d9.D3DXVec4Transform);
     }
     return null;
 }
