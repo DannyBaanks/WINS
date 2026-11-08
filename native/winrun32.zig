@@ -119,9 +119,28 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (std.mem.eql(u8, name, "D3DXMatrixMultiply")) return @ptrCast(&d3d9.D3DXMatrixMultiply);
         if (std.mem.eql(u8, name, "D3DXMatrixTranspose")) return @ptrCast(&d3d9.D3DXMatrixTranspose);
         if (std.mem.eql(u8, name, "D3DXMatrixMultiplyTranspose")) return @ptrCast(&d3d9.D3DXMatrixMultiplyTranspose);
+        if (std.mem.eql(u8, name, "D3DXMatrixInverse")) return @ptrCast(&d3d9.D3DXMatrixInverse);
+        if (std.mem.eql(u8, name, "D3DXMatrixRotationYawPitchRoll")) return @ptrCast(&d3d9.D3DXMatrixRotationYawPitchRoll);
         if (std.mem.eql(u8, name, "D3DXVec3Normalize")) return @ptrCast(&d3d9.D3DXVec3Normalize);
         if (std.mem.eql(u8, name, "D3DXVec3TransformCoord")) return @ptrCast(&d3d9.D3DXVec3TransformCoord);
+        if (std.mem.eql(u8, name, "D3DXVec3TransformNormal")) return @ptrCast(&d3d9.D3DXVec3TransformNormal);
         if (std.mem.eql(u8, name, "D3DXVec4Transform")) return @ptrCast(&d3d9.D3DXVec4Transform);
+        if (std.mem.eql(u8, name, "D3DXPlaneNormalize")) return @ptrCast(&d3d9.D3DXPlaneNormalize);
+        if (std.mem.eql(u8, name, "D3DXPlaneTransform")) return @ptrCast(&d3d9.D3DXPlaneTransform);
+        if (std.mem.eql(u8, name, "D3DXCreateBuffer")) return @ptrCast(&d3d9.D3DXCreateBuffer);
+        if (std.mem.eql(u8, name, "D3DXGetShaderConstantTable")) return @ptrCast(&d3d9.D3DXGetShaderConstantTable);
+        if (std.mem.eql(u8, name, "D3DXGetVertexShaderProfile")) return @ptrCast(&d3d9.D3DXGetVertexShaderProfile);
+        if (std.mem.eql(u8, name, "D3DXGetPixelShaderProfile")) return @ptrCast(&d3d9.D3DXGetPixelShaderProfile);
+        if (std.mem.eql(u8, name, "D3DXAssembleShader")) return @ptrCast(&d3d9.D3DXAssembleShader);
+        if (std.mem.eql(u8, name, "D3DXAssembleShaderFromFileA")) return @ptrCast(&d3d9.D3DXAssembleShaderFromFileA);
+        if (std.mem.eql(u8, name, "D3DXCompileShader")) return @ptrCast(&d3d9.D3DXCompileShader);
+        if (std.mem.eql(u8, name, "D3DXCompileShaderFromFileA")) return @ptrCast(&d3d9.D3DXCompileShaderFromFileA);
+        if (std.mem.eql(u8, name, "D3DXGetImageInfoFromFileInMemory")) return @ptrCast(&d3d9.D3DXGetImageInfoFromFileInMemory);
+        if (std.mem.eql(u8, name, "D3DXCreateTextureFromFileInMemory")) return @ptrCast(&d3d9.D3DXCreateTextureFromFileInMemory);
+        if (std.mem.eql(u8, name, "D3DXCreateCubeTextureFromFileInMemory")) return @ptrCast(&d3d9.D3DXCreateCubeTextureFromFileInMemory);
+        if (std.mem.eql(u8, name, "D3DXCreateVolumeTextureFromFileInMemory")) return @ptrCast(&d3d9.D3DXCreateVolumeTextureFromFileInMemory);
+        if (std.mem.eql(u8, name, "D3DXLoadSurfaceFromSurface")) return @ptrCast(&d3d9.D3DXLoadSurfaceFromSurface);
+        if (std.mem.eql(u8, name, "D3DXSaveTextureToFileA")) return @ptrCast(&d3d9.D3DXSaveTextureToFileA);
     }
     return null;
 }
