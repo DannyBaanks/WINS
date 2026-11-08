@@ -157,8 +157,20 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             exitWith(code);
         }
 
+        var image_base_addr: usize = 0;
+
+        fn GetModuleHandleW(name: ?[*:0]const u16) callconv(W) usize {
+            if (name == null) return image_base_addr;
+            return 0;
+        }
+
+        fn GetModuleHandleA(name: ?[*:0]const u8) callconv(W) usize {
+            if (name == null) return image_base_addr;
+            return 0;
+        }
+
         const Export = struct { name: []const u8, addr: usize };
-        fn exports() [7]Export {
+        fn exports() [9]Export {
             return .{
                 .{ .name = "GetLastError", .addr = @intFromPtr(&GetLastError) },
                 .{ .name = "SetLastError", .addr = @intFromPtr(&SetLastError) },
@@ -167,6 +179,8 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                 .{ .name = "ReadFile", .addr = @intFromPtr(&ReadFile) },
                 .{ .name = "ExitProcess", .addr = @intFromPtr(&ExitProcess) },
                 .{ .name = "GetCurrentProcessId", .addr = @intFromPtr(&GetCurrentProcessId) },
+                .{ .name = "GetModuleHandleW", .addr = @intFromPtr(&GetModuleHandleW) },
+                .{ .name = "GetModuleHandleA", .addr = @intFromPtr(&GetModuleHandleA) },
             };
         }
 
@@ -289,6 +303,7 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             if (linux.errno(mrc) != .SUCCESS) die(.map_failed, "mmap of 0x{x} bytes failed", .{map_len});
             const base: usize = mrc;
             if (base == image_base) die(.map_failed, "kernel chose ImageBase itself; refusing to hide relocation bugs", .{});
+            image_base_addr = base;
             const img: []u8 = @as([*]u8, @ptrFromInt(base))[0..map_len];
             @memcpy(img[0..size_of_headers], file[0..size_of_headers]);
             for (secs) |s| {

@@ -39,6 +39,8 @@ class WinrunGuiTests(unittest.TestCase):
             if not shutil.which(tool):
                 raise unittest.SkipTest(f'{tool} is not installed')
         cls.directory = Path(tempfile.mkdtemp(prefix='wins-gui-'))
+        cls.wine_pfx = cls.directory / 'pfx'
+        cls.wine_pfx.mkdir(parents=True, exist_ok=True)
         cls.probe = cls.directory / 'probe.exe'
         cls.unresolved = cls.directory / 'unresolved.exe'
         cls.loader = cls.directory / 'loader'
@@ -65,6 +67,11 @@ class WinrunGuiTests(unittest.TestCase):
         zig_cc('-target', 'x86_64-windows-gnu', '-O2', '-nostdlib',
                '-Wl,-e,wWinMainCRTStartup,--subsystem,windows', '-lkernel32',
                'native/testdata/winrun_gui_tls_callback.c', '-o', cls.tls_withcb)
+        cls.wndproc_probe = cls.directory / 'wndproc_probe.exe'
+        zig('native/testdata/winrun_gui_wndproc_probe.zig', '-target', 'x86_64-windows-gnu',
+            '-O', 'ReleaseSmall', '-fentry=wWinMainCRTStartup', '--subsystem', 'windows',
+            '-luser32', '-lkernel32', f'-femit-bin={cls.wndproc_probe}')
+        cls.wndproc_digest = hashlib.sha256(cls.wndproc_probe.read_bytes()).hexdigest()
         cls.digest = hashlib.sha256(cls.probe.read_bytes()).hexdigest()
 
     def sandbox(self, loader, *args, server=False):
@@ -135,10 +142,31 @@ class WinrunGuiTests(unittest.TestCase):
     def test_same_probe_with_wine_when_available(self):
         if not shutil.which('wine'):
             self.skipTest('Wine reference unavailable')
-        argv = BOX + ['--ro-bind', str(self.probe), '/probe.exe', '--', '/bin/sh', '-c', SERVER,
+        argv = BOX + ['--bind', str(self.wine_pfx), '/tmp/pfx',
+                      '--ro-bind', str(self.probe), '/probe.exe', '--', '/bin/sh', '-c', SERVER,
                       'private-x11', '/usr/bin/wine', '/probe.exe']
         result = subprocess.run(argv, capture_output=True, text=True, timeout=180)
         self.assertEqual(result.returncode, 41, result.stderr)
+
+    def test_wndproc_message_loop_in_private_server(self):
+        """Custom window class, WndProc lifecycle (WM_CREATE, WM_PAINT, WM_CLOSE, WM_DESTROY),
+        message loop and PostQuitMessage exit in private Xvfb."""
+        argv = BOX + ['--ro-bind', str(self.wndproc_probe), '/probe.exe',
+                      '--ro-bind', str(self.loader), '/loader', '--']
+        command = ['/loader', '--sha256', self.wndproc_digest, '/probe.exe']
+        result = subprocess.run(argv + ['/bin/sh', '-c', SERVER, 'private-x11', *command],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 52, result.stderr)
+
+    def test_wndproc_matches_wine_when_available(self):
+        """Compare custom WndProc message loop execution with Wine 9 reference."""
+        if not shutil.which('wine'):
+            self.skipTest('Wine reference unavailable')
+        argv = BOX + ['--bind', str(self.wine_pfx), '/tmp/pfx',
+                      '--ro-bind', str(self.wndproc_probe), '/probe.exe', '--', '/bin/sh', '-c', SERVER,
+                      'private-x11', '/usr/bin/wine', '/probe.exe']
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 52, result.stderr)
 
 
 if __name__ == '__main__':

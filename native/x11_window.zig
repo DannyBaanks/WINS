@@ -7,6 +7,7 @@ extern "X11" fn XCloseDisplay(*Display) c_int;
 extern "X11" fn XDefaultRootWindow(*Display) Window;
 extern "X11" fn XCreateSimpleWindow(*Display, Window, c_int, c_int, c_uint, c_uint, c_uint, c_ulong, c_ulong) Window;
 extern "X11" fn XMapWindow(*Display, Window) c_int;
+extern "X11" fn XUnmapWindow(*Display, Window) c_int;
 extern "X11" fn XDestroyWindow(*Display, Window) c_int;
 extern "X11" fn XSync(*Display, c_int) c_int;
 extern "X11" fn XGetGeometry(*Display, Window, *Window, *c_int, *c_int, *c_uint, *c_uint, *c_uint, *c_uint) c_int;
@@ -42,6 +43,16 @@ pub const Connection = struct {
         var depth: c_uint = 0;
         if (XGetGeometry(self.display, window, &root, &x, &y, &width, &height, &border, &depth) == 0) return error.GeometryFailed;
         return .{ .width = width, .height = height };
+    }
+
+    pub fn map(self: Connection, window: Window) void {
+        _ = XMapWindow(self.display, window);
+        _ = XSync(self.display, 0);
+    }
+
+    pub fn unmap(self: Connection, window: Window) void {
+        _ = XUnmapWindow(self.display, window);
+        _ = XSync(self.display, 0);
     }
 
     pub fn destroy(self: Connection, window: Window) void {

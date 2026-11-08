@@ -193,14 +193,21 @@ test_same_probe_with_wine_when_available ... ok
 test_tls_data_only_probe_runs ... ok
 test_tls_with_callbacks_is_refused ... ok
 test_unimplemented_gui_import_refuses_before_entry ... ok
+test_wndproc_matches_wine_when_available ... ok
+test_wndproc_message_loop_in_private_server ... ok
 OK
 ```
 
-`winrun_gui` es una variante experimental separada. Resuelve solo un caso estrecho de `CreateWindowExW`, `GetClientRect` y `DestroyWindow`: una ventana `STATIC` popup visible sin padre ni título, en el Xvfb privado `:91`. Rechaza los argumentos fuera de ese caso; no implementa controles, pintura, callbacks ni bucle de mensajes, y el comportamiento de errores Win32 no está demostrado. El `winrun` normal sigue rechazando el subsistema gráfico.
+`winrun_gui` es una variante experimental separada (Peldaño 2). Resuelve llamadas a `user32.dll` (`CreateWindowExW`, `GetClientRect`, `DestroyWindow`, `RegisterClassExW`, `RegisterClassW`, `DefWindowProcW`, `ShowWindow`, `UpdateWindow`, `GetMessageW`, `PeekMessageW`, `TranslateMessage`, `DispatchMessageW`, `PostQuitMessage`, `PostMessageW`, `SendMessageW`) y `kernel32.dll` (`GetModuleHandleW`, `GetModuleHandleA`), ejecutando ventanas sintéticas sobre el servidor Xvfb privado `:91`.
+
+**Ciclo de vida Win32 y bucle de mensajes:**
+El loader permite registrar clases de ventana personalizadas con puntero a procedimiento de ventana (`lpfnWndProc`). Al crear la ventana (`CreateWindowExW`), despacha `WM_CREATE` con la estructura `CREATESTRUCTW`. Soporta mostrar y ocultar (`ShowWindow`), invalidar/actualizar (`UpdateWindow`), encolar mensajes (`PostMessageW`), despachar sincrónicamente (`SendMessageW`) y el bucle de mensajes estándar (`GetMessageW` -> `TranslateMessage` -> `DispatchMessageW`). Al recibir `WM_CLOSE`, `DefWindowProcW` destruye la ventana, despachando `WM_DESTROY`. `PostQuitMessage` encola `WM_QUIT`, haciendo que `GetMessageW` devuelva 0 y finalice el bucle con el código de salida especificado.
+
+La sonda sintética `native/testdata/winrun_gui_wndproc_probe.zig` ejerce este ciclo completo y finaliza con código 52 tanto bajo `winrun_gui` como bajo Wine 9.0 en Xvfb privado.
 
 **TLS y SEH (loader GUI):** a partir de este peldaño el loader GUI tolera TLS *data-only* (sin callbacks) y registros de desenrollado con manejadores SEH. El TLS data-only se inicializa con el template de la imagen (slot 0); los manejadores SEH están presentes en el encabezado de excepción pero no se despachan: si una excepción real llegara, la señal Linux terminaría el proceso. Esto es necesario para pasar el rechazo de verificación inicial de Notepad++ (21 DLLs, 629 imports), cuyo siguiente bloqueo es exit 4 (imports sin resolver). El loader de consola sigue rechazando TLS y SEH.
 
-**Esto no demuestra que Notepad++ funcione.** Nunca uses la variante experimental con un servidor de escritorio o fuera de `bubblewrap`.
+**Esto no demuestra que Notepad++ funcione.** Todavía faltan APIs gráficas GDI32, controles COMCTL32, COM/OLE y bucles Win32 completos. Nunca uses la variante experimental con un servidor de escritorio o fuera de `bubblewrap`.
 
 # winrun: cargador nativo de PE de consola (peldaño 1)
 
