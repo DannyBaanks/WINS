@@ -173,7 +173,34 @@ test_window_round_trip_and_zero_size_rejection ... ok
 OK
 ```
 
-Requiere Zig, bibliotecas de desarrollo X11, `bubblewrap` y `Xvfb`. La prueba crea su propio servidor sin red dentro de la caja; no conecta al escritorio. Desactiva GLX y DRI3 porque en este host Xvfb falló al intentar cargar el controlador gráfico. Compara dimensiones solicitadas con la respuesta del servidor y comprueba casos negativos. Esta base X11 es independiente de `winrun`: **no implementa USER32, no ejecuta programas gráficos de Windows y no demuestra que Notepad++ funcione**.
+Requiere Zig, bibliotecas de desarrollo X11, `bubblewrap` y `Xvfb`. La prueba crea su propio servidor sin red dentro de la caja; no conecta al escritorio. Desactiva GLX y DRI3 porque en este host Xvfb falló al intentar cargar el controlador gráfico. Compara dimensiones solicitadas con la respuesta del servidor y comprueba casos negativos.
+
+Para probar además el cargador gráfico experimental con un PE sintético:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 XDG_CACHE_HOME=/tmp/wins-gui-cache python3 -m unittest native.test_winrun_gui -v
+```
+
+Salida real, abreviada:
+
+```text
+test_console_loader_still_refuses_gui ... ok
+test_console_loader_still_refuses_tls ... ok
+test_gui_fails_without_display ... ok
+test_gui_loader_still_requires_exact_hash ... ok
+test_gui_probe_in_private_server ... ok
+test_same_probe_with_wine_when_available ... ok
+test_tls_data_only_probe_runs ... ok
+test_tls_with_callbacks_is_refused ... ok
+test_unimplemented_gui_import_refuses_before_entry ... ok
+OK
+```
+
+`winrun_gui` es una variante experimental separada. Resuelve solo un caso estrecho de `CreateWindowExW`, `GetClientRect` y `DestroyWindow`: una ventana `STATIC` popup visible sin padre ni título, en el Xvfb privado `:91`. Rechaza los argumentos fuera de ese caso; no implementa controles, pintura, callbacks ni bucle de mensajes, y el comportamiento de errores Win32 no está demostrado. El `winrun` normal sigue rechazando el subsistema gráfico.
+
+**TLS y SEH (loader GUI):** a partir de este peldaño el loader GUI tolera TLS *data-only* (sin callbacks) y registros de desenrollado con manejadores SEH. El TLS data-only se inicializa con el template de la imagen (slot 0); los manejadores SEH están presentes en el encabezado de excepción pero no se despachan: si una excepción real llegara, la señal Linux terminaría el proceso. Esto es necesario para pasar el rechazo de verificación inicial de Notepad++ (21 DLLs, 629 imports), cuyo siguiente bloqueo es exit 4 (imports sin resolver). El loader de consola sigue rechazando TLS y SEH.
+
+**Esto no demuestra que Notepad++ funcione.** Nunca uses la variante experimental con un servidor de escritorio o fuera de `bubblewrap`.
 
 # winrun: cargador nativo de PE de consola (peldaño 1)
 
@@ -295,5 +322,5 @@ Los tres controles negativos fallan en la iteración 0:
 
 Pruebas automatizadas: `python3 -m unittest native.test_winrun -v`.
 
-**Límites (NOT_DEMONSTRATED):** solo x86-64 y consola. No soporta DLLs externas, llamadas a la API de Windows fuera de las 6 funciones mínimas de `kernel32`, SEH / desenrollado de excepciones con manejadores, TLS, TEB/PEB ni interfaz gráfica. El código de salida de Windows se trunca a 8 bits por el kernel de Linux.
+**Límites (NOT_DEMONSTRATED):** solo x86-64 y consola. No soporta DLLs externas, llamadas a la API de Windows fuera de las 7 funciones mínimas de `kernel32`, SEH / desenrollado de excepciones con manejadores, TLS, TEB/PEB ni interfaz gráfica. El código de salida de Windows se trunca a 8 bits por el kernel de Linux.
 

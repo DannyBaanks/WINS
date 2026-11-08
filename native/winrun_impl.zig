@@ -71,6 +71,15 @@ const SCN_CODE: u32 = 0x00000020;
 const Section = struct { name: [8]u8, va: u32, vsize: u32, raw_ptr: u32, raw_size: u32, chars: u32 };
 
 pub fn Impl(comptime bug: Bug) type {
+    return ImplMode(bug, false);
+}
+
+/// Separate experimental executable only; the normal loader remains console-only.
+pub fn GuiImpl(comptime bug: Bug) type {
+    return ImplMode(bug, true);
+}
+
+fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
     return struct {
         threadlocal var last_error: u32 = 0;
 
@@ -162,8 +171,12 @@ pub fn Impl(comptime bug: Bug) type {
         }
 
         fn lookup(lib: []const u8, name: []const u8) ?usize {
-            if (!std.ascii.eqlIgnoreCase(lib, "kernel32.dll")) return null;
-            for (exports()) |e| if (std.mem.eql(u8, name, e.name)) return e.addr;
+            if (std.ascii.eqlIgnoreCase(lib, "kernel32.dll")) {
+                for (exports()) |e| if (std.mem.eql(u8, name, e.name)) return e.addr;
+            }
+            if (comptime gui) {
+                if (std.ascii.eqlIgnoreCase(lib, "user32.dll")) return @import("winrun_gui_support.zig").lookup(name);
+            }
             return null;
         }
 
@@ -223,7 +236,7 @@ pub fn Impl(comptime bug: Bug) type {
             const size_of_headers = need(u32, file, opt + 60, "SizeOfHeaders");
             const subsystem = need(u16, file, opt + 68, "subsystem");
             const ndirs = need(u32, file, opt + 108, "NumberOfRvaAndSizes");
-            if (subsystem != 3) die(.refused, "subsystem {d} is not console (3)", .{subsystem});
+            if (subsystem != 3 and !(gui and subsystem == 2)) die(.refused, "subsystem {d} is not console (3)", .{subsystem});
             if (sect_align < 4096 or sect_align % 4096 != 0) die(.refused, "SectionAlignment 0x{x} below page size", .{sect_align});
             if (size_of_image == 0 or size_of_image > 256 * 1024 * 1024) die(.bad_image, "SizeOfImage 0x{x}", .{size_of_image});
             if (size_of_headers > file.len or size_of_headers > size_of_image) die(.bad_image, "SizeOfHeaders 0x{x}", .{size_of_headers});
@@ -232,10 +245,19 @@ pub fn Impl(comptime bug: Bug) type {
             const Dir = struct { rva: u32, size: u32 };
             var dirs: [16]Dir = undefined;
             for (&dirs, 0..) |*d, k| d.* = .{ .rva = need(u32, file, opt + 112 + k * 8, "dir"), .size = need(u32, file, opt + 116 + k * 8, "dir") };
-            if (dirs[9].size != 0) die(.refused, "TLS directory present (unsupported)", .{});
+            if (!gui and dirs[9].size != 0) die(.refused, "TLS directory present (unsupported)", .{});
             if (dirs[13].size != 0) die(.refused, "delay-import directory present (unsupported)", .{});
             if (dirs[14].size != 0) die(.refused, "CLR header present (managed code unsupported)", .{});
             if (dirs[11].size != 0) die(.refused, "bound-import directory present (unsupported)", .{});
+
+            // TLS: data-only allowed in GUI mode (no callbacks).
+            // We read the directory early so we know the template bounds; we apply it
+            // after the image is mapped (step 4) in a separate block below.
+            const tls_present: bool = gui and dirs[9].size != 0;
+            // PE32+ TLS directory is 40 bytes: start_va(8) end_va(8) index_va(8) callbacks_va(8) zero_fill(4) characteristics(4)
+            const tls_min_size: u32 = 40;
+            if (tls_present and dirs[9].size < tls_min_size) die(.bad_image, "TLS directory too small ({d})", .{dirs[9].size});
+            if (tls_present and @as(u64, dirs[9].rva) + dirs[9].size > size_of_image) die(.bad_image, "TLS directory beyond image", .{});
 
             // 3. Sections.
             const sec_off = opt + opt_size;
@@ -274,6 +296,36 @@ pub fn Impl(comptime bug: Bug) type {
                 if (n != 0) @memcpy(img[s.va..][0..n], file[s.raw_ptr..][0..n]);
             }
 
+            // 4b. TLS data-only setup (GUI mode, no callbacks).
+            // After sections are copied, patch the TLS index slot so thread_local
+            // statics in the program see slot 0.  We allocate a single TLS block
+            // from the anonymous mapping (the template bytes are already there
+            // because they lived in a data section that was copied above).
+            // This is single-threaded; there is no TLS expansion array.
+            if (tls_present) {
+                const td = dirs[9].rva; // TLS directory RVA (in image, post-copy)
+                const start_va = need(u64, img, td + 0, "TLS.StartAddressOfRawData");
+                const end_va = need(u64, img, td + 8, "TLS.EndAddressOfRawData");
+                const index_va = need(u64, img, td + 16, "TLS.AddressOfIndex");
+                const cb_va = need(u64, img, td + 24, "TLS.AddressOfCallBacks");
+                if (start_va > end_va) die(.bad_image, "TLS start_va > end_va", .{});
+                if (end_va - start_va > 1024 * 1024) die(.refused, "TLS template too large ({})", .{end_va - start_va});
+                // Callbacks must be an array starting with a null pointer (empty).
+                if (cb_va != 0) {
+                    const cb_rva = cb_va -% image_base;
+                    if (cb_rva >= size_of_image or cb_rva + 8 > size_of_image) die(.bad_image, "TLS callbacks VA out of image", .{});
+                    const first_cb = need(u64, img, @intCast(cb_rva), "TLS.Callbacks[0]");
+                    if (first_cb != 0) die(.refused, "TLS callbacks present (unsupported)", .{});
+                }
+                // Patch AddressOfIndex with the relocated VA of the slot.
+                // The TLS index storage lives in the image's .tls section which is
+                // already writable (data section).  We just write 0 there directly.
+                const index_rva = index_va -% image_base;
+                if (index_rva >= size_of_image or index_rva + 4 > size_of_image) die(.bad_image, "TLS index VA out of image", .{});
+                std.mem.writeInt(u32, img[@intCast(index_rva)..][0..4], 0, .little);
+                // start_va used above in size check; template already in image.
+            }
+
             // 5. Base relocations.
             const delta: u64 = @as(u64, base) -% image_base;
             var n_relocs: usize = 0;
@@ -309,7 +361,12 @@ pub fn Impl(comptime bug: Bug) type {
                 if (p != end) die(.bad_image, "truncated relocation block", .{});
             } else die(.refused, "no relocation directory; winrun never maps at ImageBase", .{});
 
-            // 6. Exception data: tolerate unwind info, refuse handlers (nothing would dispatch them).
+            // 6. Exception data: tolerate unwind info.
+            // Console mode: refuse any SEH handler (nothing would dispatch them).
+            // GUI mode: tolerate SEH handler records — they are present in every MSVC
+            // C++ binary and are only invoked when an exception propagates.  Normal
+            // execution paths never reach them; if an unhandled exception does fire,
+            // the Linux signal will kill the process rather than dispatching SEH.
             if (dirs[3].size != 0) {
                 if (@as(u64, dirs[3].rva) + dirs[3].size > size_of_image or dirs[3].size % 12 != 0) die(.bad_image, "exception directory malformed", .{});
                 var p: usize = dirs[3].rva;
@@ -320,7 +377,7 @@ pub fn Impl(comptime bug: Bug) type {
                         if (depth > 32) die(.bad_image, "unwind chain too deep", .{});
                         const hdr = need(u8, img, ui, "unwind info");
                         const flags = hdr >> 3;
-                        if (flags & 0x3 != 0) die(.refused, "function at RVA 0x{x} has an exception handler (SEH unsupported)", .{need(u32, img, p, "begin")});
+                        if (!gui and flags & 0x3 != 0) die(.refused, "function at RVA 0x{x} has an exception handler (SEH unsupported)", .{need(u32, img, p, "begin")});
                         if (flags & 0x4 == 0) break; // not chained
                         const codes = need(u8, img, ui + 2, "unwind code count");
                         const chained = ui + 4 + std.mem.alignForward(usize, codes, 2) * 2;
