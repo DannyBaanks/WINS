@@ -5,7 +5,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
+const W: std.builtin.CallingConvention = .winapi;
 
 // ---------------------------------------------------------------------------
 // 1. ADVAPI32.dll
@@ -395,6 +395,11 @@ pub fn lookupAdvapi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "CryptEncrypt")) return @intFromPtr(&crypt_ret_one);
     if (std.mem.eql(u8, name, "CryptImportKey")) return @intFromPtr(&crypt_ret_one);
     if (std.mem.eql(u8, name, "CryptDestroyKey")) return @intFromPtr(&crypt_ret_one);
+    // 7zr asks for these two; neither is meaningful without a real security
+    // subsystem, and "failure" is the answer that cannot fabricate a privilege.
+    if (std.mem.eql(u8, name, "SetFileSecurityW")) return @intFromPtr(&crypt_ret_zero);
+    if (std.mem.eql(u8, name, "GetFileSecurityW")) return @intFromPtr(&crypt_ret_zero);
+    if (std.mem.eql(u8, name, "LookupPrivilegeValueW")) return @intFromPtr(&crypt_ret_zero);
     return null;
 }
 
@@ -837,11 +842,22 @@ fn MsgWaitForMultipleObjects(count: u32, handles: ?*const usize, wait_all: i32, 
     if (ms > 0 and ms < 1000) {
         var req: linux.timespec = .{
             .sec = 0,
-            .nsec = @as(isize, ms) * 1_000_000,
+            .nsec = @as(isize, @intCast(ms)) * 1_000_000,
         };
         _ = linux.nanosleep(&req, null);
     }
     return 0; // WAIT_OBJECT_0
+}
+
+/// CharUpperW: uppercase in place, ASCII only. The Win32 locale-sensitive
+/// conversion is NOT modelled; an ASCII-only FNV-free table walk is what this is.
+fn CharUpperW(str: ?[*]u16) callconv(W) ?[*]u16 {
+    const s = str orelse return null;
+    var i: usize = 0;
+    while (s[i] != 0) : (i += 1) {
+        if (s[i] >= 'a' and s[i] <= 'z') s[i] -= 32;
+    }
+    return s;
 }
 
 pub fn lookupUser32Console(name: []const u8) ?usize {
@@ -852,6 +868,7 @@ pub fn lookupUser32Console(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "IsWindowVisible")) return @intFromPtr(&IsWindowVisible);
     if (std.mem.eql(u8, name, "ShowWindow")) return @intFromPtr(&ShowWindow);
     if (std.mem.eql(u8, name, "MsgWaitForMultipleObjects")) return @intFromPtr(&MsgWaitForMultipleObjects);
+    if (std.mem.eql(u8, name, "CharUpperW")) return @intFromPtr(&CharUpperW);
     return null;
 }
 
@@ -1223,6 +1240,9 @@ pub fn lookupOleaut32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "VariantInit")) return @intFromPtr(&VariantInit);
     if (std.mem.eql(u8, name, "VariantClear")) return @intFromPtr(&VariantClear);
     if (std.mem.eql(u8, name, "GetErrorInfo")) return @intFromPtr(&GetErrorInfo);
+    // This module does not distinguish the A and W variants of the BSTR family;
+    // both names resolve to the wide implementation above.
+    if (std.mem.eql(u8, name, "SysAllocStringA")) return @intFromPtr(&SysAllocString);
     return null;
 }
 

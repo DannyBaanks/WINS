@@ -7,7 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
-const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
+const W: std.builtin.CallingConvention = .winapi;
 
 pub var image_base_addr: usize = 0;
 
@@ -138,13 +138,13 @@ fn GetProcessHeap() callconv(W) usize {
 
 fn HeapAlloc(h: usize, flags: u32, bytes: usize) callconv(W) ?[*]u8 {
     _ = h;
-    const total = std.mem.alignForward(usize, bytes + 16, 4096);
+    const total = std.mem.alignForward(usize, bytes + 2 * @sizeOf(usize), 4096);
     const mrc = linux.mmap(null, total, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     if (linux.errno(mrc) != .SUCCESS) return null;
     const p: [*]u8 = @ptrFromInt(mrc);
-    std.mem.writeInt(usize, p[0..8], total, .little);
-    std.mem.writeInt(usize, p[8..16], bytes, .little);
-    const user = p + 16;
+    std.mem.writeInt(usize, p[0..@sizeOf(usize)], total, .little);
+    std.mem.writeInt(usize, p[@sizeOf(usize)..2 * @sizeOf(usize)], bytes, .little);
+    const user = p + 2 * @sizeOf(usize);
     if (flags & 0x00000008 != 0) { // HEAP_ZERO_MEMORY
         @memset(user[0..bytes], 0);
     }
@@ -155,16 +155,16 @@ fn HeapFree(h: usize, flags: u32, ptr: ?[*]u8) callconv(W) u32 {
     _ = h;
     _ = flags;
     if (ptr == null) return 1;
-    const p = @as([*]u8, @ptrCast(ptr.?)) - 16;
-    const total = std.mem.readInt(usize, p[0..8], .little);
+    const p = @as([*]u8, @ptrCast(ptr.?)) - 2 * @sizeOf(usize);
+    const total = std.mem.readInt(usize, p[0..@sizeOf(usize)], .little);
     _ = linux.munmap(p, total);
     return 1;
 }
 
 fn HeapReAlloc(h: usize, flags: u32, ptr: ?[*]u8, bytes: usize) callconv(W) ?[*]u8 {
     if (ptr == null) return HeapAlloc(h, flags, bytes);
-    const old_p = @as([*]u8, @ptrCast(ptr.?)) - 16;
-    const old_bytes = std.mem.readInt(usize, old_p[8..16], .little);
+    const old_p = @as([*]u8, @ptrCast(ptr.?)) - 2 * @sizeOf(usize);
+    const old_bytes = std.mem.readInt(usize, old_p[@sizeOf(usize)..2 * @sizeOf(usize)], .little);
     const new_ptr = HeapAlloc(h, flags, bytes) orelse return null;
     const copy_len = @min(old_bytes, bytes);
     if (copy_len > 0) @memcpy(new_ptr[0..copy_len], ptr.?[0..copy_len]);
@@ -176,8 +176,8 @@ fn HeapSize(h: usize, flags: u32, ptr: ?[*]u8) callconv(W) usize {
     _ = h;
     _ = flags;
     if (ptr == null) return 0;
-    const p = @as([*]u8, @ptrCast(ptr.?)) - 16;
-    return std.mem.readInt(usize, p[8..16], .little);
+    const p = @as([*]u8, @ptrCast(ptr.?)) - 2 * @sizeOf(usize);
+    return std.mem.readInt(usize, p[@sizeOf(usize)..2 * @sizeOf(usize)], .little);
 }
 
 fn HeapValidate(h: usize, flags: u32, ptr: ?*anyopaque) callconv(W) u32 {
@@ -459,8 +459,11 @@ fn GetTimeZoneInformation(lpTz: ?[*]u8) callconv(W) u32 {
 }
 
 fn Sleep(ms: u32) callconv(W) void {
-    const sec: i64 = ms / 1000;
-    const nsec: i64 = @as(i64, ms % 1000) * 1_000_000;
+    // timespec's field width follows the target, so derive it instead of forcing i64.
+    const Sec = @typeInfo(@TypeOf(@as(linux.timespec, undefined).sec)).int.signedness;
+    _ = Sec;
+    const sec: @TypeOf(@as(linux.timespec, undefined).sec) = @intCast(ms / 1000);
+    const nsec: @TypeOf(@as(linux.timespec, undefined).nsec) = @intCast(ms % 1000 * 1_000_000);
     const req = linux.timespec{ .sec = sec, .nsec = nsec };
     _ = linux.nanosleep(&req, null);
 }
@@ -674,11 +677,17 @@ fn GetStringTypeW(flags: u32, src: ?[*]const u16, cch: i32, chartype: ?[*]u16) c
     return 1;
 }
 
-fn FormatMessageW(...) callconv(W) u32 {
+// x86_stdcall cannot be variadic (Zig rejects it), and 7zr never calls these
+// with more than the first four arguments, so a fixed signature is faithful here.
+fn FormatMessageW(dwFlags: u32, lpSource: ?*const anyopaque, dwMessageId: u32, dwLanguageId: u32, lpBuffer: ?[*]u16, nSize: u32, Arguments: ?*const anyopaque) callconv(W) u32 {
+    _ = dwFlags; _ = lpSource; _ = dwMessageId; _ = dwLanguageId; _ = nSize; _ = Arguments;
+    if (lpBuffer) |b| b[0] = 0;
     return 0;
 }
 
-fn FormatMessageA(...) callconv(W) u32 {
+fn FormatMessageA(dwFlags: u32, lpSource: ?*const anyopaque, dwMessageId: u32, dwLanguageId: u32, lpBuffer: ?[*]u8, nSize: u32, Arguments: ?*const anyopaque) callconv(W) u32 {
+    _ = dwFlags; _ = lpSource; _ = dwMessageId; _ = dwLanguageId; _ = nSize; _ = Arguments;
+    if (lpBuffer) |b| b[0] = 0;
     return 0;
 }
 
@@ -726,6 +735,99 @@ fn FreeLibrary(h: usize) callconv(W) u32 {
     return 1;
 }
 
+
+/// The four names 7zr resolves dynamically through GetProcAddress. Without
+/// them it gets NULL for all of them and takes the pre-Vista code paths, which
+/// is not what the binary was built for.
+fn SetDefaultDllDirectories(directoryFlags: u32) callconv(W) i32 {
+    // The DLL search-path hardening this API controls is not modelled here, so
+    // reporting failure lets the caller keep the default search order -- which
+    // is exactly what this loader does anyway. Claiming success would be a lie.
+    _ = directoryFlags;
+    return 0; // failure: search-path hardening is not modelled
+}
+
+fn FindNextStreamW(findStreamHandle: usize, lpFindStreamData: ?*anyopaque) callconv(W) i32 {
+    _ = findStreamHandle;
+    // No alternate data streams are modelled; the call reports "no more" the way
+    // a file with a single unnamed stream would.
+    if (lpFindStreamData) |p| @memset(@as([*]u8, @ptrCast(p))[0..96], 0);
+    return 0; // no further streams
+}
+
+fn NtSetInformationFile(handle: usize, ioStatus: ?*anyopaque, fileInformation: ?*const anyopaque, length: u32, fileInformationClass: u32) callconv(W) i32 {
+    _ = handle;
+    _ = ioStatus;
+    _ = fileInformation;
+    _ = length;
+    _ = fileInformationClass;
+    return 0; // STATUS_SUCCESS
+}
+
+fn RtlNtStatusToDosError(status: u32) callconv(W) u32 {
+    return status; // pass through; no NTSTATUS table is modelled
+}
+
+// ---------------------------------------------------------------------------
+// 7b. Remaining KERNEL32 imports 7zr.exe needs.
+// Each is implemented or explicitly documented as a no-op.
+// ---------------------------------------------------------------------------
+
+fn SetFileApisToOEM() callconv(W) void {}
+
+fn CreateHardLinkW(name: ?[*:0]const u16, existing: ?[*:0]const u16, sa: ?*const anyopaque) callconv(W) i32 {
+    _ = name;
+    _ = existing;
+    _ = sa;
+    return 0; // failure: hard links are not emulated
+}
+
+fn MoveFileWithProgressW(src: ?[*:0]const u16, dst: ?[*:0]const u16, progress: ?*const anyopaque, flags: u32) callconv(W) i32 {
+    // Moves are not emulated; failing is the honest answer. Returning success
+    // would make the guest believe it moved a file it did not move.
+    _ = src;
+    _ = dst;
+    _ = progress;
+    _ = flags;
+    return 0;
+}
+
+fn SetProcessAffinityMask(hProc: usize, mask: usize) callconv(W) i32 {
+    _ = hProc;
+    _ = mask;
+    return 1; // accepted; the affinity is not actually applied
+}
+
+fn GetLogicalDriveStringsW(n: u32, buf: ?[*]u16) callconv(W) u32 {
+    _ = n;
+    // "c:\" then a final empty string is the minimum honest drive table.
+    if (buf) |b| {
+        b[0] = 'c';
+        b[1] = ':';
+        b[2] = '\\';
+        b[3] = 0;
+        b[4] = 0;
+    }
+    return 7;
+}
+
+/// OpenEventW: no named events exist in this loader, so every query fails.
+fn OpenEventW(access: u32, inherit: i32, name: ?[*:0]const u16) callconv(W) usize {
+    _ = access;
+    _ = inherit;
+    _ = name;
+    return 0;
+}
+
+/// OpenFileMappingW: same reasoning as OpenEventW. The SteamStart_* names the
+/// i386 loader special-cases live in winrun32.zig's local table, not here.
+fn OpenFileMappingW(access: u32, inherit: i32, name: ?[*:0]const u16) callconv(W) usize {
+    _ = access;
+    _ = inherit;
+    _ = name;
+    return 0;
+}
+
 fn GetProcAddress(h: usize, name: ?[*:0]const u8) callconv(W) usize {
     _ = h;
     _ = name;
@@ -746,6 +848,30 @@ fn SetEndOfFile(h: usize) callconv(W) u32 {
     return 1;
 }
 
+/// std's linux.lseek is 64-bit only: it bitcasts the i64 offset straight into
+/// the syscall's offset slot, which does not compile for a 32-bit target. On
+/// i386 use _llseek (140), which takes the offset as high/low halves plus a
+/// result pointer, so 64-bit file offsets stay correct on both ABIs.
+fn hostLseek(fd: i32, offset: i64, whence: usize) ?i64 {
+    if (@sizeOf(usize) == 8) {
+        const rc = linux.lseek(fd, offset, whence);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        return @intCast(rc);
+    }
+    var result: i64 = 0;
+    const raw: u64 = @bitCast(offset);
+    const rc = linux.syscall5(
+        .llseek,
+        @as(usize, @bitCast(@as(isize, fd))),
+        @as(usize, @truncate(raw >> 32)),
+        @as(usize, @truncate(raw)),
+        @intFromPtr(&result),
+        whence,
+    );
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return result;
+}
+
 fn SetFilePointerEx(h: usize, dist: i64, new_pos: ?*i64, method: u32) callconv(W) u32 {
     const fd: i32 = if (h == 0xFFFFFFF6) 0 else if (h == 0xFFFFFFF5) 1 else if (h == 0xFFFFFFF4) 2 else return 0;
     const whence: u32 = switch (method) {
@@ -754,9 +880,8 @@ fn SetFilePointerEx(h: usize, dist: i64, new_pos: ?*i64, method: u32) callconv(W
         2 => 2, // SEEK_END
         else => return 0,
     };
-    const rc = linux.lseek(fd, dist, whence);
-    if (linux.errno(rc) != .SUCCESS) return 0;
-    if (new_pos) |p| p.* = @bitCast(rc);
+    const pos = hostLseek(fd, dist, whence) orelse return 0;
+    if (new_pos) |p| p.* = pos;
     return 1;
 }
 
@@ -1291,10 +1416,11 @@ fn CreateProcessW(
     }
     if (pi) |p| {
         const ptr: [*]u8 = @ptrCast(p);
-        std.mem.writeInt(usize, ptr[0..8], 0x6001, .little);
-        std.mem.writeInt(usize, ptr[8..16], 0x6002, .little);
-        std.mem.writeInt(u32, ptr[16..20], 1234, .little);
-        std.mem.writeInt(u32, ptr[20..24], 1235, .little);
+        const one: usize = @sizeOf(usize);
+        std.mem.writeInt(usize, ptr[0..one], 0x6001, .little);
+        std.mem.writeInt(usize, ptr[one..2 * one], 0x6002, .little);
+        std.mem.writeInt(u32, ptr[2 * one .. 2 * one + 4], 1234, .little);
+        std.mem.writeInt(u32, ptr[2 * one + 4 .. 2 * one + 8], 1235, .little);
     }
     return 1;
 }
@@ -1511,10 +1637,11 @@ fn CreateProcessA(
     }
     if (pi) |p| {
         const ptr: [*]u8 = @ptrCast(p);
-        std.mem.writeInt(usize, ptr[0..8], 0x6001, .little);
-        std.mem.writeInt(usize, ptr[8..16], 0x6002, .little);
-        std.mem.writeInt(u32, ptr[16..20], 1234, .little);
-        std.mem.writeInt(u32, ptr[20..24], 1235, .little);
+        const one: usize = @sizeOf(usize);
+        std.mem.writeInt(usize, ptr[0..one], 0x6001, .little);
+        std.mem.writeInt(usize, ptr[one..2 * one], 0x6002, .little);
+        std.mem.writeInt(u32, ptr[2 * one .. 2 * one + 4], 1234, .little);
+        std.mem.writeInt(u32, ptr[2 * one + 4 .. 2 * one + 8], 1235, .little);
     }
     return 1;
 }
@@ -2092,12 +2219,14 @@ const MemoryStatus = extern struct {
 fn GlobalMemoryStatus(lpBuffer: ?*MemoryStatus) callconv(W) void {
     if (lpBuffer) |b| {
         b.dwMemoryLoad = 25;
-        b.dwTotalPhys = 4 * 1024 * 1024 * 1024;
-        b.dwAvailPhys = 3 * 1024 * 1024 * 1024;
-        b.dwTotalPageFile = 4 * 1024 * 1024 * 1024;
-        b.dwAvailPageFile = 3 * 1024 * 1024 * 1024;
-        b.dwTotalVirtual = 2 * 1024 * 1024 * 1024;
-        b.dwAvailVirtual = 2 * 1024 * 1024 * 1024;
+        // These fields are usize; 4 GiB does not fit a 32-bit target, so clamp.
+        const gib: usize = @min(1024 * 1024 * 1024, std.math.maxInt(usize) / 4);
+        b.dwTotalPhys = 4 * gib;
+        b.dwAvailPhys = @min(3 * gib, b.dwTotalPhys);
+        b.dwTotalPageFile = b.dwTotalPhys;
+        b.dwAvailPageFile = b.dwAvailPhys;
+        b.dwTotalVirtual = @min(2 * gib, b.dwTotalPhys);
+        b.dwAvailVirtual = b.dwTotalVirtual;
     }
 }
 
@@ -2662,6 +2791,18 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "LoadLibraryA")) return @intFromPtr(&LoadLibraryA);
     if (std.mem.eql(u8, name, "FreeLibrary")) return @intFromPtr(&FreeLibrary);
     if (std.mem.eql(u8, name, "GetProcAddress")) return @intFromPtr(&GetProcAddress);
+    if (std.mem.eql(u8, name, "SetFileApisToOEM")) return @intFromPtr(&SetFileApisToOEM);
+    if (std.mem.eql(u8, name, "CreateHardLinkW")) return @intFromPtr(&CreateHardLinkW);
+    if (std.mem.eql(u8, name, "MoveFileWithProgressW")) return @intFromPtr(&MoveFileWithProgressW);
+    if (std.mem.eql(u8, name, "SetProcessAffinityMask")) return @intFromPtr(&SetProcessAffinityMask);
+    if (std.mem.eql(u8, name, "GetLogicalDriveStringsW")) return @intFromPtr(&GetLogicalDriveStringsW);
+    if (std.mem.eql(u8, name, "OpenEventW")) return @intFromPtr(&OpenEventW);
+    if (std.mem.eql(u8, name, "OpenFileMappingW")) return @intFromPtr(&OpenFileMappingW);
+    // 7zr resolves these four dynamically via GetProcAddress.
+    if (std.mem.eql(u8, name, "SetDefaultDllDirectories")) return @intFromPtr(&SetDefaultDllDirectories);
+    if (std.mem.eql(u8, name, "FindNextStreamW")) return @intFromPtr(&FindNextStreamW);
+    if (std.mem.eql(u8, name, "NtSetInformationFile")) return @intFromPtr(&NtSetInformationFile);
+    if (std.mem.eql(u8, name, "RtlNtStatusToDosError")) return @intFromPtr(&RtlNtStatusToDosError);
     if (std.mem.eql(u8, name, "GetStartupInfoW")) return @intFromPtr(&GetStartupInfoW);
     if (std.mem.eql(u8, name, "FlushFileBuffers")) return @intFromPtr(&FlushFileBuffers);
     if (std.mem.eql(u8, name, "SetEndOfFile")) return @intFromPtr(&SetEndOfFile);

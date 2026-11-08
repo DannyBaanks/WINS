@@ -6,7 +6,14 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
+// The C runtime is cdecl, not stdcall: the CALLER pops the arguments. The
+// Win32 DLL modules (kernel32, user32, ...) are stdcall instead. On i386 this
+// distinction is fatal -- a stdcall shim bound into a cdecl slot leaves the
+// guest's stack misaligned by the argument count and the next `ret` lands on
+// garbage. On x86_64 both conventions lower to the same ABI, which is why the
+// 64-bit loader never showed this.
+const W: std.builtin.CallingConvention = .winapi;
+const C: std.builtin.CallingConvention = .c;
 
 // ---------------------------------------------------------------------------
 // 1. Data Exports & Global CRT State
@@ -21,43 +28,43 @@ pub var msvcrt_timezone: i32 = 0;
 var thread_errno: i32 = 0;
 var app_type: i32 = 1;
 
-fn _errno() callconv(W) *i32 {
+fn _errno() callconv(C) *i32 {
     return &thread_errno;
 }
 
-fn __p__fmode() callconv(W) *i32 {
+fn __p__fmode() callconv(C) *i32 {
     return &msvcrt_fmode;
 }
 
-fn __p__commode() callconv(W) *i32 {
+fn __p__commode() callconv(C) *i32 {
     return &msvcrt_commode;
 }
 
-fn __p___argv() callconv(W) *?[*]?[*:0]u8 {
+fn __p___argv() callconv(C) *?[*]?[*:0]u8 {
     return &msvcrt_argv;
 }
 
-fn __p___argc() callconv(W) *i32 {
+fn __p___argc() callconv(C) *i32 {
     return &saved_argc;
 }
 
-fn __p__environ() callconv(W) *?[*]?[*:0]u8 {
+fn __p__environ() callconv(C) *?[*]?[*:0]u8 {
     return &msvcrt_environ;
 }
 
-fn __set_app_type(at: i32) callconv(W) void {
+fn __set_app_type(at: i32) callconv(C) void {
     app_type = at;
 }
 
-fn __setusermatherr(handler: ?*anyopaque) callconv(W) void {
+fn __setusermatherr(handler: ?*anyopaque) callconv(C) void {
     _ = handler;
 }
 
-fn ___lc_codepage_func() callconv(W) u32 {
+fn ___lc_codepage_func() callconv(C) u32 {
     return 65001; // CP_UTF8
 }
 
-fn ___mb_cur_max_func() callconv(W) i32 {
+fn ___mb_cur_max_func() callconv(C) i32 {
     return 4;
 }
 
@@ -92,7 +99,7 @@ const Lconv = extern struct {
 
 var default_lconv: Lconv = .{};
 
-fn localeconv() callconv(W) *Lconv {
+fn localeconv() callconv(C) *Lconv {
     return &default_lconv;
 }
 
@@ -141,7 +148,7 @@ fn __getmainargs(
     penv: ?*?[*]?[*:0]u8,
     dowildcard: i32,
     startinfo: ?*anyopaque,
-) callconv(W) i32 {
+) callconv(C) i32 {
     _ = dowildcard;
     _ = startinfo;
     ensureDefaultArgs();
@@ -152,47 +159,54 @@ fn __getmainargs(
     return 0;
 }
 
-const InitFunc = *const fn () callconv(W) void;
+const InitFunc = *const fn () callconv(C) void;
 
-fn _initterm(begin: ?[*]const usize, end: ?[*]const usize) callconv(W) void {
+fn _initterm(begin: ?[*]const usize, end: ?[*]const usize) callconv(C) void {
     if (begin == null or end == null) return;
     var cur = @intFromPtr(begin.?);
     const stop = @intFromPtr(end.?);
+    var ran: usize = 0;
     while (cur < stop) : (cur += @sizeOf(usize)) {
         const fn_addr = @as(*const usize, @ptrFromInt(cur)).*;
         if (fn_addr != 0) {
             const f: InitFunc = @ptrFromInt(fn_addr);
+            // Static constructors: the only place guest vtables get filled in.
+            // Traced only when the operator asks (WINS_TRACE=1), because this is
+            // library code shared with the 64-bit loader.
+            if (trace_static_init) std.debug.print("[msvcrt] _initterm initializer 0x{x:0>8}\n", .{fn_addr});
             f();
+            ran += 1;
         }
     }
+    if (trace_static_init) std.debug.print("[msvcrt] _initterm ran {d} initializer(s)\n", .{ran});
 }
 
-fn _onexit(func: ?*anyopaque) callconv(W) ?*anyopaque {
+fn _onexit(func: ?*anyopaque) callconv(C) ?*anyopaque {
     return func;
 }
 
-fn _lock(locknum: i32) callconv(W) void {
+fn _lock(locknum: i32) callconv(C) void {
     _ = locknum;
 }
 
-fn _unlock(locknum: i32) callconv(W) void {
+fn _unlock(locknum: i32) callconv(C) void {
     _ = locknum;
 }
 
-fn __C_specific_handler() callconv(W) i32 {
+fn __C_specific_handler() callconv(C) i32 {
     return 1; // ExceptionContinueExecution / handler stub
 }
 
-fn signal(sig: i32, handler: ?*anyopaque) callconv(W) ?*anyopaque {
+fn signal(sig: i32, handler: ?*anyopaque) callconv(C) ?*anyopaque {
     _ = sig;
     return handler;
 }
 
 const ATEXIT_MAX = 32;
-var atexit_funcs: [ATEXIT_MAX]?*const fn () callconv(W) void = .{null} ** ATEXIT_MAX;
+var atexit_funcs: [ATEXIT_MAX]?*const fn () callconv(C) void = .{null} ** ATEXIT_MAX;
 var atexit_count: usize = 0;
 
-fn atexit(func: ?*const fn () callconv(W) void) callconv(W) i32 {
+fn atexit(func: ?*const fn () callconv(C) void) callconv(C) i32 {
     const f = func orelse return -1;
     if (atexit_count >= ATEXIT_MAX) return -1;
     atexit_funcs[atexit_count] = f;
@@ -209,26 +223,26 @@ fn runAtExit() void {
     }
 }
 
-fn exit(status: i32) callconv(W) noreturn {
+fn exit(status: i32) callconv(C) noreturn {
     runAtExit();
     linux.exit_group(@bitCast(status));
 }
 
-fn _exit(status: i32) callconv(W) noreturn {
+fn _exit(status: i32) callconv(C) noreturn {
     linux.exit_group(@bitCast(status));
 }
 
-fn _cexit() callconv(W) void {
+fn _cexit() callconv(C) void {
     runAtExit();
 }
 
-fn _c_exit() callconv(W) void {}
+fn _c_exit() callconv(C) void {}
 
-fn _amsg_exit(rterrnum: i32) callconv(W) noreturn {
+fn _amsg_exit(rterrnum: i32) callconv(C) noreturn {
     linux.exit_group(@bitCast(255 + rterrnum));
 }
 
-fn abort() callconv(W) noreturn {
+fn abort() callconv(C) noreturn {
     linux.exit_group(3);
 }
 
@@ -256,7 +270,7 @@ fn ensureCrtHeap() bool {
     return true;
 }
 
-fn malloc(size: usize) callconv(W) ?[*]u8 {
+fn malloc(size: usize) callconv(C) ?[*]u8 {
     if (!ensureCrtHeap()) return null;
     const req = if (size == 0) 16 else std.mem.alignForward(usize, size, 16);
     if (crt_heap_off + 16 + req > CRT_HEAP_CAP) return null;
@@ -267,18 +281,18 @@ fn malloc(size: usize) callconv(W) ?[*]u8 {
     return user_ptr;
 }
 
-fn calloc(nmemb: usize, size: usize) callconv(W) ?[*]u8 {
+fn calloc(nmemb: usize, size: usize) callconv(C) ?[*]u8 {
     const total = nmemb *| size;
     const ptr = malloc(total) orelse return null;
     if (total > 0) @memset(ptr[0..total], 0);
     return ptr;
 }
 
-fn free(ptr: ?*anyopaque) callconv(W) void {
+fn free(ptr: ?*anyopaque) callconv(C) void {
     _ = ptr;
 }
 
-fn realloc(ptr: ?*anyopaque, new_size: usize) callconv(W) ?[*]u8 {
+fn realloc(ptr: ?*anyopaque, new_size: usize) callconv(C) ?[*]u8 {
     if (ptr == null) return malloc(new_size);
     if (new_size == 0) return null;
     const new_ptr = malloc(new_size) orelse return null;
@@ -298,21 +312,37 @@ fn realloc(ptr: ?*anyopaque, new_size: usize) callconv(W) ?[*]u8 {
 // 4. FILE Streams & I/O
 // ---------------------------------------------------------------------------
 
-pub const MsvcrtFile = extern struct {
-    _ptr: ?[*]u8 = null, // +0x00
-    _cnt: i32 = 0, // +0x08
-    _pad0: i32 = 0, // +0x0c
-    _base: ?[*]u8 = null, // +0x10
-    _flag: i32 = 0, // +0x18
-    _file: i32 = -1, // +0x1c
-    _charbuf: i32 = 0, // +0x20
-    _bufsiz: i32 = 0, // +0x24
-    _tmpfname: ?[*]u8 = null, // +0x28
+/// The guest CRT's FILE. The two layouts are NOT the same struct with different
+/// padding: the field order differs too. 64-bit UCRT puts `_cnt` right after
+/// `_ptr`; 32-bit MSVCRT puts `_base` there. Pick by pointer width so i386
+/// guests (winrun32) see the layout their CRT actually has.
+pub const MsvcrtFile = if (@sizeOf(usize) == 8) extern struct {
+    _ptr: ?[*]u8 = null, // 0x00
+    _cnt: i32 = 0, // 0x08
+    _pad0: i32 = 0, // 0x0c
+    _base: ?[*]u8 = null, // 0x10
+    _flag: i32 = 0, // 0x18
+    _file: i32 = -1, // 0x1c
+    _charbuf: i32 = 0, // 0x20
+    _bufsiz: i32 = 0, // 0x24
+    _tmpfname: ?[*]u8 = null, // 0x28
+} else extern struct {
+    _ptr: ?[*]u8 = null, // 0x00
+    _cnt: i32 = 0, // 0x04
+    _base: ?[*]u8 = null, // 0x08
+    _flag: i32 = 0, // 0x0c
+    _file: i32 = -1, // 0x10
+    _charbuf: i32 = 0, // 0x14
+    _bufsiz: i32 = 0, // 0x18
+    _tmpfname: ?[*]u8 = null, // 0x1c
 };
 
 comptime {
-    std.debug.assert(@sizeOf(MsvcrtFile) == 48);
+    std.debug.assert(@sizeOf(MsvcrtFile) == if (@sizeOf(usize) == 8) 48 else 32);
 }
+
+/// Set from the loader when WINS_TRACE=1. Keeps library output clean by default.
+pub var trace_static_init: bool = false;
 
 const IOB_COUNT = 32;
 var iob_table: [IOB_COUNT]MsvcrtFile = initIobTable();
@@ -342,11 +372,11 @@ fn streamIndex(stream: ?*MsvcrtFile) ?usize {
     return idx;
 }
 
-fn __iob_func() callconv(W) [*]MsvcrtFile {
+fn __iob_func() callconv(C) [*]MsvcrtFile {
     return &iob_table;
 }
 
-fn __acrt_iob_func(idx: u32) callconv(W) ?*MsvcrtFile {
+fn __acrt_iob_func(idx: u32) callconv(C) ?*MsvcrtFile {
     if (idx >= IOB_COUNT) return null;
     return &iob_table[idx];
 }
@@ -360,7 +390,7 @@ fn normalizePathA(src: [*:0]const u8, out: *[512:0]u8) void {
     out[copy_len] = 0;
 }
 
-fn fopen(filename: ?[*:0]const u8, mode: ?[*:0]const u8) callconv(W) ?*MsvcrtFile {
+fn fopen(filename: ?[*:0]const u8, mode: ?[*:0]const u8) callconv(C) ?*MsvcrtFile {
     if (filename == null or mode == null) return null;
     var slot: ?usize = null;
     for (3..IOB_COUNT) |i| {
@@ -421,7 +451,7 @@ fn fopen(filename: ?[*:0]const u8, mode: ?[*:0]const u8) callconv(W) ?*MsvcrtFil
     return &iob_table[idx];
 }
 
-fn fclose(stream: ?*MsvcrtFile) callconv(W) i32 {
+fn fclose(stream: ?*MsvcrtFile) callconv(C) i32 {
     const idx = streamIndex(stream) orelse return -1;
     const fd = iob_table[idx]._file;
     if (fd >= 3) {
@@ -435,33 +465,33 @@ fn fclose(stream: ?*MsvcrtFile) callconv(W) i32 {
     return 0;
 }
 
-fn fflush(stream: ?*MsvcrtFile) callconv(W) i32 {
+fn fflush(stream: ?*MsvcrtFile) callconv(C) i32 {
     _ = stream;
     return 0;
 }
 
-fn fseek(stream: ?*MsvcrtFile, offset: i32, whence: i32) callconv(W) i32 {
+fn fseek(stream: ?*MsvcrtFile, offset: i32, whence: i32) callconv(C) i32 {
     const s = stream orelse return -1;
     if (streamIndex(stream)) |idx| {
         iob_ungetc[idx] = -1;
     }
     s._flag &= ~@as(i32, 0x10);
-    const rc = linux.lseek(s._file, @as(i64, offset), @intCast(whence));
-    if (linux.errno(rc) != .SUCCESS) {
-        thread_errno = @intCast(@intFromEnum(linux.errno(rc)));
+    const pos = _lseeki64(s._file, offset, whence);
+    if (pos == null) {
+        thread_errno = 22; // EINVAL
         return -1;
     }
     return 0;
 }
 
-fn ftell(stream: ?*MsvcrtFile) callconv(W) i32 {
+fn ftell(stream: ?*MsvcrtFile) callconv(C) i32 {
     const s = stream orelse return -1;
-    const rc = linux.lseek(s._file, 0, linux.SEEK.CUR);
-    if (linux.errno(rc) != .SUCCESS) {
-        thread_errno = @intCast(@intFromEnum(linux.errno(rc)));
+    const rc = _lseeki64(s._file, 0, 1); // SEEK_CUR
+    if (rc == null) {
+        thread_errno = 22; // EINVAL
         return -1;
     }
-    var pos: i32 = @intCast(rc);
+    var pos: i32 = @intCast(rc.?);
     if (streamIndex(stream)) |idx| {
         if (iob_ungetc[idx] >= 0 and pos > 0) pos -= 1;
     }
@@ -482,7 +512,7 @@ fn writeRawAll(fd: i32, data: []const u8) bool {
     return true;
 }
 
-fn fputc(c: i32, stream: ?*MsvcrtFile) callconv(W) i32 {
+fn fputc(c: i32, stream: ?*MsvcrtFile) callconv(C) i32 {
     const s = stream orelse return -1;
     const is_bin = if (streamIndex(stream)) |idx| iob_binary[idx] else false;
     const byte: u8 = @intCast(c & 0xFF);
@@ -496,7 +526,7 @@ fn fputc(c: i32, stream: ?*MsvcrtFile) callconv(W) i32 {
     return c & 0xFF;
 }
 
-fn fwrite(ptr: ?[*]const u8, size: usize, nmemb: usize, stream: ?*MsvcrtFile) callconv(W) usize {
+fn fwrite(ptr: ?[*]const u8, size: usize, nmemb: usize, stream: ?*MsvcrtFile) callconv(C) usize {
     if (ptr == null or stream == null or size == 0 or nmemb == 0) return 0;
     const s = stream.?;
     const total = size * nmemb;
@@ -523,7 +553,7 @@ fn fwrite(ptr: ?[*]const u8, size: usize, nmemb: usize, stream: ?*MsvcrtFile) ca
     return nmemb;
 }
 
-fn getc(stream: ?*MsvcrtFile) callconv(W) i32 {
+fn getc(stream: ?*MsvcrtFile) callconv(C) i32 {
     const s = stream orelse return -1;
     const idx_opt = streamIndex(stream);
     if (idx_opt) |idx| {
@@ -551,7 +581,7 @@ fn getc(stream: ?*MsvcrtFile) callconv(W) i32 {
     return b[0];
 }
 
-fn ungetc(c: i32, stream: ?*MsvcrtFile) callconv(W) i32 {
+fn ungetc(c: i32, stream: ?*MsvcrtFile) callconv(C) i32 {
     if (c < 0) return -1;
     if (streamIndex(stream)) |idx| {
         iob_ungetc[idx] = c & 0xFF;
@@ -561,7 +591,7 @@ fn ungetc(c: i32, stream: ?*MsvcrtFile) callconv(W) i32 {
     return -1;
 }
 
-fn fread(ptr: ?[*]u8, size: usize, nmemb: usize, stream: ?*MsvcrtFile) callconv(W) usize {
+fn fread(ptr: ?[*]u8, size: usize, nmemb: usize, stream: ?*MsvcrtFile) callconv(C) usize {
     if (ptr == null or stream == null or size == 0 or nmemb == 0) return 0;
     const s = stream.?;
     const total = size * nmemb;
@@ -591,7 +621,7 @@ fn fread(ptr: ?[*]u8, size: usize, nmemb: usize, stream: ?*MsvcrtFile) callconv(
     return count / size;
 }
 
-fn fgets(buf: ?[*]u8, n: i32, stream: ?*MsvcrtFile) callconv(W) ?[*]u8 {
+fn fgets(buf: ?[*]u8, n: i32, stream: ?*MsvcrtFile) callconv(C) ?[*]u8 {
     if (buf == null or n <= 0 or stream == null) return null;
     const limit: usize = @intCast(n - 1);
     var pos: usize = 0;
@@ -609,50 +639,50 @@ fn fgets(buf: ?[*]u8, n: i32, stream: ?*MsvcrtFile) callconv(W) ?[*]u8 {
     return buf;
 }
 
-fn fputs(s: ?[*:0]const u8, stream: ?*MsvcrtFile) callconv(W) i32 {
+fn fputs(s: ?[*:0]const u8, stream: ?*MsvcrtFile) callconv(C) i32 {
     const str = s orelse return -1;
     const len = strlen(str);
     if (fwrite(str, 1, len, stream) == len) return 0 else return -1;
 }
 
-fn putchar(c: i32) callconv(W) i32 {
+fn putchar(c: i32) callconv(C) i32 {
     return fputc(c, &iob_table[1]);
 }
 
-fn feof(stream: ?*MsvcrtFile) callconv(W) i32 {
+fn feof(stream: ?*MsvcrtFile) callconv(C) i32 {
     const s = stream orelse return 0;
     return if ((s._flag & 0x10) != 0) 1 else 0;
 }
 
-fn ferror(stream: ?*MsvcrtFile) callconv(W) i32 {
+fn ferror(stream: ?*MsvcrtFile) callconv(C) i32 {
     const s = stream orelse return 0;
     return if ((s._flag & 0x20) != 0) 1 else 0;
 }
 
-fn clearerr(stream: ?*MsvcrtFile) callconv(W) void {
+fn clearerr(stream: ?*MsvcrtFile) callconv(C) void {
     if (stream) |s| s._flag &= ~@as(i32, 0x30);
 }
 
-fn _filbuf(stream: ?*MsvcrtFile) callconv(W) i32 {
+fn _filbuf(stream: ?*MsvcrtFile) callconv(C) i32 {
     return getc(stream);
 }
 
-fn _getch() callconv(W) i32 {
+fn _getch() callconv(C) i32 {
     return getc(&iob_table[0]);
 }
 
-fn _getche() callconv(W) i32 {
+fn _getche() callconv(C) i32 {
     const ch = getc(&iob_table[0]);
     if (ch >= 0) _ = fputc(ch, &iob_table[1]);
     return ch;
 }
 
-fn setbuf(stream: ?*MsvcrtFile, buffer: ?[*]u8) callconv(W) void {
+fn setbuf(stream: ?*MsvcrtFile, buffer: ?[*]u8) callconv(C) void {
     _ = stream;
     _ = buffer;
 }
 
-fn setvbuf(stream: ?*MsvcrtFile, buffer: ?[*]u8, mode: i32, size: usize) callconv(W) i32 {
+fn setvbuf(stream: ?*MsvcrtFile, buffer: ?[*]u8, mode: i32, size: usize) callconv(C) i32 {
     _ = stream;
     _ = buffer;
     _ = mode;
@@ -672,7 +702,7 @@ const _O_CREAT: i32 = 0x0100;
 const _O_TRUNC: i32 = 0x0200;
 const _O_EXCL: i32 = 0x0400;
 
-fn _open(filename: ?[*:0]const u8, oflag: i32, pmode: i32) callconv(W) i32 {
+fn _open(filename: ?[*:0]const u8, oflag: i32, pmode: i32) callconv(C) i32 {
     const name = filename orelse return -1;
     var flags: linux.O = .{};
     const access = oflag & 0x0003;
@@ -699,11 +729,11 @@ fn _open(filename: ?[*:0]const u8, oflag: i32, pmode: i32) callconv(W) i32 {
     return @intCast(rc);
 }
 
-fn _creat(filename: ?[*:0]const u8, pmode: i32) callconv(W) i32 {
+fn _creat(filename: ?[*:0]const u8, pmode: i32) callconv(C) i32 {
     return _open(filename, _O_CREAT | _O_TRUNC | _O_WRONLY, pmode);
 }
 
-fn _close(fd: i32) callconv(W) i32 {
+fn _close(fd: i32) callconv(C) i32 {
     if (fd < 0) return -1;
     const rc = linux.close(fd);
     if (linux.errno(rc) != .SUCCESS) {
@@ -713,7 +743,7 @@ fn _close(fd: i32) callconv(W) i32 {
     return 0;
 }
 
-fn _read(fd: i32, buf: ?[*]u8, count: u32) callconv(W) i32 {
+fn _read(fd: i32, buf: ?[*]u8, count: u32) callconv(C) i32 {
     const b = buf orelse return -1;
     const rc = linux.read(fd, b, count);
     if (linux.errno(rc) != .SUCCESS) {
@@ -723,7 +753,7 @@ fn _read(fd: i32, buf: ?[*]u8, count: u32) callconv(W) i32 {
     return @intCast(rc);
 }
 
-fn _write(fd: i32, buf: ?[*]const u8, count: u32) callconv(W) i32 {
+fn _write(fd: i32, buf: ?[*]const u8, count: u32) callconv(C) i32 {
     const b = buf orelse return -1;
     const rc = linux.write(fd, b, count);
     if (linux.errno(rc) != .SUCCESS) {
@@ -733,20 +763,41 @@ fn _write(fd: i32, buf: ?[*]const u8, count: u32) callconv(W) i32 {
     return @intCast(rc);
 }
 
-fn _lseeki64(fd: i32, offset: i64, origin: i32) callconv(W) i64 {
-    const rc = linux.lseek(fd, offset, @intCast(origin));
+/// Returns the resulting offset, or null on failure. std's linux.lseek cannot
+/// compile for a 32-bit target (it bitcasts an i64 into the syscall's offset
+/// slot), so the i386 path goes through _llseek (140), which takes the 64-bit
+/// offset as explicit high/low halves plus a result pointer.
+fn _lseeki64(fd: i32, offset: i64, origin: i32) ?i64 {
+    if (@sizeOf(usize) == 8) {
+        const rc = linux.lseek(fd, offset, @intCast(origin));
+        if (linux.errno(rc) != .SUCCESS) {
+            thread_errno = @intCast(@intFromEnum(linux.errno(rc)));
+            return null;
+        }
+        return @intCast(rc);
+    }
+    var result: i64 = 0;
+    const raw: u64 = @bitCast(offset);
+    const rc = linux.syscall5(
+        .llseek,
+        @as(usize, @bitCast(@as(isize, fd))),
+        @as(usize, @truncate(raw >> 32)),
+        @as(usize, @truncate(raw)),
+        @intFromPtr(&result),
+        @as(usize, @intCast(origin)),
+    );
     if (linux.errno(rc) != .SUCCESS) {
         thread_errno = @intCast(@intFromEnum(linux.errno(rc)));
-        return -1;
+        return null;
     }
-    return @intCast(rc);
+    return result;
 }
 
-fn _telli64(fd: i32) callconv(W) i64 {
-    return _lseeki64(fd, 0, 1); // SEEK_CUR
+fn _telli64(fd: i32) i64 {
+    return _lseeki64(fd, 0, 1) orelse -1; // SEEK_CUR
 }
 
-fn _dup(fd: i32) callconv(W) i32 {
+fn _dup(fd: i32) callconv(C) i32 {
     const rc = linux.dup(fd);
     if (linux.errno(rc) != .SUCCESS) {
         thread_errno = @intCast(@intFromEnum(linux.errno(rc)));
@@ -755,7 +806,7 @@ fn _dup(fd: i32) callconv(W) i32 {
     return @intCast(rc);
 }
 
-fn _dup2(fd1: i32, fd2: i32) callconv(W) i32 {
+fn _dup2(fd1: i32, fd2: i32) callconv(C) i32 {
     const rc = linux.dup2(fd1, fd2);
     if (linux.errno(rc) != .SUCCESS) {
         thread_errno = @intCast(@intFromEnum(linux.errno(rc)));
@@ -764,7 +815,7 @@ fn _dup2(fd1: i32, fd2: i32) callconv(W) i32 {
     return @intCast(rc);
 }
 
-fn _pipe(pfds: ?[*]i32, psize: u32, textmode: i32) callconv(W) i32 {
+fn _pipe(pfds: ?[*]i32, psize: u32, textmode: i32) callconv(C) i32 {
     _ = psize;
     _ = textmode;
     const p = pfds orelse return -1;
@@ -786,32 +837,32 @@ const WinSize = extern struct {
     ws_ypixel: u16 = 0,
 };
 
-fn _isatty(fd: i32) callconv(W) i32 {
+fn _isatty(fd: i32) callconv(C) i32 {
     var ws: WinSize = .{};
     const rc = linux.ioctl(fd, linux.T.IOCGWINSZ, @intFromPtr(&ws));
     return if (linux.errno(rc) == .SUCCESS) 1 else 0;
 }
 
-fn _get_osfhandle(fd: i32) callconv(W) isize {
+fn _get_osfhandle(fd: i32) callconv(C) isize {
     return @intCast(fd);
 }
 
-fn _open_osfhandle(osfhandle: isize, flags: i32) callconv(W) i32 {
+fn _open_osfhandle(osfhandle: isize, flags: i32) callconv(C) i32 {
     _ = flags;
     return @intCast(osfhandle);
 }
 
-fn _setmode(fd: i32, mode: i32) callconv(W) i32 {
+fn _setmode(fd: i32, mode: i32) callconv(C) i32 {
     _ = fd;
     return mode;
 }
 
-fn _fileno(stream: ?*MsvcrtFile) callconv(W) i32 {
+fn _fileno(stream: ?*MsvcrtFile) callconv(C) i32 {
     const s = stream orelse return -1;
     return s._file;
 }
 
-fn _fdopen(fd: i32, mode: ?[*:0]const u8) callconv(W) ?*MsvcrtFile {
+fn _fdopen(fd: i32, mode: ?[*:0]const u8) callconv(C) ?*MsvcrtFile {
     if (fd < 0) return null;
     var slot: ?usize = null;
     for (3..IOB_COUNT) |i| {
@@ -844,7 +895,7 @@ fn _fdopen(fd: i32, mode: ?[*:0]const u8) callconv(W) ?*MsvcrtFile {
 // 6. Filesystem & Paths
 // ---------------------------------------------------------------------------
 
-fn _access(path: ?[*:0]const u8, mode: i32) callconv(W) i32 {
+fn _access(path: ?[*:0]const u8, mode: i32) callconv(C) i32 {
     const p = path orelse return -1;
     var buf: [512:0]u8 = undefined;
     normalizePathA(p, &buf);
@@ -856,7 +907,7 @@ fn _access(path: ?[*:0]const u8, mode: i32) callconv(W) i32 {
     return 0;
 }
 
-fn _chmod(path: ?[*:0]const u8, mode: i32) callconv(W) i32 {
+fn _chmod(path: ?[*:0]const u8, mode: i32) callconv(C) i32 {
     const p = path orelse return -1;
     var buf: [512:0]u8 = undefined;
     normalizePathA(p, &buf);
@@ -868,7 +919,7 @@ fn _chmod(path: ?[*:0]const u8, mode: i32) callconv(W) i32 {
     return 0;
 }
 
-fn _unlink(path: ?[*:0]const u8) callconv(W) i32 {
+fn _unlink(path: ?[*:0]const u8) callconv(C) i32 {
     const p = path orelse return -1;
     var buf: [512:0]u8 = undefined;
     normalizePathA(p, &buf);
@@ -880,7 +931,7 @@ fn _unlink(path: ?[*:0]const u8) callconv(W) i32 {
     return 0;
 }
 
-fn _mkdir(path: ?[*:0]const u8) callconv(W) i32 {
+fn _mkdir(path: ?[*:0]const u8) callconv(C) i32 {
     const p = path orelse return -1;
     var buf: [512:0]u8 = undefined;
     normalizePathA(p, &buf);
@@ -892,7 +943,7 @@ fn _mkdir(path: ?[*:0]const u8) callconv(W) i32 {
     return 0;
 }
 
-fn _rmdir(path: ?[*:0]const u8) callconv(W) i32 {
+fn _rmdir(path: ?[*:0]const u8) callconv(C) i32 {
     const p = path orelse return -1;
     var buf: [512:0]u8 = undefined;
     normalizePathA(p, &buf);
@@ -904,7 +955,7 @@ fn _rmdir(path: ?[*:0]const u8) callconv(W) i32 {
     return 0;
 }
 
-fn _chdir(path: ?[*:0]const u8) callconv(W) i32 {
+fn _chdir(path: ?[*:0]const u8) callconv(C) i32 {
     const p = path orelse return -1;
     var buf: [512:0]u8 = undefined;
     normalizePathA(p, &buf);
@@ -916,7 +967,7 @@ fn _chdir(path: ?[*:0]const u8) callconv(W) i32 {
     return 0;
 }
 
-fn _getcwd(buf: ?[*]u8, maxlen: i32) callconv(W) ?[*]u8 {
+fn _getcwd(buf: ?[*]u8, maxlen: i32) callconv(C) ?[*]u8 {
     if (maxlen <= 0) return null;
     const dest = buf orelse (malloc(@intCast(maxlen)) orelse return null);
     const rc = linux.getcwd(dest, @intCast(maxlen));
@@ -927,7 +978,7 @@ fn _getcwd(buf: ?[*]u8, maxlen: i32) callconv(W) ?[*]u8 {
     return dest;
 }
 
-fn _umask(mask: i32) callconv(W) i32 {
+fn _umask(mask: i32) callconv(C) i32 {
     const rc = linux.syscall1(.umask, @as(usize, @intCast(mask & 0o777)));
     return @intCast(rc);
 }
@@ -973,7 +1024,7 @@ comptime {
     std.debug.assert(@sizeOf(StructStat64) == 56);
 }
 
-fn _fstat64(fd: i32, st_ptr: ?*StructStat64) callconv(W) i32 {
+fn _fstat64(fd: i32, st_ptr: ?*StructStat64) callconv(C) i32 {
     const st = st_ptr orelse return -1;
     var kstat: LinuxStat = undefined;
     const rc = linux.syscall2(.fstat, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&kstat));
@@ -997,7 +1048,7 @@ fn _fstat64(fd: i32, st_ptr: ?*StructStat64) callconv(W) i32 {
     return 0;
 }
 
-fn _fullpath(out_buf: ?[*]u8, rel_path: ?[*:0]const u8, max_len: usize) callconv(W) ?[*]u8 {
+fn _fullpath(out_buf: ?[*]u8, rel_path: ?[*:0]const u8, max_len: usize) callconv(C) ?[*]u8 {
     const src = rel_path orelse return null;
     const dest = out_buf orelse (malloc(if (max_len == 0) 512 else max_len) orelse return null);
     var norm: [512:0]u8 = undefined;
@@ -1020,7 +1071,7 @@ fn _fullpath(out_buf: ?[*]u8, rel_path: ?[*:0]const u8, max_len: usize) callconv
     return dest;
 }
 
-fn _mktemp(template: ?[*:0]u8) callconv(W) ?[*:0]u8 {
+fn _mktemp(template: ?[*:0]u8) callconv(C) ?[*:0]u8 {
     const t = template orelse return null;
     var len = strlen(t);
     var xcount: usize = 0;
@@ -1038,7 +1089,7 @@ fn _mktemp(template: ?[*:0]u8) callconv(W) ?[*:0]u8 {
     return t;
 }
 
-fn rename(old_path: ?[*:0]const u8, new_path: ?[*:0]const u8) callconv(W) i32 {
+fn rename(old_path: ?[*:0]const u8, new_path: ?[*:0]const u8) callconv(C) i32 {
     const o = old_path orelse return -1;
     const n = new_path orelse return -1;
     var old_buf: [512:0]u8 = undefined;
@@ -1057,11 +1108,11 @@ fn rename(old_path: ?[*:0]const u8, new_path: ?[*:0]const u8) callconv(W) i32 {
 // 7. Process, Signals & Environment
 // ---------------------------------------------------------------------------
 
-fn _getpid() callconv(W) i32 {
+fn _getpid() callconv(C) i32 {
     return @intCast(linux.getpid());
 }
 
-fn _spawnve(mode: i32, cmdname: ?[*:0]const u8, argv: ?[*]const ?[*:0]const u8, envp: ?[*]const ?[*:0]const u8) callconv(W) isize {
+fn _spawnve(mode: i32, cmdname: ?[*:0]const u8, argv: ?[*]const ?[*:0]const u8, envp: ?[*]const ?[*:0]const u8) callconv(C) isize {
     _ = mode;
     _ = cmdname;
     _ = argv;
@@ -1117,7 +1168,7 @@ fn initEnvironment() void {
     msvcrt_environ = &env_ptrs_dyn;
 }
 
-fn getenv(name: ?[*:0]const u8) callconv(W) ?[*:0]const u8 {
+fn getenv(name: ?[*:0]const u8) callconv(C) ?[*:0]const u8 {
     initEnvironment();
     const key = name orelse return null;
     const key_len = strlen(key);
@@ -1130,7 +1181,7 @@ fn getenv(name: ?[*:0]const u8) callconv(W) ?[*:0]const u8 {
     return null;
 }
 
-fn _putenv(env_string: ?[*:0]const u8) callconv(W) i32 {
+fn _putenv(env_string: ?[*:0]const u8) callconv(C) i32 {
     initEnvironment();
     const s = env_string orelse return -1;
     const eq = strchr(s, '=') orelse return -1;
@@ -1211,7 +1262,7 @@ fn fillTm(epoch: i64, tm: *StructTm) void {
     tm.tm_isdst = 0;
 }
 
-fn _time64(timer: ?*i64) callconv(W) i64 {
+fn _time64(timer: ?*i64) callconv(C) i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
     const now: i64 = @intCast(ts.sec);
@@ -1219,19 +1270,19 @@ fn _time64(timer: ?*i64) callconv(W) i64 {
     return now;
 }
 
-fn _gmtime64(timer: ?*const i64) callconv(W) ?*StructTm {
+fn _gmtime64(timer: ?*const i64) callconv(C) ?*StructTm {
     const t = timer orelse return null;
     fillTm(t.*, &global_tm);
     return &global_tm;
 }
 
-fn _localtime64(timer: ?*const i64) callconv(W) ?*StructTm {
+fn _localtime64(timer: ?*const i64) callconv(C) ?*StructTm {
     return _gmtime64(timer);
 }
 
 var ctime_buf: [32:0]u8 = undefined;
 
-fn _ctime64(timer: ?*const i64) callconv(W) ?[*:0]const u8 {
+fn _ctime64(timer: ?*const i64) callconv(C) ?[*:0]const u8 {
     const tm = _localtime64(timer) orelse return null;
     const wdays = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
@@ -1250,7 +1301,7 @@ fn _ctime64(timer: ?*const i64) callconv(W) ?[*:0]const u8 {
     return &ctime_buf;
 }
 
-fn _mktime64(timeptr: ?*StructTm) callconv(W) i64 {
+fn _mktime64(timeptr: ?*StructTm) callconv(C) i64 {
     const tm = timeptr orelse return -1;
     var year = tm.tm_year + 1900;
     var mon = tm.tm_mon;
@@ -1277,7 +1328,7 @@ fn _mktime64(timeptr: ?*StructTm) callconv(W) i64 {
     return secs;
 }
 
-fn strftime(s: ?[*]u8, maxsize: usize, format: ?[*:0]const u8, timeptr: ?*const StructTm) callconv(W) usize {
+fn strftime(s: ?[*]u8, maxsize: usize, format: ?[*:0]const u8, timeptr: ?*const StructTm) callconv(C) usize {
     const dest = s orelse return 0;
     const fmt = format orelse return 0;
     const tm = timeptr orelse return 0;
@@ -1321,34 +1372,34 @@ fn strftime(s: ?[*]u8, maxsize: usize, format: ?[*:0]const u8, timeptr: ?*const 
     return di;
 }
 
-fn clock() callconv(W) i64 {
+fn clock() callconv(C) i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.PROCESS_CPUTIME_ID, &ts);
     const ms = @as(i64, @intCast(ts.sec)) * 1000 + @divFloor(@as(i64, @intCast(ts.nsec)), 1_000_000);
     return ms;
 }
 
-fn _tzset() callconv(W) void {}
+fn _tzset() callconv(C) void {}
 
 // ---------------------------------------------------------------------------
 // 9. String, Memory & CType Functions
 // ---------------------------------------------------------------------------
 
-fn strlen(s: ?[*:0]const u8) callconv(W) usize {
+fn strlen(s: ?[*:0]const u8) callconv(C) usize {
     const p = s orelse return 0;
     var n: usize = 0;
     while (p[n] != 0) : (n += 1) {}
     return n;
 }
 
-fn wcslen(s: ?[*:0]const u16) callconv(W) usize {
+fn wcslen(s: ?[*:0]const u16) callconv(C) usize {
     const p = s orelse return 0;
     var n: usize = 0;
     while (p[n] != 0) : (n += 1) {}
     return n;
 }
 
-fn strcmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8) callconv(W) i32 {
+fn strcmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8) callconv(C) i32 {
     const a = s1 orelse return -1;
     const b = s2 orelse return 1;
     var i: usize = 0;
@@ -1356,7 +1407,7 @@ fn strcmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8) callconv(W) i32 {
     return @as(i32, a[i]) - @as(i32, b[i]);
 }
 
-fn strncmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8, n: usize) callconv(W) i32 {
+fn strncmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8, n: usize) callconv(C) i32 {
     if (n == 0) return 0;
     const a = s1 orelse return -1;
     const b = s2 orelse return 1;
@@ -1365,7 +1416,7 @@ fn strncmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8, n: usize) callconv(W) i32 {
     return @as(i32, a[i]) - @as(i32, b[i]);
 }
 
-fn strcspn(s: ?[*:0]const u8, reject: ?[*:0]const u8) callconv(W) usize {
+fn strcspn(s: ?[*:0]const u8, reject: ?[*:0]const u8) callconv(C) usize {
     const a = s orelse return 0;
     const r = reject orelse return strlen(a);
     var i: usize = 0;
@@ -1378,101 +1429,101 @@ fn strcspn(s: ?[*:0]const u8, reject: ?[*:0]const u8) callconv(W) usize {
     return i;
 }
 
-fn strerror(errnum: i32) callconv(W) [*:0]const u8 {
+fn strerror(errnum: i32) callconv(C) [*:0]const u8 {
     _ = errnum;
     return "Success";
 }
 
-fn memcpy(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(W) ?[*]u8 {
+fn memcpy(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(C) ?[*]u8 {
     if (dest != null and src != null and n > 0) {
         @memcpy(dest.?[0..n], src.?[0..n]);
     }
     return dest;
 }
 
-fn memset(dest: ?[*]u8, c: i32, n: usize) callconv(W) ?[*]u8 {
+fn memset(dest: ?[*]u8, c: i32, n: usize) callconv(C) ?[*]u8 {
     if (dest != null and n > 0) {
         @memset(dest.?[0..n], @intCast(c & 0xFF));
     }
     return dest;
 }
 
-fn isspace(c: i32) callconv(W) i32 {
+fn isspace(c: i32) callconv(C) i32 {
     return switch (c) {
         ' ', '\t', '\n', '\r', 0x0b, 0x0c => 1,
         else => 0,
     };
 }
 
-fn isxdigit(c: i32) callconv(W) i32 {
+fn isxdigit(c: i32) callconv(C) i32 {
     return switch (c) {
         '0'...'9', 'a'...'f', 'A'...'F' => 1,
         else => 0,
     };
 }
 
-fn tolower(c: i32) callconv(W) i32 {
+fn tolower(c: i32) callconv(C) i32 {
     if (c >= 'A' and c <= 'Z') return c + 32;
     return c;
 }
 
-fn toupper(c: i32) callconv(W) i32 {
+fn toupper(c: i32) callconv(C) i32 {
     if (c >= 'a' and c <= 'z') return c - 32;
     return c;
 }
 
-fn isalnum(c: i32) callconv(W) i32 {
+fn isalnum(c: i32) callconv(C) i32 {
     return switch (c) {
         '0'...'9', 'a'...'z', 'A'...'Z' => 1,
         else => 0,
     };
 }
 
-fn isalpha(c: i32) callconv(W) i32 {
+fn isalpha(c: i32) callconv(C) i32 {
     return switch (c) {
         'a'...'z', 'A'...'Z' => 1,
         else => 0,
     };
 }
 
-fn iscntrl(c: i32) callconv(W) i32 {
+fn iscntrl(c: i32) callconv(C) i32 {
     return if ((c >= 0 and c <= 0x1f) or c == 0x7f) 1 else 0;
 }
 
-fn isdigit(c: i32) callconv(W) i32 {
+fn isdigit(c: i32) callconv(C) i32 {
     return switch (c) {
         '0'...'9' => 1,
         else => 0,
     };
 }
 
-fn isgraph(c: i32) callconv(W) i32 {
+fn isgraph(c: i32) callconv(C) i32 {
     return if (c >= 0x21 and c <= 0x7e) 1 else 0;
 }
 
-fn islower(c: i32) callconv(W) i32 {
+fn islower(c: i32) callconv(C) i32 {
     return switch (c) {
         'a'...'z' => 1,
         else => 0,
     };
 }
 
-fn isprint(c: i32) callconv(W) i32 {
+fn isprint(c: i32) callconv(C) i32 {
     return if (c >= 0x20 and c <= 0x7e) 1 else 0;
 }
 
-fn ispunct(c: i32) callconv(W) i32 {
+fn ispunct(c: i32) callconv(C) i32 {
     return if (isgraph(c) != 0 and isalnum(c) == 0) 1 else 0;
 }
 
-fn isupper(c: i32) callconv(W) i32 {
+fn isupper(c: i32) callconv(C) i32 {
     return switch (c) {
         'A'...'Z' => 1,
         else => 0,
     };
 }
 
-fn _strdup(s: ?[*:0]const u8) callconv(W) ?[*:0]u8 {
+fn _strdup(s: ?[*:0]const u8) callconv(C) ?[*:0]u8 {
     const str = s orelse return null;
     const len = strlen(str);
     const mem = malloc(len + 1) orelse return null;
@@ -1481,7 +1532,7 @@ fn _strdup(s: ?[*:0]const u8) callconv(W) ?[*:0]u8 {
     return @ptrCast(mem);
 }
 
-fn _stricmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8) callconv(W) i32 {
+fn _stricmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8) callconv(C) i32 {
     const a = s1 orelse return -1;
     const b = s2 orelse return 1;
     var i: usize = 0;
@@ -1493,7 +1544,7 @@ fn _stricmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8) callconv(W) i32 {
     return tolower(a[i]) - tolower(b[i]);
 }
 
-fn _strnicmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8, n: usize) callconv(W) i32 {
+fn _strnicmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8, n: usize) callconv(C) i32 {
     if (n == 0) return 0;
     const a = s1 orelse return -1;
     const b = s2 orelse return 1;
@@ -1507,7 +1558,7 @@ fn _strnicmp(s1: ?[*:0]const u8, s2: ?[*:0]const u8, n: usize) callconv(W) i32 {
     return tolower(a[i]) - tolower(b[i]);
 }
 
-fn _wcsnicmp(s1: ?[*:0]const u16, s2: ?[*:0]const u16, n: usize) callconv(W) i32 {
+fn _wcsnicmp(s1: ?[*:0]const u16, s2: ?[*:0]const u16, n: usize) callconv(C) i32 {
     if (n == 0) return 0;
     const a = s1 orelse return -1;
     const b = s2 orelse return 1;
@@ -1523,7 +1574,7 @@ fn _wcsnicmp(s1: ?[*:0]const u16, s2: ?[*:0]const u16, n: usize) callconv(W) i32
     return ca - cb;
 }
 
-fn wcscpy(dest: ?[*]u16, src: ?[*:0]const u16) callconv(W) ?[*]u16 {
+fn wcscpy(dest: ?[*]u16, src: ?[*:0]const u16) callconv(C) ?[*]u16 {
     const d = dest orelse return null;
     const s = src orelse return null;
     var i: usize = 0;
@@ -1534,7 +1585,7 @@ fn wcscpy(dest: ?[*]u16, src: ?[*:0]const u16) callconv(W) ?[*]u16 {
     return d;
 }
 
-fn wcsncmp(s1: ?[*:0]const u16, s2: ?[*:0]const u16, n: usize) callconv(W) i32 {
+fn wcsncmp(s1: ?[*:0]const u16, s2: ?[*:0]const u16, n: usize) callconv(C) i32 {
     if (n == 0) return 0;
     const a = s1 orelse return -1;
     const b = s2 orelse return 1;
@@ -1544,7 +1595,7 @@ fn wcsncmp(s1: ?[*:0]const u16, s2: ?[*:0]const u16, n: usize) callconv(W) i32 {
     return @as(i32, a[i]) - @as(i32, b[i]);
 }
 
-fn strcpy(dest: ?[*]u8, src: ?[*:0]const u8) callconv(W) ?[*]u8 {
+fn strcpy(dest: ?[*]u8, src: ?[*:0]const u8) callconv(C) ?[*]u8 {
     const d = dest orelse return null;
     const s = src orelse return null;
     var i: usize = 0;
@@ -1555,7 +1606,7 @@ fn strcpy(dest: ?[*]u8, src: ?[*:0]const u8) callconv(W) ?[*]u8 {
     return d;
 }
 
-fn strncpy(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(W) ?[*]u8 {
+fn strncpy(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(C) ?[*]u8 {
     const d = dest orelse return null;
     const s = src orelse return null;
     var i: usize = 0;
@@ -1567,7 +1618,7 @@ fn strncpy(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(W) ?[*]u8 {
     return d;
 }
 
-fn strcat(dest: ?[*]u8, src: ?[*:0]const u8) callconv(W) ?[*]u8 {
+fn strcat(dest: ?[*]u8, src: ?[*:0]const u8) callconv(C) ?[*]u8 {
     const d = dest orelse return null;
     const s = src orelse return null;
     var len: usize = 0;
@@ -1580,7 +1631,7 @@ fn strcat(dest: ?[*]u8, src: ?[*:0]const u8) callconv(W) ?[*]u8 {
     return d;
 }
 
-fn strchr(s: ?[*:0]const u8, c: i32) callconv(W) ?[*:0]const u8 {
+fn strchr(s: ?[*:0]const u8, c: i32) callconv(C) ?[*:0]const u8 {
     const p = s orelse return null;
     const target: u8 = @intCast(c & 0xFF);
     var i: usize = 0;
@@ -1591,7 +1642,7 @@ fn strchr(s: ?[*:0]const u8, c: i32) callconv(W) ?[*:0]const u8 {
     return null;
 }
 
-fn strrchr(s: ?[*:0]const u8, c: i32) callconv(W) ?[*:0]const u8 {
+fn strrchr(s: ?[*:0]const u8, c: i32) callconv(C) ?[*:0]const u8 {
     const p = s orelse return null;
     const target: u8 = @intCast(c & 0xFF);
     var last: ?usize = null;
@@ -1604,7 +1655,7 @@ fn strrchr(s: ?[*:0]const u8, c: i32) callconv(W) ?[*:0]const u8 {
     return null;
 }
 
-fn strpbrk(s: ?[*:0]const u8, accept: ?[*:0]const u8) callconv(W) ?[*:0]const u8 {
+fn strpbrk(s: ?[*:0]const u8, accept: ?[*:0]const u8) callconv(C) ?[*:0]const u8 {
     const p = s orelse return null;
     const acc = accept orelse return null;
     var i: usize = 0;
@@ -1617,7 +1668,7 @@ fn strpbrk(s: ?[*:0]const u8, accept: ?[*:0]const u8) callconv(W) ?[*:0]const u8
     return null;
 }
 
-fn strspn(s: ?[*:0]const u8, accept: ?[*:0]const u8) callconv(W) usize {
+fn strspn(s: ?[*:0]const u8, accept: ?[*:0]const u8) callconv(C) usize {
     const p = s orelse return 0;
     const acc = accept orelse return 0;
     var i: usize = 0;
@@ -1635,7 +1686,7 @@ fn strspn(s: ?[*:0]const u8, accept: ?[*:0]const u8) callconv(W) usize {
     return i;
 }
 
-fn strstr(haystack: ?[*:0]const u8, needle: ?[*:0]const u8) callconv(W) ?[*:0]const u8 {
+fn strstr(haystack: ?[*:0]const u8, needle: ?[*:0]const u8) callconv(C) ?[*:0]const u8 {
     const h = haystack orelse return null;
     const n = needle orelse return null;
     if (n[0] == 0) return h;
@@ -1650,7 +1701,7 @@ fn strstr(haystack: ?[*:0]const u8, needle: ?[*:0]const u8) callconv(W) ?[*:0]co
 
 var strtok_saved: ?[*:0]u8 = null;
 
-fn strtok(str: ?[*:0]u8, delim: ?[*:0]const u8) callconv(W) ?[*:0]u8 {
+fn strtok(str: ?[*:0]u8, delim: ?[*:0]const u8) callconv(C) ?[*:0]u8 {
     const d = delim orelse return null;
     var s = str orelse (strtok_saved orelse return null);
     while (s[0] != 0) {
@@ -1690,7 +1741,7 @@ fn strtok(str: ?[*:0]u8, delim: ?[*:0]const u8) callconv(W) ?[*:0]u8 {
     return token_start;
 }
 
-fn memchr(s: ?[*]const u8, c: i32, n: usize) callconv(W) ?[*]const u8 {
+fn memchr(s: ?[*]const u8, c: i32, n: usize) callconv(C) ?[*]const u8 {
     const p = s orelse return null;
     const target: u8 = @intCast(c & 0xFF);
     for (0..n) |i| {
@@ -1699,7 +1750,7 @@ fn memchr(s: ?[*]const u8, c: i32, n: usize) callconv(W) ?[*]const u8 {
     return null;
 }
 
-fn memcmp(s1: ?[*]const u8, s2: ?[*]const u8, n: usize) callconv(W) i32 {
+fn memcmp(s1: ?[*]const u8, s2: ?[*]const u8, n: usize) callconv(C) i32 {
     if (n == 0) return 0;
     const a = s1 orelse return -1;
     const b = s2 orelse return 1;
@@ -1709,7 +1760,7 @@ fn memcmp(s1: ?[*]const u8, s2: ?[*]const u8, n: usize) callconv(W) i32 {
     return 0;
 }
 
-fn memmove(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(W) ?[*]u8 {
+fn memmove(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(C) ?[*]u8 {
     const d = dest orelse return null;
     const s = src orelse return null;
     if (n == 0 or d == s) return d;
@@ -1782,32 +1833,32 @@ fn parseUnsigned(s_opt: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base_in: i32, 
     return acc;
 }
 
-fn _strtoui64(s: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base: i32) callconv(W) u64 {
+fn _strtoui64(s: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base: i32) callconv(C) u64 {
     var neg = false;
     const val = parseUnsigned(s, endptr, base, &neg);
     return if (neg) 0 -% val else val;
 }
 
-fn _strtoi64(s: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base: i32) callconv(W) i64 {
+fn _strtoi64(s: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base: i32) callconv(C) i64 {
     var neg = false;
     const val = parseUnsigned(s, endptr, base, &neg);
     if (neg) return -@as(i64, @intCast(@min(val, @as(u64, @intCast(std.math.maxInt(i64))))));
     return @intCast(@min(val, @as(u64, @intCast(std.math.maxInt(i64)))));
 }
 
-fn strtoul(s: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base: i32) callconv(W) u32 {
+fn strtoul(s: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base: i32) callconv(C) u32 {
     return @truncate(_strtoui64(s, endptr, base));
 }
 
-fn strtol(s: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base: i32) callconv(W) i32 {
+fn strtol(s: ?[*:0]const u8, endptr: ?*?[*:0]const u8, base: i32) callconv(C) i32 {
     return @truncate(_strtoi64(s, endptr, base));
 }
 
-fn atoi(s: ?[*:0]const u8) callconv(W) i32 {
+fn atoi(s: ?[*:0]const u8) callconv(C) i32 {
     return strtol(s, null, 10);
 }
 
-fn atof(s: ?[*:0]const u8) callconv(W) f64 {
+fn atof(s: ?[*:0]const u8) callconv(C) f64 {
     const p = s orelse return 0.0;
     var i: usize = 0;
     while (isspace(p[i]) != 0) : (i += 1) {}
@@ -1852,12 +1903,12 @@ fn atof(s: ?[*:0]const u8) callconv(W) f64 {
 
 var rand_next: u64 = 1;
 
-fn rand() callconv(W) i32 {
+fn rand() callconv(C) i32 {
     rand_next = rand_next *% 214013 +% 2531011;
     return @as(i32, @bitCast(@as(u32, @truncate((rand_next >> 16) & 0x7fff))));
 }
 
-fn srand(seed: u32) callconv(W) void {
+fn srand(seed: u32) callconv(C) void {
     rand_next = seed;
 }
 
@@ -1866,8 +1917,8 @@ fn bsearch(
     base: ?[*]const u8,
     nmemb: usize,
     size: usize,
-    compar: ?*const fn (?*const anyopaque, ?*const anyopaque) callconv(W) i32,
-) callconv(W) ?*const anyopaque {
+    compar: ?*const fn (?*const anyopaque, ?*const anyopaque) callconv(C) i32,
+) callconv(C) ?*const anyopaque {
     const k = key orelse return null;
     const b = base orelse return null;
     const cmp = compar orelse return null;
@@ -1892,8 +1943,8 @@ fn qsort(
     base: ?[*]u8,
     nmemb: usize,
     size: usize,
-    compar: ?*const fn (?*const anyopaque, ?*const anyopaque) callconv(W) i32,
-) callconv(W) void {
+    compar: ?*const fn (?*const anyopaque, ?*const anyopaque) callconv(C) i32,
+) callconv(C) void {
     const b = base orelse return;
     const cmp = compar orelse return;
     if (nmemb < 2 or size == 0) return;
@@ -1914,7 +1965,7 @@ fn qsort(
     }
 }
 
-fn ldexp(x: f64, exp: i32) callconv(W) f64 {
+fn ldexp(x: f64, exp: i32) callconv(C) f64 {
     return std.math.scalbn(x, exp);
 }
 
@@ -2034,7 +2085,7 @@ fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]co
                 piece = tmp[0..1];
             },
             'd', 'i' => {
-                const sval: i64 = if (is_long) @bitCast(arg_val) else @as(i64, @as(i32, @truncate(@as(isize, @bitCast(arg_val)))));
+                const sval: i64 = if (is_long) @as(i64, @bitCast(@as(u64, arg_val))) else @as(i64, @as(i32, @truncate(@as(isize, @bitCast(arg_val)))));
                 piece = std.fmt.bufPrint(&tmp, "{d}", .{sval}) catch "";
             },
             'u' => {
@@ -2084,20 +2135,20 @@ fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]co
     return @intCast(out_pos);
 }
 
-fn _vsnprintf(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(W) i32 {
+fn _vsnprintf(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(C) i32 {
     return vsnprintf_impl(buf, count, fmt, ap_raw);
 }
 
-fn _vscprintf(fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(W) i32 {
+fn _vscprintf(fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(C) i32 {
     return vsnprintf_impl(null, 0, fmt, ap_raw);
 }
 
-fn sprintf(buf: ?[*]u8, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) callconv(W) i32 {
+fn sprintf(buf: ?[*]u8, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) callconv(C) i32 {
     const args = [_]usize{ a1, a2, a3, a4, a5, a6, a7, a8 };
     return vsnprintf_impl(buf, 4096, fmt, &args);
 }
 
-fn vfprintf(stream: ?*MsvcrtFile, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(W) i32 {
+fn vfprintf(stream: ?*MsvcrtFile, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(C) i32 {
     if (stream == null or fmt == null) return -1;
     var out_buf: [4096]u8 = undefined;
     const len = vsnprintf_impl(&out_buf, out_buf.len, fmt, ap_raw);
@@ -2108,17 +2159,17 @@ fn vfprintf(stream: ?*MsvcrtFile, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) 
     return len;
 }
 
-fn fprintf(stream: ?*MsvcrtFile, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize) callconv(W) i32 {
+fn fprintf(stream: ?*MsvcrtFile, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize) callconv(C) i32 {
     const args = [_]usize{ a1, a2, a3, a4 };
     return vfprintf(stream, fmt, &args);
 }
 
-fn printf(fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) callconv(W) i32 {
+fn printf(fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) callconv(C) i32 {
     const args = [_]usize{ a1, a2, a3, a4, a5, a6, a7, a8 };
     return vfprintf(&iob_table[1], fmt, &args);
 }
 
-fn puts(s: ?[*:0]const u8) callconv(W) i32 {
+fn puts(s: ?[*:0]const u8) callconv(C) i32 {
     const str = s orelse return -1;
     const len = strlen(str);
     if (fwrite(str, 1, len, &iob_table[1]) != len) return -1;
@@ -2127,7 +2178,7 @@ fn puts(s: ?[*:0]const u8) callconv(W) i32 {
     return 0;
 }
 
-fn sscanf(str: ?[*:0]const u8, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) callconv(W) i32 {
+fn sscanf(str: ?[*:0]const u8, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) callconv(C) i32 {
     const s = str orelse return -1;
     const f = fmt orelse return -1;
     const args = [_]usize{ a1, a2, a3, a4, a5, a6, a7, a8 };
@@ -2250,6 +2301,11 @@ fn sscanf(str: ?[*:0]const u8, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: us
 // ---------------------------------------------------------------------------
 
 pub fn _setjmp_impl() callconv(.naked) void {
+    // i386 is deliberately unimplemented: the x86 jmp_buf layout (the
+    // Registration/TryLevel C++-EH fields included) is not verified here.
+    // lookup() does not export this on 32-bit, so a guest importing it shows up
+    // as UNRESOLVED instead of silently corrupting a stack.
+    if (@sizeOf(usize) != 8) asm volatile ("xorl %%eax, %%eax\x0a\x09ret");
     asm volatile (
         \\ movq %%rdx, 0x00(%%rcx)
         \\ movq %%rbx, 0x08(%%rcx)
@@ -2270,6 +2326,7 @@ pub fn _setjmp_impl() callconv(.naked) void {
 }
 
 pub fn longjmp_impl() callconv(.naked) void {
+    if (@sizeOf(usize) != 8) asm volatile ("ret");
     asm volatile (
         \\ movl %%edx, %%eax
         \\ testl %%eax, %%eax
@@ -2290,9 +2347,148 @@ pub fn longjmp_impl() callconv(.naked) void {
     );
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 13. CRT startup / C++-EH surface a real MSVCRT-linked console PE needs
+//
+// These are the imports 7zr.exe (a genuine MSVCRT 6.0 console image) needs and
+// the module did not yet provide. Each documents what it does NOT do.
+// ============================================================================
+
+/// _controlfp(new, mask). The x87 control word is not emulated: report the
+/// default (RC-nearest, 64-bit precision, all exceptions masked) and never
+/// actually change it. Callers that only test flags get a sane answer.
+fn _controlfp(newv: i32, maskv: i32) callconv(C) i32 {
+    _ = newv;
+    _ = maskv;
+    return 0x0009001f;
+}
+
+fn _clearfp() callconv(C) i32 {
+    return 0x0009001f;
+}
+
+/// Pentium-era fdiv rounding bug. There is no fdiv bug on a real FPU, so this
+/// is a no-op rather than a trap emulation.
+fn _adjust_fdiv(fpu_env: ?*const anyopaque) callconv(C) void {
+    _ = fpu_env;
+}
+
+/// __CxxFrameHandler and _except_handler3 returning EXCEPTION_CONTINUE_SEARCH
+/// ("not mine") is the one answer that cannot misroute an exception into a
+/// fabricated disposition. The full SEH-based C++ EH is NOT implemented.
+fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaque, disp: ?*const anyopaque) callconv(C) i32 {
+    _ = rec;
+    _ = frame;
+    _ = ctx;
+    _ = disp;
+    return 0; // EXCEPTION_CONTINUE_SEARCH
+}
+
+fn _except_handler3(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaque, disp: ?*const anyopaque) callconv(C) i32 {
+    _ = rec;
+    _ = frame;
+    _ = ctx;
+    _ = disp;
+    return 0; // EXCEPTION_CONTINUE_SEARCH
+}
+
+fn _XcptFilter(xcpt: u32, exc: ?*const anyopaque) callconv(C) i32 {
+    _ = xcpt;
+    _ = exc;
+    return 0; // EXCEPTION_CONTINUE_SEARCH
+}
+
+/// _CxxThrowException. The CRT declares it noreturn, but with no SEH-based C++
+/// unwinding here there is nothing to unwind, so a plain return is the only
+/// reachable behaviour. Documented, not hidden behind a stub.
+fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C) void {
+    _ = exc;
+    _ = dp;
+}
+
+/// type_info::~type_info, ?terminate@@YAXXZ and _purecall have no meaningful
+/// Linux equivalent; no-ops, because aborting a guest that never reached them
+/// would be strictly worse than doing nothing.
+fn type_info_dtor(self: ?*anyopaque) callconv(C) void {
+    _ = self;
+}
+
+fn terminate_stub() callconv(C) void {}
+
+fn purecall_stub() callconv(C) void {}
+
+fn __dllonexit(rec: ?*anyopaque, term: ?*anyopaque, onexit: ?*?*anyopaque) callconv(C) ?*anyopaque {
+    // The CRT onexit list is not threaded through this module. Record the block
+    // where the guest asked for it and hand the block back.
+    _ = term;
+    if (onexit) |o| {
+        if (o.* == null) o.* = rec;
+    }
+    return rec;
+}
+
+/// __ftol, i386: truncate ST(0) to a signed 64-bit in EDX:EAX. The x87 control
+/// word is saved, forced to round-toward-zero, then restored around the store.
+fn _ftol_i386() callconv(.naked) void {
+    asm volatile (
+        \\ subl $16, %%esp
+        \\ fstcw (%%esp)
+        \\ fnstcw 4(%%esp)
+        \\ orw $0x0c00, 4(%%esp)
+        \\ fldcw 4(%%esp)
+        \\ fistpq 8(%%esp)
+        \\ fldcw (%%esp)
+        \\ movl 8(%%esp), %%eax
+        \\ movl 12(%%esp), %%edx
+        \\ addl $16, %%esp
+        \\ ret
+    );
+}
+
+/// __ftol, x86_64: the value arrives in xmm0; no x87 dance exists there.
+fn _ftol_x86_64() callconv(.naked) void {
+    asm volatile (
+        \\ cvttsd2siq %%xmm0, %%rax
+        \\ ret
+    );
+}
+
+/// _beginthreadex is deliberately NOT exported from lookup(): it would have to
+/// hand the guest a thread entry on a real secondary stack, which this loader
+/// does not create. An unresolved import gets reported; a fake handle does not.
+
+fn wcscmp(a: ?[*:0]const u16, b: ?[*:0]const u16) callconv(C) i32 {
+    const x = a orelse return -1;
+    const y = b orelse return 1;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const cx = x[i];
+        const cy = y[i];
+        if (cx != cy) return if (cx < cy) -1 else 1;
+        if (cx == 0) return 0;
+    }
+}
+
+fn wcsstr(h: ?[*:0]const u16, n: ?[*:0]const u16) callconv(C) ?[*]u16 {
+    const hay = h orelse return null;
+    const needle = n orelse return null;
+    const hlen = wcslen(hay);
+    var nlen: usize = 0;
+    while (needle[nlen] != 0) : (nlen += 1) {}
+    if (nlen == 0) return @constCast(hay);
+    if (nlen > hlen) return null;
+    var i: usize = 0;
+    while (i + nlen <= hlen) : (i += 1) {
+        var j: usize = 0;
+        while (j < nlen and needle[j] == hay[i + j]) : (j += 1) {}
+        if (j == nlen) return @constCast(hay + i);
+    }
+    return null;
+}
+
+// ============================================================================
 // 12. Lookup Dispatch Table
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 pub fn lookup(name: []const u8) ?usize {
     // Data exports
@@ -2311,6 +2507,27 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "__p___argc")) return @intFromPtr(&__p___argc);
     if (std.mem.eql(u8, name, "__p__environ")) return @intFromPtr(&__p__environ);
     if (std.mem.eql(u8, name, "__set_app_type")) return @intFromPtr(&__set_app_type);
+    if (std.mem.eql(u8, name, "_controlfp")) return @intFromPtr(&_controlfp);
+    if (std.mem.eql(u8, name, "_clearfp")) return @intFromPtr(&_clearfp);
+    // `_iob` must be the address of the single iob_table, not a second array.
+    if (std.mem.eql(u8, name, "_iob")) return @intFromPtr(&iob_table);
+    if (std.mem.eql(u8, name, "__p___initenv")) return @intFromPtr(&__p__environ);
+    if (std.mem.eql(u8, name, "_XcptFilter")) return @intFromPtr(&_XcptFilter);
+    if (std.mem.eql(u8, name, "__CxxFrameHandler")) return @intFromPtr(&__CxxFrameHandler);
+    if (std.mem.eql(u8, name, "_except_handler3")) return @intFromPtr(&_except_handler3);
+    if (std.mem.eql(u8, name, "_CxxThrowException")) return @intFromPtr(&_CxxThrowException);
+    if (std.mem.eql(u8, name, "??1type_info@@UAE@XZ")) return @intFromPtr(&type_info_dtor);
+    if (std.mem.eql(u8, name, "?terminate@@YAXXZ")) return @intFromPtr(&terminate_stub);
+    if (std.mem.eql(u8, name, "_purecall")) return @intFromPtr(&purecall_stub);
+    if (std.mem.eql(u8, name, "__dllonexit")) return @intFromPtr(&__dllonexit);
+    if (std.mem.eql(u8, name, "_adjust_fdiv")) return @intFromPtr(&_adjust_fdiv);
+    if (std.mem.eql(u8, name, "wcscmp")) return @intFromPtr(&wcscmp);
+    if (std.mem.eql(u8, name, "wcsstr")) return @intFromPtr(&wcsstr);
+    // __ftol has two ABI-specific bodies; pick the one for this target.
+    if (std.mem.eql(u8, name, "_ftol")) {
+        if (@sizeOf(usize) == 8) return @intFromPtr(&_ftol_x86_64);
+        return @intFromPtr(&_ftol_i386);
+    }
     if (std.mem.eql(u8, name, "__setusermatherr")) return @intFromPtr(&__setusermatherr);
     if (std.mem.eql(u8, name, "___lc_codepage_func")) return @intFromPtr(&___lc_codepage_func);
     if (std.mem.eql(u8, name, "___mb_cur_max_func")) return @intFromPtr(&___mb_cur_max_func);
@@ -2474,8 +2691,11 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "sscanf")) return @intFromPtr(&sscanf);
 
     // Control flow
-    if (std.mem.eql(u8, name, "_setjmp")) return @intFromPtr(&_setjmp_impl);
-    if (std.mem.eql(u8, name, "longjmp")) return @intFromPtr(&longjmp_impl);
+    // NOT exported for 32-bit guests: the x86 jmp_buf layout is unverified.
+    if (@sizeOf(usize) == 8) {
+        if (std.mem.eql(u8, name, "_setjmp")) return @intFromPtr(&_setjmp_impl);
+        if (std.mem.eql(u8, name, "longjmp")) return @intFromPtr(&longjmp_impl);
+    }
 
     return null;
 }
