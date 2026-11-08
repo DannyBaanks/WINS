@@ -2,6 +2,10 @@
 # STRICT POLICY: Never track proprietary binaries, assets, or runtimes
 
 # Binaries & packages
+bin/wins-fuzz
+native/winrun
+native/winrun_gui
+*.o
 *.exe
 *.dll
 *.so

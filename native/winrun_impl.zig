@@ -192,8 +192,17 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             if (std.ascii.eqlIgnoreCase(lib, "msvcrt.dll") or std.ascii.eqlIgnoreCase(lib, "ucrtbase.dll")) {
                 return @import("winrun_msvcrt.zig").lookup(name);
             }
-            if (comptime gui) {
-                if (std.ascii.eqlIgnoreCase(lib, "user32.dll")) return @import("winrun_gui_support.zig").lookup(name);
+            if (std.ascii.eqlIgnoreCase(lib, "advapi32.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupAdvapi32(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "ws2_32.dll") or std.ascii.eqlIgnoreCase(lib, "wsock32.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupWs2_32(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "user32.dll")) {
+                if (comptime gui) {
+                    if (@import("winrun_gui_support.zig").lookup(name)) |addr| return addr;
+                }
+                return @import("winrun_extra_dlls.zig").lookupUser32Console(name);
             }
             return null;
         }
@@ -206,6 +215,7 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             var want_hash: ?[]const u8 = null;
             var check_only = false;
             var path: ?[]const u8 = null;
+            var target_args: std.ArrayList([]const u8) = .empty;
             var i: usize = 1;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--sha256") and i + 1 < args.len) {
@@ -215,7 +225,11 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                     check_only = true;
                 } else if (path == null and !std.mem.startsWith(u8, args[i], "--")) {
                     path = args[i];
-                } else die(.usage, "usage: winrun --sha256 HEX [--check] IMAGE.exe", .{});
+                    try target_args.append(a, args[i]);
+                } else if (path != null) {
+                    if (std.mem.eql(u8, args[i], "--")) continue;
+                    try target_args.append(a, args[i]);
+                } else die(.usage, "usage: winrun --sha256 HEX [--check] IMAGE.exe [args...]", .{});
             }
             if (want_hash == null or path == null) die(.usage, "usage: winrun --sha256 HEX [--check] IMAGE.exe", .{});
             // An accidental-use guard, not a sandbox attestation: the caller
@@ -494,7 +508,8 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             // 10. Run. Setup minimal Windows x86_64 TEB, PEB & ProcessParameters so MSVC/MinGW CRT initialization
             // can read %gs:0x08 (StackBase), %gs:0x10 (StackLimit), %gs:0x30 (TEB self), %gs:0x58 (ThreadLocalStoragePointer),
             // %gs:0x60 (PEB), peb->ImageBaseAddress (0x10), peb->ProcessParameters (0x20).
-            @import("winrun_msvcrt.zig").setArgs(&.{path.?});
+            @import("winrun_msvcrt.zig").setArgs(target_args.items);
+            @import("winrun_kernel32.zig").setCommandLine(target_args.items);
 
             var dummy_teb: [4096]u8 align(4096) = [_]u8{0} ** 4096;
             var dummy_peb: [4096]u8 align(4096) = [_]u8{0} ** 4096;

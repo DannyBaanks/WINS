@@ -806,11 +806,38 @@ const empty_cmd_a: [1:0]u8 = .{0};
 const empty_cmd_w: [1:0]u16 = .{0};
 const empty_env_w: [2]u16 = .{ 0, 0 };
 
+var cmdline_storage_a: [2048:0]u8 = undefined;
+var cmdline_storage_w: [2048:0]u16 = undefined;
+var cmdline_initialized: bool = false;
+
+pub fn setCommandLine(args: []const []const u8) void {
+    if (args.len == 0) return;
+    var out_pos: usize = 0;
+    for (args, 0..) |arg, idx| {
+        if (idx > 0 and out_pos < 2047) {
+            cmdline_storage_a[out_pos] = ' ';
+            out_pos += 1;
+        }
+        for (arg) |c| {
+            if (out_pos >= 2047) break;
+            cmdline_storage_a[out_pos] = c;
+            out_pos += 1;
+        }
+    }
+    cmdline_storage_a[out_pos] = 0;
+    for (0..out_pos + 1) |i| {
+        cmdline_storage_w[i] = cmdline_storage_a[i];
+    }
+    cmdline_initialized = true;
+}
+
 fn GetCommandLineA() callconv(W) ?[*:0]const u8 {
+    if (cmdline_initialized) return &cmdline_storage_a;
     return &empty_cmd_a;
 }
 
 fn GetCommandLineW() callconv(W) ?[*:0]const u16 {
+    if (cmdline_initialized) return &cmdline_storage_w;
     return &empty_cmd_w;
 }
 
@@ -1319,6 +1346,353 @@ fn VirtualProtect(addr: ?*anyopaque, sz: usize, new_prot: u32, old_prot: ?*u32) 
     return 1;
 }
 
+// --- Additional Console, Process, File & Sync APIs for Multi-call Binaries ---
+
+fn CreateConsoleScreenBuffer(access: u32, share: u32, sa: ?*anyopaque, flags: u32, data: ?*anyopaque) callconv(W) usize {
+    _ = access; _ = share; _ = sa; _ = flags; _ = data;
+    return 0x2001;
+}
+
+fn SetConsoleActiveScreenBuffer(h: usize) callconv(W) u32 {
+    _ = h;
+    return 1;
+}
+
+fn SetConsoleScreenBufferSize(h: usize, size: u32) callconv(W) u32 {
+    _ = h; _ = size;
+    return 1;
+}
+
+fn SetConsoleCursorPosition(h: usize, coord: u32) callconv(W) u32 {
+    _ = h; _ = coord;
+    return 1;
+}
+
+fn SetConsoleTitleA(title: ?[*:0]const u8) callconv(W) u32 {
+    _ = title;
+    return 1;
+}
+
+fn GetConsoleTitleA(buf: ?[*]u8, sz: u32) callconv(W) u32 {
+    if (buf != null and sz > 0) buf.?[0] = 0;
+    return 0;
+}
+
+fn GetConsoleWindow() callconv(W) usize {
+    return 0;
+}
+
+fn FillConsoleOutputCharacterA(h: usize, ch: u8, len: u32, coord: u32, written: ?*u32) callconv(W) u32 {
+    _ = h; _ = ch; _ = coord;
+    if (written) |w| w.* = len;
+    return 1;
+}
+
+fn FillConsoleOutputAttribute(h: usize, attr: u16, len: u32, coord: u32, written: ?*u32) callconv(W) u32 {
+    _ = h; _ = attr; _ = coord;
+    if (written) |w| w.* = len;
+    return 1;
+}
+
+fn GetNumberOfConsoleInputEvents(h: usize, num: ?*u32) callconv(W) u32 {
+    _ = h;
+    if (num) |n| n.* = 0;
+    return 1;
+}
+
+fn PeekConsoleInputW(h: usize, buf: ?[*]u8, len: u32, read: ?*u32) callconv(W) u32 {
+    _ = h; _ = buf; _ = len;
+    if (read) |r| r.* = 0;
+    return 1;
+}
+
+fn ReadConsoleInputA(h: usize, buf: ?[*]u8, len: u32, read: ?*u32) callconv(W) u32 {
+    _ = h; _ = buf; _ = len;
+    if (read) |r| r.* = 0;
+    return 1;
+}
+
+fn ReadConsoleInputW(h: usize, buf: ?[*]u8, len: u32, read: ?*u32) callconv(W) u32 {
+    _ = h; _ = buf; _ = len;
+    if (read) |r| r.* = 0;
+    return 1;
+}
+
+fn SetConsoleCP(cp: u32) callconv(W) u32 {
+    _ = cp;
+    return 1;
+}
+
+fn SetConsoleOutputCP(cp: u32) callconv(W) u32 {
+    _ = cp;
+    return 1;
+}
+
+fn GenerateConsoleCtrlEvent(ctrl: u32, proc_grp: u32) callconv(W) u32 {
+    _ = ctrl; _ = proc_grp;
+    return 1;
+}
+
+fn CreateEventA(sa: ?*anyopaque, manual_reset: u32, initial_state: u32, name: ?[*:0]const u8) callconv(W) usize {
+    _ = sa; _ = manual_reset; _ = initial_state; _ = name;
+    return 0x6001;
+}
+
+fn ResetEvent(h: usize) callconv(W) u32 {
+    _ = h;
+    return 1;
+}
+
+fn WaitForMultipleObjects(count: u32, handles: ?*const usize, wait_all: u32, ms: u32) callconv(W) u32 {
+    _ = count; _ = handles; _ = wait_all; _ = ms;
+    return 0; // WAIT_OBJECT_0
+}
+
+fn SleepEx(ms: u32, alertable: u32) callconv(W) u32 {
+    _ = alertable;
+    Sleep(ms);
+    return 0;
+}
+
+fn CreateNamedPipeA(name: ?[*:0]const u8, open_mode: u32, pipe_mode: u32, max_inst: u32, out_sz: u32, in_sz: u32, timeout: u32, sa: ?*anyopaque) callconv(W) usize {
+    _ = name; _ = open_mode; _ = pipe_mode; _ = max_inst; _ = out_sz; _ = in_sz; _ = timeout; _ = sa;
+    return INVALID_HANDLE;
+}
+
+fn CreateFileMappingA(file: usize, sa: ?*anyopaque, prot: u32, max_h: u32, max_l: u32, name: ?[*:0]const u8) callconv(W) usize {
+    _ = file; _ = sa; _ = prot; _ = max_h; _ = max_l; _ = name;
+    return 0x3000;
+}
+
+fn CreateProcessA(app: ?[*:0]const u8, cmd: ?[*:0]u8, pa: ?*anyopaque, ta: ?*anyopaque, inh: u32, flags: u32, env: ?*anyopaque, dir: ?[*:0]const u8, si: ?*anyopaque, pi: ?*anyopaque) callconv(W) u32 {
+    _ = app; _ = cmd; _ = pa; _ = ta; _ = inh; _ = flags; _ = env; _ = dir; _ = si; _ = pi;
+    return 0;
+}
+
+fn CreateRemoteThread(proc: usize, sa: ?*anyopaque, stack_sz: usize, start: usize, param: usize, flags: u32, tid: ?*u32) callconv(W) usize {
+    _ = proc; _ = sa; _ = stack_sz; _ = start; _ = param; _ = flags;
+    if (tid) |t| t.* = 1002;
+    return 0x4001;
+}
+
+fn CreateToolhelp32Snapshot(flags: u32, pid: u32) callconv(W) usize {
+    _ = flags; _ = pid;
+    return 0x5001;
+}
+
+fn Process32First(h: usize, pe: ?[*]u8) callconv(W) u32 {
+    _ = h; _ = pe;
+    return 0;
+}
+
+fn Process32Next(h: usize, pe: ?[*]u8) callconv(W) u32 {
+    _ = h; _ = pe;
+    return 0;
+}
+
+fn DeviceIoControl(h: usize, code: u32, in_buf: ?*anyopaque, in_sz: u32, out_buf: ?*anyopaque, out_sz: u32, ret_bytes: ?*u32, ov: ?*anyopaque) callconv(W) u32 {
+    _ = h; _ = code; _ = in_buf; _ = in_sz; _ = out_buf; _ = out_sz; _ = ov;
+    if (ret_bytes) |b| b.* = 0;
+    return 1;
+}
+
+fn FindFirstFileA(name: ?[*:0]const u8, data: ?[*]u8) callconv(W) usize {
+    _ = name; _ = data;
+    return INVALID_HANDLE;
+}
+
+fn FindNextFileA(h: usize, data: ?[*]u8) callconv(W) u32 {
+    _ = h; _ = data;
+    return 0;
+}
+
+fn FindFirstVolumeW(name: ?[*]u16, len: u32) callconv(W) usize {
+    _ = name; _ = len;
+    return INVALID_HANDLE;
+}
+
+fn FindNextVolumeW(h: usize, name: ?[*]u16, len: u32) callconv(W) u32 {
+    _ = h; _ = name; _ = len;
+    return 0;
+}
+
+fn FindVolumeClose(h: usize) callconv(W) u32 {
+    _ = h;
+    return 1;
+}
+
+fn GetCompressedFileSizeA(name: ?[*:0]const u8, high: ?*u32) callconv(W) u32 {
+    _ = name;
+    if (high) |h| h.* = 0;
+    return 0;
+}
+
+fn GetDiskFreeSpaceExA(dir: ?[*:0]const u8, free_caller: ?*u64, total: ?*u64, total_free: ?*u64) callconv(W) u32 {
+    _ = dir;
+    if (free_caller) |p| p.* = 10_000_000_000;
+    if (total) |p| p.* = 20_000_000_000;
+    if (total_free) |p| p.* = 10_000_000_000;
+    return 1;
+}
+
+fn GetDiskFreeSpaceExW(dir: ?[*:0]const u16, free_caller: ?*u64, total: ?*u64, total_free: ?*u64) callconv(W) u32 {
+    _ = dir;
+    if (free_caller) |p| p.* = 10_000_000_000;
+    if (total) |p| p.* = 20_000_000_000;
+    if (total_free) |p| p.* = 10_000_000_000;
+    return 1;
+}
+
+fn GetDriveTypeA(root: ?[*:0]const u8) callconv(W) u32 {
+    _ = root;
+    return 3; // DRIVE_FIXED
+}
+
+fn GetEnvironmentVariableW(name: ?[*:0]const u16, buf: ?[*]u16, sz: u32) callconv(W) u32 {
+    _ = name; _ = buf; _ = sz;
+    return 0;
+}
+
+fn SetEnvironmentVariableA(name: ?[*:0]const u8, val: ?[*:0]const u8) callconv(W) u32 {
+    _ = name; _ = val;
+    return 1;
+}
+
+fn GetFileAttributesExA(file: ?[*:0]const u8, level: u32, info: ?[*]u8) callconv(W) u32 {
+    _ = file; _ = level;
+    if (info) |p| @memset(p[0..36], 0);
+    return 1;
+}
+
+fn SetFileAttributesA(file: ?[*:0]const u8, attr: u32) callconv(W) u32 {
+    _ = file; _ = attr;
+    return 1;
+}
+
+fn GetLogicalDrives() callconv(W) u32 {
+    return 0x0c; // C: and D:
+}
+
+fn GetModuleFileNameA(mod: usize, buf: ?[*]u8, sz: u32) callconv(W) u32 {
+    _ = mod;
+    const name = "busybox.exe";
+    if (buf != null and sz > name.len) {
+        @memcpy(buf.?[0..name.len], name);
+        buf.?[name.len] = 0;
+        return name.len;
+    }
+    return 0;
+}
+
+fn GetProcessAffinityMask(proc: usize, proc_mask: ?*usize, sys_mask: ?*usize) callconv(W) u32 {
+    _ = proc;
+    if (proc_mask) |p| p.* = 1;
+    if (sys_mask) |s| s.* = 1;
+    return 1;
+}
+
+fn GetProcessId(proc: usize) callconv(W) u32 {
+    _ = proc;
+    return @intCast(linux.getpid());
+}
+
+fn GetProcessTimes(proc: usize, ct: ?*anyopaque, et: ?*anyopaque, kt: ?*anyopaque, ut: ?*anyopaque) callconv(W) u32 {
+    _ = proc; _ = ct; _ = et; _ = kt; _ = ut;
+    return 1;
+}
+
+fn GetSystemDirectoryA(buf: ?[*]u8, sz: u32) callconv(W) u32 {
+    const sys = "C:\\Windows\\System32";
+    if (buf != null and sz > sys.len) {
+        @memcpy(buf.?[0..sys.len], sys);
+        buf.?[sys.len] = 0;
+        return sys.len;
+    }
+    return 0;
+}
+
+fn GetVersionExA(osvi: ?[*]u8) callconv(W) u32 {
+    if (osvi == null) return 0;
+    @memset(osvi.?[0..148], 0);
+    std.mem.writeInt(u32, osvi.?[0..4], 148, .little);
+    std.mem.writeInt(u32, osvi.?[4..8], 6, .little);
+    std.mem.writeInt(u32, osvi.?[8..12], 1, .little);
+    std.mem.writeInt(u32, osvi.?[12..16], 7601, .little);
+    std.mem.writeInt(u32, osvi.?[16..20], 2, .little);
+    return 1;
+}
+
+fn GetVolumeInformationA(root: ?[*:0]const u8, vname: ?[*]u8, vn_sz: u32, vsn: ?*u32, mcl: ?*u32, fsf: ?*u32, fsname: ?[*]u8, fsn_sz: u32) callconv(W) u32 {
+    _ = root;
+    if (vname != null and vn_sz > 0) vname.?[0] = 0;
+    if (vsn) |v| v.* = 0x12345678;
+    if (mcl) |m| m.* = 255;
+    if (fsf) |f| f.* = 0x00000003;
+    if (fsname != null and fsn_sz >= 5) {
+        @memcpy(fsname.?[0..5], "NTFS\x00");
+    }
+    return 1;
+}
+
+fn GetVolumeInformationW(root: ?[*:0]const u16, vname: ?[*]u16, vn_sz: u32, vsn: ?*u32, mcl: ?*u32, fsf: ?*u32, fsname: ?[*]u16, fsn_sz: u32) callconv(W) u32 {
+    _ = root;
+    if (vname != null and vn_sz > 0) vname.?[0] = 0;
+    if (vsn) |v| v.* = 0x12345678;
+    if (mcl) |m| m.* = 255;
+    if (fsf) |f| f.* = 0x00000003;
+    if (fsname != null and fsn_sz >= 5) {
+        fsname.?[0] = 'N'; fsname.?[1] = 'T'; fsname.?[2] = 'F'; fsname.?[3] = 'S'; fsname.?[4] = 0;
+    }
+    return 1;
+}
+
+fn IsWow64Process(proc: usize, wow64: ?*i32) callconv(W) u32 {
+    _ = proc;
+    if (wow64) |w| w.* = 0;
+    return 1;
+}
+
+fn LoadLibraryExA(name: ?[*:0]const u8, file: usize, flags: u32) callconv(W) usize {
+    _ = name; _ = file; _ = flags;
+    return 0;
+}
+
+fn MoveFileExA(from: ?[*:0]const u8, to: ?[*:0]const u8, flags: u32) callconv(W) u32 {
+    _ = from; _ = to; _ = flags;
+    return 1;
+}
+
+fn OpenProcess(access: u32, inherit: u32, pid: u32) callconv(W) usize {
+    _ = access; _ = inherit;
+    return 0x1000 + pid;
+}
+
+fn ReadDirectoryChangesW(h: usize, buf: ?[*]u8, len: u32, sub: u32, filter: u32, ret: ?*u32, ov: ?*anyopaque, cr: ?*anyopaque) callconv(W) u32 {
+    _ = h; _ = buf; _ = len; _ = sub; _ = filter; _ = ret; _ = ov; _ = cr;
+    return 0;
+}
+
+fn ReadProcessMemory(proc: usize, base: ?*const anyopaque, buf: ?[*]u8, sz: usize, num_read: ?*usize) callconv(W) u32 {
+    _ = proc; _ = base; _ = buf; _ = sz;
+    if (num_read) |r| r.* = 0;
+    return 0;
+}
+
+fn SetErrorMode(mode: u32) callconv(W) u32 {
+    _ = mode;
+    return 0;
+}
+
+fn SetHandleInformation(h: usize, mask: u32, flags: u32) callconv(W) u32 {
+    _ = h; _ = mask; _ = flags;
+    return 1;
+}
+
+fn SetSystemTime(st: ?*const SYSTEMTIME) callconv(W) u32 {
+    _ = st;
+    return 1;
+}
+
 // ---------------------------------------------------------------------------
 // 8. Lookup Dispatch Table
 // ---------------------------------------------------------------------------
@@ -1504,6 +1878,67 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "IsDBCSLeadByteEx")) return @intFromPtr(&IsDBCSLeadByteEx);
     if (std.mem.eql(u8, name, "VirtualQuery")) return @intFromPtr(&VirtualQuery);
     if (std.mem.eql(u8, name, "VirtualProtect")) return @intFromPtr(&VirtualProtect);
+
+    // Multi-call console & utility extensions
+    if (std.mem.eql(u8, name, "CreateConsoleScreenBuffer")) return @intFromPtr(&CreateConsoleScreenBuffer);
+    if (std.mem.eql(u8, name, "SetConsoleActiveScreenBuffer")) return @intFromPtr(&SetConsoleActiveScreenBuffer);
+    if (std.mem.eql(u8, name, "SetConsoleScreenBufferSize")) return @intFromPtr(&SetConsoleScreenBufferSize);
+    if (std.mem.eql(u8, name, "SetConsoleCursorPosition")) return @intFromPtr(&SetConsoleCursorPosition);
+    if (std.mem.eql(u8, name, "SetConsoleTitleA")) return @intFromPtr(&SetConsoleTitleA);
+    if (std.mem.eql(u8, name, "GetConsoleTitleA")) return @intFromPtr(&GetConsoleTitleA);
+    if (std.mem.eql(u8, name, "GetConsoleWindow")) return @intFromPtr(&GetConsoleWindow);
+    if (std.mem.eql(u8, name, "FillConsoleOutputCharacterA")) return @intFromPtr(&FillConsoleOutputCharacterA);
+    if (std.mem.eql(u8, name, "FillConsoleOutputAttribute")) return @intFromPtr(&FillConsoleOutputAttribute);
+    if (std.mem.eql(u8, name, "GetNumberOfConsoleInputEvents")) return @intFromPtr(&GetNumberOfConsoleInputEvents);
+    if (std.mem.eql(u8, name, "PeekConsoleInputW")) return @intFromPtr(&PeekConsoleInputW);
+    if (std.mem.eql(u8, name, "ReadConsoleInputA")) return @intFromPtr(&ReadConsoleInputA);
+    if (std.mem.eql(u8, name, "ReadConsoleInputW")) return @intFromPtr(&ReadConsoleInputW);
+    if (std.mem.eql(u8, name, "SetConsoleCP")) return @intFromPtr(&SetConsoleCP);
+    if (std.mem.eql(u8, name, "SetConsoleOutputCP")) return @intFromPtr(&SetConsoleOutputCP);
+    if (std.mem.eql(u8, name, "GenerateConsoleCtrlEvent")) return @intFromPtr(&GenerateConsoleCtrlEvent);
+    if (std.mem.eql(u8, name, "CreateEventA")) return @intFromPtr(&CreateEventA);
+    if (std.mem.eql(u8, name, "ResetEvent")) return @intFromPtr(&ResetEvent);
+    if (std.mem.eql(u8, name, "WaitForMultipleObjects")) return @intFromPtr(&WaitForMultipleObjects);
+    if (std.mem.eql(u8, name, "SleepEx")) return @intFromPtr(&SleepEx);
+    if (std.mem.eql(u8, name, "CreateNamedPipeA")) return @intFromPtr(&CreateNamedPipeA);
+    if (std.mem.eql(u8, name, "CreateFileMappingA")) return @intFromPtr(&CreateFileMappingA);
+    if (std.mem.eql(u8, name, "CreateProcessA")) return @intFromPtr(&CreateProcessA);
+    if (std.mem.eql(u8, name, "CreateRemoteThread")) return @intFromPtr(&CreateRemoteThread);
+    if (std.mem.eql(u8, name, "CreateToolhelp32Snapshot")) return @intFromPtr(&CreateToolhelp32Snapshot);
+    if (std.mem.eql(u8, name, "Process32First")) return @intFromPtr(&Process32First);
+    if (std.mem.eql(u8, name, "Process32Next")) return @intFromPtr(&Process32Next);
+    if (std.mem.eql(u8, name, "DeviceIoControl")) return @intFromPtr(&DeviceIoControl);
+    if (std.mem.eql(u8, name, "FindFirstFileA")) return @intFromPtr(&FindFirstFileA);
+    if (std.mem.eql(u8, name, "FindNextFileA")) return @intFromPtr(&FindNextFileA);
+    if (std.mem.eql(u8, name, "FindFirstVolumeW")) return @intFromPtr(&FindFirstVolumeW);
+    if (std.mem.eql(u8, name, "FindNextVolumeW")) return @intFromPtr(&FindNextVolumeW);
+    if (std.mem.eql(u8, name, "FindVolumeClose")) return @intFromPtr(&FindVolumeClose);
+    if (std.mem.eql(u8, name, "GetCompressedFileSizeA")) return @intFromPtr(&GetCompressedFileSizeA);
+    if (std.mem.eql(u8, name, "GetDiskFreeSpaceExA")) return @intFromPtr(&GetDiskFreeSpaceExA);
+    if (std.mem.eql(u8, name, "GetDiskFreeSpaceExW")) return @intFromPtr(&GetDiskFreeSpaceExW);
+    if (std.mem.eql(u8, name, "GetDriveTypeA")) return @intFromPtr(&GetDriveTypeA);
+    if (std.mem.eql(u8, name, "GetEnvironmentVariableW")) return @intFromPtr(&GetEnvironmentVariableW);
+    if (std.mem.eql(u8, name, "SetEnvironmentVariableA")) return @intFromPtr(&SetEnvironmentVariableA);
+    if (std.mem.eql(u8, name, "GetFileAttributesExA")) return @intFromPtr(&GetFileAttributesExA);
+    if (std.mem.eql(u8, name, "SetFileAttributesA")) return @intFromPtr(&SetFileAttributesA);
+    if (std.mem.eql(u8, name, "GetLogicalDrives")) return @intFromPtr(&GetLogicalDrives);
+    if (std.mem.eql(u8, name, "GetModuleFileNameA")) return @intFromPtr(&GetModuleFileNameA);
+    if (std.mem.eql(u8, name, "GetProcessAffinityMask")) return @intFromPtr(&GetProcessAffinityMask);
+    if (std.mem.eql(u8, name, "GetProcessId")) return @intFromPtr(&GetProcessId);
+    if (std.mem.eql(u8, name, "GetProcessTimes")) return @intFromPtr(&GetProcessTimes);
+    if (std.mem.eql(u8, name, "GetSystemDirectoryA")) return @intFromPtr(&GetSystemDirectoryA);
+    if (std.mem.eql(u8, name, "GetVersionExA")) return @intFromPtr(&GetVersionExA);
+    if (std.mem.eql(u8, name, "GetVolumeInformationA")) return @intFromPtr(&GetVolumeInformationA);
+    if (std.mem.eql(u8, name, "GetVolumeInformationW")) return @intFromPtr(&GetVolumeInformationW);
+    if (std.mem.eql(u8, name, "IsWow64Process")) return @intFromPtr(&IsWow64Process);
+    if (std.mem.eql(u8, name, "LoadLibraryExA")) return @intFromPtr(&LoadLibraryExA);
+    if (std.mem.eql(u8, name, "MoveFileExA")) return @intFromPtr(&MoveFileExA);
+    if (std.mem.eql(u8, name, "OpenProcess")) return @intFromPtr(&OpenProcess);
+    if (std.mem.eql(u8, name, "ReadDirectoryChangesW")) return @intFromPtr(&ReadDirectoryChangesW);
+    if (std.mem.eql(u8, name, "ReadProcessMemory")) return @intFromPtr(&ReadProcessMemory);
+    if (std.mem.eql(u8, name, "SetErrorMode")) return @intFromPtr(&SetErrorMode);
+    if (std.mem.eql(u8, name, "SetHandleInformation")) return @intFromPtr(&SetHandleInformation);
+    if (std.mem.eql(u8, name, "SetSystemTime")) return @intFromPtr(&SetSystemTime);
 
     return null;
 }

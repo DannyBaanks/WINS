@@ -8,6 +8,7 @@ const std = @import("std");
 const k32 = @import("winrun_kernel32.zig");
 const user32 = @import("winrun_gui_support.zig");
 const msvcrt = @import("winrun_msvcrt.zig");
+const extra = @import("winrun_extra_dlls.zig");
 
 const PeInfo = struct {
     name: []const u8,
@@ -42,10 +43,16 @@ fn resolveImport(dll: []const u8, sym: []const u8) bool {
         return k32.lookup(sym) != null;
     }
     if (std.ascii.eqlIgnoreCase(dll, "user32.dll")) {
-        return user32.lookup(sym) != null;
+        return user32.lookup(sym) != null or extra.lookupUser32Console(sym) != null;
     }
     if (std.ascii.eqlIgnoreCase(dll, "msvcrt.dll") or std.ascii.eqlIgnoreCase(dll, "ucrtbase.dll")) {
         return msvcrt.lookup(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "advapi32.dll")) {
+        return extra.lookupAdvapi32(sym) != null;
+    }
+    if (std.ascii.eqlIgnoreCase(dll, "ws2_32.dll") or std.ascii.eqlIgnoreCase(dll, "wsock32.dll")) {
+        return extra.lookupWs2_32(sym) != null;
     }
     return false;
 }

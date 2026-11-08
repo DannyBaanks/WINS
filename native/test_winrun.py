@@ -56,9 +56,9 @@ class WinrunTests(unittest.TestCase):
                                      '--', '/runner', '/winrun', '/probe.exe', sha(t/'probe.exe'), '/probe-linux', str(iterations)],
                               capture_output=True, text=True, timeout=600)
 
-    def winrun(self, image, digest=None, extra=(), stdin=b''):
+    def winrun(self, image, digest=None, extra=(), stdin=b'', app_args=()):
         return subprocess.run([sys.executable, str(ROOT/'native/winrun_box.py'), '--loader', str(self.loaders['winrun']),
-                               '--sha256', digest or sha(image), *extra, str(image)],
+                               '--sha256', digest or sha(image), *extra, str(image), *app_args],
                               input=stdin, capture_output=True, timeout=60)
 
     # --- differential fuzz -------------------------------------------------
@@ -201,6 +201,37 @@ class WinrunTests(unittest.TestCase):
         run_no_mb = self.winrun(calc, stdin=b'quit\n')
         self.assertEqual(run_no_mb.returncode, 1, run_no_mb.stderr)
         self.assertIn(b"Error: No se pudo localizar 'mbir_alu.mb'.", run_no_mb.stderr)
+
+    def test_busybox64_corpus_check_and_differential_execution(self):
+        bb = ROOT / 'corpus' / 'busybox64.exe'
+        if not bb.is_file():
+            self.skipTest('corpus/busybox64.exe not present')
+        chk = self.winrun(bb, extra=['--check'])
+        self.assertEqual(chk.returncode, 0, chk.stderr)
+        self.assertIn(b'READY', chk.stderr)
+        self.assertIn(b'imports=313', chk.stderr)
+
+        # 1. Default banner output matches Wine 9.0 bit-for-bit
+        run_banner = self.winrun(bb)
+        self.assertEqual(run_banner.returncode, 0, run_banner.stderr)
+        banner_hash = hashlib.sha256(run_banner.stdout).hexdigest()
+        self.assertEqual(banner_hash, '5d172fa8ad92bea62819ab29e34c862ceb5ce8eda38ea5d973a9e52f8d0abc6b')
+        self.assertIn(b'BusyBox v1.38.0', run_banner.stdout)
+
+        # 2. Applet: echo
+        run_echo = self.winrun(bb, app_args=['echo', 'hello', 'world'])
+        self.assertEqual(run_echo.returncode, 0, run_echo.stderr)
+        self.assertEqual(run_echo.stdout, b'hello world\n')
+
+        # 3. Applet: printf
+        run_printf = self.winrun(bb, app_args=['printf', '%d + %d = %d\n', '2', '3', '5'])
+        self.assertEqual(run_printf.returncode, 0, run_printf.stderr)
+        self.assertEqual(run_printf.stdout, b'2 + 3 = 5\n')
+
+        # 4. Applet: sha256sum via stdin pipe
+        run_sha = self.winrun(bb, app_args=['sha256sum'], stdin=b'WINS_NATIVE_FIRST')
+        self.assertEqual(run_sha.returncode, 0, run_sha.stderr)
+        self.assertIn(b'ac5f28922dea8c70eb84d939153c86efdc1bfa9cc1fb15559067dd658e820109', run_sha.stdout)
 
 
 if __name__ == '__main__':

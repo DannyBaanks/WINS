@@ -8,6 +8,7 @@ import sys
 import os
 import argparse
 import json
+import subprocess
 
 # Ensure core is on path
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,12 +18,15 @@ from core.triage import BinaryTriage
 from core.recipes.electron import ElectronRecipe
 from core.recipes.pyinstaller import PyInstallerRecipe
 from core.recipes.dotnet import DotNetRecipe
+from core.recipes.transpiler import TranspilerRecipe
 from core.tester import CleanroomTester
+from core.transpiler.harvester import BinaryHarvester
 
 RECIPES = [
     ElectronRecipe(),
     PyInstallerRecipe(),
     DotNetRecipe(),
+    TranspilerRecipe(),
 ]
 
 BANNER = r"""
@@ -100,6 +104,86 @@ def cmd_test(args):
         print(f"  -> {act}")
     print("")
 
+def cmd_harvest(args):
+    harvester = BinaryHarvester(args.target)
+    report = harvester.harvest()
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    print(f"\n[TARGET PE] {report['binary']['name']} ({report['binary']['architecture']})")
+    print(f"  Sections: {', '.join(report['binary']['sections'])}")
+    print(f"\n[API DECOMPOSITION & TRANSPILABILITY]")
+    print(f"  Total Imported DLLs:  {report['metrics']['total_imported_dlls']}")
+    print(f"  Total Imported APIs:  {report['metrics']['total_imported_apis']}")
+    print(f"  POSIX Mappable APIs:  {report['metrics']['posix_mappable_apis']} ({report['metrics']['posix_transpilability_score']})")
+    print(f"  GUI/Windowing APIs:   {report['metrics']['gui_windowing_apis']}")
+
+    if report["embedded_libraries"]:
+        print(f"\n[DISCOVERED EMBEDDED OPEN-SOURCE ENGINES]")
+        for lib in report["embedded_libraries"]:
+            print(f"  * {lib['name']}")
+            print(f"    Role: {lib['role']}")
+            print(f"    Evidence: {', '.join(lib['evidence_samples'])}")
+            print(f"    Linux Native Candidates:")
+            for cand in lib["linux_candidates"]:
+                print(f"      - {cand['package']}: {cand['description']}")
+
+    print(f"\n[RTTI REVERSE-ENGINEERED CLASSES]")
+    print(f"  Total Discovered Classes: {report['rtti_classes_count']}")
+    if report["rtti_classes_sample"]:
+        print(f"  Sample: {', '.join(report['rtti_classes_sample'][:10])}...")
+
+    print(f"\n[TOP IMPORTED API DOMAINS]")
+    for domain, data in sorted(report["api_domains"].items(), key=lambda x: x[1]["api_count"], reverse=True)[:6]:
+        flag = "[POSIX MAPPABLE]" if data["transpilable_to_posix"] else "[REQUIRES UI ADAPTER]"
+        print(f"  - {domain}: {data['api_count']} APIs {flag} -> {data['linux_equivalent']}")
+    print("")
+
+def cmd_fuzz(args):
+    fuzzer_bin = os.path.join(REPO_ROOT, "bin", "wins-fuzz")
+    if not os.path.isfile(fuzzer_bin) or not os.access(fuzzer_bin, os.X_OK):
+        print(f"[WINS] Compiling Zig differential fuzzer engine...", file=sys.stderr)
+        build_cmd = ["zig", "build-exe", "-O", "ReleaseFast", "core/fuzzer/src/main.zig", f"-femit-bin={fuzzer_bin}"]
+        res = subprocess.run(build_cmd, cwd=REPO_ROOT)
+        if res.returncode != 0:
+            print("[ERROR] Failed to compile Zig differential fuzzer.", file=sys.stderr)
+            sys.exit(1)
+
+    cmd = [fuzzer_bin, "--suite", args.suite, "--iterations", str(args.iterations)]
+    if args.json:
+        cmd.append("--json")
+
+    subprocess.run(cmd)
+
+def cmd_compile_fuzz(args):
+    print("[ERROR] Legacy compile-fuzz disabled: it invokes generated shims in-process and does not validate a PE port. See GUIA.md for the isolated Zig workflow.", file=sys.stderr)
+    sys.exit(1)
+
+def cmd_corpus_attack(args):
+    fuzzer_bin = os.path.join(REPO_ROOT, "build", "wins-corpus-fuzzer")
+    if not os.path.isfile(fuzzer_bin) or not os.access(fuzzer_bin, os.X_OK):
+        os.makedirs(os.path.dirname(fuzzer_bin), exist_ok=True)
+        print("[WINS] Compiling Zig 0.16 corpus fuzzer (native/wins_fuzzer.zig)...", file=sys.stderr)
+        build_cmd = [
+            "zig", "build-exe", "native/wins_fuzzer.zig",
+            "-O", "ReleaseSafe", "-lc", "-lX11",
+            f"-femit-bin={fuzzer_bin}",
+        ]
+        res = subprocess.run(build_cmd, cwd=REPO_ROOT)
+        if res.returncode != 0:
+            print("[ERROR] Failed to compile Zig corpus fuzzer.", file=sys.stderr)
+            sys.exit(1)
+
+    corpus_dir = args.corpus or os.path.join(REPO_ROOT, "corpus")
+    cmd = [fuzzer_bin, "--corpus", corpus_dir]
+    if args.json:
+        cmd.append("--json")
+    res = subprocess.run(cmd, cwd=REPO_ROOT)
+    if res.returncode != 0:
+        sys.exit(res.returncode)
+
+
 def cmd_list(args):
     print("\nAvailable WINS Transmutation Recipes:")
     for r in RECIPES:
@@ -131,6 +215,33 @@ def main():
     p_test.add_argument("--headless", action="store_true", help="Run under xvfb virtual display if available")
     p_test.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
     p_test.set_defaults(func=cmd_test)
+
+    # harvest
+    p_harvest = subparsers.add_parser("harvest", help="Extract IAT, demangle RTTI, and discover Linux candidates for PE binary")
+    p_harvest.add_argument("target", help="Path to Windows PE .exe")
+    p_harvest.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_harvest.set_defaults(func=cmd_harvest)
+
+    # fuzz
+    p_fuzz = subparsers.add_parser("fuzz", help="Run high-performance Zig differential fuzzer on API candidate shims")
+    p_fuzz.add_argument("--suite", default="all", choices=["all", "path", "encoding", "registry", "pixel", "security", "buffer"], help="Differential test suite")
+    p_fuzz.add_argument("--iterations", type=int, default=100000, help="Fuzz iterations count (default: 100000)")
+    p_fuzz.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_fuzz.set_defaults(func=cmd_fuzz)
+
+    # compile-fuzz
+    p_compile_fuzz = subparsers.add_parser("compile-fuzz", help="Run autonomous E2E compilation & shim synthesis fuzzer")
+    p_compile_fuzz.add_argument("target", help="Path to Windows PE .exe")
+    p_compile_fuzz.add_argument("--out", help="Path to output compiled .so (default: temporary/app specific)")
+    p_compile_fuzz.add_argument("--max-rounds", type=int, default=30, help="Maximum mutation and compilation iterations (default: 30)")
+    p_compile_fuzz.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_compile_fuzz.set_defaults(func=cmd_compile_fuzz)
+
+    # corpus-attack
+    p_corpus = subparsers.add_parser("corpus-attack", aliases=["corpus-fuzz"], help="Attack PE corpus with loader verification and Pareto missing-API ranking")
+    p_corpus.add_argument("--corpus", help="Path to corpus directory (default: <repo>/corpus)")
+    p_corpus.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_corpus.set_defaults(func=cmd_corpus_attack)
 
     # list
     p_list = subparsers.add_parser("list", help="List available transmutation recipes")
