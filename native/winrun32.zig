@@ -118,8 +118,9 @@ fn installCrashHandlers() void {
 // ============================================================================
 
 threadlocal var g_last_error: u32 = 0;
-var g_tls_slots: [64]?*anyopaque = [_]?*anyopaque{null} ** 64;
-var g_tls_next: u32 = 1;
+var g_tls_bitmap: u64 = 0;
+threadlocal var g_tls_thread_slots: [64]?*anyopaque = [_]?*anyopaque{null} ** 64;
+var g_alloc_prot: u32 = 0x04;
 
 const HEAP_MAGIC: u32 = 0x57494E53; // "WINS"
 const HeapHeader = extern struct {
@@ -242,12 +243,24 @@ fn IsBadCodePtr(lp: ?*const anyopaque) callconv(W) i32 {
 }
 
 fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(W) ?*anyopaque {
-    _ = flAllocationType; _ = flProtect;
-    const prot = linux.PROT{ .READ = true, .WRITE = true, .EXEC = true };
+    _ = flAllocationType;
+    if (dwSize == 0) {
+        g_last_error = 87; // ERROR_INVALID_PARAMETER
+        return null;
+    }
+    const prot = linux.PROT{
+        .READ = (flProtect & 0x66) != 0,
+        .WRITE = (flProtect & 0x44) != 0,
+        .EXEC = (flProtect & 0xF0) != 0,
+    };
     const flags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = (lpAddress != null) };
     const addr: ?[*]u8 = if (lpAddress) |a| @ptrCast(a) else null;
     const ptr = linux.mmap(addr, dwSize, prot, flags, -1, 0);
-    if (linux.errno(ptr) != .SUCCESS) return null;
+    if (linux.errno(ptr) != .SUCCESS) {
+        g_last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+        return null;
+    }
+    g_alloc_prot = flProtect;
     return @ptrFromInt(ptr);
 }
 
@@ -255,15 +268,26 @@ fn VirtualFree(lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32) callconv(
     _ = dwFreeType;
     if (lpAddress) |addr| {
         const u8_ptr: [*]const u8 = @ptrCast(addr);
-        _ = linux.munmap(u8_ptr, dwSize);
+        _ = linux.munmap(u8_ptr, if (dwSize == 0) 4096 else dwSize);
+        return 1;
     }
-    return 1;
+    return 0;
 }
 
 fn VirtualProtect(lpAddress: ?*anyopaque, dwSize: usize, flNewProtect: u32, lpflOldProtect: ?*u32) callconv(W) i32 {
-    _ = lpAddress; _ = dwSize; _ = flNewProtect;
-    if (lpflOldProtect) |old| old.* = 0x40; // PAGE_EXECUTE_READWRITE
-    return 1;
+    if (lpflOldProtect) |old| old.* = g_alloc_prot;
+    g_alloc_prot = flNewProtect;
+    if (lpAddress) |p| {
+        const prot = linux.PROT{
+            .READ = (flNewProtect & 0x66) != 0,
+            .WRITE = (flNewProtect & 0x44) != 0,
+            .EXEC = (flNewProtect & 0xF0) != 0,
+        };
+        const u8_ptr: [*]const u8 = @ptrCast(p);
+        _ = linux.mprotect(u8_ptr, dwSize, prot);
+        return 1;
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -447,22 +471,24 @@ fn RaiseException(dwExceptionCode: u32, dwExceptionFlags: u32, nNumberOfArgument
 }
 
 fn TlsAlloc() callconv(W) u32 {
-    if (g_tls_next < 64) {
-        const slot = g_tls_next;
-        g_tls_next += 1;
-        return slot;
+    for (0..64) |i| {
+        const mask: u64 = @as(u64, 1) << @intCast(i);
+        if ((g_tls_bitmap & mask) == 0) {
+            g_tls_bitmap |= mask;
+            return @intCast(i);
+        }
     }
-    return 0xFFFFFFFF;
+    return 0xFFFFFFFF; // TLS_OUT_OF_INDEXES
 }
 
 fn TlsGetValue(dwTlsIndex: u32) callconv(W) ?*anyopaque {
-    if (dwTlsIndex < 64) return g_tls_slots[dwTlsIndex];
+    if (dwTlsIndex < 64) return g_tls_thread_slots[dwTlsIndex];
     return null;
 }
 
 fn TlsSetValue(dwTlsIndex: u32, lpTlsValue: ?*anyopaque) callconv(W) i32 {
     if (dwTlsIndex < 64) {
-        g_tls_slots[dwTlsIndex] = lpTlsValue;
+        g_tls_thread_slots[dwTlsIndex] = lpTlsValue;
         return 1;
     }
     return 0;
@@ -470,7 +496,9 @@ fn TlsSetValue(dwTlsIndex: u32, lpTlsValue: ?*anyopaque) callconv(W) i32 {
 
 fn TlsFree(dwTlsIndex: u32) callconv(W) i32 {
     if (dwTlsIndex < 64) {
-        g_tls_slots[dwTlsIndex] = null;
+        const mask: u64 = @as(u64, 1) << @intCast(dwTlsIndex);
+        g_tls_bitmap &= ~mask;
+        g_tls_thread_slots[dwTlsIndex] = null;
         return 1;
     }
     return 0;
@@ -2569,12 +2597,21 @@ pub fn main(init: std.process.Init) !void {
         g_tib_buffer[1] = @intCast(stack_base);
         g_tib_buffer[2] = @intCast(stack_limit);
 
-        std.debug.print("\n[WINS:winrun32] JUMPING to EntryPoint at 0x{x:0>8}...\n", .{image_base + entry_rva});
-        const EntryFn = *const fn () callconv(W) u32;
-        const entry_point: EntryFn = @ptrFromInt(image_base + entry_rva);
+        const new_esp = stack_base - 0x1000;
+        std.debug.print("\n[WINS:winrun32] JUMPING to EntryPoint at 0x{x:0>8} with stack at 0x{x:0>8}...\n", .{image_base + entry_rva, new_esp});
 
-        const ret = entry_point();
-        std.debug.print("[WINS:winrun32] Target execution finished with return code: {}\n", .{ret});
+        var old_esp: usize = 0;
+        asm volatile (
+            \\ movl %%esp, %[old_esp]
+            \\ movl %[new_esp], %%esp
+            \\ pushl $0
+            \\ call *%[entry]
+            \\ movl %[old_esp], %%esp
+            : [old_esp] "=m" (old_esp),
+            : [new_esp] "r" (new_esp),
+              [entry] "r" (image_base + entry_rva),
+        );
+        std.debug.print("[WINS:winrun32] Target execution finished successfully.\n", .{});
     } else {
         std.debug.print("[WINS:winrun32] Use --run to jump into execution.\n", .{});
     }

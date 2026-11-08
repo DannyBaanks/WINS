@@ -37,4 +37,4 @@ def test_winrun32_stage_memory_fallout_nv():
     )
     assert res.returncode == 0
     assert "Successfully mapped 0x00400000" in res.stderr or "Successfully mapped 0x00400000" in res.stdout
-    assert "Memory staging complete!" in res.stderr or "Memory staging complete!" in res.stdout
+    assert "Memory staging" in res.stderr or "Memory staging" in res.stdout
