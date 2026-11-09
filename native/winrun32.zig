@@ -3250,10 +3250,29 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (std.mem.eql(u8, name, "GetStockObject")) return @ptrCast(&GetStockObject);
     } else if (std.ascii.eqlIgnoreCase(dll, "winmm.dll") or std.ascii.eqlIgnoreCase(dll, "winmm")) {
         if (std.mem.eql(u8, name, "timeGetTime")) return @ptrCast(&timeGetTime);
+        if (msvcrt_mod.lookupWinmm(name)) |addr| return @ptrFromInt(addr);
+    } else if (std.ascii.eqlIgnoreCase(dll, "xinput1_3.dll") or std.ascii.eqlIgnoreCase(dll, "xinput1_2.dll") or
+        std.ascii.eqlIgnoreCase(dll, "xinput9_1_0.dll"))
+    {
+        // FalloutNV imports XINPUT1_3 by ordinal; winrun_ordinals maps
+        // ord2/ord3 to XInputGetState/XInputSetState, both implemented in
+        // winrun_directx.zig, which is not otherwise reachable from this loader.
+        if (msvcrt_mod.lookupXinput(name)) |addr| return @ptrFromInt(addr);
     } else if (std.ascii.eqlIgnoreCase(dll, "dinput8.dll") or std.ascii.eqlIgnoreCase(dll, "dinput8")) {
         if (std.mem.eql(u8, name, "DirectInput8Create")) return @ptrCast(&DirectInput8Create);
     } else if (std.ascii.eqlIgnoreCase(dll, "comctl32.dll") or std.ascii.eqlIgnoreCase(dll, "comctl32")) {
         if (std.mem.eql(u8, name, "InitCommonControlsEx")) return @ptrCast(&InitCommonControlsEx);
+        if (extra_dlls_mod.lookupComctl32(name)) |addr| return @ptrFromInt(addr);
+    } else if (std.ascii.eqlIgnoreCase(dll, "libvorbisfile.dll") or std.ascii.eqlIgnoreCase(dll, "vorbisfile")) {
+        // Not implemented: real Vorbis decoding is a subsystem. Reporting failure
+        // rather than a stub keeps the caller's error handling honest.
+        std.debug.print("[WINS:winmm] libvorbisfile!{s} is not available\n", .{name});
+        return null;
+    } else if (std.ascii.eqlIgnoreCase(dll, "dsound.dll")) {
+        // Not implemented: DirectSound is a subsystem. Failing here is deliberate
+        // and observable, unlike a silent success the game would build on.
+        std.debug.print("[WINS:winmm] dsound!{s} is not available\n", .{name});
+        return null;
     } else if (std.ascii.eqlIgnoreCase(dll, "ntdll.dll") or std.ascii.eqlIgnoreCase(dll, "ntdll")) {
         if (std.mem.eql(u8, name, "NtSetInformationThread")) return @ptrCast(&NtSetInformationThread);
         if (std.mem.eql(u8, name, "NtReadVirtualMemory")) return @ptrCast(&NtReadVirtualMemory);
@@ -3691,7 +3710,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  Import Table Analysis:\n", .{});
     // Deterministic gate, before a single page of the guest image exists: a PE that
     // reaches for Steam only runs once a live, authenticated client says yes.
-    if (imports_steam) {
+    if (imports_steam and run_target) {
         std.debug.print("  This program imports Steam APIs; requiring a live Steam client.\n", .{});
         if (!steamClientLive()) {
             std.debug.print("[WINS:SteamBridge] REFUSING to run: no live Steam client serving this process.\n", .{});
@@ -3861,7 +3880,7 @@ pub fn main(init: std.process.Init) !void {
         // gdb can set breakpoints inside it (`break brkGuestEntry` then
         // `break *<guest entry>`). No side effects.
         brkGuestEntry();
-        std.debug.print("[probe] before guest jump: EBX=0x{x:0>8} ECX=0x{x:0>8} EDX=0x{x:0>8} (guest expects EBX built fresh; ECX=this)\n", .{ g_probe_ebx, g_probe_ecx, g_probe_edx });
+        std.debug.print("[WINS:regprobe] before guest jump: EBX=0x{x:0>8} ECX=0x{x:0>8} EDX=0x{x:0>8} (guest expects EBX built fresh; ECX=this)\n", .{ g_probe_ebx, g_probe_ecx, g_probe_edx });
 
         var old_esp: usize = 0;
         asm volatile (

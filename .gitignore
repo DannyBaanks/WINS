@@ -38,3 +38,9 @@ node_modules/
 
 # Logs
 *.log
+
+# Measurement-only instrumentation. Local scratch builds used to observe a
+# target's call flow with REA. NEVER published: the repo must not carry stubs or
+# bypass logic that someone could replicate. `tools/build_probe.sh` regenerates
+# them from the public sources.
+native/probe/
