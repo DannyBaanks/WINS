@@ -174,6 +174,27 @@ fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque
                     }
                 }
             }
+
+            // The sub-object the guest was about to dereference. EAX survives a
+            // faulting `mov (%eax),%edi`-style load when the fault is on a
+            // *different* access, and for this crash it names the object whose
+            // +4 field came back null.
+            const eax_val = uctx.uc_mcontext.eax;
+            if (eax_val > 0x1000 and eax_val + 0x40 < 0xFFFFF000) {
+                var nn: usize = 0;
+                var o: usize = 0;
+                while (o < 0x40) : (o += 4) {
+                    if (@as(*const u32, @ptrFromInt(eax_val + o)).* != 0) nn += 1;
+                }
+                std.debug.print("  Sub-object at EAX=0x{x}: {d} non-zero words in +0x00..0x40\n", .{ eax_val, nn });
+                if (nn > 0 and nn < 24) {
+                    o = 0;
+                    while (o < 0x40) : (o += 4) {
+                        const v: u32 = @as(*const u32, @ptrFromInt(eax_val + o)).*;
+                        if (v != 0) std.debug.print("    +0x{x:0>3}: 0x{x:0>8}\n", .{ o, v });
+                    }
+                }
+            }
         }
     }
     std.debug.print("=======================================================\n", .{});
