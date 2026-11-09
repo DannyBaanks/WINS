@@ -344,6 +344,10 @@ comptime {
 /// Set from the loader when WINS_TRACE=1. Keeps library output clean by default.
 pub var trace_static_init: bool = false;
 
+/// Capture the guest's EBX/ECX/EDX from inside a shim, via inline asm. A shim is
+/// host code running with the guest's register state live, so this is the only
+/// place a corruption can be observed mid-run without a debugger -- gdb cannot
+/// set guest breakpoints before the image is mapped.
 const IOB_COUNT = 32;
 var iob_table: [IOB_COUNT]MsvcrtFile = initIobTable();
 var iob_in_use: [IOB_COUNT]bool = .{ true, true, true } ++ .{false} ** (IOB_COUNT - 3);

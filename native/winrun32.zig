@@ -87,6 +87,10 @@ const Ucontext = extern struct {
 // which destroys the frame state gdb would need.
 var g_crash_trap: bool = false;
 
+var g_probe_ebx: u32 = 0;
+var g_probe_ecx: u32 = 0;
+var g_probe_edx: u32 = 0;
+
 fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
     _ = sig;
     std.debug.print("\n=======================================================\n", .{});
@@ -3300,8 +3304,25 @@ var g_guest_stack_base: usize = 0;
 var g_guest_stack_end: usize = 0;
 
 /// No-op hook placed immediately before the jump into guest code. It exists so a
-/// debugger can set breakpoints inside the already-mapped guest image.
-pub export fn brkGuestEntry() callconv(.c) void {}
+/// debugger can set breakpoints inside the already-mapped guest image, and it
+/// captures the host register state immediately before the guest starts: a value
+/// that is already wrong here is the loader's fault, not the guest's.
+pub export fn brkGuestEntry() callconv(.c) void {
+    var b: u32 = undefined;
+    var c: u32 = undefined;
+    var d: u32 = undefined;
+    asm volatile (
+        \\ movl %%ebx, %[b]
+        \\ movl %%ecx, %[c]
+        \\ movl %%edx, %[d]
+        : [b] "=r" (b),
+          [c] "=r" (c),
+          [d] "=r" (d),
+    );
+    g_probe_ebx = b;
+    g_probe_ecx = c;
+    g_probe_edx = d;
+}
 
 fn registerGuestImage(base: usize, size: usize) void {
     g_guest_base = base;
@@ -3722,6 +3743,7 @@ pub fn main(init: std.process.Init) !void {
         // gdb can set breakpoints inside it (`break brkGuestEntry` then
         // `break *<guest entry>`). No side effects.
         brkGuestEntry();
+        std.debug.print("[probe] before guest jump: EBX=0x{x:0>8} ECX=0x{x:0>8} EDX=0x{x:0>8} (guest expects EBX built fresh; ECX=this)\n", .{ g_probe_ebx, g_probe_ecx, g_probe_edx });
 
         var old_esp: usize = 0;
         asm volatile (

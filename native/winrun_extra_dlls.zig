@@ -388,18 +388,18 @@ pub fn lookupAdvapi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "SaferCreateLevel")) return @intFromPtr(&SaferCreateLevel);
     if (std.mem.eql(u8, name, "SetTokenInformation")) return @intFromPtr(&SetTokenInformation);
     if (std.mem.eql(u8, name, "SystemFunction036")) return @intFromPtr(&SystemFunction036);
-    if (std.mem.eql(u8, name, "CryptCreateHash")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CryptDestroyHash")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CryptHashData")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CryptGetHashParam")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CryptEncrypt")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CryptImportKey")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CryptDestroyKey")) return @intFromPtr(&crypt_ret_one);
+    if (std.mem.eql(u8, name, "CryptCreateHash")) return @intFromPtr(&stub5);
+    if (std.mem.eql(u8, name, "CryptDestroyHash")) return @intFromPtr(&stub1);
+    if (std.mem.eql(u8, name, "CryptHashData")) return @intFromPtr(&stub4);
+    if (std.mem.eql(u8, name, "CryptGetHashParam")) return @intFromPtr(&stub5);
+    if (std.mem.eql(u8, name, "CryptEncrypt")) return @intFromPtr(&stub7);
+    if (std.mem.eql(u8, name, "CryptImportKey")) return @intFromPtr(&stub6);
+    if (std.mem.eql(u8, name, "CryptDestroyKey")) return @intFromPtr(&stub1);
     // 7zr asks for these two; neither is meaningful without a real security
     // subsystem, and "failure" is the answer that cannot fabricate a privilege.
-    if (std.mem.eql(u8, name, "SetFileSecurityW")) return @intFromPtr(&crypt_ret_zero);
-    if (std.mem.eql(u8, name, "GetFileSecurityW")) return @intFromPtr(&crypt_ret_zero);
-    if (std.mem.eql(u8, name, "LookupPrivilegeValueW")) return @intFromPtr(&crypt_ret_zero);
+    if (std.mem.eql(u8, name, "SetFileSecurityW")) return @intFromPtr(&stub3);
+    if (std.mem.eql(u8, name, "GetFileSecurityW")) return @intFromPtr(&stub5);
+    if (std.mem.eql(u8, name, "LookupPrivilegeValueW")) return @intFromPtr(&stub3);
     return null;
 }
 
@@ -1373,29 +1373,104 @@ pub fn lookupWldap32(name: []const u8) ?usize {
 // 8. CRYPT32.dll & ncrypt.dll / bcrypt.dll
 // ---------------------------------------------------------------------------
 
-fn crypt_ret_zero() callconv(W) usize { return 0; }
-fn crypt_ret_one() callconv(W) u32 { return 1; }
+// ---------------------------------------------------------------------------
+// Stack-balanced unsupported-API stubs
+//
+// A zero-argument stub is NOT usable for a Win32 API. The caller pushes the
+// arguments and a stdcall callee pops them, so `ret` with no immediate leaves
+// every argument on the guest's stack. That imbalance shifts the frame by 4*N
+// bytes (a 3-argument API leaves 12) and the next register the guest restores
+// picks up a stale argument: 7zr came back from its SeLockMemoryPrivilege path
+// with EBX holding the L"SeLockMemoryPrivilege" string pointer, which then made
+// an `cmp %bl, <field>` compare against a non-zero byte and dereference a null
+// value pointer. Each arity therefore gets its own function so the generated
+// epilogue is `ret $0x10`-style and the stack stays balanced.
+//
+// Every one reports failure rather than success: an unsupported API that claims
+// to have worked is worse than one that reports it did not.
+fn stub1(a0: usize) callconv(W) u32 {
+    _ = a0;
+    return 0;
+}
+
+fn stub2(a0: usize, a1: usize) callconv(W) u32 {
+    _ = a0;
+    _ = a1;
+    return 0;
+}
+
+fn stub3(a0: usize, a1: usize, a2: usize) callconv(W) u32 {
+    _ = a0;
+    _ = a1;
+    _ = a2;
+    return 0;
+}
+
+fn stub4(a0: usize, a1: usize, a2: usize, a3: usize) callconv(W) u32 {
+    _ = a0;
+    _ = a1;
+    _ = a2;
+    _ = a3;
+    return 0;
+}
+
+fn stub5(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize) callconv(W) u32 {
+    _ = a0;
+    _ = a1;
+    _ = a2;
+    _ = a3;
+    _ = a4;
+    return 0;
+}
+
+fn stub6(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) callconv(W) u32 {
+    _ = a0;
+    _ = a1;
+    _ = a2;
+    _ = a3;
+    _ = a4;
+    _ = a5;
+    return 0;
+}
+
+fn stub7(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) callconv(W) u32 {
+    _ = a0;
+    _ = a1;
+    _ = a2;
+    _ = a3;
+    _ = a4;
+    _ = a5;
+    _ = a6;
+    return 0;
+}
+
+/// A null HANDLE / zero-returning stub, kept for the call sites that only need a
+/// "no handle" answer with no argument to balance.
+fn crypt_ret_zero() callconv(W) usize {
+    return 0;
+}
 
 pub fn lookupCrypt32(name: []const u8) ?usize {
-    if (std.mem.eql(u8, name, "CertOpenStore")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CertCloseStore")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CertCreateCertificateContext")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CertFreeCertificateContext")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CertAddCertificateContextToStore")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CertCreateCertificateChainEngine")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CertFreeCTLContext")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CertFreeCRLContext")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.eql(u8, name, "CryptMsgClose")) return @intFromPtr(&crypt_ret_one);
-    if (std.mem.startsWith(u8, name, "Cert") or std.mem.startsWith(u8, name, "Crypt") or std.mem.startsWith(u8, name, "PFX")) {
-        return @intFromPtr(&crypt_ret_zero);
-    }
+    if (std.mem.eql(u8, name, "CertOpenStore")) return @intFromPtr(&stub5);
+    if (std.mem.eql(u8, name, "CertCloseStore")) return @intFromPtr(&stub2);
+    if (std.mem.eql(u8, name, "CertCreateCertificateContext")) return @intFromPtr(&stub3);
+    if (std.mem.eql(u8, name, "CertFreeCertificateContext")) return @intFromPtr(&stub1);
+    if (std.mem.eql(u8, name, "CertAddCertificateContextToStore")) return @intFromPtr(&stub4);
+    if (std.mem.eql(u8, name, "CertCreateCertificateChainEngine")) return @intFromPtr(&stub2);
+    if (std.mem.eql(u8, name, "CertFreeCTLContext")) return @intFromPtr(&stub1);
+    if (std.mem.eql(u8, name, "CertFreeCRLContext")) return @intFromPtr(&stub1);
+    if (std.mem.eql(u8, name, "CryptMsgClose")) return @intFromPtr(&stub1);
+    // Crypt32 names not enumerated above are NOT stubbed: a zero-argument stub
+    // for an API of unknown arity leaves its arguments on the guest stack and
+    // shifts the frame, which is the defect this whole section exists to avoid.
+    // Exporting nothing makes the loader report the name as UNRESOLVED instead.
     return null;
 }
 
 pub fn lookupNcrypt(name: []const u8) ?usize {
-    if (std.mem.startsWith(u8, name, "BCrypt") or std.mem.startsWith(u8, name, "NCrypt")) {
-        return @intFromPtr(&crypt_ret_zero);
-    }
+    // Same reasoning as lookupCrypt32: NCrypt/BCrypt take arguments whose count
+    // is not knowable here, so no catch-all stub.
+    _ = name;
     return null;
 }
 
