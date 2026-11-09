@@ -4,6 +4,81 @@
 // routines, POSIX file I/O, filesystem, time, setjmp/longjmp, and data exports).
 
 const std = @import("std");
+
+// ---------------------------------------------------------------------------
+// MSVC x86 C++ exception handling
+//
+// The three records an SEH dispatcher hands to a frame handler. Only
+// EXCEPTION_RECORD needs real content; CONTEXT and DISPATCHER_CONTEXT are
+// supplied so the guest handler reads a plausible frame and __CxxFrameHandler can
+// fill in what its __CxxFrameHandler3 wrapper expects.
+pub const EH_MAGIC: u32 = 0x19930520;
+pub const EH_CODE: u32 = 0xE06D7363;
+
+pub const ExceptionRecord = extern struct {
+    exception_code: u32,
+    exception_flags: u32 = 1, // EXCEPTION_NONCONTINUABLE
+    exception_record: usize = 0,
+    exception_address: usize = 0,
+    number_parameters: u32 = 4,
+    exception_information: [15]usize = [_]usize{0} ** 15,
+};
+
+pub const Disposition = enum(i32) {
+    continue_search = 0,
+    execute_handler = 1,
+    continue_execution = -1,
+};
+
+/// The Win32 x86 CONTEXT, in field order. Offsets are load-bearing: the guest
+/// handler reads registers straight out of this record.
+pub const GuestContext = extern struct {
+    context_flags: u32 = 0x10007, // CONTEXT_INTEGER | CONTEXT_CONTROL | CONTEXT_SEGMENTS
+    dr0: u32 = 0,
+    dr1: u32 = 0,
+    dr2: u32 = 0,
+    dr3: u32 = 0,
+    dr6: u32 = 0,
+    dr7: u32 = 0,
+    float_save: [28]u32 = [_]u32{0} ** 28, // FLOATING_SAVE_AREA, 112 bytes
+    seg_gs: u32 = 0,
+    seg_fs: u32 = 0,
+    seg_es: u32 = 0,
+    seg_ds: u32 = 0,
+    edi: u32 = 0,
+    esi: u32 = 0,
+    ebx: u32 = 0,
+    edx: u32 = 0,
+    ecx: u32 = 0,
+    eax: u32 = 0,
+    ebp: u32 = 0,
+    eip: u32 = 0,
+    seg_cs: u32 = 0,
+    eflags: u32 = 0,
+    esp: u32 = 0,
+    seg_ss: u32 = 0,
+
+    fn sizeOf() usize {
+        return @sizeOf(GuestContext) + 512;
+    }
+};
+
+/// The Win32 DISPATCHER_CONTEXT, in field order. The guest's
+/// __CxxFrameHandler3 wrapper reads these before deciding a disposition; a
+/// zeroed block makes every frame answer EXCEPTION_CONTINUE_SEARCH.
+const DispatcherContext = extern struct {
+    control_pc: usize = 0,
+    image_base: usize = 0,
+    function_entry: usize = 0,
+    establisher_frame: usize = 0,
+    target_ip: usize = 0,
+    context_record: usize = 0,
+    language_handler: usize = 0,
+    handler_data: usize = 0,
+    msvc_func_info: usize = 0,
+    msvc_throw_info: usize = 0,
+};
+
 const linux = std.os.linux;
 
 // The C runtime is cdecl, not stdcall: the CALLER pops the arguments. The
@@ -343,6 +418,11 @@ comptime {
 
 /// Set from the loader when WINS_TRACE=1. Keeps library output clean by default.
 pub var trace_static_init: bool = false;
+
+/// Base of the guest's TIB, set by winrun32 after setupTib(). The guest stores
+/// its own SEH chain head in TIB[0] (`mov %%esp, %%fs:0`), so this is the entry
+/// point for walking the exception frames _CxxThrowException must unwind.
+pub var guest_tib_base: usize = 0;
 
 /// Capture the guest's EBX/ECX/EDX from inside a shim, via inline asm. A shim is
 /// host code running with the guest's register state live, so this is the only
@@ -2381,10 +2461,31 @@ fn _adjust_fdiv(fpu_env: ?*const anyopaque) callconv(C) void {
 /// ("not mine") is the one answer that cannot misroute an exception into a
 /// fabricated disposition. The full SEH-based C++ EH is NOT implemented.
 fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaque, disp: ?*const anyopaque) callconv(C) i32 {
-    _ = rec;
-    _ = frame;
-    _ = ctx;
-    _ = disp;
+    if (trace_static_init) {
+        std.debug.print("[eh] __CxxFrameHandler(rec=0x{x}, frame=0x{x}, ctx=0x{x}, disp=0x{x})\n", .{
+            @intFromPtr(rec), @intFromPtr(frame), @intFromPtr(ctx), @intFromPtr(disp),
+        });
+        if (rec) |r| {
+            const er: *const ExceptionRecord = @ptrCast(@alignCast(r));
+            std.debug.print("[eh]   code=0x{x:0>8} nparams={d} info[0]=0x{x:0>8} info[1]=0x{x:0>8} info[2]=0x{x:0>8}\n", .{
+                er.exception_code, er.number_parameters,
+                er.exception_information[0], er.exception_information[1], er.exception_information[2],
+            });
+        }
+        if (disp) |d| {
+            const words: [*]const usize = @ptrCast(@alignCast(d));
+            std.debug.print("[eh]   DispatcherContext[0..6]: 0x{x} 0x{x} 0x{x} 0x{x} 0x{x} 0x{x} 0x{x}\n", .{
+                words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+            });
+        }
+        if (frame) |f| {
+            const w: [*]const usize = @ptrCast(@alignCast(f));
+            var i: usize = 0;
+            std.debug.print("[eh]   frame[0..10]:", .{});
+            while (i < 10) : (i += 1) std.debug.print(" 0x{x:0>8}", .{w[i]});
+            std.debug.print("\n", .{});
+        }
+    }
     return 0; // EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -2428,10 +2529,149 @@ fn _XcptFilter(xcpt: u32, exc: ?*const anyopaque) callconv(C) i32 {
 /// returning EXCEPTION_CONTINUE_SEARCH unconditionally, which it currently does.
 /// Until then, returning is wrong but no alternative is available; a
 /// non-returning stub would take `7zr b` down with it.
+/// Walk the guest's SEH chain: TIB[0] holds the head, each registration record is
+/// {prev: *const reg, handler: usize}, and the chain ends at 0xFFFFFFFF.
+pub fn walkSehChain(depth_limit: usize) usize {
+    if (guest_tib_base == 0) return 0;
+    var node: usize = @as(*const usize, @ptrFromInt(guest_tib_base)).*;
+    var depth: usize = 0;
+    while (node != 0xFFFFFFFF and node > 0x1000 and node + 8 < 0xFFFFF000 and depth < depth_limit) : (depth += 1) {
+        const next: usize = @as(*const usize, @ptrFromInt(node)).*;
+        const handler: usize = @as(*const usize, @ptrFromInt(node + 4)).*;
+        if (trace_static_init) {
+            std.debug.print("[eh] frame {d}: node=0x{x:0>8} prev=0x{x:0>8} handler=0x{x:0>8} (guest={})\n", .{ depth, node, next, handler, handler >= 0x400000 and handler < 0x4a2000 });
+        }
+        if (next == node) break;
+        node = next;
+    }
+    return depth;
+}
+
+/// Snapshot the guest's live registers into a Win32 CONTEXT. The shim is host code
+/// entered from the guest, so at this instant the general registers are still the
+/// guest's -- this is the only place they can be observed.
+fn captureGuestContext(ctx: *GuestContext) void {
+    // Memory operands, not "=r": ten register outputs exhaust the i386 set and
+    // the compiler refuses. Only two need a register.
+    var edi: u32 = undefined;
+    var esi: u32 = undefined;
+    var ebx: u32 = undefined;
+    var edx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var eax: u32 = undefined;
+    var ebp: u32 = undefined;
+    var esp: u32 = undefined;
+    var segss: u32 = undefined;
+    var eflags: u32 = undefined;
+    asm volatile (
+        \\ movl %%edi, %[d]
+        \\ movl %%esi, %[s]
+        \\ movl %%ebx, %[b]
+        \\ movl %%edx, %[x]
+        \\ movl %%ecx, %[c]
+        \\ movl %%eax, %[a]
+        \\ movl %%ebp, %[p]
+        \\ movl %%esp, %[sp]
+        \\ pushfl
+        \\ popl %%eax
+        \\ movl %%eax, %[fl]
+        \\ movl %%ss, %%eax
+        \\ movl %%eax, %[ss]
+        : [d] "=m" (edi),
+          [s] "=m" (esi),
+          [b] "=m" (ebx),
+          [x] "=m" (edx),
+          [c] "=m" (ecx),
+          [a] "=m" (eax),
+          [p] "=m" (ebp),
+          [sp] "=m" (esp),
+          [ss] "=m" (segss),
+          [fl] "=r" (eflags),
+    );
+    ctx.edi = edi;
+    ctx.esi = esi;
+    ctx.ebx = ebx;
+    ctx.edx = edx;
+    ctx.ecx = ecx;
+    ctx.eax = eax;
+    ctx.ebp = ebp;
+    ctx.esp = esp;
+    ctx.seg_ss = segss;
+    ctx.eflags = eflags;
+    ctx.eip = @truncate(@returnAddress());
+}
+
 fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C) void {
-    if (trace_static_init) std.debug.print("[msvcrt] _CxxThrowException thrown (unwinding NOT implemented)\n", .{});
-    _ = exc;
-    _ = dp;
+    // GATED. The walk below is built and works, but running it unconditionally
+    // REGRESSES the loader: measured on 7zr, `b` (benchmark) dies with SIGSEGV
+    // and `l` still dies, whereas without the walk `b` completes. The reason is
+    // that MSVC's __CxxFrameHandler3 wrappers expect the *dispatcher* to perform
+    // the jump into the __except block; walking the chain from a shim and then
+    // returning leaves the guest with a mutated SEH chain and no transfer of
+    // control, so the guest resumes at the throw site. Left as diagnostics under
+    // WINS_TRACE until the dispatcher half exists.
+    if (!trace_static_init) return;
+
+    // Build the C++ EH record the dispatcher would build, then offer it to every
+    // frame on the chain until one says it handles the exception.
+    var rec: ExceptionRecord = .{
+        .exception_code = EH_CODE,
+        .exception_information = [_]usize{EH_MAGIC, @intFromPtr(exc), @intFromPtr(dp), 0} ++ [_]usize{0} ** 11,
+    };
+    var ctx: GuestContext = .{};
+    captureGuestContext(&ctx);
+    var dc: DispatcherContext = .{
+        .control_pc = ctx.eip,
+        .establisher_frame = 0, // filled per frame below
+        .context_record = @intFromPtr(&ctx),
+        .msvc_func_info = 0,
+        .msvc_throw_info = @intFromPtr(dp),
+    };
+
+    if (trace_static_init) std.debug.print("[eh] throwing: exc=0x{x} throwinfo=0x{x}\n", .{ @intFromPtr(exc), @intFromPtr(dp) });
+
+    // The chain head is re-read after EVERY call. A handler that accepts the
+    // exception pops its own registration off the chain, so a node cached
+    // across a call is no longer readable -- dereferencing it faults. A handler
+    // that answers EXCEPTION_CONTINUE_SEARCH pops nothing, so the head is
+    // unchanged and the walk must follow the saved node's own prev field.
+    var node: usize = @as(*const usize, @ptrFromInt(guest_tib_base)).*;
+    var depth: usize = 0;
+    while (depth < 16) : (depth += 1) {
+        if (node == 0xFFFFFFFF or node <= 0x1000 or node + 8 >= 0xFFFFF000) {
+            std.debug.print("[eh]   chain exhausted after {d} frame(s)\n", .{depth});
+            return;
+        }
+        const handler: usize = @as(*const usize, @ptrFromInt(node + 4)).*;
+        const prev: usize = @as(*const usize, @ptrFromInt(node)).*;
+        std.debug.print("[eh] frame {d}: node=0x{x:0>8} handler=0x{x:0>8} prev=0x{x:0>8}\n", .{ depth, node, handler, prev });
+        if (handler < 0x400000 or handler >= 0x4a2000) {
+            std.debug.print("[eh]   handler outside the guest image; stopping\n", .{});
+            return;
+        }
+        dc.establisher_frame = node;
+        dc.control_pc = ctx.eip;
+        const f: *const fn (*align(1) const ExceptionRecord, usize, *align(1) GuestContext, *align(1) DispatcherContext) callconv(W) i32 =
+            @ptrFromInt(handler);
+        const disp: i32 = f(&rec, node, &ctx, &dc);
+        std.debug.print("[eh]   -> disposition {d}\n", .{disp});
+        if (disp == @intFromEnum(Disposition.execute_handler)) {
+            std.debug.print("[eh]   HANDLED: unwinding stops here\n", .{});
+            return;
+        }
+        // After a CONTINUE_SEARCH the frame stays on the chain, so the walk
+        // follows the node's own prev. A handler that accepts pops its frame,
+        // but then this function returns instead of using node again. Guard
+        // against a self-referential or restored prev: 0x47a068 rewinds TIB[0]
+        // after declining, which otherwise makes the walk cycle forever.
+        const next = if (prev != node and prev > 0x1000 and prev < 0xFFFFF000) prev else 0xFFFFFFFF;
+        if (next == 0xFFFFFFFF or next == node) {
+            std.debug.print("[eh]   chain end after {d} frame(s)\n", .{depth + 1});
+            return;
+        }
+        node = next;
+    }
+    std.debug.print("[eh]   no handler accepted; unhandled\n", .{});
 }
 
 /// type_info::~type_info, ?terminate@@YAXXZ and _purecall have no meaningful

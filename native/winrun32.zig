@@ -1132,6 +1132,11 @@ fn GetCommandLineA() callconv(W) [*:0]const u8 {
 
 fn GetCommandLineW() callconv(W) [*:0]const u16 {
     if (g_cmdline_w_len == 0) return &[_:0]u16{0};
+    if (g_crash_trap or msvcrt_mod.trace_static_init) {
+        // 7-Zip splits this string into argv; a stray separator here is enough
+        // to leave an empty entry in its non-switch list.
+        std.debug.print("[WINS:Kernel32] GetCommandLineW -> \"{s}\" (len={d})\n", .{ g_cmdline_buf[0..g_cmdline_len], g_cmdline_w_len });
+    }
     return g_cmdline_w_buf[0..g_cmdline_w_len :0].ptr;
 }
 
@@ -3396,6 +3401,8 @@ fn setupTib() !void {
 
     const rc = linux.syscall1(.set_thread_area, @intFromPtr(&desc));
     if (rc != 0) return error.SetThreadAreaFailed;
+
+    msvcrt_mod.guest_tib_base = @intFromPtr(&g_tib_buffer);
 
     const selector: u16 = @intCast((desc.entry_number << 3) | 3);
     asm volatile ("mov %[sel], %%fs"
