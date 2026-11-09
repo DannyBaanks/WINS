@@ -2567,7 +2567,70 @@ fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaqu
                     if (p_catch > 0x400000 and p_catch < 0x4a2000) {
                         const h: usize = @as(*const usize, @ptrFromInt(p_catch + 12)).*;
                         if (h > 0x400000 and h < 0x4a2000) {
+                            // CatchHandlerType is {adjectives, pType, dispOfHandler,
+                            // pHandler}: dispOfHandler is where the caught object goes
+                            // (relative to the frame's EBP) and pHandler is the catch
+                            // code. Entry 0 of this binary has dispOfHandler 0 and a
+                            // handler whose global is "ERROR: Can't allocate required
+                            // memory!" -> exit 8; entry 1 has dispOfHandler -0x20 and
+                            // handler 0x43d8e0 -> prints "Command Line Error:" and exits
+                            // 7, which is Wine's behaviour. So the entry must be matched
+                            // by exception type, not taken as entry 0.
                             accept_handler = h;
+                            // Match the catch entry by exception type and place the
+                            // object where dispOfHandler says. Without this the
+                            // catch reads an empty slot and the message is wrong.
+                            const n_catches: u32 = @as(*const u32, @ptrFromInt(m + 12)).*;
+                            const p_catch_arr: usize = @as(*const usize, @ptrFromInt(m + 16)).*;
+                            var thrown_type: usize = 0;
+                            if (rec) |r| {
+                                const er: *const ExceptionRecord = @ptrCast(@alignCast(r));
+                                if (er.number_parameters >= 3 and er.exception_information[2] > 0x400000) {
+                                    const cta: usize = @as(*const usize, @ptrFromInt(er.exception_information[2] + 12)).*;
+                                    if (cta > 0x400000 and cta < 0x4a2000) {
+                                        const ct0: usize = @as(*const usize, @ptrFromInt(cta + 4)).*;
+                                        if (ct0 > 0x400000 and ct0 < 0x4a2000) {
+                                            thrown_type = @as(*const usize, @ptrFromInt(ct0 + 4)).*;
+                                        }
+                                    }
+                                }
+                            }
+                            if (p_catch_arr > 0x400000 and p_catch_arr < 0x4a2000) {
+                                var ci: u32 = 0;
+                                while (ci < n_catches and ci < 12) : (ci += 1) {
+                                    const ce = p_catch_arr + ci * 16;
+                                    const e_type: usize = @as(*const usize, @ptrFromInt(ce + 4)).*;
+                                    const e_disp: i32 = @as(*const i32, @ptrFromInt(ce + 8)).*;
+                                    const e_handler: usize = @as(*const usize, @ptrFromInt(ce + 12)).*;
+                                    if (e_handler < 0x400000 or e_handler >= 0x4a2000) continue;
+                                    if (thrown_type != 0 and e_type == thrown_type) {
+                                        accept_handler = e_handler;
+                                        if (ctx) |c| {
+                                            const g: *const GuestContext = @ptrCast(@alignCast(c));
+                                            var f: usize = g.ebp;
+                                            var hops: usize = 0;
+                                            while (f > 0x1000 and f < 0xFFFFF000 and hops < 16) : (hops += 1) {
+                                                if (f > @intFromPtr(frame.?)) {
+                                                    accept_ebp = f;
+                                                    break;
+                                                }
+                                                const nx: usize = @as(*const usize, @ptrFromInt(f)).*;
+                                                if (nx <= 0x1000 or nx >= 0xFFFFF000 or nx <= f) break;
+                                                f = nx;
+                                            }
+                                            const slot = @as(usize, @intCast(@as(isize, @intCast(accept_ebp)) + e_disp));
+                                            if (accept_ebp != 0 and slot > 0x1000 and slot < 0xFFFFF000) {
+                                                @as(*usize, @ptrFromInt(slot)).* = @intFromPtr(frame.?);
+                                                if (trace_static_init) {
+                                                    std.debug.print("[eh]     catch[{d}]: type=0x{x} disp={d} handler=0x{x}: object at ebp{d}=0x{x}\\n", .{ ci, e_type, e_disp, e_handler, e_disp, slot });
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+
                             // The catch block reads [-0xNN(%ebp)], so the accepting
                             // frame's EBP must be restored. Walk the EBP chain from
                             // the captured context -- frames chain UPWARD, and the
