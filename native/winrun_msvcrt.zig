@@ -2788,26 +2788,44 @@ fn captureGuestContext(ctx: *GuestContext) void {
 /// Transfer control into the guest's __except block. The block restores its own
 /// ESP from EBP (`mov -0x18%(%ebp),%esp`), so only EBP and the target have to be
 /// right. This does not return: the guest never comes back to the throw site.
+/// The catch is a state machine, not a single block.
+///
+/// Measured on 7zr: the pHandler (0x43d8cf) is a funclet shaped
+///     mov <global>,%%ecx ; call <print> ; mov $<next>,%%eax ; ret
+/// and 0x43d8e0 is a second one, whose `mov $0x43d90c,%eax` leads to
+///     push $0x7 ; jmp 0x43dafb          <- exit code 7, Wine's exact behaviour.
+/// Nothing CALLs these entries, so they are reached by the dispatcher calling
+/// them; the `ret` returns to it with the next state in EAX.
+///
+/// Therefore the correct entry is to CALL the first funclet with a live return
+/// address, read EAX, and repeat. Jumping straight to the funclet made its `ret`
+/// pop the guest's own stack and land EIP inside it -- which is what the SIGSEGV
+/// after `transfer` was.
 fn transferToHandler() noreturn {
-    const target = accept_handler;
+    var state = accept_handler;
     const ebp = accept_ebp;
-    if (target <= 0x400000 or target >= 0x4a2000) {
-        std.debug.print("[eh]   accept target outside the guest image; returning instead\n", .{});
-        return transferFailed();
+    var guard: usize = 0;
+    while (state > 0x400000 and state < 0x4a2000 and guard < 256) : (guard += 1) {
+        var next: usize = 0;
+        if (trace_static_init) std.debug.print("[eh]   calling state 0x{x} with ebp=0x{x}\n", .{ state, ebp });
+        asm volatile (
+            \\ movl %[b], %%ebp
+            \\ call *%[s]
+            \\ movl %%eax, %[n]
+            : [n] "=r" (next)
+            : [s] "{ecx}" (state),
+              [b] "m" (ebp),
+        );
+        if (trace_static_init) std.debug.print("[eh]   state 0x{x} -> 0x{x}\n", .{ state, next });
+        if (next <= 0x400000 or next >= 0x4a2000) {
+            if (trace_static_init) std.debug.print("[eh]   state machine ended at 0x{x}\n", .{next});
+            break;
+        }
+        state = next;
     }
-    if (trace_static_init) std.debug.print("[eh]   transfer: target=0x{x} ebp=0x{x}\n", .{ target, ebp });
-    // Explicit register binding for the target and a memory operand for EBP.
-    // With plain "r" operands and no clobber list, Zig assigned both inputs the
-    // same register, so the indirect jump received the node address instead of
-    // the catch block -- EIP landed inside the guest stack.
-    asm volatile (
-        \\ movl %[b], %%ebp
-        \\ jmp *%[t]
-        :
-        : [t] "{eax}" (target),
-          [b] "m" (ebp),
-    );
-    unreachable;
+    // The chain ended without an exit: the last state's own code jumped away
+    // (the `push $0x7; jmp` tail), so we only get here if it returned instead.
+    linux.exit_group(7);
 }
 
 fn transferFailed() noreturn {
