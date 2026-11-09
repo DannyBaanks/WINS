@@ -2527,6 +2527,80 @@ fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaqu
             std.debug.print("\n", .{});
         }
     }
+
+    // M3-A: decide, do not stub. The FuncInfo arrives in EAX; the frame's current
+    // state is the word at node+8 (measured: frame 1 holds 1, and its FuncInfo
+    // says tryLow=1/tryHigh=1 -- an exact match, not a coincidence).
+    if (func_info > 0x400000 and func_info < 0x4a2000) {
+        const n_try: u32 = @as(*const u32, @ptrFromInt(func_info + 12)).*;
+        const p_try: usize = @as(*const usize, @ptrFromInt(func_info + 16)).*;
+        const nd = @intFromPtr(frame.?);
+        if (trace_static_init) {
+            std.debug.print("[eh]   node 0x{x} words:", .{nd});
+            var z: usize = 0;
+            while (z < 8) : (z += 1) std.debug.print(" [{d}]=0x{x:0>8}", .{ z, @as(*const usize, @ptrFromInt(nd + z * 4)).* });
+            std.debug.print("\n", .{});
+        }
+        const state: i32 = @as(*const i32, @ptrFromInt(nd + 8)).*;
+        if (trace_static_init) {
+            std.debug.print("[eh]   decide: state={d} nTry={d} pTry=0x{x} maxState={d}\n", .{ state, n_try, p_try, @as(*const u32, @ptrFromInt(func_info + 4)).* });
+        }
+        if (n_try > 0 and p_try > 0x400000) {
+            var e: u32 = 0;
+            while (e < n_try and e < 4) : (e += 1) {
+                const m = p_try + e * 20;
+                const try_low: i32 = @as(*const i32, @ptrFromInt(m)).*;
+                const try_high: i32 = @as(*const i32, @ptrFromInt(m + 4)).*;
+                const catch_high: i32 = @as(*const i32, @ptrFromInt(m + 8)).*;
+                if (trace_static_init) {
+                    std.debug.print("[eh]     try[{d}]: [{d}..{d}] catchHigh={d}\n", .{ e, try_low, try_high, catch_high });
+                }
+                // Inside the try body the catch applies. catchHigh covers the
+                // handler body itself, i.e. already unwinding, so it is excluded.
+                if (state >= try_low and state <= try_high) {
+                    // CatchHandlerType array: TryBlockMapEntry+16 -> pCatch,
+                    // then entry+12 -> pHandler (measured on 7zr frame 1:
+                    // pCatch=0x489eb0, handler=0x43d8cf, which is code that
+                    // prints the message and does `push $0x7; jmp` = exit 7,
+                    // matching Wine exactly).
+                    const p_catch: usize = @as(*const usize, @ptrFromInt(m + 16)).*;
+                    if (p_catch > 0x400000 and p_catch < 0x4a2000) {
+                        const h: usize = @as(*const usize, @ptrFromInt(p_catch + 12)).*;
+                        if (h > 0x400000 and h < 0x4a2000) {
+                            accept_handler = h;
+                            // The catch block reads [-0xNN(%ebp)], so the accepting
+                            // frame's EBP must be restored. Walk the EBP chain from
+                            // the captured context -- frames chain UPWARD, and the
+                            // accepting frame's EBP is the first entry above its
+                            // own registration node (measured: node1+12, and
+                            // node2+16 for mainCRTStartup's prologue).
+                            if (ctx) |c| {
+                                const g: *const GuestContext = @ptrCast(@alignCast(c));
+                                var f: usize = g.ebp;
+                                var hops: usize = 0;
+                                while (f > 0x1000 and f < 0xFFFFF000 and hops < 16) : (hops += 1) {
+                                    if (f > @intFromPtr(frame.?)) {
+                                        accept_ebp = f;
+                                        break;
+                                    }
+                                    const nx: usize = @as(*const usize, @ptrFromInt(f)).*;
+                                    if (nx <= 0x1000 or nx >= 0xFFFFF000 or nx <= f) break;
+                                    f = nx;
+                                }
+                            }
+                            if (trace_static_init) {
+                                std.debug.print("[eh]     -> catch 0x{x} ebp=0x{x} (node=0x{x})\n", .{ h, accept_ebp, @intFromPtr(frame.?) });
+                            }
+                        }
+                    }
+                    if (trace_static_init) {
+                        std.debug.print("[eh]     -> state {d} inside try[{d}]: EXCEPTION_EXECUTE_HANDLER\n", .{ state, e });
+                    }
+                    return 1;
+                }
+            }
+        }
+    }
     return 0; // EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -2589,10 +2663,15 @@ fn _except_handler3(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaque
                 }
                 if (trace_static_init) std.debug.print("[eh]     accepted: handler block 0x{x}, ebp 0x{x}\n", .{ accept_handler, accept_ebp });
             }
+            // Win32 __except filter constants: 1 = EXCEPTION_EXECUTE_HANDLER,
+            // 0 = EXCEPTION_CONTINUE_SEARCH, -1 = EXCEPTION_CONTINUE_EXECUTION.
+            // Frame 2's filter (_XcptFilter) returns 0, i.e. "not mine", which is
+            // the correct answer for a C++ exception -- the previous mapping read
+            // that 0 as "accept", which is why forcing acceptance looked inert.
             return switch (r) {
-                -1 => @intFromEnum(Disposition.continue_execution), // EXCEPTION_CONTINUE_EXECUTION
-                0 => @intFromEnum(Disposition.execute_handler),     // EXCEPTION_EXECUTE_HANDLER
-                else => 0,                                          // EXCEPTION_CONTINUE_SEARCH
+                1 => @intFromEnum(Disposition.execute_handler),
+                -1 => @intFromEnum(Disposition.continue_execution),
+                else => 0, // EXCEPTION_CONTINUE_SEARCH
             };
         }
         if (enclosing <= 0x400000 or enclosing >= 0x4a2000) break;
@@ -2716,11 +2795,17 @@ fn transferToHandler() noreturn {
         std.debug.print("[eh]   accept target outside the guest image; returning instead\n", .{});
         return transferFailed();
     }
+    if (trace_static_init) std.debug.print("[eh]   transfer: target=0x{x} ebp=0x{x}\n", .{ target, ebp });
+    // Explicit register binding for the target and a memory operand for EBP.
+    // With plain "r" operands and no clobber list, Zig assigned both inputs the
+    // same register, so the indirect jump received the node address instead of
+    // the catch block -- EIP landed inside the guest stack.
     asm volatile (
         \\ movl %[b], %%ebp
         \\ jmp *%[t]
         :
-        : [t] "r" (target), [b] "r" (ebp),
+        : [t] "{eax}" (target),
+          [b] "m" (ebp),
     );
     unreachable;
 }
@@ -2772,7 +2857,26 @@ fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C)
         }
         const handler: usize = @as(*const usize, @ptrFromInt(node + 4)).*;
         const prev: usize = @as(*const usize, @ptrFromInt(node)).*;
-        std.debug.print("[eh] frame {d}: node=0x{x:0>8} handler=0x{x:0>8} prev=0x{x:0>8}\n", .{ depth, node, handler, prev });
+        std.debug.print("[eh] frame {d}: node=0x{x:0>8} handler=0x{x:0>8} prev=0x{x:0>8}\n", .{ depth, node, handler, prev });    if (trace_static_init and depth == 0) {
+        // Walk the EBP chain from the throw site. Each frame saves the caller's
+        // EBP at [EBP]; following it is how an unwinder reaches the accepting
+        // frame's EBP, which the catch block's [-0xNN(%ebp)] locals need.
+        var e: usize = ctx.ebp;
+        var i: usize = 0;
+        std.debug.print("[eh]   EBP chain:", .{});
+        while (e > 0x1000 and e < 0xFFFFF000 and i < 12) : (i += 1) {
+            std.debug.print(" 0x{x:0>8}", .{e});
+            const next: usize = @as(*const usize, @ptrFromInt(e)).*;
+            if (trace_static_init) std.debug.print(" [0x{x:0>8}]=0x{x:0>8}", .{ e, next });
+            // Frames chain UPWARD: a caller's EBP is higher than the callee's.
+            // The old `next >= e` guard stopped the walk immediately.
+            if (next <= 0x1000 or next >= 0xFFFFF000 or next <= e) break;
+            e = next;
+        }
+        std.debug.print("\n", .{});
+        std.debug.print("[eh]   node0=0x{x} node1=0x{x}\n", .{ node, prev });
+    }
+
         if (handler < 0x400000 or handler >= 0x4a2000) {
             std.debug.print("[eh]   handler outside the guest image; stopping\n", .{});
             return;
