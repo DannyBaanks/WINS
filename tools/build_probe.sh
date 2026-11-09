@@ -78,9 +78,15 @@ p.write_text(s)
 print("probe: Steam gate neutralised (local copy only)")
 PY2
 
+python3 "$REPO/tools/patch_probe_steam.py" "$PROBE"
+python3 "$REPO/tools/patch_probe_realclient.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_dump.py" "$PROBE"
 
-"$ZIG" build-exe "$PROBE/winrun32.zig" -target x86-linux -mcpu=i386 -O ReleaseFast \
+# Dynamic glibc i386, not static: the honest bridge needs dlopen to load the
+# REAL Steam client, and a static build cannot dlopen at all (measured:
+# glibc answers "Dynamic loading not supported"). Verified equivalent to
+# the static build on the 7zr oracle: byte-identical output.
+"$ZIG" build-exe "$PROBE/winrun32.zig" -target x86-linux-gnu.2.39 -mcpu=i386 -O ReleaseFast -lc -dynamic \
     --name winrun32_probe -femit-bin="$OUT"
 
 echo "probe loader built: $OUT"

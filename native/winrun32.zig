@@ -2879,53 +2879,178 @@ fn RegCreateKeyExA(hKey: usize, lpSubKey: ?[*:0]const u8, Reserved: u32, lpClass
     return 0; // ERROR_SUCCESS
 }
 
+var g_steam_exe_buf: [512]u8 = [_]u8{0} ** 512;
+var g_steam_exe_done: bool = false;
+
+/// The real client's PID and executable path, both discovered from /proc.
+///
+/// An earlier version answered 1337 for the PID -- a PID that exists on no
+/// machine. The guest then went looking for a process that was never there,
+/// which is the documented cause of Steam's "Application load error 5": the
+/// handshake never reaches the client. A fabricated number and an absent
+/// registry value look identical to the caller, and only one is a measurement.
+fn steamClientPid() u32 {
+    return steamClientLocate().pid;
+}
+
+/// /proc/<pid>/exe for the located client: the kernel's own answer to where the
+/// real client lives on this machine. That is what the registry reports now,
+/// instead of a Windows path that exists nowhere here.
+fn recordClientExe(pid: u32) void {
+    var p: [32:0]u8 = undefined;
+    const pn = std.fmt.bufPrint(p[0..31], "/proc/{d}/exe", .{pid}) catch return;
+    p[pn.len] = 0;
+    const n = linux.readlink(&p, &g_steam_exe_buf, g_steam_exe_buf.len);
+    if (linux.errno(n) != .SUCCESS) return;
+    g_steam_exe_buf[@intCast(n)] = 0;
+    g_steam_exe_done = true;
+}
+
+fn steamClientLocate() struct { pid: u32 } {
+    var dir_buf: [16 * 1024]u8 align(@alignOf(linux.dirent64)) = undefined;
+    const fd = linux.open("/proc", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return .{ .pid = 0 };
+    defer _ = linux.close(@intCast(fd));
+    while (true) {
+        const n = linux.getdents64(@intCast(fd), &dir_buf, dir_buf.len);
+        if (linux.errno(n) != .SUCCESS) return .{ .pid = 0 };
+        const len: usize = @intCast(n);
+        if (len == 0) return .{ .pid = 0 };
+        var off: usize = 0;
+        while (off + @sizeOf(linux.dirent64) <= len) {
+            const ent: *align(1) const linux.dirent64 = @ptrCast(&dir_buf[off]);
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
+            off += ent.reclen;
+            const pid = std.fmt.parseInt(u32, name, 10) catch continue;
+            var path_buf: [32:0]u8 = undefined;
+            const pn = std.fmt.bufPrint(path_buf[0..31], "/proc/{d}/comm", .{pid}) catch continue;
+            path_buf[pn.len] = 0;
+            const cfd = linux.open(&path_buf, .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(cfd) != .SUCCESS) continue;
+            defer _ = linux.close(@intCast(cfd));
+            var comm_buf: [32]u8 = undefined;
+            const rn = linux.read(@intCast(cfd), &comm_buf, comm_buf.len);
+            if (linux.errno(rn) != .SUCCESS) continue;
+            const comm = std.mem.trim(u8, comm_buf[0..@intCast(rn)], " \t\r\n");
+            // Exactly one process is named "steam": the client itself. Every
+            // helper around it keeps a longer name (srt-logger,
+            // steam-runtime-l, srt-bwrap, ...), so this is not ambiguous.
+            if (std.mem.eql(u8, comm, "steam")) {
+                if (!g_steam_exe_done) recordClientExe(pid);
+                return .{ .pid = pid };
+            }
+        }
+        if (len < dir_buf.len) return .{ .pid = 0 };
+    }
+}
+
+/// The real client library, derived from the running client's own executable
+/// path rather than guessed. An earlier version handed the guest the relative
+/// name "steamclient.dll", which is not a file in any directory.
+///
+/// Returns an empty slice when the client cannot be located, which the registry
+/// turns into "no such value": the honest answer when there is nothing to point
+/// at. A guessed path would be the same failure mode with a plausible-looking
+/// string.
+fn steamClientDllPath() []const u8 {
+    const prefix = "linux32/";
+    if (!g_steam_exe_done) _ = steamClientLocate();
+    if (!g_steam_exe_done) return "";
+    const exe = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&g_steam_exe_buf)), 0);
+    const arch_dir = std.fs.path.dirname(exe) orelse return "";
+    const install = std.fs.path.dirname(arch_dir) orelse return "";
+    var buf: [512]u8 = undefined;
+    const n = @min(install.len, buf.len - prefix.len - 1);
+    @memcpy(buf[0..n], install[0..n]);
+    @memcpy(buf[n .. n + prefix.len], prefix);
+    return buf[0 .. n + prefix.len];
+}
+
+/// The real client executable, as the kernel reports it for the running
+/// process. An earlier version returned "C:\Program Files\Steam\Steam.exe",
+/// which is not a path on this machine.
+fn steamClientExePath() []const u8 {
+    if (!g_steam_exe_done) _ = steamClientLocate();
+    if (!g_steam_exe_done) return "";
+    return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&g_steam_exe_buf)), 0);
+}
+
+/// REG_SZ values are counted with their terminator, and the terminator has to
+/// be inside the caller's buffer or the string has no end there.
+fn szWithTerminator(buf: []u8, s: []const u8) []const u8 {
+    const n = @min(s.len, buf.len - 1);
+    @memcpy(buf[0..n], s[0..n]);
+    buf[n] = 0;
+    return buf[0 .. n + 1];
+}
+
+/// Win32 registry query, to the contract the caller actually uses.
+///
+/// The caller may pass a null data buffer to ask only for the size, and the
+/// reported size counts the terminator; when the buffer is too small the value
+/// is not copied and ERROR_MORE_DATA is returned. An earlier version wrote into
+/// lpData whether or not the caller had supplied one and how large it was. That
+/// is a heap corruption, and it is what aborted the real Steam client with
+/// "malloc(): unaligned tcache chunk detected" once the guest got far enough to
+/// call it -- localised with the startup probe, which runs the identical
+/// dlopen and CreateInterface before any guest code and succeeds.
 fn RegQueryValueExA(hKey: usize, lpValueName: ?[*:0]const u8, lpReserved: ?*u32, lpType: ?*u32, lpData: ?[*]u8, lpcbData: ?*u32) callconv(W) i32 {
     _ = hKey; _ = lpReserved;
     const name = if (lpValueName) |vn| std.mem.sliceTo(vn, 0) else "";
-    std.debug.print("[WINS:Advapi32] RegQueryValueExA(\"{s}\")\n", .{name});
+    const ERROR_SUCCESS: i32 = 0;
+    const ERROR_MORE_DATA: i32 = 234;
+    const REG_NONE: u32 = 0;
+    const REG_SZ: u32 = 1;
+    const REG_DWORD: u32 = 4;
+
+    var reg_type: u32 = REG_NONE;
+    var bytes: []const u8 = "";
+    var word: u32 = 0;
+    var sz_buf: [512]u8 = undefined;
 
     if (std.ascii.eqlIgnoreCase(name, "pid")) {
-        if (lpType) |t| t.* = 4; // REG_DWORD
-        if (lpData) |d| std.mem.writeInt(u32, d[0..4], 1337, .little);
-        if (lpcbData) |cb| cb.* = 4;
-        return 0;
-    }
-    if (std.ascii.eqlIgnoreCase(name, "SteamClientDll")) {
-        const val = "steamclient.dll\x00";
-        if (lpType) |t| t.* = 1; // REG_SZ
-        if (lpcbData) |cb| {
-            if (lpData) |d| @memcpy(d[0..val.len], val);
-            cb.* = @intCast(val.len);
+        reg_type = REG_DWORD;
+        word = steamClientPid();
+        bytes = std.mem.asBytes(&word);
+    } else if (std.ascii.eqlIgnoreCase(name, "SteamClientDll")) {
+        const p = steamClientDllPath();
+        if (p.len == 0) {
+            if (lpcbData) |cb| cb.* = 0;
+            return 2; // ERROR_FILE_NOT_FOUND
         }
-        return 0;
-    }
-    if (std.ascii.eqlIgnoreCase(name, "SteamExe") or std.ascii.eqlIgnoreCase(name, "SteamPath")) {
-        const val = "C:\\Program Files\\Steam\\Steam.exe\x00";
-        if (lpType) |t| t.* = 1; // REG_SZ
-        if (lpcbData) |cb| {
-            if (lpData) |d| @memcpy(d[0..val.len], val);
-            cb.* = @intCast(val.len);
+        reg_type = REG_SZ;
+        bytes = szWithTerminator(&sz_buf, p);
+    } else if (std.ascii.eqlIgnoreCase(name, "SteamExe") or std.ascii.eqlIgnoreCase(name, "SteamPath")) {
+        const p = steamClientExePath();
+        if (p.len == 0) {
+            if (lpcbData) |cb| cb.* = 0;
+            return 2; // ERROR_FILE_NOT_FOUND
         }
-        return 0;
-    }
-    if (std.ascii.eqlIgnoreCase(name, "ActiveUser") or std.ascii.eqlIgnoreCase(name, "Universe")) {
-        if (lpType) |t| t.* = 4; // REG_DWORD
-        if (lpData) |d| std.mem.writeInt(u32, d[0..4], 1, .little);
-        if (lpcbData) |cb| cb.* = 4;
-        return 0;
-    }
-    if (std.ascii.eqlIgnoreCase(name, "Installed Path")) {
-        const val = "./\x00";
-        if (lpType) |t| t.* = 1; // REG_SZ
-        if (lpcbData) |cb| {
-            if (lpData) |d| @memcpy(d[0..val.len], val);
-            cb.* = @intCast(val.len);
-        }
-        return 0;
+        reg_type = REG_SZ;
+        bytes = szWithTerminator(&sz_buf, p);
+    } else if (std.ascii.eqlIgnoreCase(name, "ActiveUser") or std.ascii.eqlIgnoreCase(name, "Universe")) {
+        reg_type = REG_DWORD;
+        word = 1;
+        bytes = std.mem.asBytes(&word);
+    } else if (std.ascii.eqlIgnoreCase(name, "Installed Path")) {
+        reg_type = REG_SZ;
+        bytes = szWithTerminator(&sz_buf, "./");
+    } else {
+        if (lpcbData) |cb| cb.* = 0;
+        return 2; // ERROR_FILE_NOT_FOUND
     }
 
-    if (lpcbData) |cb| cb.* = 0;
-    return 2; // ERROR_FILE_NOT_FOUND
+    if (lpType) |t| t.* = reg_type;
+    if (lpcbData) |cb| cb.* = @intCast(bytes.len);
+    if (lpData) |d| {
+        if (lpcbData) |cb| {
+            if (cb.* >= bytes.len) {
+                @memcpy(d[0..bytes.len], bytes);
+                return ERROR_SUCCESS;
+            }
+        }
+    }
+    return ERROR_MORE_DATA;
 }
 
 fn RegSetValueExA(hKey: usize, lpValueName: ?[*:0]const u8, Reserved: u32, dwType: u32, lpData: ?[*]const u8, cbData: u32) callconv(W) i32 {

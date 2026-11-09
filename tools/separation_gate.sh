@@ -27,12 +27,15 @@ echo "== G1: no public source references the probe directory"
 if grep -rn "native/probe\|instrumented_stubs\|winrun32_probe\|\[probe\]" \
         "$REPO/native" "$REPO/tools" "$REPO/core" "$REPO/bin" \
         --include='*.zig' --include='*.py' --include='*.sh' 2>/dev/null \
-        | grep -v '^'"$REPO"'/native/probe/' | grep -v 'build_probe.sh' | grep -v 'separation_gate.sh' | grep -v 'patch_probe_dump.py' | grep -q .; then
+        | grep -v '^'"$REPO"'/native/probe/' \
+        | grep -v 'build_probe.sh' | grep -v 'separation_gate.sh' \
+        | grep -v 'patch_probe' \
+        | grep -q .; then
     note "FAIL: a public source mentions the lab"; grep -rn "native/probe\|instrumented_stubs" \
         "$REPO/native" --include='*.zig' | grep -v '/native/probe/' | head -5
     fail=1
 else
-    note "ok: no references outside tools/build_probe.sh"
+    note "ok: no references outside the lab generator scripts"
 fi
 
 echo "== G2: clean build without native/probe/"
