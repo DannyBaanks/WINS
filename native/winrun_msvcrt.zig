@@ -2583,8 +2583,10 @@ fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaqu
                             const n_catches: u32 = @as(*const u32, @ptrFromInt(m + 12)).*;
                             const p_catch_arr: usize = @as(*const usize, @ptrFromInt(m + 16)).*;
                             var thrown_type: usize = 0;
+                            var thrown_obj: usize = 0;
                             if (rec) |r| {
                                 const er: *const ExceptionRecord = @ptrCast(@alignCast(r));
+                                thrown_obj = er.exception_information[1];
                                 if (er.number_parameters >= 3 and er.exception_information[2] > 0x400000) {
                                     const cta: usize = @as(*const usize, @ptrFromInt(er.exception_information[2] + 12)).*;
                                     if (cta > 0x400000 and cta < 0x4a2000) {
@@ -2620,7 +2622,13 @@ fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaqu
                                             }
                                             const slot = @as(usize, @intCast(@as(isize, @intCast(accept_ebp)) + e_disp));
                                             if (accept_ebp != 0 and slot > 0x1000 and slot < 0xFFFFF000) {
-                                                @as(*usize, @ptrFromInt(slot)).* = @intFromPtr(frame.?);
+                                                // The slot takes the exception OBJECT, not the frame: the
+                                                // funclet does `mov -0x20(%%ebp),%%eax; push (%%eax)`, so it
+                                                // dereferences what is stored. Writing the registration node
+                                                // made it push the chain's prev pointer -- which printed as
+                                                // "???G?H". info[1] is the object the throw site built from
+                                                // the message.
+                                                @as(*usize, @ptrFromInt(slot)).* = thrown_obj;
                                                 if (trace_static_init) {
                                                     std.debug.print("[eh]     catch[{d}]: type=0x{x} disp={d} handler=0x{x}: object at ebp{d}=0x{x}\\n", .{ ci, e_type, e_disp, e_handler, e_disp, slot });
                                                 }
@@ -2871,13 +2879,19 @@ fn transferToHandler() noreturn {
     while (state > 0x400000 and state < 0x4a2000 and guard < 256) : (guard += 1) {
         var next: usize = 0;
         if (trace_static_init) std.debug.print("[eh]   calling state 0x{x} with ebp=0x{x}\n", .{ state, ebp });
+        // "r" for EBP, NOT "m": with a memory operand Zig emitted
+        // `mov -0x64(%ebp),%ebp` -- one indirection too many -- so the funclet
+        // received a stack address instead of accept_ebp. That is why the first
+        // print (which does not touch EBP) succeeded and `mov -0x20(%ebp)`
+        // read garbage. The target is pinned to %ecx so the caller cannot alias
+        // the two inputs.
         asm volatile (
             \\ movl %[b], %%ebp
             \\ call *%[s]
             \\ movl %%eax, %[n]
-            : [n] "=r" (next)
+            : [n] "={eax}" (next)
             : [s] "{ecx}" (state),
-              [b] "m" (ebp),
+              [b] "r" (ebp),
         );
         if (trace_static_init) std.debug.print("[eh]   state 0x{x} -> 0x{x}\n", .{ state, next });
         if (next <= 0x400000 or next >= 0x4a2000) {
@@ -2904,7 +2918,6 @@ fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C)
     // returning leaves the guest with a mutated SEH chain and no transfer of
     // control, so the guest resumes at the throw site. Left as diagnostics under
     // WINS_TRACE until the dispatcher half exists.
-    if (!trace_static_init) return;
 
     // Build the C++ EH record the dispatcher would build, then offer it to every
     // frame on the chain until one says it handles the exception.
