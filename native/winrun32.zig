@@ -406,20 +406,91 @@ fn VirtualProtect(lpAddress: ?*anyopaque, dwSize: usize, flNewProtect: u32, lpfl
 }
 
 // ============================================================================
-// File Mapping APIs & SteamStub IPC Simulation
+// Steam bridge: relay to the real client, never substitute for it
 // ============================================================================
+//
+// This section previously ANSWERED the Steam IPC handshake itself: it served a
+// host-side block, wrote "[0x90] = 2" to claim the Steam client was ready, and
+// wrote the auth token into the guest's target address. That is the loader
+// impersonating the client, which is exactly what "Steam still owns my DRM"
+// was not true of.
+//
+// This version does the inverse: it requires a live client and forwards the
+// guest's opens to the objects the real client publishes on Linux. Nothing
+// here fabricates a readiness flag, a token, or an account.
 
-var g_steam_shmem: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+/// Fallout: New Vegas. Steam sets SteamAppId in a child's environment only when
+/// the real client launches it, so its presence is proof of a live session.
+const STEAM_APPID: u32 = 22380;
+
+/// Written once from main, from the environment Steam provides.
+var g_steam_appid: u32 = 0;
 var g_target_path: [512]u8 = [_]u8{0} ** 512;
 var g_target_path_len: usize = 0;
+
+/// The shared-memory object Steam publishes for a running game's IPC.
+const STEAM_SHMEM_NAME = "/dev/shm/SteamStart_SharedMemFile";
+
+/// Is a Steam client actually serving this process right now?
+///
+/// Deterministic by construction: both conditions are either present or not, so
+/// the same machine state always yields the same verdict.
+///
+///   1. SteamAppId in the environment. Only the real client sets it, and only
+///      for a child it launches on an account's behalf. Hand-launching this
+///      loader leaves it empty and fails, which is the point: the account
+///      verification belongs to Steam, not to us.
+///   2. The IPC object the client must publish while a game runs. A stale
+///      /dev/shm entry from a dead client is not enough, so the object is
+///      opened for writing, which a dead session cannot satisfy.
+fn steamClientLive() bool {
+    if (g_steam_appid != STEAM_APPID) {
+        std.debug.print("[WINS:SteamBridge] SteamAppId is not {d} in the environment (got {d}).\n", .{ STEAM_APPID, g_steam_appid });
+        std.debug.print("                  This loader must be launched BY the Steam client so Steam can\n", .{});
+        std.debug.print("                  verify the account. Refusing to run.\n", .{});
+        return false;
+    }
+    const fd = linux.open(STEAM_SHMEM_NAME[0..:0].ptr, .{ .ACCMODE = .RDWR }, 0);
+    if (linux.errno(fd) != .SUCCESS) {
+        std.debug.print("[WINS:SteamBridge] {s} is not available: Steam's IPC is not live.\n", .{STEAM_SHMEM_NAME});
+        return false;
+    }
+    _ = linux.close(@intCast(fd));
+    return true;
+}
+
+/// Size of the Steam IPC object. linux.Stat is unavailable here and linux.lseek is
+/// 64-bit only in this Zig, so the raw i386 syscall is used: it takes a 32-bit
+/// off_t, which is plenty for a shared-memory object.
+fn shmObjectSize(fd: i32) ?usize {
+    if (@import("builtin").cpu.arch == .x86) {
+        const r = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, fd))), 0, 2);
+        if (linux.errno(r) != .SUCCESS) return null;
+        return @intCast(r);
+    }
+    const r = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, fd))), 0, 2);
+    if (linux.errno(r) != .SUCCESS) return null;
+    return @intCast(r);
+}
 
 fn OpenFileMappingA(dwDesiredAccess: u32, bInheritHandle: i32, lpName: ?[*:0]const u8) callconv(W) usize {
     _ = dwDesiredAccess; _ = bInheritHandle;
     const name = if (lpName) |n| std.mem.sliceTo(n, 0) else "null";
     std.debug.print("[WINS:Kernel32] OpenFileMappingA(\"{s}\")\n", .{name});
     if (std.mem.indexOf(u8, name, "SteamStart_SharedMemFile") != null) {
-        std.debug.print("  [WINS:SteamDRM] Recognized SteamStart_SharedMemFile! Providing IPC mapping.\n", .{});
-        return 0x30002;
+        // Relay, do not invent: open the object the real client published. If it
+        // is absent there is no session to talk to and the call fails exactly as
+        // it would on Windows with Steam closed.
+        if (!steamClientLive()) return 0;
+        const fd = linux.open(STEAM_SHMEM_NAME[0..:0].ptr, .{ .ACCMODE = .RDWR }, 0);
+        if (linux.errno(fd) != .SUCCESS) {
+            g_last_error = 2; // ERROR_FILE_NOT_FOUND
+            return 0;
+        }
+        std.debug.print("  [WINS:SteamBridge] Relaying to the real client's IPC object (fd={}).\\n", .{fd});
+        // Keep the fd in the handle the guest will map, so MapViewOfFile can
+        // map the same object rather than a stub buffer.
+        return @as(usize, @intCast(fd)) | 0x30000000;
     }
     g_last_error = 2; // ERROR_FILE_NOT_FOUND (allows game to act as primary instance)
     return 0;
@@ -434,15 +505,28 @@ fn CreateFileMappingA(hFile: usize, lpFileMappingAttributes: ?*anyopaque, flProt
 }
 
 fn MapViewOfFile(hFileMappingObject: usize, dwDesiredAccess: u32, dwFileOffsetHigh: u32, dwFileOffsetLow: u32, dwNumberOfBytesToMap: usize) callconv(W) ?*anyopaque {
-    _ = dwDesiredAccess; _ = dwFileOffsetHigh; _ = dwFileOffsetLow;
-    if (hFileMappingObject == 0x30002) {
-        std.debug.print("[WINS:SteamDRM] MapViewOfFile(SteamStart_SharedMemFile) -> Initializing Steam IPC protocol block!\n", .{});
-        // [buffer + 0x90] = 2 means "Steam client ready"
-        // Leave [0x94] = 0 so DRM can write its own auth request (1 = pending)
-        std.mem.writeInt(u32, g_steam_shmem[0x90..0x94], 2, .little);
-        // [0x94] stays 0 — DRM writes 1 here to request validation
-        std.mem.writeInt(u32, g_steam_shmem[0x94..0x98], 0, .little);
-        return &g_steam_shmem;
+    _ = dwDesiredAccess; _ = dwFileOffsetHigh;
+    const STEAM_BIT: usize = 0x30000000;
+    if (hFileMappingObject & STEAM_BIT == STEAM_BIT) {
+        const fd: i32 = @intCast(hFileMappingObject & ~STEAM_BIT);
+        const obj_size: usize = shmObjectSize(fd) orelse {
+            g_last_error = 2;
+            return null;
+        };
+        const size: usize = if (dwNumberOfBytesToMap == 0 or dwNumberOfBytesToMap > obj_size) obj_size else dwNumberOfBytesToMap;
+        // Map the REAL client's object read/write. The guest now talks straight
+        // to Steam: Steam writes the readiness flag, the ticket and the response
+        // itself. Notably absent here is the old "[0x90] = 2, client ready" write,
+        // which was the loader speaking for a client that was never there.
+        const prot = linux.PROT{ .READ = true, .WRITE = true };
+        const flags = linux.MAP{ .TYPE = .SHARED };
+        const ptr = linux.mmap(null, size, prot, flags, fd, @as(i64, dwFileOffsetLow));
+        if (linux.errno(ptr) != .SUCCESS) {
+            g_last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+            return null;
+        }
+        std.debug.print("  [WINS:SteamBridge] Mapped Steam's IPC object: 0x{x} ({d} bytes, shared)\\n", .{ ptr, size });
+        return @ptrFromInt(ptr);
     }
     const size = if (dwNumberOfBytesToMap == 0) 64 * 1024 else dwNumberOfBytesToMap;
     std.debug.print("[WINS:Kernel32] MapViewOfFile(handle=0x{x}, size={d})\n", .{ hFileMappingObject, size });
@@ -795,44 +879,17 @@ fn ResetEvent(hEvent: usize) callconv(W) i32 {
 
 fn WaitForSingleObject(hHandle: usize, dwMilliseconds: u32) callconv(W) u32 {
     std.debug.print("[WINS:Kernel32] WaitForSingleObject(0x{x}, {d})\n", .{ hHandle, dwMilliseconds });
-    std.debug.print("  g_steam_shmem dump: ", .{});
-    for (0..64) |i| {
-        const val = std.mem.readInt(u32, g_steam_shmem[i * 4 ..][0..4], .little);
-        if (val != 0) {
-            std.debug.print("[0x{x}]=0x{x:0>8} ", .{ i * 4, val });
-        }
+    // This shim used to be the DRM responder: it read a token out of shared memory
+    // and wrote it into the guest's target address, then reported success as though
+    // the Steam client had answered. Removing that is the whole point of the bridge.
+    // The real client's response arrives in the object it published and is read by
+    // the guest itself. Without a live session the caller sees a genuine failure
+    // instead of a success we invented.
+    if (!steamClientLive()) {
+        std.debug.print("  [WINS:SteamBridge] No live Steam client to answer this wait.\\n", .{});
+        g_last_error = 6; // ERROR_INVALID_HANDLE
+        return 0xFFFFFFFF; // WAIT_FAILED
     }
-    std.debug.print("\n", .{});
-
-    // Check if SteamStub wrote an auth request to g_steam_shmem!
-    const req_status = std.mem.readInt(u32, g_steam_shmem[0x94..][0..4], .little);
-    std.debug.print("  [SteamDRM] shmem[0x94]={d} (1=pending_auth 0=idle 2=done)\n", .{req_status});
-    // steamdrm.dll writes 2 as the "auth request pending" signal (not 1)
-    if (req_status != 0) {
-        const pid = std.mem.readInt(u32, g_steam_shmem[0x98..][0..4], .little);
-        const event_h = std.mem.readInt(u32, g_steam_shmem[0x9c..][0..4], .little);
-        const token = std.mem.readInt(u32, g_steam_shmem[0xa4..][0..4], .little);
-        const target_addr = std.mem.readInt(u32, g_steam_shmem[0xac..][0..4], .little);
-
-        std.debug.print("[WINS:SteamDRM] Intercepted SteamStub Auth Handshake:\n", .{});
-        std.debug.print("  Target Process PID: {}\n", .{pid});
-        std.debug.print("  Event Handle:       0x{x}\n", .{event_h});
-        std.debug.print("  Validation Token:   0x{x:0>8}\n", .{token});
-        std.debug.print("  Target Pointer:     0x{x:0>8}\n", .{target_addr});
-
-        if (target_addr != 0) {
-            // The target is a stack address in the guest process — ensure it's writable.
-            // mprotect the page containing it RWX before writing.
-            const page_addr = target_addr & ~@as(u32, 0xFFF);
-            const page_ptr: [*]u8 = @ptrFromInt(page_addr);
-            _ = linux.mprotect(page_ptr, 4096, linux.PROT{ .READ = true, .WRITE = true, .EXEC = true });
-            const target_ptr: *u32 = @ptrFromInt(target_addr);
-            target_ptr.* = token;
-            std.debug.print("  [WINS:SteamDRM] Injected token 0x{x:0>8} @ 0x{x:0>8} -> SteamStub unlocked!\n", .{ token, target_addr });
-        }
-
-        // Mark request as processed by Steam client
-        std.mem.writeInt(u32, g_steam_shmem[0x94..][0..4], 2, .little);    }
     return 0; // WAIT_OBJECT_0
 }
 
@@ -2184,12 +2241,20 @@ fn VerQueryValueA(pBlock: ?*const anyopaque, lpSubBlock: ?[*:0]const u8, lplpBuf
 // ============================================================================
 
 fn SteamAPI_Init() callconv(W) i32 {
-    std.debug.print("[WINS:SteamAPI] SteamAPI_Init() called -> Bypass ACTIVE, returning TRUE (1)!\n", .{});
+    // The real client decides. On Windows native this is exactly where the client
+    // checks that an account is logged in and owns the app, so there is nothing for
+    // the loader to decide. Reporting TRUE when no client is present is the bypass
+    // this bridge exists to remove.
+    if (!steamClientLive()) {
+        std.debug.print("[WINS:SteamBridge] SteamAPI_Init refused: no live, authenticated Steam client.\n", .{});
+        return 0;
+    }
+    std.debug.print("[WINS:SteamBridge] SteamAPI_Init: a live Steam client owns this session.\n", .{});
     return 1;
 }
 
 fn SteamAPI_IsSteamRunning() callconv(W) i32 {
-    return 1;
+    return if (steamClientLive()) 1 else 0;
 }
 
 fn SteamAPI_RegisterCallback(pCallback: ?*anyopaque, iCallback: i32) callconv(W) void {
@@ -3551,7 +3616,19 @@ pub fn main(init: std.process.Init) !void {
 
     // Parse Import Directory Table
     const data_dirs_offset = opt_offset + 96;
+    // Steam sets SteamAppId in the environment of the child it launches, so its
+    // presence is how the bridge knows a live client is asking for this game.
+    // A hand-launched loader leaves it empty and is refused, which is the point:
+    // the account verification belongs to Steam, not to us.
+    var appid_buf: [32]u8 = undefined;
+    if (init.environ_map.get("SteamAppId")) |v| {
+        g_steam_appid = std.fmt.parseInt(u32, v, 10) catch 0;
+        _ = &appid_buf;
+    }
+    std.debug.print("[WINS:SteamBridge] SteamAppId in environment: {d} (expected {d})\n", .{ g_steam_appid, STEAM_APPID });
+
     var total_imports: usize = 0;
+    var imports_steam: bool = false;
     var resolved_imports: usize = 0;
 
     var import_rva: u32 = 0;
@@ -3584,6 +3661,7 @@ pub fn main(init: std.process.Init) !void {
                     const name_delta = name_rva - sec.virtual_address;
                     const name_file_offset = sec.pointer_to_raw_data + name_delta;
                     const dll_name = std.mem.sliceTo(bytes[name_file_offset..], 0);
+                    if (std.ascii.indexOfIgnoreCase(dll_name, "steam") != null) imports_steam = true;
 
                     const thunk_rva = if (original_first_thunk != 0) original_first_thunk else first_thunk;
                     const thunk_delta = thunk_rva - sec.virtual_address;
@@ -3611,6 +3689,18 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("  Import Table Analysis:\n", .{});
+    // Deterministic gate, before a single page of the guest image exists: a PE that
+    // reaches for Steam only runs once a live, authenticated client says yes.
+    if (imports_steam) {
+        std.debug.print("  This program imports Steam APIs; requiring a live Steam client.\n", .{});
+        if (!steamClientLive()) {
+            std.debug.print("[WINS:SteamBridge] REFUSING to run: no live Steam client serving this process.\n", .{});
+            std.debug.print("                  Launch it through Steam so the account can be verified.\n", .{});
+            linux.exit_group(1);
+        }
+    }
+
+
     std.debug.print("    Total Imported Symbols:   {d}\n", .{total_imports});
     std.debug.print("    Core Handled APIs:        {d}\n", .{resolved_imports});
     std.debug.print("    Diagnostic Fallback APIs: {d}\n", .{total_imports - resolved_imports});
