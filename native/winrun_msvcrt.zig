@@ -424,6 +424,13 @@ pub var trace_static_init: bool = false;
 /// point for walking the exception frames _CxxThrowException must unwind.
 pub var guest_tib_base: usize = 0;
 
+/// Set by _except_handler3 when a filter says EXCEPTION_EXECUTE_HANDLER: the guest
+/// __except block to transfer control to, and the EBP its prologue
+/// `mov -0x18(%ebp),%esp` restores from. The registration node follows
+/// `push %%ebp; mov %%esp,%%ebp` plus three more pushes, so EBP == node + 12.
+pub var accept_handler: usize = 0;
+pub var accept_ebp: usize = 0;
+
 /// Capture the guest's EBX/ECX/EDX from inside a shim, via inline asm. A shim is
 /// host code running with the guest's register state live, so this is the only
 /// place a corruption can be observed mid-run without a debugger -- gdb cannot
@@ -2460,7 +2467,40 @@ fn _adjust_fdiv(fpu_env: ?*const anyopaque) callconv(C) void {
 /// __CxxFrameHandler and _except_handler3 returning EXCEPTION_CONTINUE_SEARCH
 /// ("not mine") is the one answer that cannot misroute an exception into a
 /// fabricated disposition. The full SEH-based C++ EH is NOT implemented.
+/// MSVC's __CxxFrameHandler3 thunk is `mov $pFuncInfo, %%eax; jmp *__CxxFrameHandler`.
+/// The FuncInfo therefore arrives in EAX, not on the stack -- a shim that only
+/// reads its four pointer parameters never sees which function it is filtering
+/// for, which is why every frame answered EXCEPTION_CONTINUE_SEARCH.
 fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaque, disp: ?*const anyopaque) callconv(C) i32 {
+    var func_info: usize = 0;
+    if (@import("builtin").cpu.arch != .x86) return 0;
+    asm volatile ("movl %%eax, %[o]"
+        : [o] "=r" (func_info),
+    );
+    if (trace_static_init and func_info > 0x400000 and func_info < 0x4a2000) {
+        // MSVC FuncInfo: magic, maxState, pUnwindMap, nTryBlocks, pTryMap,
+        // nIPMapEntries, pIPMap, EHFlags.
+        const fi = func_info;
+        const magic: u32 = @as(*const u32, @ptrFromInt(fi)).*;
+        const max_state: u32 = @as(*const u32, @ptrFromInt(fi + 4)).*;
+        const p_unwind: usize = @as(*const usize, @ptrFromInt(fi + 8)).*;
+        const n_try: u32 = @as(*const u32, @ptrFromInt(fi + 12)).*;
+        const p_try: usize = @as(*const usize, @ptrFromInt(fi + 16)).*;
+        const n_ip: u32 = @as(*const u32, @ptrFromInt(fi + 20)).*;
+        const p_ip: usize = @as(*const usize, @ptrFromInt(fi + 24)).*;
+        std.debug.print("[eh]   FuncInfo@0x{x}: magic=0x{x:0>8} maxState={d} nTry={d} pTry=0x{x} nIP={d} pIP=0x{x} pUnwind=0x{x}\n", .{ fi, magic, max_state, n_try, p_try, n_ip, p_ip, p_unwind });
+        if (n_try > 0 and p_try > 0x400000) {
+            var i: u32 = 0;
+            while (i < n_try and i < 8) : (i += 1) {
+                const e = p_try + i * 20;
+                const try_low: u32 = @as(*const u32, @ptrFromInt(e)).*;
+                const try_high: u32 = @as(*const u32, @ptrFromInt(e + 4)).*;
+                const catch_high: u32 = @as(*const u32, @ptrFromInt(e + 8)).*;
+                const handler: usize = @as(*const usize, @ptrFromInt(e + 12)).*;
+                std.debug.print("[eh]     try[{d}]: tryLow={d} tryHigh={d} catchHigh={d} handler=0x{x}\n", .{ i, try_low, try_high, catch_high, handler });
+            }
+        }
+    }
     if (trace_static_init) {
         std.debug.print("[eh] __CxxFrameHandler(rec=0x{x}, frame=0x{x}, ctx=0x{x}, disp=0x{x})\n", .{
             @intFromPtr(rec), @intFromPtr(frame), @intFromPtr(ctx), @intFromPtr(disp),
@@ -2474,9 +2514,10 @@ fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaqu
         }
         if (disp) |d| {
             const words: [*]const usize = @ptrCast(@alignCast(d));
-            std.debug.print("[eh]   DispatcherContext[0..6]: 0x{x} 0x{x} 0x{x} 0x{x} 0x{x} 0x{x} 0x{x}\n", .{
-                words[0], words[1], words[2], words[3], words[4], words[5], words[6],
-            });
+            std.debug.print("[eh]   DispatcherContext[0..11]:", .{});
+            var k: usize = 0;
+            while (k < 12) : (k += 1) std.debug.print(" 0x{x:0>8}", .{words[k]});
+            std.debug.print("\n", .{});
         }
         if (frame) |f| {
             const w: [*]const usize = @ptrCast(@alignCast(f));
@@ -2489,11 +2530,74 @@ fn __CxxFrameHandler(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaqu
     return 0; // EXCEPTION_CONTINUE_SEARCH
 }
 
+/// The C __except handler. Same EAX convention as __CxxFrameHandler: the guest's
+/// _except_handler3 thunk loads the scope table into EAX before jumping to the
+/// import. mainCRTStartup's __try (frame 2 of the chain, handler 0x471e8a) goes
+/// through here, not through __CxxFrameHandler -- so a stubbed __CxxFrameHandler
+/// alone never covers the outermost frame.
+/// Call a __except filter expression. MSVC passes the ExceptionRecord in EAX.
+fn callExceptFilter(filter: usize, rec: *const ExceptionRecord) i32 {
+    if (@import("builtin").cpu.arch != .x86) return 0;
+    var result: i32 = undefined;
+    asm volatile (
+        \\ movl %[r], %%eax
+        \\ call *%[f]
+        \\ movl %%eax, %[o]
+        : [o] "=r" (result)
+        : [f] "r" (filter), [r] "r" (rec)
+    );
+    return result;
+}
+
 fn _except_handler3(rec: ?*const anyopaque, frame: ?*anyopaque, ctx: ?*anyopaque, disp: ?*const anyopaque) callconv(C) i32 {
-    _ = rec;
-    _ = frame;
-    _ = ctx;
     _ = disp;
+    const establisher = @intFromPtr(frame);
+    if (rec == null or establisher <= 0x1000 or establisher + 16 >= 0xFFFFF000) return 0;
+
+    // MSVC's EXCEPTION_REGISTRATION is {prev, handler, scopetable, ...}; the
+    // guest pushes $0x483598 as that third word, and that address is the
+    // _SCOPETABLE for mainCRTStartup's __try -- confirmed against the binary.
+    var sc: usize = @as(*const usize, @ptrFromInt(establisher + 8)).*;
+    var guard: usize = 0;
+    while (sc > 0x400000 and sc + 16 < 0x4a2000 and guard < 8) : (guard += 1) {
+        const try_level: i32 = @as(*const i32, @ptrFromInt(sc)).*;
+        const filter: usize = @as(*const usize, @ptrFromInt(sc + 4)).*;
+        const enclosing: usize = @as(*const usize, @ptrFromInt(sc + 12)).*;
+        if (trace_static_init) {
+            std.debug.print("[eh]   scopetable@0x{x}: tryLevel={d} filter=0x{x} enclosing=0x{x}\n", .{ sc, try_level, filter, enclosing });
+        }
+        // tryLevel == -1 covers the whole function body. Anything below zero
+        // compares against the state number for the exact region, which this
+        // guest does not use in its outermost frame.
+        if (try_level <= -1 and filter > 0x400000 and filter < 0x4a2000) {
+            const r: i32 = callExceptFilter(filter, @ptrCast(@alignCast(rec.?)));
+            if (trace_static_init) std.debug.print("[eh]     filter -> {d}\n", .{r});
+            if (r == 0) {
+                accept_handler = @as(*const usize, @ptrFromInt(sc + 8)).*;
+                // Calibrated: node+12 is the pExcept slot, not the frame's EBP.
+                // The ContextRecord captured at throw time carries the guest EBP.
+                accept_ebp = if (ctx) |c| @as(*const GuestContext, @ptrCast(@alignCast(c))).ebp else establisher + 12;
+                if (trace_static_init) {
+                    std.debug.print("[eh]     node neigh:", .{});
+                    var q: usize = 0;
+                    while (q < 0x50) : (q += 4) {
+                        const a = establisher -% 0x20 + q;
+                        const v: usize = @as(*const usize, @ptrFromInt(a)).*;
+                        std.debug.print(" +{d}:0x{x:0>8}", .{ q, v });
+                    }
+                    std.debug.print("\n", .{});
+                }
+                if (trace_static_init) std.debug.print("[eh]     accepted: handler block 0x{x}, ebp 0x{x}\n", .{ accept_handler, accept_ebp });
+            }
+            return switch (r) {
+                -1 => @intFromEnum(Disposition.continue_execution), // EXCEPTION_CONTINUE_EXECUTION
+                0 => @intFromEnum(Disposition.execute_handler),     // EXCEPTION_EXECUTE_HANDLER
+                else => 0,                                          // EXCEPTION_CONTINUE_SEARCH
+            };
+        }
+        if (enclosing <= 0x400000 or enclosing >= 0x4a2000) break;
+        sc = enclosing;
+    }
     return 0; // EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -2551,6 +2655,7 @@ pub fn walkSehChain(depth_limit: usize) usize {
 /// entered from the guest, so at this instant the general registers are still the
 /// guest's -- this is the only place they can be observed.
 fn captureGuestContext(ctx: *GuestContext) void {
+    if (@import("builtin").cpu.arch != .x86) return;
     // Memory operands, not "=r": ten register outputs exhaust the i386 set and
     // the compiler refuses. Only two need a register.
     var edi: u32 = undefined;
@@ -2599,6 +2704,29 @@ fn captureGuestContext(ctx: *GuestContext) void {
     ctx.seg_ss = segss;
     ctx.eflags = eflags;
     ctx.eip = @truncate(@returnAddress());
+}
+
+/// Transfer control into the guest's __except block. The block restores its own
+/// ESP from EBP (`mov -0x18%(%ebp),%esp`), so only EBP and the target have to be
+/// right. This does not return: the guest never comes back to the throw site.
+fn transferToHandler() noreturn {
+    const target = accept_handler;
+    const ebp = accept_ebp;
+    if (target <= 0x400000 or target >= 0x4a2000) {
+        std.debug.print("[eh]   accept target outside the guest image; returning instead\n", .{});
+        return transferFailed();
+    }
+    asm volatile (
+        \\ movl %[b], %%ebp
+        \\ jmp *%[t]
+        :
+        : [t] "r" (target), [b] "r" (ebp),
+    );
+    unreachable;
+}
+
+fn transferFailed() noreturn {
+    @trap();
 }
 
 fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C) void {
@@ -2656,8 +2784,9 @@ fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C)
         const disp: i32 = f(&rec, node, &ctx, &dc);
         std.debug.print("[eh]   -> disposition {d}\n", .{disp});
         if (disp == @intFromEnum(Disposition.execute_handler)) {
-            std.debug.print("[eh]   HANDLED: unwinding stops here\n", .{});
-            return;
+            std.debug.print("[eh]   HANDLED: transferring to the __except block 0x{x}\n", .{accept_handler});
+            transferToHandler();
+            return; // unreachable when the transfer succeeds
         }
         // After a CONTINUE_SEARCH the frame stays on the chain, so the walk
         // follows the node's own prev. A handler that accepts pops its frame,
