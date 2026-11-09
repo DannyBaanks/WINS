@@ -2402,13 +2402,33 @@ fn _XcptFilter(xcpt: u32, exc: ?*const anyopaque) callconv(C) i32 {
     return 0; // EXCEPTION_CONTINUE_SEARCH
 }
 
-/// _CxxThrowException. The CRT declares it noreturn, but with no SEH-based C++
-/// unwinding here there is nothing to unwind, so a plain return is the only
-/// reachable behaviour. Documented, not hidden behind a stub.
+/// _CxxThrowException -- THE root cause of the empty-archive-name crash.
+///
+/// The CRT declares it noreturn, and the compiler relies on that: everything
+/// after the call site is unreachable-by-contract code. This stub returns, so
+/// execution falls straight through into the next basic block, which was
+/// generated on the assumption that control never arrives there.
+///
+/// Measured on 7zr.exe:
+///   * `7zr l`   calls it (in the "no archive name" path) and then dies at
+///               0x411ea0 -- `mov 0x4(%ebx),%eax` on the instruction immediately
+///               after the throw block, which walks a half-built object.
+///               There is no jump to 0x411ea0: it is fall-through from the
+///               throw at 0x411e8d/0x411e9b, reached when `ja 0x411ea0` is NOT
+///               taken.
+///   * `7zr i`   never calls it, and works.
+///   * `7zr b`   calls it once and survives, because the code after that
+///               particular throw happens to tolerate re-entry.
+///
+/// The real fix is C++ exception handling with unwinding: walk the guest's SEH
+/// chain (the guest writes its own frame pointer into TIB[0], which is this
+/// module's g_tib_buffer), call each frame's __CxxFrameHandler with an
+/// EXCEPTION_RECORD whose code is 0xE06D7363, and honour the disposition. That
+/// also needs __CxxFrameHandler to consult the FuncInfo scope table instead of
+/// returning EXCEPTION_CONTINUE_SEARCH unconditionally, which it currently does.
+/// Until then, returning is wrong but no alternative is available; a
+/// non-returning stub would take `7zr b` down with it.
 fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C) void {
-    // Traced: reaching this means the guest took a C++ error path. Returning
-    // instead of unwinding leaves the construction half-finished, which is the
-    // state the 0x411717 null dereference is sitting on.
     if (trace_static_init) std.debug.print("[msvcrt] _CxxThrowException thrown (unwinding NOT implemented)\n", .{});
     _ = exc;
     _ = dp;
