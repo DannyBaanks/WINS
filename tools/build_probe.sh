@@ -78,6 +78,8 @@ p.write_text(s)
 print("probe: Steam gate neutralised (local copy only)")
 PY2
 
+python3 "$REPO/tools/patch_probe_dump.py" "$PROBE"
+
 "$ZIG" build-exe "$PROBE/winrun32.zig" -target x86-linux -mcpu=i386 -O ReleaseFast \
     --name winrun32_probe -femit-bin="$OUT"
 

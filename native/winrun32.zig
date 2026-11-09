@@ -429,7 +429,43 @@ var g_target_path: [512]u8 = [_]u8{0} ** 512;
 var g_target_path_len: usize = 0;
 
 /// The shared-memory object Steam publishes for a running game's IPC.
-const STEAM_SHMEM_NAME = "/dev/shm/SteamStart_SharedMemFile";
+/// The Io handle and the resolved IPC path, resolved once and reused: the shims
+/// that need it (OpenFileMappingA, the Steam gate) have no Io of their own.
+var g_io: std.Io = undefined;
+var g_shmem_path: [512]u8 = [_]u8{0} ** 512;
+var g_shmem_path_done: bool = false;
+
+fn steamShmemPath() [:0]const u8 {
+    if (!g_shmem_path_done) {
+        g_shmem_path = findSteamShmem(g_io);
+        g_shmem_path_done = true;
+    }
+    return g_shmem_path[0..std.mem.indexOfScalar(u8, &g_shmem_path, 0) orelse 0 :0];
+}
+
+/// The object Steam publishes for its IPC. Observed on a live client:
+/// /dev/shm/u1000-ValveIPCSharedObj-Steam. The earlier
+/// "/dev/shm/SteamStart_SharedMemFile" guess never existed, which is why the
+/// bridge closed even with Steam up.
+fn findSteamShmem(io: std.Io) [512]u8 {
+    var buf: [512]u8 = [_]u8{0} ** 512;
+    var shm_dir = std.Io.Dir.cwd().openDir(io, "/dev/shm", .{ .iterate = true }) catch return buf;
+    defer shm_dir.close(io);
+    var it = shm_dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (std.mem.indexOf(u8, entry.name, "ValveIPCSharedObj") != null) {
+            const prefix = "/dev/shm/";
+            const n = @min(entry.name.len, buf.len - prefix.len - 1);
+            @memcpy(buf[0..prefix.len], prefix);
+            @memcpy(buf[prefix.len .. prefix.len + n], entry.name[0..n]);
+            buf[prefix.len + n] = 0;
+            return buf;
+        }
+    }
+    return buf;
+}
+
+const STEAM_SHMEM_NAME = "/dev/shm/u1000-ValveIPCSharedObj-Steam";
 
 /// Is a Steam client actually serving this process right now?
 ///
@@ -450,9 +486,14 @@ fn steamClientLive() bool {
         std.debug.print("                  verify the account. Refusing to run.\n", .{});
         return false;
     }
-    const fd = linux.open(STEAM_SHMEM_NAME[0..:0].ptr, .{ .ACCMODE = .RDWR }, 0);
+    const path = steamShmemPath();
+    if (path[0] == 0) {
+        std.debug.print("[WINS:SteamBridge] No ValveIPCSharedObj in /dev/shm: Steam's IPC is not live.\n", .{});
+        return false;
+    }
+    const fd = linux.open(path.ptr, .{ .ACCMODE = .RDWR }, 0);
     if (linux.errno(fd) != .SUCCESS) {
-        std.debug.print("[WINS:SteamBridge] {s} is not available: Steam's IPC is not live.\n", .{STEAM_SHMEM_NAME});
+        std.debug.print("[WINS:SteamBridge] {s} could not be opened: Steam's IPC is not live.\n", .{path});
         return false;
     }
     _ = linux.close(@intCast(fd));
@@ -850,11 +891,24 @@ fn OpenEventA(dwDesiredAccess: u32, bInheritHandle: i32, lpName: ?[*:0]const u8)
     _ = dwDesiredAccess; _ = bInheritHandle;
     const name = if (lpName) |n| std.mem.sliceTo(n, 0) else "null";
     std.debug.print("[WINS:Kernel32] OpenEventA(\"{s}\")\n", .{name});
+    // The Steam IPC lock is not a separate /dev/shm object: the real client
+    // keeps it inside the object the guest already maps. This used to return a
+    // dummy handle and log "providing IPC event", i.e. the loader answering for
+    // a client that was never there. It now fails unless a live client is
+    // actually publishing the object, so the caller sees what Windows shows
+    // when Steam is closed rather than a success we invented.
     if (std.mem.indexOf(u8, name, "SteamStart_SharedMemLock") != null) {
-        std.debug.print("  [WINS:SteamDRM] Recognized SteamStart_SharedMemLock! Providing IPC event.\n", .{});
-        return 0x2001;
+        if (!steamClientLive()) {
+            g_last_error = 6; // ERROR_INVALID_HANDLE
+            return 0;
+        }
+        // A live client is present. The handle the guest uses to reach that
+        // client's lock is the mapping OpenFileMappingA already handed back, so
+        // this echoes the same relationship instead of inventing an event.
+        return 0x30000002;
     }
-    return 0x2001;
+    g_last_error = 2; // ERROR_FILE_NOT_FOUND
+    return 0;
 }
 
 fn CreateMutexA(lpMutexAttributes: ?*anyopaque, bInitialOwner: i32, lpName: ?[*:0]const u8) callconv(W) usize {
@@ -2415,18 +2469,28 @@ var g_steamclient010_obj: [1]*anyopaque = [_]*anyopaque{@ptrCast(&g_steamclient0
 
 // ---- CreateInterface (exported from steamclient.dll) -----------------------
 // Called with cdecl from steamdrm.dll: CreateInterface(pName, pReturnCode)
+/// The real Steam client's interface factory.
+///
+/// Measured, and the reason this is NOT a dlopen: the loader is a static i386
+/// binary (Zig builds statically for this target), so `dlopen` is unavailable --
+/// glibc answers "dynamic loading not supported". Loading steamclient.so by hand
+/// was also measured: it needs 484 imports, all glibc-versioned (`abort@GLIBC_2.0`,
+/// `__ctype_b_loc@GLIBC_2.3`, ...), so a private loader would have to reimplement
+/// symbol versioning plus most of libc. Neither route is honest today.
+///
+/// Therefore this stub FALLS CLOSED: it returns null instead of a fabricated
+/// object. The previous behaviour returned dummy vtables and logged
+/// "GetAppOwnershipTicketData() -> synthetic ticket", and the DRM rejected that
+/// with ERROR_ACCESS_DENIED -- i.e. the fabrication was the failure, not the fix.
 fn steamclient_CreateInterface(pName: ?[*:0]const u8, pReturnCode: ?*i32) callconv(.c) ?*anyopaque {
-    if (pReturnCode) |rc| rc.* = 0;
+    if (pReturnCode) |rc| rc.* = -1;
     const name = if (pName) |n| std.mem.sliceTo(n, 0) else "";
     std.debug.print("[WINS:Steam] CreateInterface(\"{s}\")\n", .{name});
-    if (std.mem.startsWith(u8, name, "SteamClient")) return &g_steamclient010_obj;
-    if (std.mem.startsWith(u8, name, "SteamUtils"))  return &g_steamutils005_obj;
-    if (std.mem.startsWith(u8, name, "SteamUser"))   return &g_steamuser016_obj;
-    if (std.mem.startsWith(u8, name, "STEAMAPPTICKET")) return &g_steamappticket001_obj;
-    std.debug.print("  -> UNHANDLED interface \"{s}\", returning dummy\n", .{name});
-    return &g_steam_dummy_obj;
+    std.debug.print("  -> REFUSED: no real Steam client is reachable from a static host.\n", .{});
+    std.debug.print("     (dlopen is unavailable; loading steamclient.so by hand needs 484\n", .{});
+    std.debug.print("      versioned glibc imports. The loader will not speak for the client.)\n", .{});
+    return null;
 }
-
 // ============================================================================
 // steam_api.dll flat C exports
 // ============================================================================
@@ -3501,6 +3565,7 @@ fn setupTib() !void {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+    g_io = io;
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
