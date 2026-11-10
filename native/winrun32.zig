@@ -14,6 +14,7 @@ const d3d9 = @import("wins_d3d9.zig");
 // same ones winrun_impl.zig uses, instead of returning the null stub.
 const kernel32_mod = @import("winrun_kernel32.zig");
 const msvcrt_mod = @import("winrun_msvcrt.zig");
+const vorbis_mod = @import("winrun_vorbis.zig");
 const extra_dlls_mod = @import("winrun_extra_dlls.zig");
 // winrun_gui_support and x11_window are NOT imported: they need static libX11,
 // which is unavailable for the i386 target this loader builds for.
@@ -3745,9 +3746,13 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (std.mem.eql(u8, name, "InitCommonControlsEx")) return @ptrCast(&InitCommonControlsEx);
         if (extra_dlls_mod.lookupComctl32(name)) |addr| return @ptrFromInt(addr);
     } else if (std.ascii.eqlIgnoreCase(dll, "libvorbisfile.dll") or std.ascii.eqlIgnoreCase(dll, "vorbisfile")) {
-        // Not implemented: real Vorbis decoding is a subsystem. Reporting failure
-        // rather than a stub keeps the caller's error handling honest.
-        std.debug.print("[WINS:winmm] libvorbisfile!{s} is not available\n", .{name});
+        // A bridge to the REAL i386 libvorbisfile, not a decoder written here:
+        // both sides are cdecl, which on i386 is the same convention, so the
+        // exports forward and the guest's ov_callbacks are called directly.
+        // The only thing that had to be got right was the callback struct the
+        // guest passes by value; a standalone i386 measurement confirms the real
+        // library reads it as laid out and answers with its own error code.
+        if (vorbis_mod.lookupVorbisfile(name)) |addr| return @ptrFromInt(addr);
         return null;
     } else if (std.ascii.eqlIgnoreCase(dll, "dsound.dll")) {
         // Not implemented: DirectSound is a subsystem. Failing here is deliberate

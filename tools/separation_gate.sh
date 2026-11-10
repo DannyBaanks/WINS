@@ -90,11 +90,27 @@ else
     missing="$(printf '%s' "$out" | grep -c 'UNRESOLVED' || true)"
     note "ok: reports Check FAILED with ${missing} unresolved slot(s) still listed"
 fi
+# What is implemented, and what the artifact is not allowed to claim.
+#
+# libvorbisfile is bridged to the REAL i386 library, so it is resolved. DirectSound
+# is not implemented, so it must still be listed as unresolved: an artifact that
+# claims a device it does not have is the same failure mode as the dummy Steam
+# vtables the DRM rejected.
+if printf '%s' "$out" | grep -qi 'UNRESOLVED libvorbisfile'; then
+    note "FAIL: the vorbis bridge regressed; libvorbisfile is unresolved again"
+    fail=1
+else
+    note "ok: libvorbisfile resolves to the real i386 library"
+fi
+if printf '%s' "$out" | grep -qi 'UNRESOLVED DSOUND\|UNRESOLVED dsound'; then
+    note "ok: DirectSound still reported unresolved, not claimed"
+else
+    note "FAIL: the build claims DirectSound, which is not implemented"
+    fail=1
+fi
 if printf '%s' "$out" | grep -qiE 'DirectSoundCreate8.*implemented|ov_read.*implemented'; then
     note "FAIL: the clean build claims a capability it does not have"
     fail=1
-else
-    note "ok: claims no implemented DirectSound/Vorbis capability"
 fi
 
 echo
