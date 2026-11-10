@@ -2889,7 +2889,7 @@ fn a005_GetISteamUser(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion:
     // Walking the client's vtable here is measured to crash.
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamUser(\"{s}\") -> real client\n", .{ver});
-    return wrapSub(realFactory(pchVersion orelse return 0));
+    return wrapSubKind(SubUser, realFactory(pchVersion orelse return 0));
 }
 
 fn a009_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
@@ -2898,7 +2898,7 @@ fn a009_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32,
     // Walking the client's vtable here is measured to crash.
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamGenericInterface(\"{s}\") -> real client\n", .{ver});
-    return wrapSub(realFactory(pchVersion orelse return 0));
+    return wrapSubKind(SubGeneric, realFactory(pchVersion orelse return 0));
 }
 
 fn a013_GetISteamAppTicket(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
@@ -2907,7 +2907,7 @@ fn a013_GetISteamAppTicket(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVer
     // Walking the client's vtable here is measured to crash.
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamAppTicket(\"{s}\") -> real client\n", .{ver});
-    return wrapSub(realFactory(pchVersion orelse return 0));
+    return wrapSubKind(SubAppTicket, realFactory(pchVersion orelse return 0));
 }
 
 fn a_stub(self: usize) callconv(Tc) u32 {
@@ -2953,18 +2953,38 @@ fn subVt(comptime n: usize) *[24]usize {
     return &g_sub_vt[n];
 }
 
-var g_sub_vt: [3][24]usize = [_][24]usize{[_]usize{0} ** 24} ** 3;
+var g_sub_vt: [4][24]usize = [_][24]usize{[_]usize{0} ** 24} ** 4;
 var g_sub_vt_ready: bool = false;
+
+/// A thunk that says which slot was reached and that it has no implementation
+/// yet. The old stub returned 0 without a word, and that silence is what hid
+/// the vtable mix-up: the DRM's ticket call landed on a stub, got 0, and the
+/// log showed nothing between the interface request and the Steam2 fallback.
+/// A wrong slot must be visible in the log, because the log is the only
+/// measurement that corrects the table.
+fn stubFor(comptime slot: usize) *const fn (usize) callconv(Tc) u32 {
+    return struct {
+        fn f(self: usize) callconv(Tc) u32 {
+            _ = self;
+            std.debug.print("[WINS:Steam] unimplemented slot {d} (no thunk yet)\n", .{slot});
+            return 0;
+        }
+    }.f;
+}
 
 /// Same as ensureSteamClient010Vt, for the sub-interfaces. The slot numbers are
 /// the Steamworks layout and each thunk logs what it forwards, so a wrong guess
 /// is corrected by the log rather than silently answering.
 fn ensureSubVt() void {
     if (g_sub_vt_ready) return;
-    for (&g_sub_vt) |*t| @memset(t, @intFromPtr(&a_stub));
-    g_sub_vt[0][2] = @intFromPtr(&sub_GetSteamID);
-    g_sub_vt[1][9] = @intFromPtr(&sub_GetAppID);
-    g_sub_vt[2][0] = @intFromPtr(&sub_GetAppOwnershipTicketData);
+    inline for (0..g_sub_vt.len) |k| {
+        inline for (0..g_sub_vt[k].len) |i| {
+            g_sub_vt[k][i] = @intFromPtr(stubFor(i));
+        }
+    }
+    g_sub_vt[SubUser][2] = @intFromPtr(&sub_GetSteamID);
+    g_sub_vt[SubUtils][9] = @intFromPtr(&sub_GetAppID);
+    g_sub_vt[SubAppTicket][0] = @intFromPtr(&sub_GetAppOwnershipTicketData);
     g_sub_vt_ready = true;
 }
 
@@ -2974,19 +2994,38 @@ var g_sub_used: [3]usize = [_]usize{0} ** 3;
 /// Wrap a real sub-interface in an adapter, reusing a free slot. Order of the
 /// pool does not matter: each adapter carries its own real pointer, and the
 /// slot the guest asks for is forwarded to the object it belongs to.
-fn wrapSub(real_obj: usize) usize {
+/// Wrap a real sub-interface in an adapter, with the vtable that matches its
+/// type. The pool is keyed by the real object; the vtable is chosen by `kind`,
+/// NOT by pool position.
+///
+/// Choosing by position was measured wrong: the DRM asks for ISteamUser first
+/// (pool slot 0 -> User table) and for ISteamAppTicket second (pool slot 1 ->
+/// the Utils table). Utils slot 0 is a_stub, which returns 0 without a log
+/// line, so GetAppOwnershipTicketData answered "no ticket" silently and the
+/// DRM fell back to the Steam2 SteamStart path. The fix is to name the kind at
+/// the call site and let the pool position mean nothing but storage.
+fn wrapSubKind(kind: usize, real_obj: usize) usize {
     if (real_obj == 0) return 0;
     ensureSubVt();
     var i: usize = 0;
     while (i < g_sub_adapters.len) : (i += 1) {
+        if (g_sub_adapters[i].real == real_obj) return @intFromPtr(&g_sub_adapters[i]);
         if (g_sub_adapters[i].real == 0) {
-            g_sub_adapters[i] = .{ .vt = @intFromPtr(&g_sub_vt[i % 3]), .real = real_obj };
+            g_sub_adapters[i] = .{ .vt = @intFromPtr(&g_sub_vt[kind % g_sub_vt.len]), .real = real_obj };
             return @intFromPtr(&g_sub_adapters[i]);
         }
-        if (g_sub_adapters[i].real == real_obj) return @intFromPtr(&g_sub_adapters[i]);
     }
     return real_obj; // pool exhausted: hand the real object over rather than drop it
 }
+
+/// Sub-interface kinds, matching the g_sub_vt tables built in ensureSubVt.
+const SubUser: usize = 0;
+const SubUtils: usize = 1;
+const SubAppTicket: usize = 2;
+/// Interfaces with no modelled method yet (Apps, Friends, UserStats, the
+/// generic one): they get their own table so a call into them is logged as an
+/// unimplemented slot instead of landing on another interface's thunk.
+const SubGeneric: usize = 3;
 
 fn sub_GetSteamID(self: usize, pSteamID: ?*u64) callconv(Tc) u64 {
     const f: *const fn (usize, ?*u64) callconv(Cc) u64 = @ptrFromInt(realSlot(self, 2));
@@ -3076,7 +3115,7 @@ fn steamFlatReady() bool {
 }
 
 /// Ask the real client for a named interface and wrap it for the guest.
-fn steamFlatIface(comptime versions: []const [*:0]const u8) usize {
+fn steamFlatIface(comptime versions: []const [*:0]const u8, kind: usize) usize {
     if (!steamFlatReady()) return 0;
     const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(g_real_iface)).*);
     const generic: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(vt[9]);
@@ -3084,34 +3123,34 @@ fn steamFlatIface(comptime versions: []const [*:0]const u8) usize {
         const got = generic(g_real_iface, g_flat_user, g_flat_pipe, v);
         if (got != 0) {
             std.debug.print("[WINS:Steam] real client supplied \"{s}\"\n", .{v});
-            return wrapSub(got);
+            return wrapSubKind(kind, got);
         }
     }
     return 0;
 }
 
 fn SteamUser() callconv(W) usize {
-    if (g_flat.user == 0) g_flat.user = steamFlatIface(&[_][*:0]const u8{ "SteamUser016", "SteamUser019", "SteamUser017", "SteamUser020" });
+    if (g_flat.user == 0) g_flat.user = steamFlatIface(&[_][*:0]const u8{ "SteamUser016", "SteamUser019", "SteamUser017", "SteamUser020" }, SubUser);
     return g_flat.user;
 }
 
 fn SteamUtils() callconv(W) usize {
-    if (g_flat.utils == 0) g_flat.utils = steamFlatIface(&[_][*:0]const u8{ "SteamUtils005", "SteamUtils009", "SteamUtils010" });
+    if (g_flat.utils == 0) g_flat.utils = steamFlatIface(&[_][*:0]const u8{ "SteamUtils005", "SteamUtils009", "SteamUtils010" }, SubUtils);
     return g_flat.utils;
 }
 
 fn SteamApps() callconv(W) usize {
-    if (g_flat.apps == 0) g_flat.apps = steamFlatIface(&[_][*:0]const u8{ "SteamApps008", "SteamApps003", "SteamApps005", "SteamApps006", "SteamApps007" });
+    if (g_flat.apps == 0) g_flat.apps = steamFlatIface(&[_][*:0]const u8{ "SteamApps008", "SteamApps003", "SteamApps005", "SteamApps006", "SteamApps007" }, SubGeneric);
     return g_flat.apps;
 }
 
 fn SteamFriends() callconv(W) usize {
-    if (g_flat.friends == 0) g_flat.friends = steamFlatIface(&[_][*:0]const u8{ "SteamFriends015", "SteamFriends014", "SteamFriends013" });
+    if (g_flat.friends == 0) g_flat.friends = steamFlatIface(&[_][*:0]const u8{ "SteamFriends015", "SteamFriends014", "SteamFriends013" }, SubGeneric);
     return g_flat.friends;
 }
 
 fn SteamUserStats() callconv(W) usize {
-    if (g_flat.stats == 0) g_flat.stats = steamFlatIface(&[_][*:0]const u8{ "SteamUserStats012", "SteamUserStats011", "SteamUserStats010" });
+    if (g_flat.stats == 0) g_flat.stats = steamFlatIface(&[_][*:0]const u8{ "SteamUserStats012", "SteamUserStats011", "SteamUserStats010" }, SubGeneric);
     return g_flat.stats;
 }
 
