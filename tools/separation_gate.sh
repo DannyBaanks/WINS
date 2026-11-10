@@ -43,8 +43,14 @@ if [[ -d "$REPO/native/probe" ]]; then
     mv "$REPO/native/probe" "$WORK/probe-hidden"
     note "(probe directory temporarily moved away)"
 fi
-if ! "$ZIG" build-exe "$REPO/native/winrun32.zig" -target x86-linux -mcpu=i386 -O ReleaseFast \
-        --name winrun32 -femit-bin="$WORK/winrun32" 2>"$WORK/build.log"; then
+# The published artifact is the DYNAMIC glibc i386 build: the Steam bridge has
+# to dlopen the real client, and a static build answers dlopen with "dynamic
+# loading not supported". Measured; that was the reason an earlier conclusion
+# recorded the client as unloadable. A build that is not dynamic cannot carry
+# the bridge, so the gate builds what is shipped and asserts the linkage rather
+# than assuming it.
+if ! "$ZIG" build-exe "$REPO/native/winrun32.zig" -target x86-linux-gnu.2.39 -mcpu=i386 \
+        -O ReleaseFast -lc -dynamic --name winrun32 -femit-bin="$WORK/winrun32" 2>"$WORK/build.log"; then
     note "FAIL: clean build does not compile"; head -8 "$WORK/build.log"; fail=1
 else
     note "ok: compiles with the lab absent"
@@ -54,6 +60,13 @@ if [[ -d "$WORK/probe-hidden" ]]; then
     note "(probe directory restored)"
 fi
 [[ -x "$WORK/winrun32" ]] || { note "FAIL: no binary produced"; exit 1; }
+
+if ! readelf -l "$WORK/winrun32" 2>/dev/null | grep -q "/lib/ld-linux.so.2"; then
+    note "FAIL: the shipped artifact is not dynamic glibc i386; the Steam bridge needs dlopen"
+    fail=1
+else
+    note "ok: dynamic glibc i386, so the real client can be loaded"
+fi
 
 echo "== G3: the shipped binary carries no probe instrumentation"
 if nm "$WORK/winrun32" 2>/dev/null | grep -qi "probe\|instrumented_stub"; then

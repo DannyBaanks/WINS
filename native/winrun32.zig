@@ -346,6 +346,69 @@ fn IsBadCodePtr(lp: ?*const anyopaque) callconv(W) i32 {
     return 0;
 }
 
+/// Ranges that must not be unmapped by a caller-supplied VirtualAlloc address.
+///
+/// A first attempt removed MAP_FIXED entirely, which broke the guest: it maps
+/// its own stub image at the base it asks for (0x10000000, read from the PE
+/// header), and honouring that request is load-bearing. So the address is
+/// honoured, except where it would destroy memory that is not the guest's:
+/// glibc's heap and the real Steam client's mappings. Both are read from
+/// /proc/self/maps right after the client is loaded, so the list is measured
+/// rather than guessed. Measured consequence of ignoring this: the real client
+/// aborted with "malloc(): unaligned tcache chunk detected" once the guest had
+/// reserved over its heap.
+const ProtectedRange = struct { lo: usize, hi: usize };
+var g_protected: [64]ProtectedRange = [_]ProtectedRange{.{ .lo = 0, .hi = 0 }} ** 64;
+
+var g_protect_done = false;
+
+fn protectRange(lo: usize, hi: usize) void {
+    for (g_protected) |r| {
+        if (r.hi != 0 and r.lo == lo) return;
+    }
+    for (&g_protected) |*r| {
+        if (r.lo == 0 and r.hi == 0) {
+            r.* = .{ .lo = lo, .hi = hi };
+            return;
+        }
+    }
+}
+
+fn rangeIsProtected(lo: usize, hi: usize) bool {
+    for (g_protected) |r| {
+        if (r.hi != 0 and lo < r.hi and hi > r.lo) return true;
+    }
+    return false;
+}
+
+/// Read /proc/self/maps and protect glibc's heap plus everything the real Steam
+/// client has mapped. Called once the client is loaded, because before that
+/// there is nothing of theirs to protect.
+fn protectForeignMemory() void {
+    const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [16 * 1024]u8 = undefined;
+    const rn = linux.read(@intCast(fd), &buf, buf.len);
+    if (linux.errno(rn) != .SUCCESS) return;
+    var lines = std.mem.splitScalar(u8, buf[0..@intCast(rn)], '\n');
+    while (lines.next()) |line| {
+        const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+        const lo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+        const rest = line[dash + 1 ..];
+        const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+        const hi = std.fmt.parseInt(usize, rest[0..sp], 16) catch continue;
+        if (std.mem.indexOf(u8, line, "[heap]") != null or
+            std.mem.indexOf(u8, line, "steamclient.so") != null or
+            std.mem.indexOf(u8, line, "libc.so") != null or
+            std.mem.indexOf(u8, line, "libstdc++") != null or
+            std.mem.indexOf(u8, line, "libm.so") != null)
+        {
+            protectRange(lo, hi);
+        }
+    }
+}
+
 fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(W) ?*anyopaque {
     _ = flAllocationType;
     if (dwSize == 0) {
@@ -357,22 +420,91 @@ fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, fl
         .WRITE = (flProtect & 0x44) != 0,
         .EXEC = (flProtect & 0xF0) != 0,
     };
-    const flags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = (lpAddress != null) };
-    const addr: ?[*]u8 = if (lpAddress) |a| @ptrCast(a) else null;
-    const ptr = linux.mmap(addr, dwSize, prot, flags, -1, 0);
+    // A caller-supplied address must not silently unmap whatever the kernel
+    // already put there. An earlier version raised MAP_FIXED whenever lpAddress
+    // was non-null -- a destroy-what-is-there primitive -- and the real client
+    // aborted with "malloc(): unaligned tcache chunk detected" as a result. A
+    // later attempt dropped MAP_FIXED entirely, which broke the guest instead:
+    // it maps its own stub image at the base its PE header names, so honouring
+    // the request is load-bearing. Both measurements are kept because both are
+    // wrong: the address is honoured, except where it would destroy memory that
+    // is not the guest's.
+    const requested: ?[*]u8 = if (lpAddress) |a| @ptrCast(a) else null;
+    const free_flags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+    var ptr: usize = undefined;
+    if (requested) |req| {
+        if (rangeIsProtected(@intFromPtr(req), @intFromPtr(req) + dwSize)) {
+            std.debug.print("[WINS:Kernel32] VirtualAlloc: 0x{x}+{d} is foreign memory; relocating\n", .{ @intFromPtr(req), dwSize });
+            ptr = linux.mmap(null, dwSize, prot, free_flags, -1, 0);
+        } else {
+            const fixed = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };
+            ptr = linux.mmap(req, dwSize, prot, fixed, -1, 0);
+        }
+    } else {
+        ptr = linux.mmap(null, dwSize, prot, free_flags, -1, 0);
+    }
     if (linux.errno(ptr) != .SUCCESS) {
         g_last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
         return null;
     }
     g_alloc_prot = flProtect;
+    trackReservation(ptr, dwSize);
     return @ptrFromInt(ptr);
 }
 
+/// Every reservation made for the guest, so freeing can undo exactly what was
+/// allocated. Without this, VirtualFree munmapped the length the guest happened
+/// to pass, and a sub-range or a stale size unmapped whatever sat next to it --
+/// including memory the real Steam client and glibc were using.
+const Reservation = struct { base: usize, size: usize };
+var g_reservations: [512]Reservation = [_]Reservation{.{ .base = 0, .size = 0 }} ** 512;
+
+fn trackReservation(base: usize, size: usize) void {
+    for (&g_reservations) |*r| {
+        if (r.size == 0) {
+            r.* = .{ .base = base, .size = size };
+            return;
+        }
+        if (r.base == base) {
+            r.size = size;
+            return;
+        }
+    }
+}
+
+fn untrackReservation(base: usize) void {
+    for (&g_reservations) |*r| {
+        if (r.base == base) {
+            r.* = .{ .base = 0, .size = 0 };
+            return;
+        }
+    }
+}
+
 fn VirtualFree(lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32) callconv(W) i32 {
-    _ = dwFreeType;
     if (lpAddress) |addr| {
-        const u8_ptr: [*]const u8 = @ptrCast(addr);
-        _ = linux.munmap(u8_ptr, if (dwSize == 0) 4096 else dwSize);
+        const base = @intFromPtr(addr);
+        // MEM_RELEASE (0x8000) with dwSize 0 releases the whole reservation;
+        // MEM_DECOMMIT (0x4000) only withdraws the pages, which here means
+        // making them inaccessible rather than unmapping the neighbours. A
+        // sub-range release is not something a reservation supports, so it
+        // releases the reservation the address belongs to.
+        const is_release = (dwFreeType & 0x8000) != 0;
+        const is_decommit = (dwFreeType & 0x4000) != 0;
+        var size: usize = 0;
+        for (g_reservations) |r| {
+            if (r.size != 0 and base >= r.base and base < r.base + r.size) {
+                size = r.size;
+                break;
+            }
+        }
+        if (size == 0) size = if (dwSize == 0) 4096 else dwSize;
+        if (is_decommit and !is_release) {
+            _ = linux.mprotect(@as([*]u8, @ptrFromInt(base)), size, linux.PROT{});
+            return 1;
+        }
+        _ = linux.munmap(@as([*]u8, @ptrFromInt(base)), size);
+        untrackReservation(base);
         return 1;
     }
     return 0;
@@ -2325,194 +2457,350 @@ fn SteamAPI_Shutdown() callconv(W) void {
     std.debug.print("[WINS:SteamAPI] SteamAPI_Shutdown() called.\n", .{});
 }
 
-var g_steam_dummy_vtable: [16]*const anyopaque = [_]*const anyopaque{@ptrCast(&unhandledApiStub)} ** 16;
-var g_steam_dummy_obj: [1]*anyopaque = [_]*anyopaque{@ptrCast(&g_steam_dummy_vtable)};
-
 // ============================================================================
-// Steamworks COM Interface Vtables (ISteamClient010 / steamdrm.dll gate)
+// Steam bridge: the interface the guest gets is the REAL client's, adapted.
 // ============================================================================
 //
-// steamdrm.dll calls:
-//   GetProcAddress(hSteamClient, "CreateInterface")
-//   CreateInterface("SteamClient010", null)
-//   -> vtable->CreateSteamPipe()          slot 0
-//   -> vtable->ConnectToGlobalUser(pipe)  slot 2
-//   -> vtable->GetISteamUser(...)         slot 5  -> ISteamUser016
-//   -> vtable->GetISteamGenericInterface("SteamUtils005") slot 9 -> ISteamUtils005
-//   -> vtable->GetISteamAppTicket(...)    slot 13 -> ISteamAppTicket001
-//   ISteamUtils005::GetAppID()            slot 9  -> 22380
-//   ISteamUser016::GetSteamID(pID)        slot 2  -> 76561198175888903
-//   ISteamAppTicket001::GetAppOwnershipTicketData() slot 0 -> >0
+// The guest is Windows code compiled for the Microsoft C++ ABI: `this` travels
+// in ECX, arguments sit on the stack, and the callee cleans up (stdcall). The
+// real Steam client is Linux C++: `this` travels as the first stack argument
+// and the caller cleans up (cdecl). Handing the guest a raw pointer to the real
+// object was measured to fail exactly there: the real method read `this` from
+// [esp+4], which is actually the guest's first argument, and dereferenced it.
+//
+// So every object handed out here is a two-word adapter: [0] our vtable, whose
+// slots are thiscall thunks, and [4] the real object the call is forwarded to.
+// Nothing here decides anything about the account: the answer always comes from
+// the real client. This replaces the previous dummy vtables, which reported
+// CreateSteamPipe -> 1, GetSteamID -> 76561198175888903 and a synthetic ticket
+// of 0xAB bytes. The DRM rejected those with ERROR_ACCESS_DENIED, which is the
+// evidence that a fabricated answer is a failure, not a shortcut.
+//
+// Sequence measured from the guest (disassembly of the DRM's own call site):
+//   slot 0  CreateSteamPipe()
+//   slot 2  ConnectToGlobalUser(hPipe)
+//   slot 9  GetISteamGenericInterface(hUser, hPipe, "SteamUtils005")
+//   slot 5  GetISteamUser(hUser, hPipe, "SteamUser016")
+//   and further on slot 13 GetISteamAppTicket(hUser, hPipe, version).
 
-// ---- ISteamUtils005 (slot 9 = GetAppID) ------------------------------------
-// All vtable methods use __thiscall: ECX = this, args on stack
-fn steamutils005_stub() callconv(.{ .x86_thiscall = .{} }) u32 { return 0; }
-fn steamutils005_GetAppID(_self: usize) callconv(.{ .x86_thiscall = .{} }) u32 {
-    _ = _self;
-    std.debug.print("[WINS:Steam] ISteamUtils005::GetAppID() -> 22380\n", .{});
-    return 22380;
+const Cc = std.builtin.CallingConvention.c;
+const Tc = std.builtin.CallingConvention{ .x86_thiscall = .{} };
+
+/// The real ISteamClient object the real client's CreateInterface returned.
+var g_real_iface: usize = 0;
+
+extern fn dlopen(path: [*:0]const u8, flags: c_int) ?*anyopaque;
+extern fn dlsym(handle: ?*anyopaque, sym: [*:0]const u8) ?*anyopaque;
+
+/// Load the real Steam client and get its ISteamClient object, once.
+///
+/// This is the whole honest basis of the bridge: the client answers for itself.
+/// The build has to be dynamic glibc i386 (`-lc -dynamic`); a static build
+/// cannot dlopen at all, which is what the earlier "484 unresolvable imports"
+/// conclusion actually measured. The path is discovered from the running client
+/// (/proc/<pid>/exe), not guessed, and failure leaves g_real_iface at 0, which
+/// every caller above turns into a refusal rather than an invented answer.
+fn loadRealSteamClient() void {
+    if (g_real_iface != 0) return;
+    const dll = steamClientDllPath();
+    if (dll.len == 0) {
+        std.debug.print("[WINS:SteamBridge] no real Steam client found on this machine.\n", .{});
+        return;
+    }
+    var pathbuf: [512:0]u8 = undefined;
+    const pn = @min(dll.len, pathbuf.len - 1);
+    @memcpy(pathbuf[0..pn], dll[0..pn]);
+    pathbuf[pn] = 0;
+    const handle = dlopen(&pathbuf, 2) orelse {
+        std.debug.print("[WINS:SteamBridge] dlopen of the real client failed: {s}\n", .{dll});
+        return;
+    };
+    const sym = dlsym(handle, "CreateInterface") orelse {
+        std.debug.print("[WINS:SteamBridge] the real client has no CreateInterface export.\n", .{});
+        return;
+    };
+    const create: *const fn (?[*:0]const u8, ?*i32) callconv(.c) ?*anyopaque = @ptrCast(sym);
+    var rc: i32 = -1;
+    const iface = create("SteamClient010", &rc) orelse {
+        std.debug.print("[WINS:SteamBridge] the real client refused SteamClient010 (rc={d}).\n", .{rc});
+        return;
+    };
+    g_real_iface = @intFromPtr(iface);
+    // From here on there is foreign memory in this process that no guest
+    // reservation may unmap.
+    protectForeignMemory();
+    std.debug.print("[WINS:SteamBridge] real client's ISteamClient010 at 0x{x} (rc={d})\n", .{ g_real_iface, rc });
 }
 
-var g_steamutils005_vtable: [16]*const anyopaque = blk: {
-    var v = [_]*const anyopaque{@ptrCast(&steamutils005_stub)} ** 16;
-    v[9] = @ptrCast(&steamutils005_GetAppID);
-    break :blk v;
-};
-var g_steamutils005_obj: [1]*anyopaque = [_]*anyopaque{@ptrCast(&g_steamutils005_vtable)};
+/// Our adapters. Layout is load-bearing: [0] the vtable, [4] the real object.
+const Adapter = struct { vt: usize, real: usize };
 
-// ---- ISteamUser016 (slot 2 = GetSteamID writes u64) ------------------------
-fn steamuser016_stub() callconv(.{ .x86_thiscall = .{} }) u32 { return 0; }
-fn steamuser016_GetSteamID(_self: usize, pSteamID: ?*u64) callconv(.{ .x86_thiscall = .{} }) void {
-    _ = _self;
-    if (pSteamID) |p| p.* = 76561198175888903;
-    std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> 76561198175888903\n", .{});
+fn adapterObj(a: *Adapter) usize {
+    return @intFromPtr(a);
 }
 
-var g_steamuser016_vtable: [16]*const anyopaque = blk: {
-    var v = [_]*const anyopaque{@ptrCast(&steamuser016_stub)} ** 16;
-    v[2] = @ptrCast(&steamuser016_GetSteamID);
-    break :blk v;
-};
-var g_steamuser016_obj: [1]*anyopaque = [_]*anyopaque{@ptrCast(&g_steamuser016_vtable)};
+/// The real object behind one of our adapters.
+fn realOf(self: usize) usize {
+    if (self == 0) return 0;
+    return (@as(*const usize, @ptrFromInt(self + 4)).*);
+}
 
-// ---- ISteamAppTicket001 (slot 0 = GetAppOwnershipTicketData) ----------------
-// Signature (thiscall): uint GetAppOwnershipTicketData(AppId_t nAppID,
-//   void *pvBuffer, uint cbBufferLength,
-//   uint *piAppId, uint *piSteamId, uint *piSignature, uint *pcbSignature)
-var g_ticket_buf: [256]u8 = [_]u8{0xAB} ** 256;
-fn steamappticket001_GetAppOwnershipTicketData(
-    _self: usize,
-    _nAppID: u32,
+/// Slot k of the real object's vtable, or 0 when there is no real client.
+fn realSlot(self: usize, k: usize) usize {
+    const real = realOf(self);
+    if (real == 0) return 0;
+    const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(real)).*);
+    return vt[k];
+}
+
+// ---- ISteamClient010 -------------------------------------------------------
+
+fn a000_CreateSteamPipe(self: usize) callconv(Tc) u32 {
+    const f: *const fn (usize) callconv(Cc) u32 = @ptrFromInt(realSlot(self, 0));
+    std.debug.print("[WINS:Steam] ISteamClient010::CreateSteamPipe() -> real client\n", .{});
+    return f(realOf(self));
+}
+
+fn a001_BReleaseSteamPipe(self: usize, hSteamPipe: u32) callconv(Tc) i32 {
+    const f: *const fn (usize, u32) callconv(Cc) i32 = @ptrFromInt(realSlot(self, 1));
+    return f(realOf(self), hSteamPipe);
+}
+
+fn a002_ConnectToGlobalUser(self: usize, hSteamPipe: u32) callconv(Tc) u32 {
+    const f: *const fn (usize, u32) callconv(Cc) u32 = @ptrFromInt(realSlot(self, 2));
+    std.debug.print("[WINS:Steam] ISteamClient010::ConnectToGlobalUser(pipe={d}) -> real client\n", .{hSteamPipe});
+    return f(realOf(self), hSteamPipe);
+}
+
+fn a004_ReleaseUser(self: usize, hSteamPipe: u32, hSteamUser: u32) callconv(Tc) void {
+    const f: *const fn (usize, u32, u32) callconv(Cc) void = @ptrFromInt(realSlot(self, 4));
+    f(realOf(self), hSteamPipe, hSteamUser);
+}
+
+fn a005_GetISteamUser(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+    const f: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(realSlot(self, 5));
+    const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
+    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamUser(\"{s}\") -> real client\n", .{ver});
+    return wrapSub(f(realOf(self), hSteamUser, hSteamPipe, pchVersion));
+}
+
+fn a009_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+    const f: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(realSlot(self, 9));
+    const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
+    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamGenericInterface(\"{s}\") -> real client\n", .{ver});
+    return wrapSub(f(realOf(self), hSteamUser, hSteamPipe, pchVersion));
+}
+
+fn a013_GetISteamAppTicket(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+    const f: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(realSlot(self, 13));
+    const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
+    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamAppTicket(\"{s}\") -> real client\n", .{ver});
+    return wrapSub(f(realOf(self), hSteamUser, hSteamPipe, pchVersion));
+}
+
+fn a_stub(self: usize) callconv(Tc) u32 {
+    _ = self;
+    return 0;
+}
+
+var g_steamclient010_vt: [16]usize = [_]usize{0} ** 16;
+var g_steamclient010_vt_ready: bool = false;
+
+/// Filled at runtime: Zig cannot take a function address in a comptime
+/// initialiser, so the table is built once on first use rather than at compile
+/// time. The slot->method mapping is the one measured from the guest's own call
+/// site (disassembly of the DRM: slots 0, 2, 9, 5, 13).
+fn ensureSteamClient010Vt() void {
+    if (g_steamclient010_vt_ready) return;
+    @memset(&g_steamclient010_vt, @intFromPtr(&a_stub));
+    g_steamclient010_vt[0] = @intFromPtr(&a000_CreateSteamPipe);
+    g_steamclient010_vt[1] = @intFromPtr(&a001_BReleaseSteamPipe);
+    g_steamclient010_vt[2] = @intFromPtr(&a002_ConnectToGlobalUser);
+    g_steamclient010_vt[4] = @intFromPtr(&a004_ReleaseUser);
+    g_steamclient010_vt[5] = @intFromPtr(&a005_GetISteamUser);
+    g_steamclient010_vt[9] = @intFromPtr(&a009_GetISteamGenericInterface);
+    g_steamclient010_vt[13] = @intFromPtr(&a013_GetISteamAppTicket);
+    g_steamclient010_vt_ready = true;
+}
+
+var g_steamclient010_adapter: Adapter = .{ .vt = 0, .real = 0 };
+
+// ---- sub-interfaces the DRM asks for --------------------------------------
+//
+// The real client hands back real ISteamUser016 / ISteamUtils005 / ISteamAppTicket
+// objects, and the guest will call those with the Microsoft ABI too, so they are
+// wrapped the same way. The slot numbers below are the Steamworks layout and are
+// VERIFIED BY THE LOG LINE each thunk prints: if the guest's call lands on a
+// different slot the log names it, which is the measurement that corrects the
+// table. Everything else forwards, so a wrong guess forwards wrongly rather than
+// silently inventing an answer.
+
+var g_sub_adapters: [8]Adapter = [_]Adapter{.{ .vt = 0, .real = 0 }} ** 8;
+
+fn subVt(comptime n: usize) *[24]usize {
+    return &g_sub_vt[n];
+}
+
+var g_sub_vt: [3][24]usize = [_][24]usize{[_]usize{0} ** 24} ** 3;
+var g_sub_vt_ready: bool = false;
+
+/// Same as ensureSteamClient010Vt, for the sub-interfaces. The slot numbers are
+/// the Steamworks layout and each thunk logs what it forwards, so a wrong guess
+/// is corrected by the log rather than silently answering.
+fn ensureSubVt() void {
+    if (g_sub_vt_ready) return;
+    for (&g_sub_vt) |*t| @memset(t, @intFromPtr(&a_stub));
+    g_sub_vt[0][2] = @intFromPtr(&sub_GetSteamID);
+    g_sub_vt[1][9] = @intFromPtr(&sub_GetAppID);
+    g_sub_vt[2][0] = @intFromPtr(&sub_GetAppOwnershipTicketData);
+    g_sub_vt_ready = true;
+}
+
+var g_sub_real: [3]usize = [_]usize{0} ** 3;
+var g_sub_used: [3]usize = [_]usize{0} ** 3;
+
+/// Wrap a real sub-interface in an adapter, reusing a free slot. Order of the
+/// pool does not matter: each adapter carries its own real pointer, and the
+/// slot the guest asks for is forwarded to the object it belongs to.
+fn wrapSub(real_obj: usize) usize {
+    if (real_obj == 0) return 0;
+    ensureSubVt();
+    var i: usize = 0;
+    while (i < g_sub_adapters.len) : (i += 1) {
+        if (g_sub_adapters[i].real == 0) {
+            g_sub_adapters[i] = .{ .vt = @intFromPtr(&g_sub_vt[i % 3]), .real = real_obj };
+            return @intFromPtr(&g_sub_adapters[i]);
+        }
+        if (g_sub_adapters[i].real == real_obj) return @intFromPtr(&g_sub_adapters[i]);
+    }
+    return real_obj; // pool exhausted: hand the real object over rather than drop it
+}
+
+fn sub_GetSteamID(self: usize, pSteamID: ?*u64) callconv(Tc) u64 {
+    const f: *const fn (usize, ?*u64) callconv(Cc) u64 = @ptrFromInt(realSlot(self, 2));
+    const r = f(realOf(self), pSteamID);
+    std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> 0x{x} (from the real client)\n", .{r});
+    return r;
+}
+
+fn sub_GetAppID(self: usize) callconv(Tc) u32 {
+    const f: *const fn (usize) callconv(Cc) u32 = @ptrFromInt(realSlot(self, 9));
+    const r = f(realOf(self));
+    std.debug.print("[WINS:Steam] ISteamUtils005::GetAppID() -> {d} (from the real client)\n", .{r});
+    return r;
+}
+
+fn sub_GetAppOwnershipTicketData(
+    self: usize,
+    nAppID: u32,
     pvBuffer: ?[*]u8,
     cbBufferLength: u32,
     piAppId: ?*u32,
     piSteamId: ?*u32,
     piSignature: ?*u32,
     pcbSignature: ?*u32,
-) callconv(.{ .x86_thiscall = .{} }) u32 {
-    _ = _self; _ = _nAppID;
-    std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData() -> synthetic ticket\n", .{});
-    const copy_len = @min(cbBufferLength, 128);
-    if (pvBuffer) |buf| @memcpy(buf[0..copy_len], g_ticket_buf[0..copy_len]);
-    if (piAppId) |p| p.* = 22380;
-    if (piSteamId) |p| p.* = @truncate(76561198175888903 & 0xFFFFFFFF);
-    if (piSignature) |p| p.* = copy_len; // offset where "signature" starts
-    if (pcbSignature) |p| p.* = 16;    // 16-byte dummy sig length
-    return copy_len;
+) callconv(Tc) u32 {
+    const f: *const fn (usize, u32, ?[*]u8, u32, ?*u32, ?*u32, ?*u32, ?*u32) callconv(Cc) u32 = @ptrFromInt(realSlot(self, 0));
+    const r = f(realOf(self), nAppID, pvBuffer, cbBufferLength, piAppId, piSteamId, piSignature, pcbSignature);
+    std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}, {d} bytes) -> {d} (from the real client)\n", .{ nAppID, cbBufferLength, r });
+    return r;
 }
-fn steamappticket001_stub() callconv(.{ .x86_thiscall = .{} }) u32 { return 0; }
-
-var g_steamappticket001_vtable: [4]*const anyopaque = blk: {
-    var v = [_]*const anyopaque{@ptrCast(&steamappticket001_stub)} ** 4;
-    v[0] = @ptrCast(&steamappticket001_GetAppOwnershipTicketData);
-    break :blk v;
-};
-var g_steamappticket001_obj: [1]*anyopaque = [_]*anyopaque{@ptrCast(&g_steamappticket001_vtable)};
-
-// ---- ISteamClient010 (slots 0,1,2,4,5,9,13) --------------------------------
-fn steamclient010_CreateSteamPipe(_self: usize) callconv(.{ .x86_thiscall = .{} }) u32 {
-    _ = _self;
-    std.debug.print("[WINS:Steam] ISteamClient010::CreateSteamPipe() -> 1\n", .{});
-    return 1;
-}
-fn steamclient010_BReleaseSteamPipe(_self: usize, hSteamPipe: u32) callconv(.{ .x86_thiscall = .{} }) i32 {
-    _ = _self; _ = hSteamPipe;
-    return 1;
-}
-fn steamclient010_ConnectToGlobalUser(_self: usize, hSteamPipe: u32) callconv(.{ .x86_thiscall = .{} }) u32 {
-    _ = _self; _ = hSteamPipe;
-    std.debug.print("[WINS:Steam] ISteamClient010::ConnectToGlobalUser() -> 1\n", .{});
-    return 1;
-}
-fn steamclient010_ReleaseUser(_self: usize, hSteamPipe: u32, hUser: u32) callconv(.{ .x86_thiscall = .{} }) void {
-    _ = _self; _ = hSteamPipe; _ = hUser;
-}
-fn steamclient010_GetISteamUser(
-    _self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8,
-) callconv(.{ .x86_thiscall = .{} }) ?*anyopaque {
-    _ = _self; _ = hSteamUser; _ = hSteamPipe;
-    const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
-    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamUser(\"{s}\") -> &ISteamUser016\n", .{ver});
-    return &g_steamuser016_obj;
-}
-fn steamclient010_GetISteamGenericInterface(
-    _self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8,
-) callconv(.{ .x86_thiscall = .{} }) ?*anyopaque {
-    _ = _self; _ = hSteamUser; _ = hSteamPipe;
-    const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
-    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamGenericInterface(\"{s}\")\n", .{ver});
-    if (std.mem.startsWith(u8, ver, "SteamUtils")) return &g_steamutils005_obj;
-    return &g_steam_dummy_obj;
-}
-fn steamclient010_GetISteamAppTicket(
-    _self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8,
-) callconv(.{ .x86_thiscall = .{} }) ?*anyopaque {
-    _ = _self; _ = hSteamUser; _ = hSteamPipe;
-    const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
-    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamAppTicket(\"{s}\") -> &ISteamAppTicket001\n", .{ver});
-    return &g_steamappticket001_obj;
-}
-fn steamclient010_stub() callconv(.{ .x86_thiscall = .{} }) u32 { return 0; }
-
-var g_steamclient010_vtable: [16]*const anyopaque = blk: {
-    var v = [_]*const anyopaque{@ptrCast(&steamclient010_stub)} ** 16;
-    v[0]  = @ptrCast(&steamclient010_CreateSteamPipe);
-    v[1]  = @ptrCast(&steamclient010_BReleaseSteamPipe);
-    v[2]  = @ptrCast(&steamclient010_ConnectToGlobalUser);
-    v[4]  = @ptrCast(&steamclient010_ReleaseUser);
-    v[5]  = @ptrCast(&steamclient010_GetISteamUser);
-    v[9]  = @ptrCast(&steamclient010_GetISteamGenericInterface);
-    v[13] = @ptrCast(&steamclient010_GetISteamAppTicket);
-    break :blk v;
-};
-var g_steamclient010_obj: [1]*anyopaque = [_]*anyopaque{@ptrCast(&g_steamclient010_vtable)};
 
 // ---- CreateInterface (exported from steamclient.dll) -----------------------
-// Called with cdecl from steamdrm.dll: CreateInterface(pName, pReturnCode)
-/// The real Steam client's interface factory.
-///
-/// Measured, and the reason this is NOT a dlopen: the loader is a static i386
-/// binary (Zig builds statically for this target), so `dlopen` is unavailable --
-/// glibc answers "dynamic loading not supported". Loading steamclient.so by hand
-/// was also measured: it needs 484 imports, all glibc-versioned (`abort@GLIBC_2.0`,
-/// `__ctype_b_loc@GLIBC_2.3`, ...), so a private loader would have to reimplement
-/// symbol versioning plus most of libc. Neither route is honest today.
-///
-/// Therefore this stub FALLS CLOSED: it returns null instead of a fabricated
-/// object. The previous behaviour returned dummy vtables and logged
-/// "GetAppOwnershipTicketData() -> synthetic ticket", and the DRM rejected that
-/// with ERROR_ACCESS_DENIED -- i.e. the fabrication was the failure, not the fix.
+//
+// Called cdecl by the DRM. The object handed back is an adapter over the real
+// client's object: every method the guest calls is forwarded to the real client,
+// across the ABI boundary. When there is no real client to ask, this returns
+// null and says why -- the alternative is the dummy vtable that answered for a
+// client that was never there, and the DRM rejected it with ERROR_ACCESS_DENIED.
 fn steamclient_CreateInterface(pName: ?[*:0]const u8, pReturnCode: ?*i32) callconv(.c) ?*anyopaque {
     if (pReturnCode) |rc| rc.* = -1;
     const name = if (pName) |n| std.mem.sliceTo(n, 0) else "";
     std.debug.print("[WINS:Steam] CreateInterface(\"{s}\")\n", .{name});
-    std.debug.print("  -> REFUSED: no real Steam client is reachable from a static host.\n", .{});
-    std.debug.print("     (dlopen is unavailable; loading steamclient.so by hand needs 484\n", .{});
-    std.debug.print("      versioned glibc imports. The loader will not speak for the client.)\n", .{});
-    return null;
+
+    loadRealSteamClient();
+    if (g_real_iface == 0) {
+        std.debug.print("  -> REFUSED: no real Steam client is reachable from this process.\n", .{});
+        std.debug.print("     The build must be dynamic glibc i386 (-lc -dynamic) for the loader\n", .{});
+        std.debug.print("     to dlopen the real client at all. The loader will not speak for it.\n", .{});
+        return null;
+    }
+    ensureSteamClient010Vt();
+    g_steamclient010_adapter = .{ .vt = @intFromPtr(&g_steamclient010_vt), .real = g_real_iface };
+    if (pReturnCode) |rc| rc.* = 0;
+    std.debug.print("  -> adapter over the real client's object (real=0x{x})\n", .{g_real_iface});
+    return @ptrFromInt(adapterObj(&g_steamclient010_adapter));
 }
+
 // ============================================================================
 // steam_api.dll flat C exports
 // ============================================================================
+//
+// These used to return dummy objects. They now go through the real client: one
+// pipe and one global user, established once, and each interface obtained by
+// asking the real client for it by version. When the real client cannot supply
+// a version, the answer is null and the log says so -- which is what a missing
+// capability looks like, as opposed to an object that answers for the client.
 
-fn SteamApps() callconv(W) ?*anyopaque {
-    return &g_steam_dummy_obj;
+var g_flat_pipe: u32 = 0;
+var g_flat_user: u32 = 0;
+var g_flat_ready: bool = false;
+
+const FlatIface = struct { user: usize = 0, utils: usize = 0, apps: usize = 0, friends: usize = 0, stats: usize = 0 };
+var g_flat: FlatIface = .{};
+
+/// Establish the pipe and the global user against the real client, once.
+fn steamFlatReady() bool {
+    if (g_flat_ready) return true;
+    if (g_real_iface == 0) return false;
+    const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(g_real_iface)).*);
+    const createPipe: *const fn (usize) callconv(Cc) u32 = @ptrFromInt(vt[0]);
+    const connectUser: *const fn (usize, u32) callconv(Cc) u32 = @ptrFromInt(vt[2]);
+    g_flat_pipe = createPipe(g_real_iface);
+    g_flat_user = connectUser(g_real_iface, g_flat_pipe);
+    g_flat_ready = true;
+    std.debug.print("[WINS:Steam] real client: pipe={d} user={d}\n", .{ g_flat_pipe, g_flat_user });
+    return true;
 }
 
-fn SteamFriends() callconv(W) ?*anyopaque {
-    return &g_steam_dummy_obj;
+/// Ask the real client for a named interface and wrap it for the guest.
+fn steamFlatIface(comptime versions: []const [*:0]const u8) usize {
+    if (!steamFlatReady()) return 0;
+    const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(g_real_iface)).*);
+    const generic: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(vt[9]);
+    inline for (versions) |v| {
+        const got = generic(g_real_iface, g_flat_user, g_flat_pipe, v);
+        if (got != 0) {
+            std.debug.print("[WINS:Steam] real client supplied \"{s}\"\n", .{v});
+            return wrapSub(got);
+        }
+    }
+    return 0;
 }
 
-fn SteamUser() callconv(W) ?*anyopaque {
-    return &g_steamuser016_obj;
+fn SteamUser() callconv(W) usize {
+    if (g_flat.user == 0) g_flat.user = steamFlatIface(&[_][*:0]const u8{ "SteamUser016", "SteamUser019", "SteamUser017", "SteamUser020" });
+    return g_flat.user;
 }
 
-fn SteamUserStats() callconv(W) ?*anyopaque {
-    return &g_steam_dummy_obj;
+fn SteamUtils() callconv(W) usize {
+    if (g_flat.utils == 0) g_flat.utils = steamFlatIface(&[_][*:0]const u8{ "SteamUtils005", "SteamUtils009", "SteamUtils010" });
+    return g_flat.utils;
 }
 
-fn SteamUtils() callconv(W) ?*anyopaque {
-    return &g_steamutils005_obj;
+fn SteamApps() callconv(W) usize {
+    if (g_flat.apps == 0) g_flat.apps = steamFlatIface(&[_][*:0]const u8{ "SteamApps008", "SteamApps003", "SteamApps005", "SteamApps006", "SteamApps007" });
+    return g_flat.apps;
+}
+
+fn SteamFriends() callconv(W) usize {
+    if (g_flat.friends == 0) g_flat.friends = steamFlatIface(&[_][*:0]const u8{ "SteamFriends015", "SteamFriends014", "SteamFriends013" });
+    return g_flat.friends;
+}
+
+fn SteamUserStats() callconv(W) usize {
+    if (g_flat.stats == 0) g_flat.stats = steamFlatIface(&[_][*:0]const u8{ "SteamUserStats012", "SteamUserStats011", "SteamUserStats010" });
+    return g_flat.stats;
 }
 
 // ============================================================================
@@ -2952,18 +3240,22 @@ fn steamClientLocate() struct { pid: u32 } {
 /// turns into "no such value": the honest answer when there is nothing to point
 /// at. A guessed path would be the same failure mode with a plausible-looking
 /// string.
+var g_steam_dll_buf: [512]u8 = [_]u8{0} ** 512;
+
+/// The path lives in a file-scope buffer on purpose: the first version returned
+/// a slice of a stack local, which is a dangling pointer, and dlopen was measured
+/// receiving garbage because of it.
 fn steamClientDllPath() []const u8 {
-    const prefix = "linux32/";
+    const prefix = "/linux32/steamclient.so";
     if (!g_steam_exe_done) _ = steamClientLocate();
     if (!g_steam_exe_done) return "";
     const exe = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&g_steam_exe_buf)), 0);
     const arch_dir = std.fs.path.dirname(exe) orelse return "";
     const install = std.fs.path.dirname(arch_dir) orelse return "";
-    var buf: [512]u8 = undefined;
-    const n = @min(install.len, buf.len - prefix.len - 1);
-    @memcpy(buf[0..n], install[0..n]);
-    @memcpy(buf[n .. n + prefix.len], prefix);
-    return buf[0 .. n + prefix.len];
+    const n = @min(install.len, g_steam_dll_buf.len - prefix.len - 1);
+    @memcpy(g_steam_dll_buf[0..n], install[0..n]);
+    @memcpy(g_steam_dll_buf[n .. n + prefix.len], prefix);
+    return g_steam_dll_buf[0 .. n + prefix.len];
 }
 
 /// The real client executable, as the kernel reports it for the running
@@ -3689,6 +3981,9 @@ fn setupTib() !void {
 // ============================================================================
 
 pub fn main(init: std.process.Init) !void {
+    // Before any guest code runs, because the guest's address reservations
+              // (MAP_FIXED) happen before it ever asks for the Steam interface.
+    protectForeignMemory();
     const io = init.io;
     g_io = io;
     const allocator = init.arena.allocator();

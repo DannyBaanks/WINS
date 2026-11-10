@@ -79,7 +79,6 @@ print("probe: Steam gate neutralised (local copy only)")
 PY2
 
 python3 "$REPO/tools/patch_probe_steam.py" "$PROBE"
-python3 "$REPO/tools/patch_probe_realclient.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_dump.py" "$PROBE"
 
 # Dynamic glibc i386, not static: the honest bridge needs dlopen to load the
