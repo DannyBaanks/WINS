@@ -3085,6 +3085,157 @@ fn wcsstr(h: ?[*:0]const u16, n: ?[*:0]const u16) callconv(C) ?[*]u16 {
 // 12. Lookup Dispatch Table
 // ============================================================================
 
+/// XInput9/10/13 shims. Ordinals 2 and 3 of XINPUT1_3 (derived from the real
+/// DLL's export table) are XInputGetState and XInputSetState.
+///
+/// No gamepad is modelled, so the honest answer is ERROR_DEVICE_NOT_CONNECTED
+/// (1167), which is what Windows also returns with no controller and what makes
+/// the game fall back to keyboard/mouse. A zeroed "connected" state would make
+/// the game sit still in its menus believing a stick was centred at 0.
+pub fn lookupXinput(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "XInputGetState")) return @intFromPtr(&XInputGetState);
+    if (std.mem.eql(u8, name, "XInputSetState")) return @intFromPtr(&XInputSetState);
+    if (std.mem.eql(u8, name, "XInputGetCapabilities")) return @intFromPtr(&XInputGetCapabilities);
+    if (std.mem.eql(u8, name, "XInputEnable")) return @intFromPtr(&XInputEnable);
+    return null;
+}
+
+fn XInputGetState(dwUserIndex: u32, pState: ?*anyopaque) callconv(C) u32 {
+    _ = dwUserIndex;
+    if (pState) |p| @memset(@as([*]u8, @ptrCast(p))[0..12], 0);
+    return 1167; // ERROR_DEVICE_NOT_CONNECTED
+}
+
+fn XInputSetState(dwUserIndex: u32, pVibration: ?*const anyopaque) callconv(C) u32 {
+    _ = dwUserIndex; _ = pVibration;
+    return 1167; // ERROR_DEVICE_NOT_CONNECTED
+}
+
+fn XInputGetCapabilities(dwUserIndex: u32, dwFlags: u32, pCapabilities: ?*anyopaque) callconv(C) u32 {
+    _ = dwUserIndex; _ = dwFlags; _ = pCapabilities;
+    return 1167; // ERROR_DEVICE_NOT_CONNECTED
+}
+
+fn XInputEnable(enable: u32) callconv(C) void {
+    _ = enable;
+}
+
+/// winmm's mmio* (RIFF chunk I/O over a real fd). The RIFF parser itself is not
+/// modelled: mmioOpen/mmioRead/mmioSeek/mmioClose do real file I/O, and the
+/// chunk-navigation calls (Ascend/Descend/GetInfo/SetInfo) report failure rather
+/// than inventing a chunk, because a wrong chunk position corrupts the caller's
+/// parse of the file it opened.
+pub fn lookupWinmm(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "mmioClose")) return @intFromPtr(&mmioClose);
+    if (std.mem.eql(u8, name, "mmioDescend")) return @intFromPtr(&mmioDescend);
+    if (std.mem.eql(u8, name, "mmioAscend")) return @intFromPtr(&mmioAscend);
+    if (std.mem.eql(u8, name, "mmioGetInfo")) return @intFromPtr(&mmioGetInfo);
+    if (std.mem.eql(u8, name, "mmioSetInfo")) return @intFromPtr(&mmioSetInfo);
+    if (std.mem.eql(u8, name, "mmioRead")) return @intFromPtr(&mmioRead);
+    if (std.mem.eql(u8, name, "mmioSeek")) return @intFromPtr(&mmioSeek);
+    if (std.mem.eql(u8, name, "mmioAdvance")) return @intFromPtr(&mmioAdvance);
+    if (std.mem.eql(u8, name, "mmioOpenA")) return @intFromPtr(&mmioOpenA);
+    return null;
+}
+
+// Minimal open/free-tracking set: the guest gets a real fd-backed handle, so a
+// successful mmioOpen means the file really opened, and mmioRead really reads it.
+const MMIO_IO = extern struct {
+    fd: i32,
+    used: bool,
+};
+
+var g_mmio_table: [16]MMIO_IO = [_]MMIO_IO{ .{ .fd = -1, .used = false } } ** 16;
+
+fn mmioOpenA(szFilename: ?[*:0]const u8, pmioopen: ?*const anyopaque, dwOpenFlags: u32) callconv(C) usize {
+    _ = pmioopen;
+    const path = szFilename orelse return 0;
+    if (dwOpenFlags & 0x0001 != 0) {
+        // MMIO_READ: open read-only, which is the only mode these shims model.
+        const fd = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(fd) != .SUCCESS) return 0;
+        for (&g_mmio_table) |*e| {
+            if (!e.used) {
+                e.used = true;
+                e.fd = @intCast(fd);
+                return @as(usize, 0x31000) + @intFromPtr(e);
+            }
+        }
+        _ = linux.close(@intCast(fd));
+        return 0;
+    }
+    return 0;
+}
+
+fn mmioClose(hmmio: usize, wFlags: u32) callconv(C) u32 {
+    _ = wFlags;
+    const idx: usize = (hmmio - 0x31000) / @sizeOf(MMIO_IO);
+    if (idx >= g_mmio_table.len) return 0xFFFFFFFF;
+    g_mmio_table[idx].used = false;
+    _ = linux.close(@intCast(g_mmio_table[idx].fd));
+    return 0;
+}
+
+fn mmioRead(hmmio: usize, pch: ?[*]u8, cch: u32) callconv(C) i32 {
+    const idx: usize = (hmmio - 0x31000) / @sizeOf(MMIO_IO);
+    if (idx >= g_mmio_table.len) return -1;
+    const buf = pch orelse return 0;
+    const fd: i32 = g_mmio_table[idx].fd;
+    if (@import("builtin").cpu.arch == .x86) {
+        const r = linux.syscall3(.read, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(buf), cch);
+        if (linux.errno(r) != .SUCCESS) return -1;
+        return @intCast(r);
+    }
+    const r = linux.read(fd, buf[0..cch]);
+    if (linux.errno(r) != .SUCCESS) return -1;
+    return @intCast(r);
+}
+
+fn mmioSeek(hmmio: usize, lOffset: i32, iOrigin: i32) callconv(C) i32 {
+    const idx: usize = (hmmio - 0x31000) / @sizeOf(MMIO_IO);
+    if (idx >= g_mmio_table.len) return -1;
+    const fd: i32 = g_mmio_table[idx].fd;
+    const whence: u32 = if (iOrigin == 0) 0 else if (iOrigin == 1) 1 else 2;
+    if (@import("builtin").cpu.arch == .x86) {
+        const r = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, fd))), @as(usize, @bitCast(@as(isize, lOffset))), whence);
+        if (linux.errno(r) != .SUCCESS) return -1;
+        return @intCast(r);
+    }
+    return -1;
+}
+
+// The four chunk-navigation calls are not modelled: inventing a chunk would
+// corrupt the caller's view of the file.
+fn mmioAscend(hmmio: usize, pmmioinfo: ?*anyopaque, wFlags: u32) callconv(C) u32 {
+    _ = hmmio; _ = pmmioinfo; _ = wFlags;
+    std.debug.print("[WINS:winmm] mmioAscend: RIFF chunk navigation is not modelled.\n", .{});
+    return 0xFFFFFFFF;
+}
+
+fn mmioDescend(hmmio: usize, pmmioinfo: ?*anyopaque, pmmcki: ?*const anyopaque, wFlags: u32) callconv(C) u32 {
+    _ = hmmio; _ = pmmioinfo; _ = pmmcki; _ = wFlags;
+    std.debug.print("[WINS:winmm] mmioDescend: RIFF chunk navigation is not modelled.\n", .{});
+    return 0xFFFFFFFF;
+}
+
+fn mmioGetInfo(hmmio: usize, pmmioinfo: ?*anyopaque, wFlags: u32) callconv(C) u32 {
+    _ = hmmio; _ = pmmioinfo; _ = wFlags;
+    std.debug.print("[WINS:winmm] mmioGetInfo: not modelled.\n", .{});
+    return 0xFFFFFFFF;
+}
+
+fn mmioAdvance(hmmio: usize, pmmioinfo: ?*const anyopaque, wFlags: u32) callconv(C) u32 {
+    _ = hmmio; _ = pmmioinfo; _ = wFlags;
+    std.debug.print("[WINS:winmm] mmioAdvance: buffered I/O is not modelled.\n", .{});
+    return 0xFFFFFFFF;
+}
+
+fn mmioSetInfo(hmmio: usize, pmmioinfo: ?*const anyopaque, wFlags: u32) callconv(C) u32 {
+    _ = hmmio; _ = pmmioinfo; _ = wFlags;
+    std.debug.print("[WINS:winmm] mmioSetInfo: not modelled.\n", .{});
+    return 0xFFFFFFFF;
+}
+
 pub fn lookup(name: []const u8) ?usize {
     // Data exports
     if (std.mem.eql(u8, name, "_fmode")) return @intFromPtr(&msvcrt_fmode);

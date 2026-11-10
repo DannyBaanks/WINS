@@ -257,6 +257,8 @@ fn HeapFree(hHeap: usize, dwFlags: u32, lpMem: ?*anyopaque) callconv(W) i32 {
         const hdr_ptr = u8_ptr - @sizeOf(HeapHeader);
         const hdr: *HeapHeader = @ptrCast(@alignCast(hdr_ptr));
         if (hdr.magic == HEAP_MAGIC) {
+            // hdr.size is the whole mapping including the guard page, so freeing
+            // releases all of it rather than leaving the guard behind.
             _ = linux.munmap(hdr_ptr, hdr.size);
             return 1;
         }
@@ -557,6 +559,7 @@ fn VirtualProtect(lpAddress: ?*anyopaque, dwSize: usize, flNewProtect: u32, lpfl
 const STEAM_APPID: u32 = 22380;
 
 /// Written once from main, from the environment Steam provides.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 var g_steam_appid: u32 = 0;
 var g_target_path: [512]u8 = [_]u8{0} ** 512;
 var g_target_path_len: usize = 0;
@@ -4035,7 +4038,14 @@ pub fn main(init: std.process.Init) !void {
     // "malloc(): unaligned tcache chunk detected": by then the guest has
     // corrupted glibc's heap. It is the same request either way, so making it
     // early changes nothing about who answers, only where the machine is.
-    loadRealSteamClient();
+    //
+    // Only when the environment says a Steam product is being run. SteamAppId is
+    // set by the real client for the processes it launches, and nothing else
+    // sets it, so this is the client's own statement about its child -- and it
+    // keeps a 50 MB library out of every unrelated guest. Measured: with the
+    // call unconditional, 7zr's run differed from its oracle by one log line and
+    // nothing else, which is how the mistake was caught.
+    if (getenv("SteamAppId") != null) loadRealSteamClient();
     // Before any guest code runs, because the guest's address reservations
               // (MAP_FIXED) happen before it ever asks for the Steam interface.
     protectForeignMemory();

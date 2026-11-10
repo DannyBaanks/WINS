@@ -16,9 +16,9 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
             7 => "getsockopt",
             8 => "htonl",
             9 => "htons",
-            10 => "ioctlsocket",
-            11 => "inet_addr",
-            12 => "inet_ntoa",
+            10 => "inet_addr",
+            11 => "inet_ntoa",
+            12 => "ioctlsocket",
             13 => "listen",
             14 => "ntohl",
             15 => "ntohs",
@@ -32,6 +32,20 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
             23 => "socket",
             52 => "gethostbyname",
             53 => "getprotobyname",
+            51 => "gethostbyaddr",
+            54 => "getprotobynumber",
+            55 => "getservbyname",
+            56 => "getservbyport",
+            101 => "WSAAsyncSelect",
+            102 => "WSAAsyncGetHostByAddr",
+            104 => "WSAAsyncGetProtoByNumber",
+            105 => "WSAAsyncGetProtoByName",
+            106 => "WSAAsyncGetServByPort",
+            107 => "WSAAsyncGetServByName",
+            109 => "WSASetBlockingHook",
+            110 => "WSAUnhookBlockingHook",
+            113 => "WSACancelBlockingCall",
+            114 => "WSAIsBlocking",
             57 => "gethostname",
             103 => "WSAAsyncGetHostByName",
             108 => "WSACancelAsyncRequest",
@@ -100,6 +114,36 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
             211 => "ldap_set_option",
             217 => "ldap_sslinit",
             301 => "ber_free",
+            else => null,
+        };
+    }
+
+    // XInput and DirectSound, derived from the export tables of the real DLLs
+    // (DirectX redistributable xinput1_3.dll, and Proton's dsound.dll), not from
+    // memory: both use ordinal base 1, so ordinal 2 in XINPUT1_3 really is
+    // XInputGetState, and ordinal 11 in DSOUND really is DirectSoundCreate8.
+    if (std.ascii.eqlIgnoreCase(dll, "xinput1_3.dll") or std.ascii.eqlIgnoreCase(dll, "xinput1_2.dll") or
+        std.ascii.eqlIgnoreCase(dll, "xinput9_1_0.dll"))
+    {
+        return switch (ord) {
+            2 => "XInputGetState",
+            3 => "XInputSetState",
+            4 => "XInputGetCapabilities",
+            5 => "XInputEnable",
+            6 => "XInputGetDSoundAudioDeviceGuids",
+            7 => "XInputGetBatteryInformation",
+            8 => "XInputGetKeystroke",
+            else => null,
+        };
+    }
+
+    if (std.ascii.eqlIgnoreCase(dll, "dsound.dll")) {
+        return switch (ord) {
+            1 => "DirectSoundCreate",
+            6 => "DirectSoundCaptureCreate",
+            10 => "DirectSoundFullDuplexCreate",
+            11 => "DirectSoundCreate8",
+            12 => "DirectSoundCaptureCreate8",
             else => null,
         };
     }

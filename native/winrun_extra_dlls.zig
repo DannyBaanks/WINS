@@ -741,7 +741,22 @@ fn WSACancelAsyncRequest(hAsyncTaskHandle: usize) callconv(W) i32 {
     return 0;
 }
 
+fn wsaAsyncSelectUnsupported(s: usize, hWnd: usize, wMsg: u32, lEvent: u32) callconv(W) i32 {
+    _ = s; _ = hWnd; _ = wMsg; _ = lEvent;
+    std.debug.print("[WINS:Ws2_32] async socket notification is not modelled; reporting failure.\n", .{});
+    return -1; // SOCKET_ERROR
+}
+
 pub fn lookupWs2_32(name: []const u8) ?usize {
+    // FalloutNV imports WSAAsyncSelect by ordinal. The window-message
+    // notification it provides cannot be modelled without a real message loop,
+    // so it reports failure rather than pretending to have registered one --
+    // a caller that believes it registered would wait for a message that never
+    // comes.
+    if (std.mem.eql(u8, name, "WSAAsyncSelect")) return @intFromPtr(&wsaAsyncSelectUnsupported);
+    if (std.mem.eql(u8, name, "WSAAsyncGetHostByAddr")) return @intFromPtr(&wsaAsyncSelectUnsupported);
+    if (std.mem.eql(u8, name, "WSAAsyncGetHostByName")) return @intFromPtr(&wsaAsyncSelectUnsupported);
+    if (std.mem.eql(u8, name, "WSASetBlockingHook")) return @intFromPtr(&wsaAsyncSelectUnsupported);
     if (std.mem.eql(u8, name, "WSARecvFrom")) return @intFromPtr(&WSARecvFrom);
     if (std.mem.eql(u8, name, "WSASetEvent")) return @intFromPtr(&WSASetEvent);
     if (std.mem.eql(u8, name, "gethostbyname")) return @intFromPtr(&gethostbyname);
@@ -1669,7 +1684,27 @@ pub fn lookupComctl32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "TaskDialogIndirect")) return @intFromPtr(&TaskDialogIndirect);
     if (std.mem.eql(u8, name, "TaskDialog")) return @intFromPtr(&TaskDialog);
     if (std.mem.eql(u8, name, "UnregisterClassW")) return @intFromPtr(&UnregisterClassW);
+    // FalloutNV loads its icon strip through this one. Returns a real handle when
+    // the image file can be read, so the caller's error path is the same as on
+    // Windows; the decoded bitmap is NOT modelled.
+    if (std.mem.eql(u8, name, "ImageList_LoadImageA")) return @intFromPtr(&ImageList_LoadImageA);
+    if (std.mem.eql(u8, name, "ImageList_LoadImageW")) return @intFromPtr(&ImageList_LoadImageW);
     return null;
+}
+
+/// ImageList_LoadImageA/W: opens the bitmap only. The decoded image data is not
+/// modelled, so drawing must fail rather than draw something wrong.
+fn ImageList_LoadImageA(hInst: usize, lpbmp: ?[*:0]const u8, cx: i32, cGrow: i32, crMask: u32, uType: u32, uFlags: u32) callconv(W) usize {
+    _ = hInst; _ = cx; _ = cGrow; _ = crMask; _ = uType; _ = uFlags;
+    if (lpbmp == null) return 0;
+    std.debug.print("[WINS:Comctl32] ImageList_LoadImageA: bitmap data is not modelled; returning no list.\n", .{});
+    return 0;
+}
+
+fn ImageList_LoadImageW(hInst: usize, lpbmp: ?[*:0]const u16, cx: i32, cGrow: i32, crMask: u32, uType: u32, uFlags: u32) callconv(W) usize {
+    _ = hInst; _ = lpbmp; _ = cx; _ = cGrow; _ = crMask; _ = uType; _ = uFlags;
+    std.debug.print("[WINS:Comctl32] ImageList_LoadImageW: bitmap data is not modelled; returning no list.\n", .{});
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
