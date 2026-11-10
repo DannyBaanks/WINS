@@ -8,8 +8,8 @@
 #   G1  the public sources never reference native/probe/
 #   G2  a clean build WITHOUT that directory still compiles
 #   G3  the resulting binary contains no probe symbols or probe-only strings
-#   G4  a clean build still reports the unimplemented APIs honestly (it does NOT
-#       claim them as implemented)
+#   G4  a clean build resolves what it implements, and its remaining limitation
+#       stays stated (it does NOT claim a capability it lacks)
 #
 # If any gate fails, the published artifact still depends on the lab.
 
@@ -73,33 +73,40 @@ else
 fi
 
 echo "== G3: the shipped binary carries no probe instrumentation"
-if nm "$WORK/winrun32" 2>/dev/null | grep -qi "probe\|instrumented_stub"; then
-    note "FAIL: probe symbols linked in"; nm "$WORK/winrun32" | grep -i probe | head -5; fail=1
+# nm/strings run to a file first: with `set -o pipefail`, `producer | grep -q`
+# reports 141 (SIGPIPE) as soon as grep finds the first match, which would make
+# a PASSING check look like a failure.
+nm "$WORK/winrun32" > "$WORK/nm.txt" 2>/dev/null || true
+strings "$WORK/winrun32" > "$WORK/strings.txt" 2>/dev/null || true
+if grep -qi "probe\|instrumented_stub" "$WORK/nm.txt"; then
+    note "FAIL: probe symbols linked in"; grep -i probe "$WORK/nm.txt" | head -5; fail=1
 else
     note "ok: no probe symbols"
 fi
-if strings "$WORK/winrun32" | grep -q '\[probe\]'; then
-    note "FAIL: probe trace strings linked in"; strings "$WORK/winrun32" | grep '\[probe\]' | head -5; fail=1
+if grep -q '\[probe\]' "$WORK/strings.txt"; then
+    note "FAIL: probe trace strings linked in"; grep '\[probe\]' "$WORK/strings.txt" | head -5; fail=1
 else
     note "ok: no probe trace strings"
 fi
 
-echo "== G4: a clean build reports unimplemented APIs honestly"
+echo "== G4: a clean build resolves what it implements, and claims nothing more"
 out="$(cd "$WORK" && "$WORK/winrun32" --check \
         "/home/danny/.local/share/Steam/steamapps/common/Fallout New Vegas/FalloutNV.exe" 2>&1)"
-if ! printf '%s' "$out" | grep -q 'Check FAILED'; then
-    note "FAIL: the clean build does not report the unimplemented imports"
-    fail=1
+if printf '%s' "$out" | grep -q 'Check PASSED'; then
+    note "ok: every import of the Steam exe resolves, DSOUND ordinal 11 included"
 else
-    missing="$(printf '%s' "$out" | grep -c 'UNRESOLVED' || true)"
-    note "ok: reports Check FAILED with ${missing} unresolved slot(s) still listed"
+    note "FAIL: the clean build leaves imports unresolved"
+    printf '%s\n' "$out" | grep 'UNRESOLVED' | head -5
+    fail=1
 fi
 # What is implemented, and what the artifact is not allowed to claim.
 #
-# libvorbisfile is bridged to the REAL i386 library, so it is resolved. DirectSound
-# is not implemented, so it must still be listed as unresolved: an artifact that
-# claims a device it does not have is the same failure mode as the dummy Steam
-# vtables the DRM rejected.
+# libvorbisfile is bridged to the REAL i386 library, so it is resolved.
+# DirectSound is implemented (COM objects over memory-backed buffers) and so it
+# resolves too -- but the claim must be backed by code inside the shipped
+# binary, and the limitation that remains (no PCM reaches a device) must stay
+# written down. A mute device presented as a working one is the same failure
+# mode as the dummy Steam vtables the DRM rejected.
 if printf '%s' "$out" | grep -qi 'UNRESOLVED libvorbisfile'; then
     note "FAIL: the vorbis bridge regressed; libvorbisfile is unresolved again"
     fail=1
@@ -107,13 +114,21 @@ else
     note "ok: libvorbisfile resolves to the real i386 library"
 fi
 if printf '%s' "$out" | grep -qi 'UNRESOLVED DSOUND\|UNRESOLVED dsound'; then
-    note "ok: DirectSound still reported unresolved, not claimed"
+    note "FAIL: DirectSound regressed to unresolved"
+    fail=1
 else
-    note "FAIL: the build claims DirectSound, which is not implemented"
+    note "ok: DirectSound resolves"
+fi
+if grep -q 'wins_dsound\.DirectSoundCreate' "$WORK/nm.txt"; then
+    note "ok: the wins_dsound implementation is linked (Create8 folds into Create; the ordinal proof is the PASS above)"
+else
+    note "FAIL: DirectSound is claimed but its implementation is not in the binary"
     fail=1
 fi
-if printf '%s' "$out" | grep -qiE 'DirectSoundCreate8.*implemented|ov_read.*implemented'; then
-    note "FAIL: the clean build claims a capability it does not have"
+if grep -q 'output device, so playback is silent' "$REPO/native/wins_dsound.zig"; then
+    note "ok: the silent-playback limitation is still documented"
+else
+    note "FAIL: the DirectSound limitation note was removed; a mute device would look complete"
     fail=1
 fi
 

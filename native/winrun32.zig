@@ -16,6 +16,7 @@ const kernel32_mod = @import("winrun_kernel32.zig");
 const msvcrt_mod = @import("winrun_msvcrt.zig");
 const vorbis_mod = @import("winrun_vorbis.zig");
 const extra_dlls_mod = @import("winrun_extra_dlls.zig");
+const dsound_mod = @import("wins_dsound.zig");
 // winrun_gui_support and x11_window are NOT imported: they need static libX11,
 // which is unavailable for the i386 target this loader builds for.
 const ordinals_mod = @import("winrun_ordinals.zig");
@@ -4065,9 +4066,14 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (vorbis_mod.lookupVorbisfile(name)) |addr| return @ptrFromInt(addr);
         return null;
     } else if (std.ascii.eqlIgnoreCase(dll, "dsound.dll")) {
-        // Not implemented: DirectSound is a subsystem. Failing here is deliberate
-        // and observable, unlike a silent success the game would build on.
-        std.debug.print("[WINS:winmm] dsound!{s} is not available\n", .{name});
+        // The real Steam build imports DSOUND ordinal 11, which the ordinal
+        // table maps to DirectSoundCreate8; with no implementation the loader
+        // refused to run the image. wins_dsound.zig carries the COM object
+        // graph (IDirectSound8 + IDirectSoundBuffer8 over memory-backed
+        // buffers). No PCM reaches a device yet, and that is stated in the
+        // module header rather than implied by a silent success.
+        if (dsound_mod.lookupDsound(name)) |addr| return @ptrFromInt(addr);
+        std.debug.print("[WINS:dsound] dsound!{s} is not available\n", .{name});
         return null;
     } else if (std.ascii.eqlIgnoreCase(dll, "ntdll.dll") or std.ascii.eqlIgnoreCase(dll, "ntdll")) {
         if (std.mem.eql(u8, name, "NtSetInformationThread")) return @ptrCast(&NtSetInformationThread);
