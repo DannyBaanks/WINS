@@ -78,6 +78,7 @@ p.write_text(s)
 print("probe: Steam gate neutralised (local copy only)")
 PY2
 
+python3 "$REPO/tools/patch_probe_nostart.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_steam.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_dump.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_wait.py" "$PROBE"
