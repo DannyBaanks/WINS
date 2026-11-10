@@ -80,13 +80,27 @@ PY2
 
 python3 "$REPO/tools/patch_probe_steam.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_dump.py" "$PROBE"
+python3 "$REPO/tools/patch_probe_wait.py" "$PROBE"
+python3 "$REPO/tools/patch_probe_abort.py" "$PROBE"
 
 # Dynamic glibc i386, not static: the honest bridge needs dlopen to load the
 # REAL Steam client, and a static build cannot dlopen at all (measured:
 # glibc answers "Dynamic loading not supported"). Verified equivalent to
 # the static build on the 7zr oracle: byte-identical output.
+#
+# --image-base 0x2000000 is load-bearing, not cosmetic. The guest's PE image
+# is mapped at 0x00400000 and is 16.5 MB wide, so it owns [0x400000, 0x147b000).
+# The kernel places the process's brk heap at a RANDOMISED address just above
+# the executable and grows it upward, so that heap lands inside the guest's
+# window in roughly half of all runs -- and the guest's image is mapped
+# MAP_FIXED, which silently replaces it. Measured: the real Steam client's
+# heap was destroyed that way and the client aborted later inside its own
+# malloc with "malloc(): unaligned tcache chunk detected".
+# The kernel derives start_brk from the LAST PT_LOAD of the executable, so
+# loading the loader itself above the guest's window puts start_brk -- and
+# therefore the heap -- permanently above it.
 "$ZIG" build-exe "$PROBE/winrun32.zig" -target x86-linux-gnu.2.39 -mcpu=i386 -O ReleaseFast -lc -dynamic \
-    --name winrun32_probe -femit-bin="$OUT"
+    --image-base 0x2000000 --name winrun32_probe -femit-bin="$OUT"
 
 echo "probe loader built: $OUT"
 echo "NOTE: measurement only. Never publish native/probe/ or this binary."

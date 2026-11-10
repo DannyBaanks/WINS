@@ -93,9 +93,8 @@ var g_probe_ecx: u32 = 0;
 var g_probe_edx: u32 = 0;
 
 fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
-    _ = sig;
     std.debug.print("\n=======================================================\n", .{});
-    std.debug.print("CRASH INTERCEPTED: Segmentation Fault (SIGSEGV)!\n", .{});
+    std.debug.print("CRASH INTERCEPTED: signal {d}\n", .{@intFromEnum(sig)});
     std.debug.print("Faulting Memory Address: 0x{x:0>8}\n", .{@intFromPtr(info.fields.sigfault.addr)});
     if (ctx_ptr) |ctx| {
         const uctx: *const Ucontext = @ptrCast(@alignCast(ctx));
@@ -111,6 +110,9 @@ fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque
         });
 
         const esp_val = uctx.uc_mcontext.esp;
+        // Which module holds the faulting instruction? The name is the only
+        // thing that says whether the client, libc, or the loader is at fault.
+        describeAddr(uctx.uc_mcontext.eip);
         if (esp_val > 0x1000 and esp_val < 0xFFFFF000) {
             const stack_words: [*]const u32 = @ptrFromInt(esp_val);
             std.debug.print("Stack Dump (top 8 dwords at ESP):\n", .{});
@@ -228,21 +230,36 @@ threadlocal var g_tls_thread_slots: [64]?*anyopaque = [_]?*anyopaque{null} ** 64
 var g_alloc_prot: u32 = 0x04;
 
 const HEAP_MAGIC: u32 = 0x57494E53; // "WINS"
+/// Header in front of every block the loader hands to the guest.
+///
+/// The magic is what makes a release safe. HeapFree may only release a block
+/// it can prove came from HeapAlloc; without the tag, a guest that frees a
+/// pointer it did not get from us makes the loader munmap an arbitrary range,
+/// and that range can be the real Steam client's heap. Measured: the client
+/// then aborted with "malloc(): unaligned tcache chunk detected", and the
+/// crash-time map showed its [heap] gone.
+///
+/// The layout is shared with winrun_kernel32.zig, so a block allocated
+/// through either heap implementation can be freed through either one.
 const HeapHeader = extern struct {
     magic: u32,
-    size: u32,
+    total: u32,
+    bytes: u32,
+    pad: u32,
 };
 
 fn HeapAlloc(hHeap: usize, dwFlags: u32, dwBytes: usize) callconv(W) ?*anyopaque {
     _ = hHeap;
-    const total = dwBytes + @sizeOf(HeapHeader);
+    const total = std.mem.alignForward(usize, dwBytes + @sizeOf(HeapHeader), 4096);
     const prot = linux.PROT{ .READ = true, .WRITE = true };
     const flags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     const ptr = linux.mmap(null, total, prot, flags, -1, 0);
     if (linux.errno(ptr) != .SUCCESS) return null;
     const hdr: *HeapHeader = @ptrFromInt(ptr);
     hdr.magic = HEAP_MAGIC;
-    hdr.size = @intCast(total);
+    hdr.total = @intCast(total);
+    hdr.bytes = @intCast(dwBytes);
+    hdr.pad = 0;
     const user_ptr: [*]u8 = @ptrFromInt(ptr + @sizeOf(HeapHeader));
     if ((dwFlags & 0x00000008) != 0) { // HEAP_ZERO_MEMORY
         @memset(user_ptr[0..dwBytes], 0);
@@ -257,13 +274,15 @@ fn HeapFree(hHeap: usize, dwFlags: u32, lpMem: ?*anyopaque) callconv(W) i32 {
         const hdr_ptr = u8_ptr - @sizeOf(HeapHeader);
         const hdr: *HeapHeader = @ptrCast(@alignCast(hdr_ptr));
         if (hdr.magic == HEAP_MAGIC) {
-            // hdr.size is the whole mapping including the guard page, so freeing
-            // releases all of it rather than leaving the guard behind.
-            _ = linux.munmap(hdr_ptr, hdr.size);
+            // hdr.total is the whole mapping, so freeing releases all of it.
+            _ = linux.munmap(hdr_ptr, hdr.total);
             return 1;
         }
+        // Not one of ours. Releasing it would unmap whatever the address
+        // happens to point at, which may be the real client's heap.
+        std.debug.print("[WINS:Kernel32] HeapFree: 0x{x} was not allocated here; leaving it alone\n", .{@intFromPtr(p)});
     }
-    return 1;
+    return 0;
 }
 
 fn HeapReAlloc(hHeap: usize, dwFlags: u32, lpMem: ?*anyopaque, dwBytes: usize) callconv(W) ?*anyopaque {
@@ -273,7 +292,7 @@ fn HeapReAlloc(hHeap: usize, dwFlags: u32, lpMem: ?*anyopaque, dwBytes: usize) c
     const hdr_ptr = u8_ptr - @sizeOf(HeapHeader);
     const hdr: *const HeapHeader = @ptrCast(@alignCast(hdr_ptr));
     if (hdr.magic == HEAP_MAGIC) {
-        const old_user_size = hdr.size - @sizeOf(HeapHeader);
+        const old_user_size = hdr.bytes;
         const copy_len = @min(old_user_size, dwBytes);
         const new_u8: [*]u8 = @ptrCast(new_mem);
         @memcpy(new_u8[0..copy_len], u8_ptr[0..copy_len]);
@@ -289,7 +308,7 @@ fn HeapSize(hHeap: usize, dwFlags: u32, lpMem: ?*anyopaque) callconv(W) usize {
         const hdr_ptr = u8_ptr - @sizeOf(HeapHeader);
         const hdr: *const HeapHeader = @ptrCast(@alignCast(hdr_ptr));
         if (hdr.magic == HEAP_MAGIC) {
-            return hdr.size - @sizeOf(HeapHeader);
+            return hdr.bytes;
         }
     }
     return 0;
@@ -384,6 +403,104 @@ fn rangeIsProtected(lo: usize, hi: usize) bool {
     return false;
 }
 
+/// Name the mapping that holds `addr`, so a fault can be attributed to a module
+/// instead of guessed at.
+fn describeAddr(addr: usize) void {
+    const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [16 * 1024]u8 = undefined;
+    const rn = linux.read(@intCast(fd), &buf, buf.len);
+    if (linux.errno(rn) != .SUCCESS) return;
+    var lines = std.mem.splitScalar(u8, buf[0..@intCast(rn)], '\n');
+    while (lines.next()) |line| {
+        const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+        const mlo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+        const rest = line[dash + 1 ..];
+        const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+        const mhi = std.fmt.parseInt(usize, rest[0..sp], 16) catch continue;
+        if (addr >= mlo and addr < mhi) {
+            std.debug.print("  EIP 0x{x:0>8} is in: {s}\n", .{ addr, line });
+            return;
+        }
+    }
+    std.debug.print("  EIP 0x{x:0>8} is in: (unmapped)\n", .{addr});
+}
+
+/// Print the mappings that overlap [lo, hi), so a collision can be named
+/// instead of guessed at.
+fn describeOverlap(lo: usize, hi: usize) void {
+    const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [16 * 1024]u8 = undefined;
+    const rn = linux.read(@intCast(fd), &buf, buf.len);
+    if (linux.errno(rn) != .SUCCESS) return;
+    var lines = std.mem.splitScalar(u8, buf[0..@intCast(rn)], '\n');
+    while (lines.next()) |line| {
+        const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+        const mlo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+        const rest = line[dash + 1 ..];
+        const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+        const mhi = std.fmt.parseInt(usize, rest[0..sp], 16) catch continue;
+        if (lo < mhi and hi > mlo) std.debug.print("    overlapping: {s}\n", .{line});
+    }
+}
+
+/// Is any part of [lo, hi) mapped by something that is not the guest's own?
+///
+/// Read from /proc/self/maps at the moment of the question, because the
+/// snapshot in g_protected is taken once and goes stale: the real client
+/// creates thread stacks and arenas after it, and those are anonymous, so
+/// they never appear in the named-region filter the snapshot uses. A guest
+/// reservation placed over one of those puts the guest's writes on top of the
+/// client's live memory, which is what the client reports as "malloc():
+/// unaligned tcache chunk detected": the bad tcache entry was a tick count
+/// the client had written into a chunk the guest had taken over.
+///
+/// The guest's own memory does not count as foreign. The guest asks for its
+/// module images section by section -- 0x10000000 for the whole image, then
+/// 0x10001000, 0x10042000, 0x1005a000, 0x10063000 for the sections inside it
+/// -- so the second request lands on a range the loader already mapped for the
+/// guest. Honouring that is load-bearing; relocating it breaks the guest.
+fn rangeIsForeign(lo: usize, hi: usize) bool {
+    const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) {
+        // If the maps cannot be read, assume the worst: a reservation that
+        // silently lands on someone else's memory is the failure mode this
+        // whole check exists to prevent.
+        return true;
+    }
+    defer _ = linux.close(@intCast(fd));
+    var buf: [16 * 1024]u8 = undefined;
+    const rn = linux.read(@intCast(fd), &buf, buf.len);
+    if (linux.errno(rn) != .SUCCESS) return true;
+    var lines = std.mem.splitScalar(u8, buf[0..@intCast(rn)], '\n');
+    while (lines.next()) |line| {
+        const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+        const mlo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+        const rest = line[dash + 1 ..];
+        const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+        const mhi = std.fmt.parseInt(usize, rest[0..sp], 16) catch continue;
+        if (lo < mhi and hi > mlo) {
+            const olo = @max(mlo, lo);
+            const ohi = @min(mhi, hi);
+            if (!rangeIsGuestOwned(olo, ohi)) return true;
+        }
+    }
+    return false;
+}
+
+/// Is [lo, hi) inside memory the loader made for the guest?
+fn rangeIsGuestOwned(lo: usize, hi: usize) bool {
+    for (g_reservations) |r| {
+        if (r.size != 0 and lo >= r.base and hi <= r.base + r.size) return true;
+    }
+    if (g_guest_base != 0 and lo >= g_guest_base and hi <= g_guest_end) return true;
+    if (g_guest_stack_base != 0 and lo >= g_guest_stack_end and hi <= g_guest_stack_base) return true;
+    return false;
+}
+
 /// Read /proc/self/maps and protect glibc's heap plus everything the real Steam
 /// client has mapped. Called once the client is loaded, because before that
 /// there is nothing of theirs to protect.
@@ -436,8 +553,23 @@ fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, fl
     const free_flags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     var ptr: usize = undefined;
     if (requested) |req| {
-        if (rangeIsProtected(@intFromPtr(req), @intFromPtr(req) + dwSize)) {
-            std.debug.print("[WINS:Kernel32] VirtualAlloc: 0x{x}+{d} is foreign memory; relocating\n", .{ @intFromPtr(req), dwSize });
+        // The question is not "is this range one the snapshot knew about" but
+        // "is this range free right now". The snapshot is taken once, when the
+        // client is loaded, and it only covers the named regions (the heap,
+        // steamclient.so, libc.so, libstdc++, libm.so). Everything the client
+        // allocates afterwards is anonymous: thread stacks, per-thread arenas,
+        // its own buffers. A guest reservation placed over one of those puts
+        // the guest's writes on top of the client's live memory, which is what
+        // the client reports as "malloc(): unaligned tcache chunk detected":
+        // the bad tcache entry was a tick count the client had written into a
+        // chunk the guest had taken over.
+        //
+        // So ask the kernel, here, now: /proc/self/maps is the only authority
+        // on what is mapped. The address is still honoured when it is actually
+        // free, because the guest maps its own image at the base its PE header
+        // names and that is load-bearing.
+        if (rangeIsForeign(@intFromPtr(req), @intFromPtr(req) + dwSize)) {
+            std.debug.print("[WINS:Kernel32] VirtualAlloc: 0x{x}+{d} is not the guest's; relocating\n", .{ @intFromPtr(req), dwSize });
             ptr = linux.mmap(null, dwSize, prot, free_flags, -1, 0);
         } else {
             const fixed = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };
@@ -484,9 +616,28 @@ fn untrackReservation(base: usize) void {
     }
 }
 
+/// Release a block the loader owns, for the kernel32 module's VirtualFree.
+///
+/// The module has its own export table and cannot see g_reservations, so it
+/// used to munmap (address, dwSize) unconditionally -- which meant a guest
+/// free could unmap the real Steam client's heap. The module now calls this
+/// instead: a release that cannot prove ownership does not unmap.
+pub fn releaseOwnedBlock(addr: usize, size: usize) bool {
+    for (g_reservations) |r| {
+        if (r.size != 0 and addr >= r.base and addr < r.base + r.size) {
+            _ = linux.munmap(@as([*]u8, @ptrFromInt(r.base)), r.size);
+            untrackReservation(r.base);
+            return true;
+        }
+    }
+    _ = size;
+    return false;
+}
+
 fn VirtualFree(lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32) callconv(W) i32 {
     if (lpAddress) |addr| {
         const base = @intFromPtr(addr);
+        std.debug.print("[WINS:Kernel32] VirtualFree(0x{x}, size={d}, type=0x{x})\n", .{ base, dwSize, dwFreeType });
         // MEM_RELEASE (0x8000) with dwSize 0 releases the whole reservation;
         // MEM_DECOMMIT (0x4000) only withdraws the pages, which here means
         // making them inaccessible rather than unmapping the neighbours. A
@@ -501,7 +652,13 @@ fn VirtualFree(lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32) callconv(
                 break;
             }
         }
-        if (size == 0) size = if (dwSize == 0) 4096 else dwSize;
+        if (size == 0) {
+            // Not one of our reservations. Unmapping it would destroy memory
+            // that belongs to someone else -- the real client, libc, or the
+            // kernel. A release that cannot prove ownership must not unmap.
+            std.debug.print("[WINS:Kernel32] VirtualFree: 0x{x} is not one of our reservations; refusing to release it\n", .{base});
+            return 0;
+        }
         if (is_decommit and !is_release) {
             _ = linux.mprotect(@as([*]u8, @ptrFromInt(base)), size, linux.PROT{});
             return 1;
@@ -519,16 +676,12 @@ fn VirtualProtect(lpAddress: ?*anyopaque, dwSize: usize, flNewProtect: u32, lpfl
     std.debug.print("[WINS:Kernel32] VirtualProtect(0x{x}, size={d}, prot=0x{x})\n", .{ @intFromPtr(lpAddress), dwSize, flNewProtect });
     if (lpAddress) |p| {
         const u8_ptr: [*]u8 = @constCast(@ptrCast(p));
-        // Check if steamdrm.dll has been unpacked
-        const sig = "\x0f\x85\xc5\x00\x00\x00";
-        if (@intFromPtr(p) >= 0x1000 and @intFromPtr(p) < 0x70000000 and dwSize >= 0x4900) {
-            if (std.mem.eql(u8, u8_ptr[0x4843..0x4849], sig)) {
-                std.debug.print("[WINS:SteamDRM] Recognized steamdrm.dll in VirtualProtect at 0x{x}!\n", .{@intFromPtr(p)});
-                _ = linux.mprotect(@ptrCast(u8_ptr), 0x10000, linux.PROT{ .READ = true, .WRITE = true, .EXEC = true });
-                @memcpy(u8_ptr[0x4843..0x4849], "\xe9\xfe\x02\x00\x00\x90");
-                std.debug.print("  [WINS:SteamDRM] Patched RSA ticket gate to direct AES in-RAM decryption!\n", .{});
-            }
-        }
+        // NOTE: there used to be a steamdrm.dll signature check here that
+        // rewrote the RSA-ticket gate into a direct AES decrypt (JNE -> JMP).
+        // That was the loader bypassing the DRM check itself, which is exactly
+        // what "Steam still owns my DRM" forbids: the loader must not stand in
+        // for the client. Steam owns verification, so the loader leaves the
+        // guest's DRM code alone and only translates the API around it.
         const prot = linux.PROT{
             .READ = (flNewProtect & 0x66) != 0,
             .WRITE = (flNewProtect & 0x44) != 0,
@@ -2582,15 +2735,126 @@ fn realSlot(self: usize, k: usize) usize {
     return vt[k];
 }
 
+/// Forward a call into the real client with the stack the Linux ABI requires.
+///
+/// Why this exists, measured: the real client's SSE store
+///
+///     movaps %xmm4,-0x78(%ebp)
+///
+/// faulted because the destination was 8 mod 16. The Linux i386 ABI requires ESP
+/// to be 16-byte aligned at the point of a call. The Microsoft i386 ABI does
+/// not require that; the guest's stack is only 4-byte aligned, and it is the
+/// guest's stack we are standing on when it calls us. Forwarding with the
+/// guest's stack as-is hands Linux-compiled code an alignment it is allowed to
+/// assume and does not get.
+///
+/// The shape is the standard trampoline. Save the caller's ESP, move down to a
+/// 16-byte boundary, lay out the frame the callee expects, call with ESP
+/// 16-byte aligned, restore the caller's ESP exactly. Moving *down* matters:
+/// `andl $-16, %esp` rounds the value down, which on a stack means moving up,
+/// and that lands inside this function's own frame.
+///
+/// The frame the callee reads is [ret][a0][a1]..., so a0 is the first argument.
+/// For a Windows method on a COM-ish object, `this` is that first argument; for
+/// a flat exported helper it is not there at all. Passing a `this` word to a
+/// flat helper shifts every real argument by one, so the two cases get
+/// different helpers rather than one helper with a flag.
+///
+/// The padding is what keeps ESP aligned at the call: the preamble leaves ESP
+/// 16-byte aligned, and this helper pushes exactly four words in total
+/// (padding plus arguments), so ESP is 16-byte aligned again when `call` runs.
+///
+/// EBX holds the saved ESP. It is callee-saved, so the real client preserves
+/// it, and it is declared clobbered so that Zig saves and restores the
+/// caller's EBX around the block and never allocates an operand to it. An
+/// ordinary "=r" output would have been a bug: EAX, ECX and EDX are
+/// caller-saved, the real client overwrites them, and the restored ESP would
+/// then have been garbage.
+fn callAligned0(fnptr: usize) usize {
+    var ret: usize = undefined;
+    asm volatile (
+        \\ movl %%esp, %%ebx
+        \\ subl $12, %%esp
+        \\ andl $-16, %%esp
+        \\ call *%[fnptr]
+        \\ movl %%ebx, %%esp
+        : [ret] "={eax}" (ret),
+        : [fnptr] "r" (fnptr),
+        : .{ .memory = true, .cc = true, .ecx = true, .edx = true, .ebx = true }
+    );
+    return ret;
+}
+
+fn callAligned1(fnptr: usize, a0: usize) usize {
+    var ret: usize = undefined;
+    asm volatile (
+        \\ movl %%esp, %%ebx
+        \\ subl $12, %%esp
+        \\ andl $-16, %%esp
+        \\ subl $12, %%esp
+        \\ pushl %[a0]
+        \\ call *%[fnptr]
+        \\ movl %%ebx, %%esp
+        : [ret] "={eax}" (ret),
+        : [a0] "r" (a0),
+          [fnptr] "r" (fnptr),
+        : .{ .memory = true, .cc = true, .ecx = true, .edx = true, .ebx = true }
+    );
+    return ret;
+}
+
+fn callAligned2(fnptr: usize, a0: usize, a1: usize) usize {
+    var ret: usize = undefined;
+    asm volatile (
+        \\ movl %%esp, %%ebx
+        \\ subl $12, %%esp
+        \\ andl $-16, %%esp
+        \\ subl $8, %%esp
+        \\ pushl %[a1]
+        \\ pushl %[a0]
+        \\ call *%[fnptr]
+        \\ movl %%ebx, %%esp
+        : [ret] "={eax}" (ret),
+        : [a1] "r" (a1),
+          [a0] "r" (a0),
+          [fnptr] "r" (fnptr),
+        : .{ .memory = true, .cc = true, .ecx = true, .edx = true, .ebx = true }
+    );
+    return ret;
+}
+
+fn callAligned3(fnptr: usize, a0: usize, a1: usize, a2: usize) usize {
+    var ret: usize = undefined;
+    asm volatile (
+        \\ movl %%esp, %%ebx
+        \\ subl $12, %%esp
+        \\ andl $-16, %%esp
+        \\ subl $4, %%esp
+        \\ pushl %[a2]
+        \\ pushl %[a1]
+        \\ pushl %[a0]
+        \\ call *%[fnptr]
+        \\ movl %%ebx, %%esp
+        : [ret] "={eax}" (ret),
+        : [a2] "r" (a2),
+          [a1] "r" (a1),
+          [a0] "r" (a0),
+          [fnptr] "r" (fnptr),
+        : .{ .memory = true, .cc = true, .ecx = true, .edx = true, .ebx = true }
+    );
+    return ret;
+}
+
 // ---- ISteamClient010 -------------------------------------------------------
 
 fn a000_CreateSteamPipe(self: usize) callconv(Tc) u32 {
     _ = self;
     // Through the client's own exported helper, not its vtable: measured, a
     // method called on the CreateInterface object crashes inside the client,
-    // while the helper returns a valid handle.
+    // while the helper returns a valid handle. The call is aligned, because the
+    // guest's stack is only 4-byte aligned and Linux code assumes 16.
     if (g_pipe_fn) |f| {
-        const pipe = f();
+        const pipe: u32 = @truncate(callAligned0(@intFromPtr(f)));
         std.debug.print("[WINS:Steam] ISteamClient010::CreateSteamPipe() -> real client, pipe={d}\n", .{pipe});
         return pipe;
     }
@@ -2605,7 +2869,8 @@ fn a001_BReleaseSteamPipe(self: usize, hSteamPipe: u32) callconv(Tc) i32 {
 fn a002_ConnectToGlobalUser(self: usize, hSteamPipe: u32) callconv(Tc) u32 {
     _ = self;
     if (g_user_fn) |f| {
-        const user = f(hSteamPipe);
+        // Aligned for the same reason as CreateSteamPipe: the Linux ABI needs 16.
+        const user: u32 = @truncate(callAligned1(@intFromPtr(f), hSteamPipe));
         std.debug.print("[WINS:Steam] ISteamClient010::ConnectToGlobalUser(pipe={d}) -> real client, user={d}\n", .{ hSteamPipe, user });
         return user;
     }
@@ -4031,13 +4296,25 @@ fn setupTib() !void {
 // ============================================================================
 
 pub fn main(init: std.process.Init) !void {
-    // Ask the real Steam client for its interface HERE, before any guest code
-    // runs, because that is the only point at which it is measured to answer.
-    // Called later -- from the DRM's own CreateInterface, after the guest has
-    // executed -- the identical dlopen + CreateInterface aborts with
-    // "malloc(): unaligned tcache chunk detected": by then the guest has
-    // corrupted glibc's heap. It is the same request either way, so making it
-    // early changes nothing about who answers, only where the machine is.
+    // The real Steam client is loaded LATER, once the guest's image window is
+    // reserved (see the image mapping below). The order matters and was
+    // measured, not guessed:
+    //
+    // glibc's heap grows with brk(), and Linux randomises where that heap
+    // starts. The guest's image lives at 0x00400000 and is 16.5 MB wide, so a
+    // randomised brk heap that starts below it and grows upward lands INSIDE
+    // the image window. The image is mapped MAP_FIXED, so the heap is
+    // silently replaced by the image: the client's live allocations are
+    // destroyed, and the client aborts later inside its own malloc with
+    // "malloc(): unaligned tcache chunk detected". The loader even printed
+    // the collision and then overwrote the memory anyway:
+    //
+    //   [Memory] WARNING: 0x00400000+17281024 overlaps live memory ...
+    //     overlapping: 00b38000-00bdd000 rw-p [heap]
+    //
+    // Reserving the image first inverts the race: brk cannot grow into a
+    // window that is already mapped, so glibc falls back to mmap for the
+    // overflow and the client's heap stays intact.
     //
     // Only when the environment says a Steam product is being run. SteamAppId is
     // set by the real client for the processes it launches, and nothing else
@@ -4045,10 +4322,6 @@ pub fn main(init: std.process.Init) !void {
     // keeps a 50 MB library out of every unrelated guest. Measured: with the
     // call unconditional, 7zr's run differed from its oracle by one log line and
     // nothing else, which is how the mistake was caught.
-    if (getenv("SteamAppId") != null) loadRealSteamClient();
-    // Before any guest code runs, because the guest's address reservations
-              // (MAP_FIXED) happen before it ever asks for the Steam interface.
-    protectForeignMemory();
     const io = init.io;
     g_io = io;
     const allocator = init.arena.allocator();
@@ -4295,6 +4568,21 @@ pub fn main(init: std.process.Init) !void {
         .FIXED = true,
     };
 
+    // MAP_FIXED replaces whatever was there, silently. The guest's image is
+    // 16.5 MB, so if the real client -- which is loaded before the guest runs
+    // and whose heap, arenas and thread stacks are anonymous, so they never
+    // show up in a filter by module name -- happens to hold anything inside
+    // that window, the client's live memory is destroyed here. The client
+    // notices much later, when its next malloc pops a corrupted tcache entry
+    // and aborts with "malloc(): unaligned tcache chunk detected".
+    //
+    // Checked before the mapping, not after: after it, the region is the
+    // guest's own and would always look foreign.
+    if (rangeIsForeign(image_base, image_base + size_of_image)) {
+        std.debug.print("  [Memory] WARNING: 0x{x:0>8}+{d} overlaps live memory that is not the guest's.\\n", .{ image_base, size_of_image });
+        describeOverlap(image_base, image_base + size_of_image);
+    }
+
     const mapped_ptr = linux.mmap(
         @ptrFromInt(image_base),
         size_of_image,
@@ -4312,10 +4600,26 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  [Memory] Successfully mapped 0x{x:0>8} (size: {d} bytes).\n", .{ image_base, size_of_image });
     registerGuestImage(image_base, size_of_image);
 
+    // The guest's image window is now reserved, so the real client's brk heap
+    // cannot grow into it. Load the client NOW, before any guest code runs:
+    // the client answers for itself, and the loader only translates the API
+    // around it. SteamAppId is set by the real client for the processes it
+    // launches, and nothing else sets it, so it is the client's own statement
+    // about its child -- and it keeps a 50 MB library out of every unrelated
+    // guest. Measured: with the call unconditional, 7zr's run differed from
+    // its oracle by one log line and nothing else, which is how the mistake
+    // was caught.
+    if (getenv("SteamAppId") != null) loadRealSteamClient();
+    // Before any guest code runs, because the guest's address reservations
+    // (MAP_FIXED) happen before it ever asks for the Steam interface.
+    protectForeignMemory();
+
     // The delegated libraries keep their own image-base and command-line state.
     // The local table above shadows GetCommandLineA/GetModuleFileNameA, but the
     // module versions are reachable through GetProcAddress, so keep them honest.
     kernel32_mod.setImageBase(@intCast(image_base));
+    // Give the module's VirtualFree a way to prove ownership before it unmaps.
+    kernel32_mod.release_hook = releaseOwnedBlock;
     msvcrt_mod.setArgs(guest_args.items);
     kernel32_mod.setCommandLine(guest_args.items);
     setGuestCommandLine(guest_args.items);

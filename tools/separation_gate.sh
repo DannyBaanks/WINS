@@ -49,8 +49,12 @@ fi
 # recorded the client as unloadable. A build that is not dynamic cannot carry
 # the bridge, so the gate builds what is shipped and asserts the linkage rather
 # than assuming it.
+# --image-base 0x2000000 must match the shipped build exactly (see
+# tools/build_probe.sh for why it is load-bearing): the gate has to build what
+# is shipped, not a variant of it.
 if ! "$ZIG" build-exe "$REPO/native/winrun32.zig" -target x86-linux-gnu.2.39 -mcpu=i386 \
-        -O ReleaseFast -lc -dynamic --name winrun32 -femit-bin="$WORK/winrun32" 2>"$WORK/build.log"; then
+        -O ReleaseFast -lc -dynamic --image-base 0x2000000 --name winrun32 \
+        -femit-bin="$WORK/winrun32" 2>"$WORK/build.log"; then
     note "FAIL: clean build does not compile"; head -8 "$WORK/build.log"; fail=1
 else
     note "ok: compiles with the lab absent"

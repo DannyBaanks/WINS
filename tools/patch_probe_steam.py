@@ -41,9 +41,15 @@ for line in target.read_text().split("\n"):
             "        // the protocol is presence-only; if it still fails, the answer is",
             "        // validated and no honest bridge exists without the real client.",
             "        if (st == 2 and tk != 0 and tg != 0) {",
-            "            @as(*u32, @ptrFromInt(tg)).* = tk;",
-            "            @as(*u32, @ptrFromInt(ptr + 0x94)).* = 3;",
-            '            std.debug.print("[probe] echoed token to 0x{x:0>8}, status=3\\n", .{tg});',
+            "            // The echo writes to an address that belongs to another",
+            "            // process, so it faults there. It stays an instrument, but",
+            "            // it is opt-in: the default run must reach the guest's own",
+            "            // exit path instead of dying inside the probe.",
+            '            if (getenv("WINS_PROBE_ECHO") != null) {',
+            "                @as(*u32, @ptrFromInt(tg)).* = tk;",
+            "                @as(*u32, @ptrFromInt(ptr + 0x94)).* = 3;",
+            '                std.debug.print("[probe] echoed token to 0x{x:0>8}, status=3\\n", .{tg});',
+            "            }",
             "        }",
         ]
 

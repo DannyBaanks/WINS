@@ -136,15 +136,29 @@ fn GetProcessHeap() callconv(W) usize {
     return HEAP_COOKIE;
 }
 
+/// Shared with winrun32.zig: a block is ours only if this magic is in front
+/// of it. A free that cannot find the magic must not unmap: the address may
+/// belong to the real Steam client.
+const HEAP_MAGIC: u32 = 0x57494E53; // "WINS"
+const HeapHeader = extern struct {
+    magic: u32,
+    total: u32,
+    bytes: u32,
+    pad: u32,
+};
+
 fn HeapAlloc(h: usize, flags: u32, bytes: usize) callconv(W) ?[*]u8 {
     _ = h;
-    const total = std.mem.alignForward(usize, bytes + 2 * @sizeOf(usize), 4096);
+    const total = std.mem.alignForward(usize, bytes + @sizeOf(HeapHeader), 4096);
     const mrc = linux.mmap(null, total, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     if (linux.errno(mrc) != .SUCCESS) return null;
     const p: [*]u8 = @ptrFromInt(mrc);
-    std.mem.writeInt(usize, p[0..@sizeOf(usize)], total, .little);
-    std.mem.writeInt(usize, p[@sizeOf(usize)..2 * @sizeOf(usize)], bytes, .little);
-    const user = p + 2 * @sizeOf(usize);
+    const hdr: *HeapHeader = @ptrCast(@alignCast(p));
+    hdr.magic = HEAP_MAGIC;
+    hdr.total = @intCast(total);
+    hdr.bytes = @intCast(bytes);
+    hdr.pad = 0;
+    const user = p + @sizeOf(HeapHeader);
     if (flags & 0x00000008 != 0) { // HEAP_ZERO_MEMORY
         @memset(user[0..bytes], 0);
     }
@@ -155,16 +169,24 @@ fn HeapFree(h: usize, flags: u32, ptr: ?[*]u8) callconv(W) u32 {
     _ = h;
     _ = flags;
     if (ptr == null) return 1;
-    const p = @as([*]u8, @ptrCast(ptr.?)) - 2 * @sizeOf(usize);
-    const total = std.mem.readInt(usize, p[0..@sizeOf(usize)], .little);
-    _ = linux.munmap(p, total);
+    const p = @as([*]u8, @ptrCast(ptr.?)) - @sizeOf(HeapHeader);
+    const hdr: *const HeapHeader = @ptrCast(@alignCast(p));
+    if (hdr.magic != HEAP_MAGIC) {
+        // Not one of ours. The old code took the size from wherever the
+        // pointer happened to point and unmapped that much, which destroyed
+        // the real client's heap. Leave it alone.
+        std.debug.print("[WINS:Kernel32] HeapFree: 0x{x} was not allocated here; leaving it alone\n", .{@intFromPtr(ptr.?)});
+        return 0;
+    }
+    _ = linux.munmap(p, hdr.total);
     return 1;
 }
 
 fn HeapReAlloc(h: usize, flags: u32, ptr: ?[*]u8, bytes: usize) callconv(W) ?[*]u8 {
     if (ptr == null) return HeapAlloc(h, flags, bytes);
-    const old_p = @as([*]u8, @ptrCast(ptr.?)) - 2 * @sizeOf(usize);
-    const old_bytes = std.mem.readInt(usize, old_p[@sizeOf(usize)..2 * @sizeOf(usize)], .little);
+    const old_p = @as([*]u8, @ptrCast(ptr.?)) - @sizeOf(HeapHeader);
+    const old_hdr: *const HeapHeader = @ptrCast(@alignCast(old_p));
+    const old_bytes = old_hdr.bytes;
     const new_ptr = HeapAlloc(h, flags, bytes) orelse return null;
     const copy_len = @min(old_bytes, bytes);
     if (copy_len > 0) @memcpy(new_ptr[0..copy_len], ptr.?[0..copy_len]);
@@ -176,8 +198,10 @@ fn HeapSize(h: usize, flags: u32, ptr: ?[*]u8) callconv(W) usize {
     _ = h;
     _ = flags;
     if (ptr == null) return 0;
-    const p = @as([*]u8, @ptrCast(ptr.?)) - 2 * @sizeOf(usize);
-    return std.mem.readInt(usize, p[@sizeOf(usize)..2 * @sizeOf(usize)], .little);
+    const p = @as([*]u8, @ptrCast(ptr.?)) - @sizeOf(HeapHeader);
+    const hdr: *const HeapHeader = @ptrCast(@alignCast(p));
+    if (hdr.magic != HEAP_MAGIC) return 0;
+    return hdr.bytes;
 }
 
 fn HeapValidate(h: usize, flags: u32, ptr: ?*anyopaque) callconv(W) u32 {
@@ -2112,12 +2136,23 @@ fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, fl
     return @ptrFromInt(mrc);
 }
 
+/// Installed by the loader: release a block only if the loader can prove it
+/// owns it. A free that cannot prove ownership must not unmap -- the address
+/// may belong to the real Steam client, and unmapping it is what made the
+/// client abort with "malloc(): unaligned tcache chunk detected".
+pub var release_hook: ?*const fn (usize, usize) bool = null;
+
 fn VirtualFree(lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32) callconv(W) i32 {
     _ = dwFreeType;
     if (lpAddress) |addr| {
-        _ = linux.munmap(@ptrCast(@alignCast(addr)), dwSize);
+        const base = @intFromPtr(addr);
+        std.debug.print("[WINS:Kernel32] VirtualFree(0x{x}, size={d})\n", .{ base, dwSize });
+        if (release_hook) |hook| {
+            if (hook(base, dwSize)) return 1;
+        }
+        std.debug.print("[WINS:Kernel32] VirtualFree: 0x{x} is not one of our allocations; refusing to release it\n", .{base});
     }
-    return 1;
+    return 0;
 }
 
 fn GetThreadContext(hThread: usize, lpContext: ?*anyopaque) callconv(W) i32 {
