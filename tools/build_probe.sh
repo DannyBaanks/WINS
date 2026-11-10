@@ -26,7 +26,7 @@ mkdir -p "$PROBE"
 # The probe is the public loader copied verbatim, so a change to the loader can
 # never silently diverge from what gets measured.
 for src in winrun32.zig winrun_kernel32.zig winrun_msvcrt.zig winrun_extra_dlls.zig \
-           winrun_ordinals.zig wins_d3d9.zig wins_graph.zig; do
+           winrun_ordinals.zig wins_d3d9.zig wins_graph.zig winrun_vorbis.zig; do
     cp "$REPO/native/$src" "$PROBE/$src"
 done
 

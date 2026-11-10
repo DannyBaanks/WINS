@@ -2489,6 +2489,23 @@ const Tc = std.builtin.CallingConvention{ .x86_thiscall = .{} };
 
 /// The real ISteamClient object the real client's CreateInterface returned.
 var g_real_iface: usize = 0;
+var g_real_create: ?*const fn ([*:0]const u8, ?*i32) callconv(Cc) ?*anyopaque = null;
+var g_pipe_fn: ?*const fn () callconv(Cc) u32 = null;
+var g_user_fn: ?*const fn (u32) callconv(Cc) u32 = null;
+
+/// The client's factory, used for every sub-interface: the guest names the
+/// version it wants, and the client answers. This replaces walking the client's
+/// vtable, which is measured to crash because the client has not been driven
+/// through its own entry points.
+fn realFactory(version: [*:0]const u8) usize {
+    if (g_real_create) |f| {
+        var rc: i32 = -1;
+        const got = f(version, &rc);
+        if (got) |g| return @intFromPtr(g);
+        std.debug.print("[WINS:Steam] the real client did not supply \"{s}\" (rc={d})\n", .{ version, rc });
+    }
+    return 0;
+}
 
 extern fn dlopen(path: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, sym: [*:0]const u8) ?*anyopaque;
@@ -2521,6 +2538,14 @@ fn loadRealSteamClient() void {
         return;
     };
     const create: *const fn (?[*:0]const u8, ?*i32) callconv(.c) ?*anyopaque = @ptrCast(sym);
+    // The client's own flat helpers. Measured: CreateInterface succeeds but a
+    // method called on the object it returns crashes inside the client with a
+    // null dereference, while Steam_CreateSteamPipe() and
+    // Steam_ConnectToGlobalUser(pipe) both return valid handles. So the client
+    // initialises through its own API, and that is what the bridge drives --
+    // using the client's entry points rather than a vtable it has not set up.
+    g_pipe_fn = @ptrCast(dlsym(handle, "Steam_CreateSteamPipe"));
+    g_user_fn = @ptrCast(dlsym(handle, "Steam_ConnectToGlobalUser"));
     var rc: i32 = -1;
     const iface = create("SteamClient010", &rc) orelse {
         std.debug.print("[WINS:SteamBridge] the real client refused SteamClient010 (rc={d}).\n", .{rc});
@@ -2557,9 +2582,16 @@ fn realSlot(self: usize, k: usize) usize {
 // ---- ISteamClient010 -------------------------------------------------------
 
 fn a000_CreateSteamPipe(self: usize) callconv(Tc) u32 {
-    const f: *const fn (usize) callconv(Cc) u32 = @ptrFromInt(realSlot(self, 0));
-    std.debug.print("[WINS:Steam] ISteamClient010::CreateSteamPipe() -> real client\n", .{});
-    return f(realOf(self));
+    _ = self;
+    // Through the client's own exported helper, not its vtable: measured, a
+    // method called on the CreateInterface object crashes inside the client,
+    // while the helper returns a valid handle.
+    if (g_pipe_fn) |f| {
+        const pipe = f();
+        std.debug.print("[WINS:Steam] ISteamClient010::CreateSteamPipe() -> real client, pipe={d}\n", .{pipe});
+        return pipe;
+    }
+    return 0;
 }
 
 fn a001_BReleaseSteamPipe(self: usize, hSteamPipe: u32) callconv(Tc) i32 {
@@ -2568,9 +2600,13 @@ fn a001_BReleaseSteamPipe(self: usize, hSteamPipe: u32) callconv(Tc) i32 {
 }
 
 fn a002_ConnectToGlobalUser(self: usize, hSteamPipe: u32) callconv(Tc) u32 {
-    const f: *const fn (usize, u32) callconv(Cc) u32 = @ptrFromInt(realSlot(self, 2));
-    std.debug.print("[WINS:Steam] ISteamClient010::ConnectToGlobalUser(pipe={d}) -> real client\n", .{hSteamPipe});
-    return f(realOf(self), hSteamPipe);
+    _ = self;
+    if (g_user_fn) |f| {
+        const user = f(hSteamPipe);
+        std.debug.print("[WINS:Steam] ISteamClient010::ConnectToGlobalUser(pipe={d}) -> real client, user={d}\n", .{ hSteamPipe, user });
+        return user;
+    }
+    return 0;
 }
 
 fn a004_ReleaseUser(self: usize, hSteamPipe: u32, hSteamUser: u32) callconv(Tc) void {
@@ -2579,24 +2615,30 @@ fn a004_ReleaseUser(self: usize, hSteamPipe: u32, hSteamUser: u32) callconv(Tc) 
 }
 
 fn a005_GetISteamUser(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
-    const f: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(realSlot(self, 5));
+    _ = self; _ = hSteamUser; _ = hSteamPipe;
+    // The guest names the version it wants; the client's own factory answers.
+    // Walking the client's vtable here is measured to crash.
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamUser(\"{s}\") -> real client\n", .{ver});
-    return wrapSub(f(realOf(self), hSteamUser, hSteamPipe, pchVersion));
+    return wrapSub(realFactory(pchVersion orelse return 0));
 }
 
 fn a009_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
-    const f: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(realSlot(self, 9));
+    _ = self; _ = hSteamUser; _ = hSteamPipe;
+    // The guest names the version it wants; the client's own factory answers.
+    // Walking the client's vtable here is measured to crash.
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamGenericInterface(\"{s}\") -> real client\n", .{ver});
-    return wrapSub(f(realOf(self), hSteamUser, hSteamPipe, pchVersion));
+    return wrapSub(realFactory(pchVersion orelse return 0));
 }
 
 fn a013_GetISteamAppTicket(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
-    const f: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(realSlot(self, 13));
+    _ = self; _ = hSteamUser; _ = hSteamPipe;
+    // The guest names the version it wants; the client's own factory answers.
+    // Walking the client's vtable here is measured to crash.
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamAppTicket(\"{s}\") -> real client\n", .{ver});
-    return wrapSub(f(realOf(self), hSteamUser, hSteamPipe, pchVersion));
+    return wrapSub(realFactory(pchVersion orelse return 0));
 }
 
 fn a_stub(self: usize) callconv(Tc) u32 {
@@ -3986,6 +4028,14 @@ fn setupTib() !void {
 // ============================================================================
 
 pub fn main(init: std.process.Init) !void {
+    // Ask the real Steam client for its interface HERE, before any guest code
+    // runs, because that is the only point at which it is measured to answer.
+    // Called later -- from the DRM's own CreateInterface, after the guest has
+    // executed -- the identical dlopen + CreateInterface aborts with
+    // "malloc(): unaligned tcache chunk detected": by then the guest has
+    // corrupted glibc's heap. It is the same request either way, so making it
+    // early changes nothing about who answers, only where the machine is.
+    loadRealSteamClient();
     // Before any guest code runs, because the guest's address reservations
               // (MAP_FIXED) happen before it ever asks for the Steam interface.
     protectForeignMemory();
