@@ -61,9 +61,29 @@ class BinaryTriage:
         sample_bytes = sample_start + sample_end
         envelope = self._detect_envelope(sample_bytes)
 
+        # A Velopack/Squirrel setup carries its payload as a ZIP appended after
+        # the PE image. The structural check wins over the string heuristics.
+        overlay = None
+        try:
+            from .velopack import find_zip_overlay, nuspec_metadata
+
+            overlay = find_zip_overlay(self.file_path)
+            if overlay:
+                nuspec = nuspec_metadata(self.file_path, overlay)
+                if nuspec.get("id"):
+                    envelope = {
+                        "type": "velopack",
+                        "name": "Velopack / Squirrel installer (NuGet nupkg payload)",
+                        "archive_offset": overlay["archive_offset"],
+                        "archive_size": overlay["archive_size"],
+                        "nuspec": nuspec,
+                    }
+        except Exception:
+            overlay = None
+
         # Deep envelope inspection if available
         runtime_info = None
-        if envelope["type"] in ["nsis", "inno", "7z_sfx"]:
+        if envelope["type"] in ["nsis", "inno", "7z_sfx", "velopack"]:
             runtime_info = self._probe_installer_contents(envelope["type"])
 
         if not runtime_info:
@@ -97,6 +117,65 @@ class BinaryTriage:
         return {"type": "standalone_pe", "name": "Standalone Portable Executable"}
 
     def _probe_installer_contents(self, envelope_type: str = "nsis") -> Optional[Dict[str, Any]]:
+        # 0. Velopack / Squirrel: the nupkg is a ZIP appended to the setup binary
+        if envelope_type == "velopack":
+            try:
+                from .velopack import find_zip_overlay, overlay_entries, read_overlay_entry
+
+                overlay = find_zip_overlay(self.file_path)
+                if not overlay:
+                    return None
+                names = overlay_entries(self.file_path, overlay)
+                runtimeconfigs = [n for n in names if n.endswith(".runtimeconfig.json")]
+                nuspecs = [n for n in names if n.endswith(".nuspec")]
+                framework = None
+                if runtimeconfigs:
+                    raw = read_overlay_entry(self.file_path, overlay, runtimeconfigs[0])
+                    import json as _json
+
+                    try:
+                        config = _json.loads(raw.decode("utf-8", "replace"))
+                        frameworks = config.get("runtimeOptions", {}).get("frameworks", [])
+                        framework = ", ".join(f.get("name", "?") for f in frameworks) or None
+                    except Exception:
+                        framework = None
+                if runtimeconfigs:
+                    details = {
+                        "framework": framework or "Microsoft .NET Core / Modern .NET",
+                        "envelope": "Velopack (nupkg overlay)",
+                        "payload_entries": len(names),
+                    }
+                    if framework and "WindowsDesktop" in framework:
+                        details["gui_backend"] = "WPF (Windows Presentation Foundation)"
+                        return {
+                            "runtime": "dotnet",
+                            "details": details,
+                            "feasibility": (
+                                "REQUIRES_UI_REWRITE (WPF has no Linux implementation; "
+                                "the managed logic can be ported, the XAML UI cannot be re-hosted)"
+                            ),
+                            "recipe": "recipe_dotnet",
+                        }
+                    return {
+                        "runtime": "dotnet",
+                        "details": details,
+                        "feasibility": "HIGH (Direct execution via Linux native `dotnet` host)",
+                        "recipe": "recipe_dotnet",
+                    }
+                if nuspecs:
+                    return {
+                        "runtime": "native_pe",
+                        "details": {
+                            "framework": "Native Compiled Win32/x86_64 Machine Code",
+                            "envelope": "Velopack (nupkg overlay)",
+                            "payload_entries": len(names),
+                        },
+                        "feasibility": "REQUIRES_ISOLATED_EMULATION (Pure Win32 C/C++ binary)",
+                        "recipe": "recipe_transpiler",
+                    }
+            except Exception:
+                return None
+
         # 1. Inno Setup probing via innoextract
         if envelope_type == "inno":
             inno = self._find_innoextract()

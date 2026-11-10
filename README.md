@@ -61,6 +61,8 @@ mkdir -p build && zig build-exe native/main.zig -O ReleaseSafe -femit-bin=build/
 |---|---|
 | `wins-native inspect FILE` | SHA-256, PE format, sections |
 | `wins-native imports FILE [--json]` | Imports **and delay-load imports**, ordinals, CLR flag |
+| `wins-native velopack-inspect FILE [--json]` | Velopack/Squirrel overlay: nupkg offset, entry count, nuspec metadata |
+| `wins-native velopack-extract FILE NEW_DIR` | Extract the appended nupkg payload (zip-slip safe, CRC-checked) |
 | `wins-native extract FILE NEW_DIR EXTRACTOR <7z\|inno\|msi>` | Unpack an installer inside a sandbox, into a new directory |
 | `wins-native cab-find CAB MEMBER` | Locate a member in a (possibly partial) cabinet without extracting |
 | `wins-native closure CAB FILE_TSV ROOT_KEY EXTRACTOR NEW_DIR` | Full dependency closure of a product: 198 PEs in seconds |
