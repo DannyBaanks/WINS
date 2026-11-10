@@ -28,7 +28,7 @@ for line in target.read_text().split("\n"):
             "        g_last_relay_ptr = ptr;",
             "        g_last_relay_len = size;",
             '        std.debug.print("[probe] +0x90 before: {d}\\n", .{@as(*const u32, @ptrFromInt(ptr + 0x90)).*});',
-            "        if (size > 0xb0) {",
+            "        if (size > 0xb0 and getenv(\"WINS_PROBE_REFLECT\") != null) {",
             "            @as(*u32, @ptrFromInt(ptr + 0x90)).* = 2;",
             '            std.debug.print("[probe] +0x90 after reflect: 2\\n", .{});',
             "        }",
