@@ -114,6 +114,22 @@ fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque
         // Which module holds the faulting instruction? The name is the only
         // thing that says whether the client, libc, or the loader is at fault.
         describeAddr(uctx.uc_mcontext.eip);
+        // The whole map: when the fault is in the guest, the module table is
+        // the only thing that says WHICH guest module died, and the loader
+        // knows no other way to name it.
+        {
+            const fd_maps = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(fd_maps) == .SUCCESS) {
+                defer _ = linux.close(@intCast(fd_maps));
+                var buf_maps: [16 * 1024]u8 = undefined;
+                const rn = linux.read(@intCast(fd_maps), &buf_maps, buf_maps.len);
+                if (rn > 0) {
+                    std.debug.print("  --- maps at crash ---\n", .{});
+                    var it = std.mem.splitScalar(u8, buf_maps[0..@intCast(rn)], '\n');
+                    while (it.next()) |line| std.debug.print("    {s}\n", .{line});
+                }
+            }
+        }
         if (esp_val > 0x1000 and esp_val < 0xFFFFF000) {
             const stack_words: [*]const u32 = @ptrFromInt(esp_val);
             std.debug.print("Stack Dump (top 8 dwords at ESP):\n", .{});
@@ -2920,38 +2936,66 @@ fn callAligned3(fnptr: usize, a0: usize, a1: usize, a2: usize) usize {
 // ---- ISteamClient010 -------------------------------------------------------
 
 fn a000_CreateSteamPipe(self: usize) callconv(Tc) u32 {
-    _ = self;
-    // Through the client's own exported helper, not its vtable: measured, a
-    // method called on the CreateInterface object crashes inside the client,
-    // while the helper returns a valid handle. The call is aligned, because the
-    // guest's stack is only 4-byte aligned and Linux code assumes 16.
-    if (g_pipe_fn) |f| {
-        const pipe: u32 = @truncate(callAligned0(@intFromPtr(f)));
-        std.debug.print("[WINS:Steam] ISteamClient010::CreateSteamPipe() -> real client, pipe={d}\n", .{pipe});
-        return pipe;
-    }
-    return 0;
+    // The client's own method, not its flat helper. Measured: the handles the
+    // flat helper hands out are not the ones the client's interface methods
+    // validate against -- the ticket call asserts IsValidHSteamUserPipe when
+    // the handle came from the helper. The earlier note that "a method called
+    // on the CreateInterface object crashes inside the client" was the stack
+    // alignment, not the vtable: the client faults on an SSE store when ESP is
+    // not 16-byte aligned, and the guest's stack never is.
+    const slot = realSlot(self, 0);
+    if (slot == 0) return 0;
+    const pipe: u32 = @truncate(callAligned1(slot, realOf(self)));
+    std.debug.print("[WINS:Steam] ISteamClient010::CreateSteamPipe() -> real client, pipe={d}\n", .{pipe});
+    return pipe;
 }
 
 fn a001_BReleaseSteamPipe(self: usize, hSteamPipe: u32) callconv(Tc) i32 {
-    const f: *const fn (usize, u32) callconv(Cc) i32 = @ptrFromInt(realSlot(self, 1));
-    return f(realOf(self), hSteamPipe);
+    // Aligned, like every other call into the client: a plain call from this
+    // thiscall hands the client the guest's 4-byte-aligned stack, and the
+    // client's SSE stores fault on that. This one also went unlogged, which is
+    // why a call the DRM makes right after the ticket was invisible in the log.
+    const slot = realSlot(self, 1);
+    if (slot == 0) return 0;
+    const r: i32 = @bitCast(callAligned2(slot, realOf(self), hSteamPipe));
+    std.debug.print("[WINS:Steam] ISteamClient010::ReleaseSteamPipe(pipe={d}) -> real client, ok={d}\n", .{ hSteamPipe, r });
+    return r;
 }
 
 fn a002_ConnectToGlobalUser(self: usize, hSteamPipe: u32) callconv(Tc) u32 {
-    _ = self;
-    if (g_user_fn) |f| {
-        // Aligned for the same reason as CreateSteamPipe: the Linux ABI needs 16.
-        const user: u32 = @truncate(callAligned1(@intFromPtr(f), hSteamPipe));
-        std.debug.print("[WINS:Steam] ISteamClient010::ConnectToGlobalUser(pipe={d}) -> real client, user={d}\n", .{ hSteamPipe, user });
-        return user;
-    }
-    return 0;
+    // The client's own method, for the same reason as CreateSteamPipe.
+    const slot = realSlot(self, 2);
+    if (slot == 0) return 0;
+    const user: u32 = @truncate(callAligned2(slot, realOf(self), hSteamPipe));
+    g_guest_pipe = hSteamPipe;
+    g_guest_user = user;
+    std.debug.print("[WINS:Steam] ISteamClient010::ConnectToGlobalUser(pipe={d}) -> real client, user={d}\n", .{ hSteamPipe, user });
+    return user;
 }
 
-fn a004_ReleaseUser(self: usize, hSteamPipe: u32, hSteamUser: u32) callconv(Tc) void {
-    const f: *const fn (usize, u32, u32) callconv(Cc) void = @ptrFromInt(realSlot(self, 4));
-    f(realOf(self), hSteamPipe, hSteamUser);
+/// ISteamClient slot 4: one argument -- the user handle.
+///
+/// Measured: the real client's slot 4 takes a single argument and answers
+/// without complaint. Handing it two makes it read the second one as a pipe
+/// handle, and the client then validates a (user, pipe) pair that was never
+/// issued: IsValidHSteamUserPipe fires, the client's own assert handler runs,
+/// and that handler faults on its SSE store and takes the process down with it.
+/// The second argument this thunk used to read was stack junk from the guest
+/// (0x4A2C2BF3, a pointer), which is how the bad pair was built.
+fn a004_DisconnectGlobalUser(self: usize, hSteamUser: u32) callconv(Tc) void {
+    const slot = realSlot(self, 4);
+    if (slot == 0) return;
+    _ = callAligned2(slot, realOf(self), hSteamUser);
+    std.debug.print("[WINS:Steam] ISteamClient010::DisconnectGlobalUser(user={d}) -> real client\n", .{hSteamUser});
+}
+
+/// ISteamClient slot 3: the (pipe, user) pair. The client validates both on
+/// this one, so both have to be the ones it issued.
+fn a003_ReleaseUser(self: usize, hSteamPipe: u32, hSteamUser: u32) callconv(Tc) void {
+    const slot = realSlot(self, 3);
+    if (slot == 0) return;
+    _ = callAligned3(slot, realOf(self), hSteamPipe, hSteamUser);
+    std.debug.print("[WINS:Steam] ISteamClient010::ReleaseUser(pipe={d}, user={d}) -> real client\n", .{ hSteamPipe, hSteamUser });
 }
 
 /// Which adapter table an interface needs, decided by the name the guest asked
@@ -2976,6 +3020,7 @@ fn a005_GetISteamUser(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion:
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     const vptr: usize = if (pchVersion) |v| @intFromPtr(v) else 0;
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamUser(\"{s}\") -> real client\n", .{ver});
+    std.debug.print("[WINS:Steam]   (guest pid={d} pipe={d})\n", .{ hSteamUser, hSteamPipe });
     const obj = callAligned4(realSlot(self, 5), realOf(self), hSteamUser, hSteamPipe, vptr);
     std.debug.print("[WINS:Steam] user interface -> 0x{x}\n", .{obj});
     return wrapSubKind(SubUser, obj);
@@ -3005,9 +3050,19 @@ fn a013_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32,
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     const vptr: usize = if (pchVersion) |v| @intFromPtr(v) else 0;
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamGenericInterface(\"{s}\") -> real client\n", .{ver});
-    const obj = callAligned4(realSlot(self, 13), realOf(self), hSteamUser, hSteamPipe, vptr);
-    std.debug.print("[WINS:Steam] generic interface -> 0x{x}\n", .{obj});
-    return wrapSubKind(kindForVersion(pchVersion), obj);
+    std.debug.print("[WINS:Steam]   (guest pid={d} pipe={d})\n", .{ hSteamUser, hSteamPipe });
+    // The client's own pipe and user, not the ones the guest passes: the
+    // client validates that pair (IsValidHSteamUserPipe) and the guest's
+    // pair is not the one the client issued.
+    const use_user = if (g_guest_user != 0) g_guest_user else hSteamUser;
+    const use_pipe = if (g_guest_pipe != 0) g_guest_pipe else hSteamPipe;
+    const obj = callAligned4(realSlot(self, 13), realOf(self), use_user, use_pipe, vptr);
+    std.debug.print("[WINS:Steam] generic interface -> 0x{x} (client pid={d} pipe={d})\n", .{ obj, use_user, use_pipe });
+    const kind = kindForVersion(pchVersion);
+    // The ticket object is the one the DRM will ask for the ownership ticket
+    // on, and the SteamID the DRM asks for comes out of that same ticket.
+    if (kind == SubAppTicket and obj != 0) g_real_ticket = obj;
+    return wrapSubKind(kind, obj);
 }
 
 fn a_stub(self: usize) callconv(Tc) u32 {
@@ -3035,7 +3090,8 @@ fn ensureSteamClient010Vt() void {
     g_steamclient010_vt[0] = @intFromPtr(&a000_CreateSteamPipe);
     g_steamclient010_vt[1] = @intFromPtr(&a001_BReleaseSteamPipe);
     g_steamclient010_vt[2] = @intFromPtr(&a002_ConnectToGlobalUser);
-    g_steamclient010_vt[4] = @intFromPtr(&a004_ReleaseUser);
+    g_steamclient010_vt[3] = @intFromPtr(&a003_ReleaseUser);
+    g_steamclient010_vt[4] = @intFromPtr(&a004_DisconnectGlobalUser);
     g_steamclient010_vt[5] = @intFromPtr(&a005_GetISteamUser);
     g_steamclient010_vt[9] = @intFromPtr(&a009_GetISteamUtils);
     g_steamclient010_vt[13] = @intFromPtr(&a013_GetISteamGenericInterface);
@@ -3056,11 +3112,11 @@ var g_steamclient010_adapter: Adapter = .{ .vt = 0, .real = 0 };
 
 var g_sub_adapters: [8]Adapter = [_]Adapter{.{ .vt = 0, .real = 0 }} ** 8;
 
-fn subVt(comptime n: usize) *[24]usize {
+fn subVt(comptime n: usize) *[64]usize {
     return &g_sub_vt[n];
 }
 
-var g_sub_vt: [4][24]usize = [_][24]usize{[_]usize{0} ** 24} ** 4;
+var g_sub_vt: [4][64]usize = [_][64]usize{[_]usize{0} ** 64} ** 4;
 var g_sub_vt_ready: bool = false;
 
 /// A thunk that says which slot was reached and that it has no implementation
@@ -3134,15 +3190,114 @@ const SubAppTicket: usize = 2;
 /// unimplemented slot instead of landing on another interface's thunk.
 const SubGeneric: usize = 3;
 
+/// The pipe and the global user the guest itself created, and the app id the
+/// client reported. The ticket fetch needs them: the client's ticket call is
+/// made on behalf of a user bound to a pipe.
+var g_guest_pipe: u32 = 0;
+var g_guest_user: u32 = 0;
+var g_guest_appid: u32 = 0;
+
+/// One ticket fetch in the real client's own shape.
+///
+/// Measured against steamclient.so: the client writes ONE blob -- the ticket
+/// part followed by the signature -- and hands back the OFFSETS of the app id
+/// (16), of the SteamID64 (8), of the signature (110) and the length of that
+/// signature (128). The Steamworks ABI wants pointers to values and a
+/// separate signature buffer, so this is the raw call and the translation
+/// lives in the thunk above it.
+/// The ticket the client already gave us, kept so the DRM's two questions --
+/// "who is the user" and "give me the ownership ticket" -- cost ONE request to
+/// the client instead of two. The client's answer does not change between them
+/// (same app, same user) and asking twice is one IPC round trip too many.
+var g_ticket_cache: [512]u8 = undefined;
+var g_ticket_cache_valid: bool = false;
+var g_ticket_cache_appid: u32 = 0;
+var g_ticket_cache_len: u32 = 0;
+var g_ticket_cache_appid_out: u32 = 0;
+var g_ticket_cache_steamid: u64 = 0;
+var g_ticket_cache_sig: [128]u8 = [_]u8{0} ** 128;
+var g_ticket_cache_siglen: u32 = 0;
+
+fn fetchRealTicket(real_ticket: usize, appid: u32, buf: []u8, steamid_out: ?*u64, appid_out: ?*u32, sig_out: ?[*]u8, siglen_out: ?*u32) u32 {
+    if (real_ticket == 0) return 0;
+    if (g_ticket_cache_valid and g_ticket_cache_appid == appid) {
+        const copy = @min(g_ticket_cache_len, buf.len);
+        @memcpy(buf[0..copy], g_ticket_cache[0..copy]);
+        if (steamid_out) |p| p.* = g_ticket_cache_steamid;
+        if (appid_out) |p| p.* = g_ticket_cache_appid_out;
+        if (sig_out) |dst| @memcpy(dst[0..g_ticket_cache_siglen], g_ticket_cache_sig[0..g_ticket_cache_siglen]);
+        if (siglen_out) |p| p.* = g_ticket_cache_siglen;
+        return g_ticket_cache_len;
+    }
+    const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(real_ticket)).*);
+    var off_appid: u32 = 0;
+    var off_steamid: u32 = 0;
+    var off_sig: u32 = 0;
+    var len_sig: u32 = 0;
+    const total = callAligned8(
+        vt[0],
+        real_ticket,
+        appid,
+        @intFromPtr(buf.ptr),
+        buf.len,
+        @intFromPtr(&off_appid),
+        @intFromPtr(&off_steamid),
+        @intFromPtr(&off_sig),
+        @intFromPtr(&len_sig),
+    );
+    if (total == 0) return 0;
+    if (off_appid + 4 <= buf.len and off_steamid + 8 <= buf.len and off_sig + len_sig <= buf.len) {
+        // The app id and the SteamID are read from the blob itself, not from
+        // the caller's out-parameters: the first caller (the SteamID question)
+        // asks for neither, and a cache filled from it would hand the next
+        // caller a zero app id.
+        const blob_appid = std.mem.readInt(u32, buf[off_appid..][0..4], .little);
+        const blob_steamid = std.mem.readInt(u64, buf[off_steamid..][0..8], .little);
+        if (appid_out) |p| p.* = blob_appid;
+        if (steamid_out) |p| p.* = blob_steamid;
+        if (sig_out) |dst| @memcpy(dst[0..len_sig], buf[off_sig..][0..len_sig]);
+        if (siglen_out) |p| p.* = len_sig;
+        // Keep the answer for the next question about the same app.
+        g_ticket_cache_valid = true;
+        g_ticket_cache_appid = appid;
+        g_ticket_cache_len = std.mem.readInt(u32, buf[0..4], .little);
+        g_ticket_cache_appid_out = blob_appid;
+        g_ticket_cache_steamid = blob_steamid;
+        g_ticket_cache_siglen = len_sig;
+        @memcpy(g_ticket_cache_sig[0..len_sig], buf[off_sig..][0..len_sig]);
+        const keep = @min(g_ticket_cache_len, g_ticket_cache.len);
+        @memcpy(g_ticket_cache[0..keep], buf[0..keep]);
+    }
+    return std.mem.readInt(u32, buf[0..4], .little);
+}
+
+/// The real ticket object, once the DRM has asked the client for it.
+var g_real_ticket: usize = 0;
+
 fn sub_GetSteamID(self: usize, pSteamID: ?*u64) callconv(Tc) u64 {
-    std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> calling the real client (slot 2) arg=0x{x}\n", .{if (pSteamID) |q| @intFromPtr(q) else 0});
-    const r = callAligned2(realSlot(self, 2), realOf(self), if (pSteamID) |p| @intFromPtr(p) else 0);
-    std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> 0x{x} (from the real client)\n", .{r});
-    return r;
+    // Measured: the real client's user interface does not answer this in the
+    // shape the guest uses. Its slots either fault inside the client or
+    // answer something else -- the object it hands back for "SteamUser016"
+    // has no method that writes a SteamID64 anywhere. The SteamID the DRM
+    // wants is the one the client itself puts in the ownership ticket, so
+    // ask the client for the ticket and read it from there: the value still
+    // comes from Steam, not from us.
+    _ = self;
+    var scratch: [512]u8 = undefined;
+    var steamid: u64 = 0;
+    const len = fetchRealTicket(g_real_ticket, g_guest_appid, scratch[0..], &steamid, null, null, null);
+    if (len == 0) {
+        std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> the client gave no ticket\n", .{});
+        return 0;
+    }
+    if (pSteamID) |p| p.* = steamid;
+    std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> 0x{x} (from the client's own ticket)\n", .{steamid});
+    return 1;
 }
 
 fn sub_GetAppID(self: usize) callconv(Tc) u32 {
     const r = callAligned1(realSlot(self, 9), realOf(self));
+    g_guest_appid = @truncate(r);
     std.debug.print("[WINS:Steam] ISteamUtils005::GetAppID() -> {d} (from the real client)\n", .{r});
     return @truncate(r);
 }
@@ -3157,23 +3312,27 @@ fn sub_GetAppOwnershipTicketData(
     pbSignature: ?[*]u8,
     pcbSignature: ?*u32,
 ) callconv(Tc) u32 {
-    // The real client faults on an SSE store when the stack is not 16-byte
-    // aligned, and the guest's stack never is: this call goes through the
-    // aligned helper for the same reason the others do.
-    std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}, {d} bytes) -> calling the real client (slot 0)\n", .{ nAppID, cbBufferLength });
-    const r = callAligned8(
-        realSlot(self, 0),
-        realOf(self),
-        nAppID,
-        if (pvBuffer) |b| @intFromPtr(b) else 0,
-        cbBufferLength,
-        if (piAppId) |a| @intFromPtr(a) else 0,
-        if (piSteamId) |a| @intFromPtr(a) else 0,
-        if (pbSignature) |a| @intFromPtr(a) else 0,
-        if (pcbSignature) |a| @intFromPtr(a) else 0,
-    );
-    std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}, {d} bytes) -> {d} (from the real client)\n", .{ nAppID, cbBufferLength, r });
-    return @truncate(r);
+    _ = self;
+    var scratch: [512]u8 = undefined;
+    var steamid: u64 = 0;
+    var appid: u32 = 0;
+    var siglen: u32 = 0;
+    const len = fetchRealTicket(g_real_ticket, nAppID, scratch[0..], &steamid, &appid, pbSignature, &siglen);
+    if (len == 0) {
+        std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}) -> the client gave nothing\n", .{nAppID});
+        return 0;
+    }
+    // The ticket part is what the DRM parses; the signature follows it in the
+    // client's blob and goes into its own buffer, as the Steamworks ABI says.
+    if (pvBuffer) |dst| {
+        const copy = @min(len, cbBufferLength);
+        @memcpy(dst[0..copy], scratch[0..copy]);
+    }
+    if (piAppId) |p| p.* = appid;
+    if (piSteamId) |p| p.* = steamid;
+    if (pcbSignature) |p| p.* = siglen;
+    std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}) -> {d} bytes, appid={d}, steamid=0x{x}, firma={d} bytes (from the real client)\n", .{ nAppID, len, appid, steamid, siglen });
+    return len;
 }
 
 // ---- CreateInterface (exported from steamclient.dll) -----------------------
