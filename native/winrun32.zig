@@ -570,6 +570,22 @@ fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, fl
     const free_flags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     var ptr: usize = undefined;
     if (requested) |req| {
+        const req_lo = @intFromPtr(req);
+        const req_hi = req_lo + dwSize;
+        // The guest's own image is not the guest's to hand out. Windows refuses
+        // an allocation whose range is already mapped, and a MAP_FIXED mapping
+        // here would destroy the image the guest is running from.
+        //
+        // Measured: the game asked for 6 MB at 0x1000000, which is inside its
+        // own image (0x400000-0x147b000). The mapping replaced the top 6 MB of
+        // that image -- .data, .tls, .rsrc, .reloc and .bind all read back as
+        // zeros -- and the game then died in its own startup, asking for
+        // "CoreExitProcess" through strings that were no longer there.
+        if (g_guest_base != 0 and req_lo < g_guest_end and req_hi > g_guest_base) {
+            std.debug.print("[WINS:Kernel32] VirtualAlloc: 0x{x}+{d} overlaps the guest's own image (0x{x}-0x{x}); refusing, as Windows does\n", .{ req_lo, dwSize, g_guest_base, g_guest_end });
+            g_last_error = 87; // ERROR_INVALID_PARAMETER
+            return null;
+        }
         // The question is not "is this range one the snapshot knew about" but
         // "is this range free right now". The snapshot is taken once, when the
         // client is loaded, and it only covers the named regions (the heap,
@@ -687,12 +703,110 @@ fn VirtualFree(lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32) callconv(
     return 0;
 }
 
+/// The protection a page of guest memory has right now, in the constants
+/// Windows uses. Read from /proc/self/maps, because the kernel is the only
+/// authority on what is mapped how -- and because the guest asks for the
+/// previous protection when it restores one. Answering that question with a
+/// stale value silently takes execute permission away from code the guest is
+/// about to run, and the failure looks like a mystery jump into a page that
+/// is mapped but not executable.
+fn currentProtection(addr: usize) u32 {
+    const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return 0x04;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [16 * 1024]u8 = undefined;
+    const rn = linux.read(@intCast(fd), &buf, buf.len);
+    if (linux.errno(rn) != .SUCCESS) return 0x04;
+    var lines = std.mem.splitScalar(u8, buf[0..@intCast(rn)], '\n');
+    while (lines.next()) |line| {
+        const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+        const mlo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+        const rest = line[dash + 1 ..];
+        const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+        const mhi = std.fmt.parseInt(usize, rest[0..sp], 16) catch continue;
+        if (addr < mlo or addr >= mhi) continue;
+        if (rest.len < sp + 5) continue;
+        const perms = rest[sp + 1 ..][0..4];
+        const r = perms[0] == 'r';
+        const w = perms[1] == 'w';
+        const x = perms[2] == 'x';
+        if (x and r and w) return 0x40; // PAGE_EXECUTE_READWRITE
+        if (x and r) return 0x20; // PAGE_EXECUTE_READ
+        if (x) return 0x10; // PAGE_EXECUTE
+        if (r and w) return 0x04; // PAGE_READWRITE
+        if (r) return 0x02; // PAGE_READONLY
+        return 0x01; // PAGE_NOACCESS
+    }
+    return 0x04;
+}
+
+/// The guest's static TLS, set up the way a 32-bit Windows process has it.
+///
+/// A module with a TLS directory gets one block of thread data (the template
+/// the image carries, plus zero fill) and one index in the thread's TLS
+/// array. The index is written into the image at the address the TLS
+/// directory names, and the array hangs off the TEB: on x86, TEB+0x2c is the
+/// thread's TLS pointer. Without this, the first read of a thread-local
+/// variable is a read through a null pointer -- measured, not guessed: the
+/// guest reads its TLS index from the address its own TLS directory names and
+/// then indexes the array the TEB is supposed to point at.
+const TLS_SLOT_COUNT = 64;
+var g_tls_index_array: [TLS_SLOT_COUNT]usize align(16) = [_]usize{0} ** TLS_SLOT_COUNT;
+var g_tls_block: []u8 = &[_]u8{};
+
+fn setupGuestTls(allocator: std.mem.Allocator, image_base: usize, tls_rva: u32, tls_size: u32) void {
+    if (tls_rva == 0 or tls_size < 24) return;
+    const dir: [*]const u8 = @ptrFromInt(image_base + tls_rva);
+    const start_va = std.mem.readInt(u32, dir[0..4], .little);
+    const end_va = std.mem.readInt(u32, dir[4..8], .little);
+    const index_va = std.mem.readInt(u32, dir[8..12], .little);
+    const callbacks_va = std.mem.readInt(u32, dir[12..16], .little);
+    const zero_fill = std.mem.readInt(u32, dir[16..20], .little);
+    if (end_va < start_va) return;
+    const template_len = end_va - start_va;
+    const block = allocator.alloc(u8, template_len + zero_fill) catch {
+        std.debug.print("[WINS:TLS] could not allocate {d} bytes for the guest's thread data\n", .{template_len + zero_fill});
+        return;
+    };
+    @memcpy(block[0..template_len], @as([*]const u8, @ptrFromInt(start_va))[0..template_len]);
+    @memset(block[template_len..], 0);
+
+    // The executable is the first module loaded, so its TLS block takes index
+    // one; slot zero is the array's own address, the way Windows does it.
+    const index: usize = 1;
+    g_tls_index_array[0] = @intFromPtr(&g_tls_index_array);
+    if (index < TLS_SLOT_COUNT) g_tls_index_array[index] = @intFromPtr(block.ptr);
+    g_tls_block = block;
+
+    // The image carries the index it was given, at the address its TLS
+    // directory names; the guest reads it from there.
+    if (index_va != 0) {
+        std.mem.writeInt(u32, @as([*]u8, @ptrFromInt(index_va))[0..4], @intCast(index), .little);
+    }
+    // TEB+0x2c is the thread's TLS pointer on x86.
+    g_tib_buffer[0x2c / 4] = @intFromPtr(&g_tls_index_array);
+
+    std.debug.print("[WINS:TLS] static TLS: {d} bytes of thread data at 0x{x}, index {d}, array at 0x{x}\n", .{ block.len, @intFromPtr(block.ptr), index, @intFromPtr(&g_tls_index_array) });
+
+    // The loader runs the TLS callbacks before the entry point.
+    if (callbacks_va != 0) {
+        const cbs: [*]const u32 = @ptrFromInt(callbacks_va);
+        var i: usize = 0;
+        while (i < 64) : (i += 1) {
+            const fn_va = cbs[i];
+            if (fn_va == 0) break;
+            const cb_fn: *const fn (usize, u32, ?*anyopaque) callconv(.c) void = @ptrFromInt(fn_va);
+            std.debug.print("[WINS:TLS] callback 0x{x} (DLL_PROCESS_ATTACH)\n", .{fn_va});
+            cb_fn(image_base, 1, null);
+        }
+    }
+}
+
 fn VirtualProtect(lpAddress: ?*anyopaque, dwSize: usize, flNewProtect: u32, lpflOldProtect: ?*u32) callconv(W) i32 {
-    if (lpflOldProtect) |old| old.* = g_alloc_prot;
+    if (lpflOldProtect) |old| old.* = if (lpAddress) |p| currentProtection(@intFromPtr(p)) else 0x04;
     g_alloc_prot = flNewProtect;
     std.debug.print("[WINS:Kernel32] VirtualProtect(0x{x}, size={d}, prot=0x{x})\n", .{ @intFromPtr(lpAddress), dwSize, flNewProtect });
     if (lpAddress) |p| {
-        const u8_ptr: [*]u8 = @constCast(@ptrCast(p));
         // NOTE: there used to be a steamdrm.dll signature check here that
         // rewrote the RSA-ticket gate into a direct AES decrypt (JNE -> JMP).
         // That was the loader bypassing the DRM check itself, which is exactly
@@ -704,7 +818,20 @@ fn VirtualProtect(lpAddress: ?*anyopaque, dwSize: usize, flNewProtect: u32, lpfl
             .WRITE = (flNewProtect & 0x44) != 0,
             .EXEC = (flNewProtect & 0xF0) != 0,
         };
-        _ = linux.mprotect(u8_ptr, dwSize, prot);
+        // mprotect wants a page-aligned range; Windows rounds the address
+        // down and the size up.
+        const page = std.heap.page_size_min;
+        const addr = @intFromPtr(p);
+        const base = addr & ~(page - 1);
+        const end = (addr + dwSize + page - 1) & ~(page - 1);
+        if (end > base) {
+            const rc = linux.mprotect(@ptrFromInt(base), end - base, prot);
+            if (linux.errno(rc) != .SUCCESS) {
+                std.debug.print("[WINS:Kernel32] VirtualProtect FAILED on 0x{x}..0x{x}: errno={d}\n", .{ base, end, @intFromEnum(linux.errno(rc)) });
+                g_last_error = 5; // ERROR_ACCESS_DENIED
+                return 0;
+            }
+        }
         return 1;
     }
     return 0;
@@ -2673,14 +2800,17 @@ var g_user_fn: ?*const fn (u32) callconv(Cc) u32 = null;
 fn realFactory(version: [*:0]const u8) usize {
     if (g_real_create) |f| {
         var rc: i32 = -1;
-        const got = f(version, &rc);
+        // The client's factory is Linux-compiled code: it wants the stack
+        // 16-byte aligned, and a plain C call from a 4-byte-aligned frame does
+        // not promise that. See the alignment note above callAligned0.
+        const got = callAligned2(@intFromPtr(f), @intFromPtr(version), @intFromPtr(&rc));
         // Both answers are logged, not just the failure: the previous form only
         // spoke when the client refused, and a caller that printed "-> real
         // client" before the call had no way to tell a real object from a null
         // one. That silence is what hid the missing ticket interface.
-        const ptr: usize = if (got) |g| @intFromPtr(g) else 0;
+        const ptr: usize = got;
         std.debug.print("[WINS:Steam] factory(\"{s}\") -> 0x{x} (rc={d})\n", .{ version, ptr, rc });
-        if (got) |g| return @intFromPtr(g);
+        if (ptr != 0) return ptr;
     } else {
         std.debug.print("[WINS:Steam] factory(\"{s}\") -> no CreateInterface export\n", .{version});
     }
@@ -2736,7 +2866,11 @@ fn loadRealSteamClient() void {
     g_pipe_fn = @ptrCast(dlsym(handle, "Steam_CreateSteamPipe"));
     g_user_fn = @ptrCast(dlsym(handle, "Steam_ConnectToGlobalUser"));
     var rc: i32 = -1;
-    const iface = create("SteamClient010", &rc) orelse {
+    // Aligned: the client's factory is Linux-compiled code and wants the stack
+    // 16-byte aligned at the call. See the alignment note above callAligned0.
+    const iface_ptr = callAligned2(@intFromPtr(create), @intFromPtr("SteamClient010"), @intFromPtr(&rc));
+    const iface_opt: ?*anyopaque = if (iface_ptr != 0) @ptrFromInt(iface_ptr) else null;
+    const iface = iface_opt orelse {
         std.debug.print("[WINS:SteamBridge] the real client refused SteamClient010 (rc={d}).\n", .{rc});
         return;
     };
@@ -3209,25 +3343,45 @@ var g_guest_appid: u32 = 0;
 /// "who is the user" and "give me the ownership ticket" -- cost ONE request to
 /// the client instead of two. The client's answer does not change between them
 /// (same app, same user) and asking twice is one IPC round trip too many.
+/// The client's answer about one app's ownership ticket.
+///
+/// The client writes one blob: the ticket, and the signature over it right
+/// behind it. It also says where each piece sits inside that blob. Both the
+/// blob and the offsets are the client's own, measured, not assumed.
+const TicketBlob = struct {
+    /// Bytes the client wrote: the ticket, with the signature behind it.
+    total: u32 = 0,
+    /// Where the app id sits inside the blob.
+    off_appid: u32 = 0,
+    /// Where the SteamID64 sits inside the blob.
+    off_steamid: u32 = 0,
+    /// Where the signature sits inside the blob.
+    off_sig: u32 = 0,
+    /// How long the signature is.
+    len_sig: u32 = 0,
+    /// The app id, read from the blob at off_appid.
+    appid: u32 = 0,
+    /// The SteamID64, read from the blob at off_steamid.
+    steamid: u64 = 0,
+};
+
 var g_ticket_cache: [512]u8 = undefined;
 var g_ticket_cache_valid: bool = false;
 var g_ticket_cache_appid: u32 = 0;
-var g_ticket_cache_len: u32 = 0;
-var g_ticket_cache_appid_out: u32 = 0;
-var g_ticket_cache_steamid: u64 = 0;
-var g_ticket_cache_sig: [128]u8 = [_]u8{0} ** 128;
-var g_ticket_cache_siglen: u32 = 0;
+var g_ticket_cache_blob: TicketBlob = .{};
 
-fn fetchRealTicket(real_ticket: usize, appid: u32, buf: []u8, steamid_out: ?*u64, appid_out: ?*u32, sig_out: ?[*]u8, siglen_out: ?*u32) u32 {
-    if (real_ticket == 0) return 0;
+/// Ask the real client for an app's ownership ticket.
+///
+/// The client answers with the blob (the ticket, with its signature behind
+/// it) and the offsets of the pieces inside it. The blob is kept whole: the
+/// guest's DRM verifies the signature over the ticket bytes, so it needs both
+/// in one place.
+fn fetchRealTicket(real_ticket: usize, appid: u32, buf: []u8) TicketBlob {
+    if (real_ticket == 0) return .{};
     if (g_ticket_cache_valid and g_ticket_cache_appid == appid) {
-        const copy = @min(g_ticket_cache_len, buf.len);
+        const copy = @min(g_ticket_cache_blob.total, buf.len);
         @memcpy(buf[0..copy], g_ticket_cache[0..copy]);
-        if (steamid_out) |p| p.* = g_ticket_cache_steamid;
-        if (appid_out) |p| p.* = g_ticket_cache_appid_out;
-        if (sig_out) |dst| @memcpy(dst[0..g_ticket_cache_siglen], g_ticket_cache_sig[0..g_ticket_cache_siglen]);
-        if (siglen_out) |p| p.* = g_ticket_cache_siglen;
-        return g_ticket_cache_len;
+        return g_ticket_cache_blob;
     }
     const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(real_ticket)).*);
     var off_appid: u32 = 0;
@@ -3245,30 +3399,35 @@ fn fetchRealTicket(real_ticket: usize, appid: u32, buf: []u8, steamid_out: ?*u64
         @intFromPtr(&off_sig),
         @intFromPtr(&len_sig),
     );
-    if (total == 0) return 0;
-    if (off_appid + 4 <= buf.len and off_steamid + 8 <= buf.len and off_sig + len_sig <= buf.len) {
-        // The app id and the SteamID are read from the blob itself, not from
-        // the caller's out-parameters: the first caller (the SteamID question)
-        // asks for neither, and a cache filled from it would hand the next
-        // caller a zero app id.
-        const blob_appid = std.mem.readInt(u32, buf[off_appid..][0..4], .little);
-        const blob_steamid = std.mem.readInt(u64, buf[off_steamid..][0..8], .little);
-        if (appid_out) |p| p.* = blob_appid;
-        if (steamid_out) |p| p.* = blob_steamid;
-        if (sig_out) |dst| @memcpy(dst[0..len_sig], buf[off_sig..][0..len_sig]);
-        if (siglen_out) |p| p.* = len_sig;
-        // Keep the answer for the next question about the same app.
-        g_ticket_cache_valid = true;
-        g_ticket_cache_appid = appid;
-        g_ticket_cache_len = std.mem.readInt(u32, buf[0..4], .little);
-        g_ticket_cache_appid_out = blob_appid;
-        g_ticket_cache_steamid = blob_steamid;
-        g_ticket_cache_siglen = len_sig;
-        @memcpy(g_ticket_cache_sig[0..len_sig], buf[off_sig..][0..len_sig]);
-        const keep = @min(g_ticket_cache_len, g_ticket_cache.len);
-        @memcpy(g_ticket_cache[0..keep], buf[0..keep]);
+    if (total == 0) return .{};
+    if (total > buf.len) {
+        std.debug.print("[WINS:Steam] the client wrote {d} bytes into a {d}-byte buffer\n", .{ total, buf.len });
+        return .{};
     }
-    return std.mem.readInt(u32, buf[0..4], .little);
+    if (off_appid + 4 > total or off_steamid + 8 > total or off_sig + len_sig > total) {
+        std.debug.print("[WINS:Steam] the client's ticket blob does not hold its own pieces (total={d}, appid@{d}, steamid@{d}, firma@{d}+{d})\n", .{ total, off_appid, off_steamid, off_sig, len_sig });
+        return .{};
+    }
+    // The app id and the SteamID are read from the blob itself, not from the
+    // client's out-parameters: the first caller (the SteamID question) asks
+    // for neither, and a blob filled from it would hand the next caller a
+    // zero app id.
+    const blob = TicketBlob{
+        .total = total,
+        .off_appid = off_appid,
+        .off_steamid = off_steamid,
+        .off_sig = off_sig,
+        .len_sig = len_sig,
+        .appid = std.mem.readInt(u32, buf[off_appid..][0..4], .little),
+        .steamid = std.mem.readInt(u64, buf[off_steamid..][0..8], .little),
+    };
+    // Keep the whole answer for the next question about the same app.
+    g_ticket_cache_valid = true;
+    g_ticket_cache_appid = appid;
+    g_ticket_cache_blob = blob;
+    const keep = @min(total, g_ticket_cache.len);
+    @memcpy(g_ticket_cache[0..keep], buf[0..keep]);
+    return blob;
 }
 
 /// The real ticket object, once the DRM has asked the client for it.
@@ -3284,14 +3443,15 @@ fn sub_GetSteamID(self: usize, pSteamID: ?*u64) callconv(Tc) u64 {
     // comes from Steam, not from us.
     _ = self;
     var scratch: [512]u8 = undefined;
-    var steamid: u64 = 0;
-    const len = fetchRealTicket(g_real_ticket, g_guest_appid, scratch[0..], &steamid, null, null, null);
-    if (len == 0) {
+    const blob = fetchRealTicket(g_real_ticket, g_guest_appid, scratch[0..]);
+    if (blob.total == 0) {
         std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> the client gave no ticket\n", .{});
         return 0;
     }
-    if (pSteamID) |p| p.* = steamid;
-    std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> 0x{x} (from the client's own ticket)\n", .{steamid});
+    // The DRM copies the 8 bytes it gets here into one 8-byte local, so it
+    // wants the whole SteamID64 written, not a 32-bit half of it.
+    if (pSteamID) |p| p.* = blob.steamid;
+    std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> 0x{x} (from the client's own ticket)\n", .{blob.steamid});
     return 1;
 }
 
@@ -3302,37 +3462,46 @@ fn sub_GetAppID(self: usize) callconv(Tc) u32 {
     return @truncate(r);
 }
 
+/// ISteamAppTicket001::GetAppOwnershipTicketData, as the DRM's own code calls
+/// it.
+///
+/// Measured against the code the guest actually runs (the CEG image it builds
+/// at 0x10000000), the four out-parameters are not values: they are where the
+/// pieces sit inside the buffer the DRM passed in. The DRM reads the app id
+/// at the first offset and compares it against the app it asked for, compares
+/// the SteamID64 at the second against the one the user interface gave it,
+/// and verifies the signature at the third, of the given length, over the
+/// first `total - len_sig` bytes of the same buffer. So the whole blob goes
+/// into the guest's buffer and the offsets go back untouched.
 fn sub_GetAppOwnershipTicketData(
     self: usize,
     nAppID: u32,
     pvBuffer: ?[*]u8,
     cbBufferLength: u32,
-    piAppId: ?*u32,
-    piSteamId: ?*u64,
-    pbSignature: ?[*]u8,
-    pcbSignature: ?*u32,
+    piAppIdOffset: ?*u32,
+    piSteamIdOffset: ?*u32,
+    piSignatureOffset: ?*u32,
+    piSignatureLength: ?*u32,
 ) callconv(Tc) u32 {
     _ = self;
     var scratch: [512]u8 = undefined;
-    var steamid: u64 = 0;
-    var appid: u32 = 0;
-    var siglen: u32 = 0;
-    const len = fetchRealTicket(g_real_ticket, nAppID, scratch[0..], &steamid, &appid, pbSignature, &siglen);
-    if (len == 0) {
+    const blob = fetchRealTicket(g_real_ticket, nAppID, scratch[0..]);
+    if (blob.total == 0) {
         std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}) -> the client gave nothing\n", .{nAppID});
         return 0;
     }
-    // The ticket part is what the DRM parses; the signature follows it in the
-    // client's blob and goes into its own buffer, as the Steamworks ABI says.
+    // The ticket and the signature travel together: the DRM verifies the
+    // signature over the ticket bytes, in the buffer it passed in.
     if (pvBuffer) |dst| {
-        const copy = @min(len, cbBufferLength);
+        const copy = @min(blob.total, cbBufferLength);
         @memcpy(dst[0..copy], scratch[0..copy]);
     }
-    if (piAppId) |p| p.* = appid;
-    if (piSteamId) |p| p.* = steamid;
-    if (pcbSignature) |p| p.* = siglen;
-    std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}) -> {d} bytes, appid={d}, steamid=0x{x}, firma={d} bytes (from the real client)\n", .{ nAppID, len, appid, steamid, siglen });
-    return len;
+    if (piAppIdOffset) |p| p.* = blob.off_appid;
+    if (piSteamIdOffset) |p| p.* = blob.off_steamid;
+    if (piSignatureOffset) |p| p.* = blob.off_sig;
+    if (piSignatureLength) |p| p.* = blob.len_sig;
+    std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}) -> {d} bytes (appid@{d}, steamid@{d}, firma@{d}+{d}) (from the real client)\n", .{ nAppID, blob.total, blob.off_appid, blob.off_steamid, blob.off_sig, blob.len_sig });
+    return blob.total;
 }
 
 // ---- CreateInterface (exported from steamclient.dll) -----------------------
@@ -3397,10 +3566,17 @@ fn steamFlatReady() bool {
     if (g_flat_ready) return true;
     if (g_real_iface == 0) return false;
     const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(g_real_iface)).*);
-    const createPipe: *const fn (usize) callconv(Cc) u32 = @ptrFromInt(vt[0]);
-    const connectUser: *const fn (usize, u32) callconv(Cc) u32 = @ptrFromInt(vt[2]);
-    g_flat_pipe = createPipe(g_real_iface);
-    g_flat_user = connectUser(g_real_iface, g_flat_pipe);
+    // These are the real client's own methods, so they are called with the
+    // client's calling convention and the client's alignment requirement.
+    //
+    // Measured: called through a plain C call, the client's CreateSteamPipe
+    // faulted on its own SSE store (`movaps %xmm4,-0x78(%ebp)`) because the
+    // stack was not 16-byte aligned -- the Linux i386 ABI requires that at a
+    // call, and a C call from a 4-byte-aligned frame does not give it. The
+    // same two calls made through callAligned1/callAligned2, which is what
+    // the CEG path does, do not fault.
+    g_flat_pipe = @truncate(callAligned1(vt[0], g_real_iface));
+    g_flat_user = @truncate(callAligned2(vt[2], g_real_iface, g_flat_pipe));
     g_flat_ready = true;
     std.debug.print("[WINS:Steam] real client: pipe={d} user={d}\n", .{ g_flat_pipe, g_flat_user });
     return true;
@@ -3415,9 +3591,9 @@ fn steamFlatReady() bool {
 fn steamFlatIface(comptime versions: []const [*:0]const u8, kind: usize) usize {
     if (!steamFlatReady()) return 0;
     const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(g_real_iface)).*);
-    const generic: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(vt[13]);
     inline for (versions) |v| {
-        const got = generic(g_real_iface, g_flat_user, g_flat_pipe, v);
+        // Aligned for the same reason as steamFlatReady above.
+        const got = callAligned4(vt[13], g_real_iface, g_flat_user, g_flat_pipe, @intFromPtr(v));
         if (got != 0) {
             std.debug.print("[WINS:Steam] real client supplied \"{s}\"\n", .{v});
             return wrapSubKind(kind, got);
@@ -4531,7 +4707,11 @@ fn GetProcAddress(hModule: usize, lpProcName: ?[*:0]const u8) callconv(W) ?*cons
         // pushed, and the argument left on the stack is eventually popped into
         // EIP by a later `ret`. 7zr hit exactly that on SetDefaultDllDirectories
         // and jumped to its own 0xc00 flags argument.
-        std.debug.print("  -> GetProcAddress: \"{s}\" NOT FOUND (returning NULL)\n", .{slice});
+        //
+        // The asking address is in the message: a name that is not in any of
+        // the modules is either a module the loader does not know, or a name
+        // the caller built wrong, and those two need different fixes.
+        std.debug.print("  -> GetProcAddress: \"{s}\" NOT FOUND in any known module (returning NULL), asked by 0x{x:0>8} for module 0x{x:0>8}\n", .{ slice, @returnAddress(), hModule });
         g_last_error = 127; // ERROR_PROC_NOT_FOUND
     }
     return null;
@@ -4818,6 +4998,15 @@ pub fn main(init: std.process.Init) !void {
     var import_rva: u32 = 0;
     var import_size: u32 = 0;
 
+    // Entry 9 is the TLS directory: the guest's static thread data, and the
+    // address where it expects to find the index the loader gave it.
+    var tls_rva: u32 = 0;
+    var tls_size: u32 = 0;
+    if (data_dirs_offset + 9 * 8 + 8 <= opt_offset + opt_header_size) {
+        tls_rva = std.mem.readInt(u32, bytes[data_dirs_offset + 9 * 8 ..][0..4], .little);
+        tls_size = std.mem.readInt(u32, bytes[data_dirs_offset + 9 * 8 + 4 ..][0..4], .little);
+    }
+
     if (data_dirs_offset + 8 <= opt_offset + opt_header_size) {
         import_rva = std.mem.readInt(u32, bytes[data_dirs_offset + 8 ..][0..4], .little);
         import_size = std.mem.readInt(u32, bytes[data_dirs_offset + 12 ..][0..4], .little);
@@ -5068,6 +5257,10 @@ pub fn main(init: std.process.Init) !void {
         g_tib_buffer[1] = @intCast(stack_base);
         g_tib_buffer[2] = @intCast(stack_limit);
         registerGuestStack(stack_base, stack_limit);
+
+        // The guest's thread data, before any guest code runs: the image is
+        // mapped and its sections are in place, so the template can be copied.
+        setupGuestTls(allocator, image_base, tls_rva, tls_size);
 
         const new_esp = stack_base - 0x1000;
         std.debug.print("\n[WINS:winrun32] JUMPING to EntryPoint at 0x{x:0>8} with stack at 0x{x:0>8}...\n", .{image_base + entry_rva, new_esp});
