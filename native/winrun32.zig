@@ -2658,8 +2658,15 @@ fn realFactory(version: [*:0]const u8) usize {
     if (g_real_create) |f| {
         var rc: i32 = -1;
         const got = f(version, &rc);
+        // Both answers are logged, not just the failure: the previous form only
+        // spoke when the client refused, and a caller that printed "-> real
+        // client" before the call had no way to tell a real object from a null
+        // one. That silence is what hid the missing ticket interface.
+        const ptr: usize = if (got) |g| @intFromPtr(g) else 0;
+        std.debug.print("[WINS:Steam] factory(\"{s}\") -> 0x{x} (rc={d})\n", .{ version, ptr, rc });
         if (got) |g| return @intFromPtr(g);
-        std.debug.print("[WINS:Steam] the real client did not supply \"{s}\" (rc={d})\n", .{ version, rc });
+    } else {
+        std.debug.print("[WINS:Steam] factory(\"{s}\") -> no CreateInterface export\n", .{version});
     }
     return 0;
 }
@@ -2695,6 +2702,15 @@ fn loadRealSteamClient() void {
         return;
     };
     const create: *const fn (?[*:0]const u8, ?*i32) callconv(.c) ?*anyopaque = @ptrCast(sym);
+    // The factory has to be reachable by every caller, not only by the one that
+    // asks for "SteamClient010". The DRM asks the client for its user
+    // interface and for the app-ticket interface BY NAME, through the same
+    // entry point. While this global stayed null, realFactory() answered null
+    // to every one of those names, the DRM saw three null interfaces, gave up
+    // on the Steamworks path and fell back to the Steam2 one -- which is the
+    // path that needs the SteamStart shared memory and dies with
+    // "Application load error P:0000065432".
+    g_real_create = @ptrCast(create);
     // The client's own flat helpers. Measured: CreateInterface succeeds but a
     // method called on the object it returns crashes inside the client with a
     // null dereference, while Steam_CreateSteamPipe() and
@@ -2786,6 +2802,58 @@ fn callAligned0(fnptr: usize) usize {
     return ret;
 }
 
+fn callAligned4(fnptr: usize, a0: usize, a1: usize, a2: usize, a3: usize) usize {
+    // The arguments travel in memory: there are more of them than there are
+    // registers to hold them in, and the real client's ABI wants them on the
+    // stack anyway.
+    const args = [4]usize{ a0, a1, a2, a3 };
+    var ret: usize = undefined;
+    asm volatile (
+        \\ movl %%esp, %%ebx
+        \\ subl $12, %%esp
+        \\ andl $-16, %%esp
+        \\ pushl 12(%[args])
+        \\ pushl 8(%[args])
+        \\ pushl 4(%[args])
+        \\ pushl 0(%[args])
+        \\ call *%[fnptr]
+        \\ movl %%ebx, %%esp
+        : [ret] "={eax}" (ret),
+        : [args] "r" (&args),
+          [fnptr] "r" (fnptr),
+        : .{ .memory = true, .cc = true, .ecx = true, .edx = true, .ebx = true }
+    );
+    return ret;
+}
+
+/// Eight arguments, for GetAppOwnershipTicketData: the object plus the seven
+/// the Steamworks signature has. The arguments travel through memory because
+/// there are more of them than there are registers to hold them in.
+fn callAligned8(fnptr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize) usize {
+    const args = [8]usize{ a0, a1, a2, a3, a4, a5, a6, a7 };
+    var ret: usize = undefined;
+    asm volatile (
+        \\ movl %%esp, %%ebx
+        \\ subl $12, %%esp
+        \\ andl $-16, %%esp
+        \\ pushl 28(%[args])
+        \\ pushl 24(%[args])
+        \\ pushl 20(%[args])
+        \\ pushl 16(%[args])
+        \\ pushl 12(%[args])
+        \\ pushl 8(%[args])
+        \\ pushl 4(%[args])
+        \\ pushl 0(%[args])
+        \\ call *%[fnptr]
+        \\ movl %%ebx, %%esp
+        : [ret] "={eax}" (ret),
+        : [args] "r" (&args),
+          [fnptr] "r" (fnptr),
+        : .{ .memory = true, .cc = true, .ecx = true, .edx = true, .ebx = true }
+    );
+    return ret;
+}
+
 fn callAligned1(fnptr: usize, a0: usize) usize {
     var ret: usize = undefined;
     asm volatile (
@@ -2805,19 +2873,23 @@ fn callAligned1(fnptr: usize, a0: usize) usize {
 }
 
 fn callAligned2(fnptr: usize, a0: usize, a1: usize) usize {
+    // The arguments travel in memory rather than in registers. The real
+    // client's ABI wants them on the stack anyway, and a register per
+    // argument does not fit: a thiscall caller has to keep ECX for `self`,
+    // and the call itself clobbers ECX and EDX.
+    const args = [2]usize{ a0, a1 };
     var ret: usize = undefined;
     asm volatile (
         \\ movl %%esp, %%ebx
         \\ subl $12, %%esp
         \\ andl $-16, %%esp
         \\ subl $8, %%esp
-        \\ pushl %[a1]
-        \\ pushl %[a0]
+        \\ pushl 4(%[args])
+        \\ pushl 0(%[args])
         \\ call *%[fnptr]
         \\ movl %%ebx, %%esp
         : [ret] "={eax}" (ret),
-        : [a1] "r" (a1),
-          [a0] "r" (a0),
+        : [args] "r" (&args),
           [fnptr] "r" (fnptr),
         : .{ .memory = true, .cc = true, .ecx = true, .edx = true, .ebx = true }
     );
@@ -2825,21 +2897,20 @@ fn callAligned2(fnptr: usize, a0: usize, a1: usize) usize {
 }
 
 fn callAligned3(fnptr: usize, a0: usize, a1: usize, a2: usize) usize {
+    const args = [3]usize{ a0, a1, a2 };
     var ret: usize = undefined;
     asm volatile (
         \\ movl %%esp, %%ebx
         \\ subl $12, %%esp
         \\ andl $-16, %%esp
         \\ subl $4, %%esp
-        \\ pushl %[a2]
-        \\ pushl %[a1]
-        \\ pushl %[a0]
+        \\ pushl 8(%[args])
+        \\ pushl 4(%[args])
+        \\ pushl 0(%[args])
         \\ call *%[fnptr]
         \\ movl %%ebx, %%esp
         : [ret] "={eax}" (ret),
-        : [a2] "r" (a2),
-          [a1] "r" (a1),
-          [a0] "r" (a0),
+        : [args] "r" (&args),
           [fnptr] "r" (fnptr),
         : .{ .memory = true, .cc = true, .ecx = true, .edx = true, .ebx = true }
     );
@@ -2883,31 +2954,60 @@ fn a004_ReleaseUser(self: usize, hSteamPipe: u32, hSteamUser: u32) callconv(Tc) 
     f(realOf(self), hSteamPipe, hSteamUser);
 }
 
+/// Which adapter table an interface needs, decided by the name the guest asked
+/// for. The client hands back one object per name and each object's method set
+/// is different, so the name decides which table we wrap it in.
+fn kindForVersion(version: ?[*:0]const u8) usize {
+    const v = if (version) |p| std.mem.sliceTo(p, 0) else "";
+    if (std.mem.indexOf(u8, v, "APPTICKET") != null) return SubAppTicket;
+    if (std.mem.indexOf(u8, v, "SteamUtils") != null) return SubUtils;
+    if (std.mem.indexOf(u8, v, "SteamUser") != null) return SubUser;
+    return SubGeneric;
+}
+
+/// ISteamClient slot 5: GetISteamUser(hSteamUser, hSteamPipe, version).
+///
+/// Measured against the real client: the user interface is only reachable
+/// through the client's own getter. Its global CreateInterface knows the
+/// SteamClient* family and nothing else -- asking it for "SteamUser016"
+/// answers null -- and three null interfaces are what used to make the DRM
+/// walk away from the Steamworks path.
 fn a005_GetISteamUser(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
-    _ = self; _ = hSteamUser; _ = hSteamPipe;
-    // The guest names the version it wants; the client's own factory answers.
-    // Walking the client's vtable here is measured to crash.
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
+    const vptr: usize = if (pchVersion) |v| @intFromPtr(v) else 0;
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamUser(\"{s}\") -> real client\n", .{ver});
-    return wrapSubKind(SubUser, realFactory(pchVersion orelse return 0));
+    const obj = callAligned4(realSlot(self, 5), realOf(self), hSteamUser, hSteamPipe, vptr);
+    std.debug.print("[WINS:Steam] user interface -> 0x{x}\n", .{obj});
+    return wrapSubKind(SubUser, obj);
 }
 
-fn a009_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
-    _ = self; _ = hSteamUser; _ = hSteamPipe;
-    // The guest names the version it wants; the client's own factory answers.
-    // Walking the client's vtable here is measured to crash.
+/// ISteamClient slot 9: GetISteamUtils(hSteamPipe, version).
+///
+/// Two arguments, not three: measured against the real client, handing it
+/// three makes it fault inside the client, and reading a third argument here
+/// is what used to make the log show an empty version name for a call the
+/// guest had made with a perfectly good one.
+fn a009_GetISteamUtils(self: usize, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
+    const vptr: usize = if (pchVersion) |v| @intFromPtr(v) else 0;
+    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamUtils(\"{s}\") -> real client\n", .{ver});
+    const obj = callAligned3(realSlot(self, 9), realOf(self), hSteamPipe, vptr);
+    std.debug.print("[WINS:Steam] utils interface -> 0x{x}\n", .{obj});
+    return wrapSubKind(SubUtils, obj);
+}
+
+/// ISteamClient slot 13: the generic getter. It dispatches on the version
+/// name and hands back the object for it -- the ticket name gives the ticket
+/// object, the utils name the utils object. This is where the app-ownership
+/// ticket comes from: the real client answers GetAppOwnershipTicketData(22380)
+/// with 238 bytes of ticket and a 128-byte signature.
+fn a013_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+    const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
+    const vptr: usize = if (pchVersion) |v| @intFromPtr(v) else 0;
     std.debug.print("[WINS:Steam] ISteamClient010::GetISteamGenericInterface(\"{s}\") -> real client\n", .{ver});
-    return wrapSubKind(SubGeneric, realFactory(pchVersion orelse return 0));
-}
-
-fn a013_GetISteamAppTicket(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
-    _ = self; _ = hSteamUser; _ = hSteamPipe;
-    // The guest names the version it wants; the client's own factory answers.
-    // Walking the client's vtable here is measured to crash.
-    const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
-    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamAppTicket(\"{s}\") -> real client\n", .{ver});
-    return wrapSubKind(SubAppTicket, realFactory(pchVersion orelse return 0));
+    const obj = callAligned4(realSlot(self, 13), realOf(self), hSteamUser, hSteamPipe, vptr);
+    std.debug.print("[WINS:Steam] generic interface -> 0x{x}\n", .{obj});
+    return wrapSubKind(kindForVersion(pchVersion), obj);
 }
 
 fn a_stub(self: usize) callconv(Tc) u32 {
@@ -2915,7 +3015,7 @@ fn a_stub(self: usize) callconv(Tc) u32 {
     return 0;
 }
 
-var g_steamclient010_vt: [16]usize = [_]usize{0} ** 16;
+var g_steamclient010_vt: [40]usize = [_]usize{0} ** 40;
 var g_steamclient010_vt_ready: bool = false;
 
 /// Filled at runtime: Zig cannot take a function address in a comptime
@@ -2924,14 +3024,21 @@ var g_steamclient010_vt_ready: bool = false;
 /// site (disassembly of the DRM: slots 0, 2, 9, 5, 13).
 fn ensureSteamClient010Vt() void {
     if (g_steamclient010_vt_ready) return;
-    @memset(&g_steamclient010_vt, @intFromPtr(&a_stub));
+    // Every hole announces itself. The old fill used a_stub, which returned 0
+    // in silence: a DRM call into a slot we had not modelled looked exactly
+    // like a client that had nothing to say, and the DRM walked away from the
+    // whole handshake. The table is also grown to the real ISteamClient size so
+    // a call past the old 16 slots cannot read past the end of the array.
+    inline for (0..g_steamclient010_vt.len) |i| {
+        g_steamclient010_vt[i] = @intFromPtr(stubFor(i));
+    }
     g_steamclient010_vt[0] = @intFromPtr(&a000_CreateSteamPipe);
     g_steamclient010_vt[1] = @intFromPtr(&a001_BReleaseSteamPipe);
     g_steamclient010_vt[2] = @intFromPtr(&a002_ConnectToGlobalUser);
     g_steamclient010_vt[4] = @intFromPtr(&a004_ReleaseUser);
     g_steamclient010_vt[5] = @intFromPtr(&a005_GetISteamUser);
-    g_steamclient010_vt[9] = @intFromPtr(&a009_GetISteamGenericInterface);
-    g_steamclient010_vt[13] = @intFromPtr(&a013_GetISteamAppTicket);
+    g_steamclient010_vt[9] = @intFromPtr(&a009_GetISteamUtils);
+    g_steamclient010_vt[13] = @intFromPtr(&a013_GetISteamGenericInterface);
     g_steamclient010_vt_ready = true;
 }
 
@@ -3028,17 +3135,16 @@ const SubAppTicket: usize = 2;
 const SubGeneric: usize = 3;
 
 fn sub_GetSteamID(self: usize, pSteamID: ?*u64) callconv(Tc) u64 {
-    const f: *const fn (usize, ?*u64) callconv(Cc) u64 = @ptrFromInt(realSlot(self, 2));
-    const r = f(realOf(self), pSteamID);
+    std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> calling the real client (slot 2) arg=0x{x}\n", .{if (pSteamID) |q| @intFromPtr(q) else 0});
+    const r = callAligned2(realSlot(self, 2), realOf(self), if (pSteamID) |p| @intFromPtr(p) else 0);
     std.debug.print("[WINS:Steam] ISteamUser016::GetSteamID() -> 0x{x} (from the real client)\n", .{r});
     return r;
 }
 
 fn sub_GetAppID(self: usize) callconv(Tc) u32 {
-    const f: *const fn (usize) callconv(Cc) u32 = @ptrFromInt(realSlot(self, 9));
-    const r = f(realOf(self));
+    const r = callAligned1(realSlot(self, 9), realOf(self));
     std.debug.print("[WINS:Steam] ISteamUtils005::GetAppID() -> {d} (from the real client)\n", .{r});
-    return r;
+    return @truncate(r);
 }
 
 fn sub_GetAppOwnershipTicketData(
@@ -3047,14 +3153,27 @@ fn sub_GetAppOwnershipTicketData(
     pvBuffer: ?[*]u8,
     cbBufferLength: u32,
     piAppId: ?*u32,
-    piSteamId: ?*u32,
-    piSignature: ?*u32,
+    piSteamId: ?*u64,
+    pbSignature: ?[*]u8,
     pcbSignature: ?*u32,
 ) callconv(Tc) u32 {
-    const f: *const fn (usize, u32, ?[*]u8, u32, ?*u32, ?*u32, ?*u32, ?*u32) callconv(Cc) u32 = @ptrFromInt(realSlot(self, 0));
-    const r = f(realOf(self), nAppID, pvBuffer, cbBufferLength, piAppId, piSteamId, piSignature, pcbSignature);
+    // The real client faults on an SSE store when the stack is not 16-byte
+    // aligned, and the guest's stack never is: this call goes through the
+    // aligned helper for the same reason the others do.
+    std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}, {d} bytes) -> calling the real client (slot 0)\n", .{ nAppID, cbBufferLength });
+    const r = callAligned8(
+        realSlot(self, 0),
+        realOf(self),
+        nAppID,
+        if (pvBuffer) |b| @intFromPtr(b) else 0,
+        cbBufferLength,
+        if (piAppId) |a| @intFromPtr(a) else 0,
+        if (piSteamId) |a| @intFromPtr(a) else 0,
+        if (pbSignature) |a| @intFromPtr(a) else 0,
+        if (pcbSignature) |a| @intFromPtr(a) else 0,
+    );
     std.debug.print("[WINS:Steam] ISteamAppTicket001::GetAppOwnershipTicketData(appid={d}, {d} bytes) -> {d} (from the real client)\n", .{ nAppID, cbBufferLength, r });
-    return r;
+    return @truncate(r);
 }
 
 // ---- CreateInterface (exported from steamclient.dll) -----------------------
@@ -3077,9 +3196,23 @@ fn steamclient_CreateInterface(pName: ?[*:0]const u8, pReturnCode: ?*i32) callco
         return null;
     }
     ensureSteamClient010Vt();
-    g_steamclient010_adapter = .{ .vt = @intFromPtr(&g_steamclient010_vt), .real = g_real_iface };
+    // Honour the version the guest asked for: the client has an object for
+    // each one of them, and the guest asks for "SteamClient010" first and
+    // "SteamClient009" when it falls back. The slot layout used here was
+    // measured on SteamClient010.
+    var real = g_real_iface;
+    if (g_real_create) |f| {
+        var rc2: i32 = -1;
+        if (f(name, &rc2)) |o| {
+            real = @intFromPtr(o);
+            std.debug.print("  -> the real client supplied \"{s}\" (0x{x})\n", .{ name, real });
+        } else {
+            std.debug.print("  -> the real client has no \"{s}\" (rc={d}); keeping SteamClient010\n", .{ name, rc2 });
+        }
+    }
+    g_steamclient010_adapter = .{ .vt = @intFromPtr(&g_steamclient010_vt), .real = real };
     if (pReturnCode) |rc| rc.* = 0;
-    std.debug.print("  -> adapter over the real client's object (real=0x{x})\n", .{g_real_iface});
+    std.debug.print("  -> adapter over the real client's object (real=0x{x})\n", .{real});
     return @ptrFromInt(adapterObj(&g_steamclient010_adapter));
 }
 
@@ -3115,10 +3248,15 @@ fn steamFlatReady() bool {
 }
 
 /// Ask the real client for a named interface and wrap it for the guest.
+///
+/// The named interfaces come from the client's generic getter, which is slot
+/// 13 of its vtable and dispatches on the version name -- measured. Slot 9 is
+/// GetISteamUtils, which takes two arguments and faults inside the client when
+/// given three; asking it for a name other than the utils one answers null.
 fn steamFlatIface(comptime versions: []const [*:0]const u8, kind: usize) usize {
     if (!steamFlatReady()) return 0;
     const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(g_real_iface)).*);
-    const generic: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(vt[9]);
+    const generic: *const fn (usize, u32, u32, ?[*:0]const u8) callconv(Cc) usize = @ptrFromInt(vt[13]);
     inline for (versions) |v| {
         const got = generic(g_real_iface, g_flat_user, g_flat_pipe, v);
         if (got != 0) {
