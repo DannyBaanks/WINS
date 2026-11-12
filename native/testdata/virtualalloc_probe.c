@@ -14,6 +14,8 @@ void probe_main(void) {
     p[0] = 'A'; p[4096] = 'B';
     char *q = VirtualAlloc(p + 4096, 4096, MEM_COMMIT, PAGE_READWRITE);
     if (!q) ExitProcess(11);
+    char *occupied = VirtualAlloc(p, 8192, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+    if (occupied) ExitProcess(12);
     char out[] = {p[0], p[4096], '\n'};
     WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), out, sizeof(out), &written, 0);
     ExitProcess(q != p + 4096 || out[0] != 'A' || out[1] != 'B');

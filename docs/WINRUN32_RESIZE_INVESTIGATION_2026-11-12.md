@@ -42,3 +42,21 @@ The raw local traces are temporary, not canonical permanent evidence:
 The test does not demonstrate that the game runs, that the earlier `VirtualAlloc`
 bug caused its crash, or that Wine exactly matches Windows. Original proprietary
 game files are not included in this repository.
+
+## Follow-up: requested reservation addresses
+
+The guest repeatedly requested large reservations at a specific address already
+occupied by the loader. WINS returned a different address and the guest's
+high-byte ownership table subsequently pointed to the wrong pool. The loader now
+uses a non-destructive mmap hint and fails if it cannot return the requested
+address, instead of relocating or replacing a mapping. The expanded synthetic
+probe also attempts to reserve already allocated pages: both Wine and the new
+loader returned failure, preserved `AB`, and exited 0. The expanded probe PE
+SHA-256 is `08f7ce16495ddc06d9395eef773afdc545369973ce8aca38a64048fc8786e6b7`.
+
+In one isolated run with this change, the application advanced past the earlier
+`0x713eea` crash into D3D9, then repeatedly invoked the unimplemented
+`SetRenderTarget` path and the process exited 139. This is progress, not proof
+of a working display or of the cause of the later termination. The local trace
+`/tmp/wins-resume/sandbox-output/shipped-run-exact-codex.log` has SHA-256
+`f0a0658f3b7b07c19d58e5a02f57098e6d2c7956827750fa793159d0d0c1d210`.

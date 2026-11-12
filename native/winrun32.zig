@@ -586,15 +586,8 @@ fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, fl
         g_last_error = 487; // ERROR_INVALID_ADDRESS: no matching reservation
         return null;
     }
-    // A caller-supplied address must not silently unmap whatever the kernel
-    // already put there. An earlier version raised MAP_FIXED whenever lpAddress
-    // was non-null -- a destroy-what-is-there primitive -- and the real client
-    // aborted with "malloc(): unaligned tcache chunk detected" as a result. A
-    // later attempt dropped MAP_FIXED entirely, which broke the guest instead:
-    // it maps its own stub image at the base its PE header names, so honouring
-    // the request is load-bearing. Both measurements are kept because both are
-    // wrong: the address is honoured, except where it would destroy memory that
-    // is not the guest's.
+    // A caller-supplied reservation must neither replace an existing mapping
+    // nor silently move to a different address.
     const requested: ?[*]u8 = if (lpAddress) |a| @ptrCast(a) else null;
     const free_flags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     var ptr: usize = undefined;
@@ -615,27 +608,16 @@ fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, fl
             g_last_error = 87; // ERROR_INVALID_PARAMETER
             return null;
         }
-        // The question is not "is this range one the snapshot knew about" but
-        // "is this range free right now". The snapshot is taken once, when the
-        // client is loaded, and it only covers the named regions (the heap,
-        // steamclient.so, libc.so, libstdc++, libm.so). Everything the client
-        // allocates afterwards is anonymous: thread stacks, per-thread arenas,
-        // its own buffers. A guest reservation placed over one of those puts
-        // the guest's writes on top of the client's live memory, which is what
-        // the client reports as "malloc(): unaligned tcache chunk detected":
-        // the bad tcache entry was a tick count the client had written into a
-        // chunk the guest had taken over.
-        //
-        // So ask the kernel, here, now: /proc/self/maps is the only authority
-        // on what is mapped. The address is still honoured when it is actually
-        // free, because the guest maps its own image at the base its PE header
-        // names and that is load-bearing.
-        if (rangeIsForeign(@intFromPtr(req), @intFromPtr(req) + dwSize)) {
-            std.debug.print("[WINS:Kernel32] VirtualAlloc: 0x{x}+{d} is not the guest's; relocating\n", .{ @intFromPtr(req), dwSize });
-            ptr = linux.mmap(null, dwSize, prot, free_flags, -1, 0);
-        } else {
-            const fixed = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };
-            ptr = linux.mmap(req, dwSize, prot, fixed, -1, 0);
+        // A requested reservation is an exact-address request. Using
+        // MAP_FIXED destroys an existing mapping; silently relocating breaks
+        // guests that index allocations by address. An ordinary mmap hint is
+        // atomic and non-destructive: discard any alternative the kernel
+        // chooses and report the occupied address to the guest.
+        ptr = linux.mmap(req, dwSize, prot, free_flags, -1, 0);
+        if (linux.errno(ptr) == .SUCCESS and ptr != @intFromPtr(req)) {
+            _ = linux.munmap(@ptrFromInt(ptr), dwSize);
+            g_last_error = 487; // ERROR_INVALID_ADDRESS
+            return null;
         }
     } else {
         ptr = linux.mmap(null, dwSize, prot, free_flags, -1, 0);
@@ -6046,6 +6028,9 @@ test "VirtualAlloc recommit preserves existing contents and refuses an unreserve
     bytes[4096] = 0x42;
     const second: *anyopaque = @ptrCast(bytes + 4096);
     try std.testing.expectEqual(second, VirtualAlloc(second, 4096, 0x1000, 0x04).?);
+    try std.testing.expectEqual(@as(u8, 0x41), bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x42), bytes[4096]);
+    try std.testing.expect(VirtualAlloc(page, 8192, 0x3000, 0x04) == null);
     try std.testing.expectEqual(@as(u8, 0x41), bytes[0]);
     try std.testing.expectEqual(@as(u8, 0x42), bytes[4096]);
     try std.testing.expect(VirtualAlloc(@ptrFromInt(0x10000), 4096, 0x1000, 0x04) == null);
