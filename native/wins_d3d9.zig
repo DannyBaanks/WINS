@@ -27,6 +27,7 @@ pub const D3D_OK: HRESULT = S_OK;
 
 pub const D3DFMT_A8R8G8B8: u32 = 21;
 pub const D3DFMT_X8R8G8B8: u32 = 22;
+pub const D3DFMT_A8B8G8R8: u32 = 23;
 pub const D3DFMT_D24S8: u32 = 75;
 pub const D3DFMT_D16: u32 = 80;
 pub const D3DFMT_INDEX16: u32 = 101;
@@ -43,6 +44,7 @@ pub const D3DRTYPE_TEXTURE: u32 = 3;
 pub const D3DMULTISAMPLE_NONE: u32 = 0;
 pub const D3DDEVTYPE_HAL: u32 = 1;
 pub const D3DDEVTYPE_REF: u32 = 2;
+pub const D3DDEVCAPS_HWTRANSFORMLIGHT: u32 = 0x00010000;
 pub const D3DDEVTYPE_SW: u32 = 3;
 pub const D3DDEVTYPE_NULLREF: u32 = 4;
 
@@ -1224,7 +1226,7 @@ fn d3d9_GetAdapterModeCount(this: *anyopaque, adapter: u32, format: u32) callcon
     _ = this;
     if (adapter != 0) return 0;
     // D3DFORMAT_UNKNOWN asks for every mode the adapter has.
-    if (format == 0 or format == kDisplayMode.Format) return 1;
+    if (format == 0 or isRenderTargetFormat(format)) return 1;
     return 0;
 }
 
@@ -1234,7 +1236,7 @@ fn d3d9_EnumAdapterModes(this: *anyopaque, adapter: u32, format: u32, mode: u32,
     _ = this;
     if (adapter != 0) return D3DERR_INVALIDARG;
     if (mode != 0) return D3DERR_INVALIDARG;
-    if (format != 0 and format != kDisplayMode.Format) return D3DERR_INVALIDARG;
+    if (format != 0 and !isRenderTargetFormat(format)) return D3DERR_INVALIDARG;
     const out: ?*align(1) D3DDISPLAYMODE = if (pMode) |p| @ptrCast(p) else null;
     const m = out orelse return E_POINTER;
     m.* = kDisplayMode;
@@ -1255,6 +1257,10 @@ fn d3d9_GetDeviceCaps(this: *anyopaque, adapter: u32, dev_type: u32, pCaps: ?*D3
     if (pCaps) |caps| {
         @memset(std.mem.asBytes(caps), 0);
         caps.DeviceType = dev_type;
+        // The rasterizer is software, so transform & lighting run on the CPU:
+        // the HWTRANSFORMLIGHT cap is honest here, and guests gate on it
+        // before calling CreateDevice.
+        caps.DevCaps = D3DDEVCAPS_HWTRANSFORMLIGHT;
         caps.MaxTextureWidth = 8192;
         caps.MaxTextureHeight = 8192;
         caps.MaxVolumeExtent = 2048;
@@ -1291,11 +1297,12 @@ fn d3d9_CreateDevice(
 }
 /// The formats this adapter can render into.
 ///
-/// The software back buffer is 32-bit RGBA, which the guest sees as either of
-/// these. Everything else is refused rather than silently accepted: a guest
-/// that is told a format is available allocates it and then writes to it.
+/// The software back buffer is 32-bit; both RGBA byte orders (22 and 23,
+/// matching what Proton's HAL accepts) are served from it. Everything else is
+/// refused rather than silently accepted: a guest that is told a format is
+/// available allocates it and then writes to it.
 fn isRenderTargetFormat(format: u32) bool {
-    return format == D3DFMT_A8R8G8B8 or format == D3DFMT_X8R8G8B8;
+    return format == D3DFMT_A8R8G8B8 or format == D3DFMT_X8R8G8B8 or format == D3DFMT_A8B8G8R8;
 }
 
 /// The depth/stencil formats this adapter can allocate.
@@ -3292,4 +3299,20 @@ test "D3DX linear algebra math and matrix inversion" {
     try std.testing.expect(buf_raw != null);
     const buf: *WinsD3DXBuffer = @ptrCast(@alignCast(buf_raw.?));
     try std.testing.expectEqual(@as(u32, 1024), buf.vtbl.GetBufferSize(buf));
+}
+
+test "adapter caps advertise hardware transform and lighting (software T&L)" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    var caps: D3DCAPS9 = undefined;
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.GetDeviceCaps(d3d, 0, D3DDEVTYPE_HAL, &caps));
+    try std.testing.expect(caps.DevCaps & D3DDEVCAPS_HWTRANSFORMLIGHT != 0);
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.GetDeviceCaps(d3d, 0, D3DDEVTYPE_REF, &caps));
+    try std.testing.expect(caps.DevCaps & D3DDEVCAPS_HWTRANSFORMLIGHT != 0);
+}
+
+test "format 23 (A8B8G8R8) is accepted wherever 22 (X8R8G8B8) is" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, D3DFMT_A8B8G8R8));
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceType(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DFMT_A8B8G8R8, 1));
+    try std.testing.expectEqual(@as(u32, 1), d3d.vtbl.GetAdapterModeCount(d3d, 0, D3DFMT_A8B8G8R8));
 }
