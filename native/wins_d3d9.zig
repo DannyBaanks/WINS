@@ -1078,6 +1078,8 @@ pub const WinsD3D9 = struct {
 pub const WinsD3DDevice9 = struct {
     vtbl: *const IDirect3DDevice9Vtbl,
     ref_count: u32,
+    adapter: u32,
+    device_type: u32,
     params: D3DPRESENT_PARAMETERS,
     viewport: D3DVIEWPORT9,
     in_scene: bool,
@@ -1097,7 +1099,7 @@ pub const WinsD3DDevice9 = struct {
     active_ps: ?*WinsShader9,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, params: D3DPRESENT_PARAMETERS) !*WinsD3DDevice9 {
+    pub fn init(allocator: std.mem.Allocator, adapter: u32, device_type: u32, params: D3DPRESENT_PARAMETERS) !*WinsD3DDevice9 {
         const dev = try allocator.create(WinsD3DDevice9);
         const w = if (params.BackBufferWidth > 0) params.BackBufferWidth else 800;
         const h = if (params.BackBufferHeight > 0) params.BackBufferHeight else 600;
@@ -1111,6 +1113,8 @@ pub const WinsD3DDevice9 = struct {
         dev.* = .{
             .vtbl = &g_device9_vtbl,
             .ref_count = 1,
+            .adapter = adapter,
+            .device_type = device_type,
             .params = params,
             .viewport = .{
                 .X = 0,
@@ -1247,10 +1251,10 @@ fn d3d9_GetAdapterDisplayMode(this: *anyopaque, adapter: u32, pMode: ?*anyopaque
     return D3D_OK;
 }
 fn d3d9_GetDeviceCaps(this: *anyopaque, adapter: u32, dev_type: u32, pCaps: ?*D3DCAPS9) callconv(W) HRESULT {
-    _ = this; _ = adapter; _ = dev_type;
+    _ = this; _ = adapter;
     if (pCaps) |caps| {
         @memset(std.mem.asBytes(caps), 0);
-        caps.DeviceType = 1; // HAL
+        caps.DeviceType = dev_type;
         caps.MaxTextureWidth = 8192;
         caps.MaxTextureHeight = 8192;
         caps.MaxVolumeExtent = 2048;
@@ -1278,10 +1282,10 @@ fn d3d9_CreateDevice(
     pParams: ?*D3DPRESENT_PARAMETERS,
     ppDevice: ?*?*anyopaque,
 ) callconv(W) HRESULT {
-    _ = this; _ = adapter; _ = dev_type; _ = hFocusWindow; _ = behavior_flags;
+    _ = this; _ = hFocusWindow; _ = behavior_flags;
     if (ppDevice == null or pParams == null) return E_FAIL;
     const gpa = std.heap.page_allocator;
-    const dev = WinsD3DDevice9.init(gpa, pParams.?.*) catch return E_OUTOFMEMORY;
+    const dev = WinsD3DDevice9.init(gpa, adapter, dev_type, pParams.?.*) catch return E_OUTOFMEMORY;
     ppDevice.?.* = @ptrCast(dev);
     return D3D_OK;
 }
@@ -1829,10 +1833,8 @@ fn dev9_GetDirect3D(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
 }
 
 fn dev9_GetDeviceCaps(this: *anyopaque, p0: ?*D3DCAPS9) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!GetDeviceCaps is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const dev: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    return d3d9_GetDeviceCaps(this, dev.adapter, dev.device_type, p0);
 }
 
 fn dev9_GetDisplayMode(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
@@ -3169,6 +3171,15 @@ pub export fn D3DXSaveTextureToFileA(
 // Unit Tests (Embedded Verification)
 // ============================================================================
 
+test "GetDeviceCaps reports the requested HAL or REF device type" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    var caps: D3DCAPS9 = undefined;
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.GetDeviceCaps(d3d, 0, 1, &caps));
+    try std.testing.expectEqual(@as(u32, 1), caps.DeviceType);
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.GetDeviceCaps(d3d, 0, 2, &caps));
+    try std.testing.expectEqual(@as(u32, 2), caps.DeviceType);
+}
+
 test "Direct3DCreate9 and device initialization" {
     const d3d9_ptr = Direct3DCreate9(32);
     try std.testing.expect(d3d9_ptr != null);
@@ -3197,6 +3208,9 @@ test "Direct3DCreate9 and device initialization" {
     try std.testing.expect(dev_raw != null);
 
     const dev: *WinsD3DDevice9 = @ptrCast(@alignCast(dev_raw.?));
+    var device_caps: D3DCAPS9 = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetDeviceCaps(dev, &device_caps));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&caps), std.mem.asBytes(&device_caps));
     try std.testing.expectEqual(@as(u32, 640), dev.viewport.Width);
     try std.testing.expectEqual(@as(u32, 480), dev.viewport.Height);
 
