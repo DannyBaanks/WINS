@@ -122,7 +122,36 @@ Because the shim is produced by the toolchain instead of being hand-written
 per application, it stays reproducible and repairable: `wins heal-bin <dir>`
 re-applies it to an existing installation at any time.
 
-### 2.7 The Cleanroom Diagnostic Engine (`core/tester.py`)
+### 2.7 The Host Control Channel (companion bridge multiplexing)
+
+The desktop hands its local file API to the operator on **fd 3**. A Windows
+process under Wine cannot inherit that descriptor, so the WINS companion
+launcher relays it:
+
+```
+fd3 <-socat-> TCP loopback <- bridge (node.exe under Wine) -> Wine named pipe
+```
+
+The named pipe accepts a single client, so the bridge multiplexes two logical
+channels over it and routes JSON-RPC responses back **by id**:
+
+* **primary** - the desktop relay (file queries, host calls);
+* **control** - a loopback port published in a `0600` file
+  (`~/.cache/wins/logs/<name>-control.port`), used by WINS to drive operator
+  host calls (`wins local-addon --sync`).
+
+Two failure modes are handled explicitly, because both killed the port:
+
+* the bridge used to arm an **unconditional 120 s idle timer**; when it fired,
+  the operator saw its parent gone ("parent process exited, shutting down"),
+  the desktop respawned it and the device flapped offline in the cloud every
+  two minutes. The timer now only applies while the pipe was never reached;
+* the bridge must hand the operator a **valid Windows `PARENT_PID`**: the
+  desktop PID is a Linux PID and is invalid under Wine, so the bridge writes
+  `<unix-pid>:<windows-pid>` to a pidfile *before* listening and the launcher
+  waits for a live bridge before exporting it.
+
+### 2.8 The Cleanroom Diagnostic Engine (`core/tester.py`)
 Executes transmuted applications in an isolated subprocess with telemetry logging:
 * Real-time stream parsing for FFI failures, dlopen errors, missing modules, and unhandled rejections.
 * Analyzes execution health (`HEALTHY_RUNNING`, `CLEAN_EXIT`, `CRITICAL_ANOMALIES_DETECTED`).

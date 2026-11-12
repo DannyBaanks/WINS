@@ -33,42 +33,166 @@ from .native_modules import NativeModuleHealer
 # Bridge used to hand the local file API (fd 3) to a Windows process under Wine.
 # It writes "<unix-pid>:<windows-pid>" to the pidfile BEFORE listening so the
 # launcher never races the operator's PARENT_PID validation.
-BRIDGE_JS = """// WINS companion bridge: TCP loopback <-> Wine named pipe.
-// One client only (the launcher's socat fd 3 relay).
+#
+# The Windows named pipe accepts a single client, so the bridge multiplexes
+# two logical channels over it:
+#   * the primary channel  - the desktop relay (fd 3 <-> socat <-> TCP)
+#   * the control channel  - an optional host-side controller (WINS) that
+#                            needs to drive operator host calls such as
+#                            `addon.local.sync`
+# Responses are routed back by JSON-RPC id, so both channels stay independent.
+BRIDGE_JS = """// WINS companion bridge: TCP loopback <-> Wine named pipe (multiplexed).
 const net = require('net');
 const fs = require('fs');
 const pipe = process.env.MANUS_BRIDGE_PIPE;
 const port = Number(process.env.MANUS_BRIDGE_PORT);
+const controlPort = Number(process.env.MANUS_BRIDGE_CONTROL_PORT || 0);
 const pidfile = process.env.MANUS_BRIDGE_PIDFILE;
 
 let unixPid = String(process.pid);
 try { unixPid = fs.readFileSync('/proc/self/stat', 'utf8').split(' ')[0]; } catch (e) { /* not linux */ }
 try { fs.writeFileSync(pidfile, unixPid + ':' + process.pid); } catch (e) { console.error('bridge pidfile: ' + e.message); }
 
-const srv = net.createServer((c) => {
-  srv.close();
+const PRIMARY = 'primary';
+const CONTROL = 'control';
+const debug = !!process.env.MANUS_BRIDGE_DEBUG;
+const dbg = (...args) => { if (debug) { console.error(...args); } };
+const channels = new Map();   // id -> channel name
+const pending = new Map();   // id -> socket
+let primary = null;
+let pipeConn = null;
+let closed = false;
+let connected = false;
+const startedAt = Date.now();
+
+function die(code) {
+  if (closed) { return; }
+  closed = true;
+  try { if (pipeConn) { pipeConn.destroy(); } } catch (e) { /* ignore */ }
+  process.exit(code);
+}
+
+function route(line, origin) {
+  if (closed) { return; }
+  if (!pipeConn || !pipeConn.writable) {
+    dbg('bridge: drop (no pipe) from ' + origin + ': ' + line.slice(0, 120));
+    return;
+  }
+  dbg('bridge: route ' + origin + ' -> pipe: ' + line.slice(0, 120));
+  pipeConn.write(line + '\\n');
+  // remember which channel owns the request id (responses come back later)
+  let parsed = null;
+  try { parsed = JSON.parse(line); } catch (e) { parsed = null; }
+  if (parsed && typeof parsed.id === 'number' && parsed.method) {
+    channels.set(parsed.id, origin);
+  }
+}
+
+function deliver(line) {
+  if (closed) { return; }
+  dbg('bridge: pipe -> ' + line.slice(0, 120));
+  let parsed = null;
+  try { parsed = JSON.parse(line); } catch (e) { parsed = null; }
+  let target = primary;
+  let origin = null;
+  if (parsed && typeof parsed.id === 'number') {
+    origin = channels.get(parsed.id) || null;
+    if (origin === CONTROL && controlSockets.size > 0) {
+      target = controlSockets.keys().next().value;
+    }
+    channels.delete(parsed.id);
+  }
+  dbg('bridge: deliver origin=' + origin + ' controls=' + controlSockets.size +
+      ' primary=' + (primary ? 'yes' : 'no') + ' target=' + (target ? 'yes' : 'none'));
+  if (!target) { return; }
+  try { target.write(line + '\\n'); } catch (e) { console.error('bridge: write failed: ' + e.message); }
+}
+
+function attachClient(socket, name) {
+  socket.setEncoding('utf8');
+  let buffer = '';
+  socket.on('data', (chunk) => {
+    buffer += chunk;
+    let index;
+    while ((index = buffer.indexOf('\\n')) !== -1) {
+      const line = buffer.slice(0, index).trim();
+      buffer = buffer.slice(index + 1);
+      if (line) { route(line, name); }
+    }
+  });
+  socket.on('close', () => {
+    if (name === PRIMARY && primary === socket) { primary = null; }
+  });
+  socket.on('error', () => { /* ignore */ });
+}
+
+const controlSockets = new Map();
+
+function connectPipe() {
   const deadline = Date.now() + 90000;
-  (function dial() {
+  const dial = () => {
     const p = net.connect(pipe);
     p.once('connect', () => {
-      c.pipe(p); p.pipe(c);
-      // 'end' fires when the operator closes the pipe; exit promptly instead
-      // of lingering until the idle timeout.
-      const done = () => { try { p.destroy(); c.destroy(); } catch (e) {} process.exit(0); };
-      p.on('close', done);
-      p.on('end', done);
-      c.on('close', done);
-      c.on('end', done);
+      dbg('bridge: pipe connected: ' + pipe);
+      pipeConn = p;
+      connected = true;
+      p.setEncoding('utf8');
+      let buffer = '';
+      p.on('data', (chunk) => {
+        buffer += chunk;
+        let index;
+        while ((index = buffer.indexOf('\\n')) !== -1) {
+          const line = buffer.slice(0, index).trim();
+          buffer = buffer.slice(index + 1);
+          if (line) { deliver(line); }
+        }
+      });
+      p.on('close', () => die(0));
+      p.on('error', () => { /* handled by close */ });
+      if (primary) { attachClient(primary, PRIMARY); }
+      for (const socket of controlSockets.values()) { attachClient(socket, CONTROL); }
     });
     p.once('error', (e) => {
-      if (Date.now() > deadline) { console.error('bridge: ' + e.message); process.exit(1); }
+      if (Date.now() > deadline) { console.error('bridge: ' + e.message); die(1); }
       setTimeout(dial, 300);
     });
-  })();
-  c.on('error', () => process.exit(1));
+  };
+  dial();
+}
+
+const srv = net.createServer((c) => {
+  if (!primary) { primary = c; attachClient(c, PRIMARY); }
+  else { c.destroy(); }
 });
 srv.listen(port, '127.0.0.1');
-setTimeout(() => process.exit(0), 120000).unref();
+
+let controlSrv = null;
+if (controlPort > 0) {
+  try {
+    controlSrv = net.createServer((c) => {
+      controlSockets.set(c, CONTROL);
+      attachClient(c, CONTROL);
+      c.on('close', () => { controlSockets.delete(c); });
+    });
+    controlSrv.on('error', (e) => { console.error('bridge control: ' + e.message); controlSrv = null; });
+    controlSrv.listen(controlPort, '127.0.0.1');
+  } catch (e) {
+    console.error('bridge control: ' + e.message);
+    controlSrv = null;
+  }
+}
+
+connectPipe();
+// Idle timeout: only applies while the named pipe has never been reached.
+// Once connected, the bridge lives as long as the operator (the pipe close
+// handler ends it). An unconditional timer here used to kill the bridge
+// after 120s, which shut the operator down ("parent process exited") and made
+// the device flap offline in the cloud.
+const idleTimer = setInterval(() => {
+  if (connected) { clearInterval(idleTimer); return; }
+  if (Date.now() - startedAt > 120000) { die(1); }
+}, 1000);
+idleTimer.unref();
 """
 
 # Launcher template. Tokens: @NAME@, @EXE_NAME@.
@@ -167,6 +291,27 @@ WINS_BRIDGE_EOF
     WPIDFILE="$(winepath -w "$PIDFILE" 2>/dev/null)"
     [ -n "$WPIDFILE" ] || WPIDFILE="$PIDFILE"
     export MANUS_BRIDGE_PIDFILE="$WPIDFILE"
+
+    # Host-side control channel: a second logical channel multiplexed over
+    # the same named pipe, used by WINS to drive operator host calls
+    # (`wins local-addon --sync`). Loopback only, single client, and the
+    # port is published in a 0600 file.
+    CONTROL_PORT_FILE="$LOG_DIR/@NAME@-control.port"
+    CONTROL_PORT=""
+    for _ in $(seq 1 20); do
+        CAND=$((40000 + RANDOM % 20000))
+        if ! (exec 3<>/dev/tcp/127.0.0.1/$CAND) 2>/dev/null; then
+            CONTROL_PORT="$CAND"
+            break
+        fi
+    done
+    if [ -n "$CONTROL_PORT" ]; then
+        export MANUS_BRIDGE_CONTROL_PORT="$CONTROL_PORT"
+        printf '%s' "$CONTROL_PORT" > "$CONTROL_PORT_FILE"
+        chmod 600 "$CONTROL_PORT_FILE"
+    else
+        rm -f "$CONTROL_PORT_FILE"
+    fi
 
     NODE_OPTIONS= wine "$DIR/node.exe" "$(winepath -w "$BRIDGE_JS" 2>/dev/null || printf '%s' "$BRIDGE_JS")" >>"$BRIDGE_LOG" 2>&1 &
     BRIDGE_UNIX_PID=$!

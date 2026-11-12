@@ -9,6 +9,7 @@ import sys
 import json
 import tempfile
 import shutil
+import subprocess
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
@@ -212,6 +213,39 @@ class TestCompanionBinaryHealer(unittest.TestCase):
         self.assertIn("MANUS_BRIDGE_PIPE", content)
         self.assertNotEqual(content, "// stale\n")
 
+
+
+    def test_bridge_javascript_is_syntactically_valid(self):
+        """The generated bridge must parse (a syntax error kills the operator)."""
+        self._write_pe("agent.exe")
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+        bridge = os.path.join(self.bin_dir, ".wins-bridge-agent.js")
+        with open(bridge) as f:
+            source = f.read()
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        res = subprocess.run([node, "--check", bridge], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr[:400])
+
+    def test_bridge_has_no_duplicate_declarations(self):
+        self._write_pe("agent.exe")
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+        bridge = os.path.join(self.bin_dir, ".wins-bridge-agent.js")
+        with open(bridge) as f:
+            source = f.read()
+        self.assertEqual(source.count("let connected = false;"), 1)
+        self.assertEqual(source.count("const startedAt = Date.now();"), 1)
+
+    def test_bridge_idle_timeout_only_before_connection(self):
+        """An unconditional timer used to kill the bridge (and the operator)."""
+        self._write_pe("agent.exe")
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+        bridge = os.path.join(self.bin_dir, ".wins-bridge-agent.js")
+        with open(bridge) as f:
+            source = f.read()
+        self.assertNotIn("setTimeout(() => die(0), 120000)", source)
+        self.assertIn("if (connected)", source)
 
 if __name__ == "__main__":
     unittest.main()
