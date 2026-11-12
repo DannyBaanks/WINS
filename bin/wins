@@ -19,6 +19,7 @@ from core.recipes.pyinstaller import PyInstallerRecipe
 from core.recipes.dotnet import DotNetRecipe
 from core.tester import CleanroomTester
 from core.healers.companion_binaries import CompanionBinaryHealer
+from core.port_context import PortContext
 
 RECIPES = [
     ElectronRecipe(),
@@ -73,6 +74,8 @@ def cmd_transmute(args):
         "app_id": args.app_id,
         "arch": args.arch,
         "allow_wine_fallback": not args.no_wine_fallback,
+        "skills_dir": args.skills_dir,
+        "workspace": args.workspace,
     }
 
     print(f"[WINS] Selected Recipe: {matched_recipe.name} ({matched_recipe.description})")
@@ -131,6 +134,29 @@ def cmd_heal_bin(args):
         print(f"  - [error]  {err}")
     print("")
 
+def cmd_port_context(args):
+    """Generates the agent-facing host corpus of a transmuted (ported) app."""
+    context = PortContext(
+        app_id=args.app_id,
+        app_title=args.title,
+        install_dir=args.install_dir,
+        skills_dir=args.skills_dir,
+        workspace=args.workspace,
+        slug=args.slug,
+    )
+    report = context.install(print_preamble=not args.json)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    print(f"\n[WINS PORT CONTEXT] {report['app_id']}")
+    print(f"  Skill:         {report['skill'] or '(not installed)'}")
+    print(f"  Workspace doc: {report['workspace_doc'] or '(not installed)'}")
+    print(f"\n  Preamble for the agent chat:\n")
+    for line in report["preamble"].split(". "):
+        print(f"    - {line.strip()}")
+    print("")
+
 def cmd_list(args):
     print("\nAvailable WINS Transmutation Recipes:")
     for r in RECIPES:
@@ -156,6 +182,8 @@ def main():
     p_trans.add_argument("--app-id", default=None, help="Application id used to resolve native Linux companion builds")
     p_trans.add_argument("--arch", default="x64", help="Target architecture for native builds (default: x64)")
     p_trans.add_argument("--no-wine-fallback", action="store_true", help="Do not generate micro-Wine shims for PE companions")
+    p_trans.add_argument("--skills-dir", default=None, help="Skill directory for the generated host corpus SKILL.md")
+    p_trans.add_argument("--workspace", default=None, help="Workspace directory for the generated host corpus")
     p_trans.set_defaults(func=cmd_transmute)
 
     # test
@@ -182,6 +210,20 @@ def main():
     p_heal.add_argument("--dry-run", action="store_true", help="Report what would be done without writing")
     p_heal.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
     p_heal.set_defaults(func=cmd_heal_bin)
+
+    # port-context
+    p_ctx = subparsers.add_parser(
+        "port-context",
+        help="Generate the agent-facing host corpus (AGENTS/skill + command corpus) of a ported app",
+    )
+    p_ctx.add_argument("--app-id", required=True, help="Application id (e.g. manus)")
+    p_ctx.add_argument("--title", default=None, help="Human readable application title")
+    p_ctx.add_argument("--install-dir", default=None, help="Ported application install directory")
+    p_ctx.add_argument("--skills-dir", default=None, help="Skill directory to install the SKILL.md into")
+    p_ctx.add_argument("--workspace", default=None, help="Workspace directory to drop AGENTS.md / WINS-PORT.md into")
+    p_ctx.add_argument("--slug", default="wins-port-context", help="Skill slug (default: wins-port-context)")
+    p_ctx.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_ctx.set_defaults(func=cmd_port_context)
 
     if len(sys.argv) == 1:
         print(BANNER)
