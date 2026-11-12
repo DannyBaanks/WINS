@@ -1805,11 +1805,35 @@ fn CloseHandle(hObject: usize) callconv(W) i32 {
     return 1;
 }
 
+/// The Win32 access rights and creation dispositions a caller can ask for.
+///
+/// CreateFileA used to ignore every one of them: it opened the path O_RDWR,
+/// then O_RDONLY, and when neither succeeded it handed back a read-only
+/// handle to the TARGET EXECUTABLE. A guest that asked for a file it had not
+/// created yet -- Fallout: New Vegas opens Warnings.txt, its ini and its
+/// saved settings that way, and it opens them for WRITE -- therefore got an
+/// unrelated file it could not write to, with a return code indistinguishable
+/// from success. Measured: the guest asked for Warnings.txt, was handed
+/// FalloutNV.exe, wrote nothing, and quit at once.
+///
+/// The dispositions are honoured now, so the answer names the real reason
+/// when the file cannot be had: not found, already exists, access denied.
+const GENERIC_READ: u32 = 0x80000000;
+const GENERIC_WRITE: u32 = 0x40000000;
+const CREATE_NEW: u32 = 1;
+const CREATE_ALWAYS: u32 = 2;
+const OPEN_EXISTING: u32 = 3;
+const OPEN_ALWAYS: u32 = 4;
+const TRUNCATE_EXISTING: u32 = 5;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_ALREADY_EXISTS: u32 = 183;
+
 fn CreateFileA(lpFileName: ?[*:0]const u8, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: usize) callconv(W) usize {
-    _ = dwDesiredAccess; _ = dwShareMode; _ = lpSecurityAttributes; _ = dwCreationDisposition; _ = dwFlagsAndAttributes; _ = hTemplateFile;
+    _ = dwShareMode; _ = lpSecurityAttributes; _ = dwFlagsAndAttributes; _ = hTemplateFile;
     if (lpFileName) |fn_ptr| {
         const path = std.mem.sliceTo(fn_ptr, 0);
-        std.debug.print("[WINS:Kernel32] CreateFileA(\"{s}\")\n", .{path});
+        std.debug.print("[WINS:Kernel32] CreateFileA(\"{s}\", access=0x{x}, disp={d})\n", .{ path, dwDesiredAccess, dwCreationDisposition });
         var norm_buf: [512]u8 = undefined;
         const norm_len = @min(norm_buf.len - 1, path.len);
         for (0..norm_len) |i| {
@@ -1818,45 +1842,79 @@ fn CreateFileA(lpFileName: ?[*:0]const u8, dwDesiredAccess: u32, dwShareMode: u3
         norm_buf[norm_len] = 0;
         const norm_slice = norm_buf[0..norm_len:0];
 
-        // 1. Try opening normalized path directly
-        const fd = linux.open(norm_slice.ptr, .{ .ACCMODE = .RDWR }, 0);
+        // What the caller asked to do with the file once it has it.
+        const wants_read = dwDesiredAccess & GENERIC_READ != 0 or dwDesiredAccess == 0;
+        const wants_write = dwDesiredAccess & GENERIC_WRITE != 0;
+
+        var open_flags: linux.O = .{
+            .ACCMODE = if (wants_write and wants_read) .RDWR else if (wants_write) .WRONLY else .RDONLY,
+        };
+        var must_exist = false;
+        switch (dwCreationDisposition) {
+            CREATE_NEW => {
+                open_flags.CREAT = true;
+                open_flags.EXCL = true;
+            },
+            CREATE_ALWAYS => {
+                open_flags.CREAT = true;
+                open_flags.TRUNC = true;
+            },
+            OPEN_EXISTING => must_exist = true,
+            OPEN_ALWAYS => open_flags.CREAT = true,
+            TRUNCATE_EXISTING => {
+                must_exist = true;
+                open_flags.TRUNC = true;
+            },
+            // An unmodelled disposition must not become a silent default.
+            else => must_exist = true,
+        }
+
+        const fd = linux.open(norm_slice.ptr, open_flags, 0o644);
         if (linux.errno(fd) == .SUCCESS) {
             std.debug.print("  -> SUCCESS fd={}\n", .{fd});
+            g_last_error = 0;
             return @as(usize, @intCast(fd)) + 0x10000;
         }
-        const fd_ro = linux.open(norm_slice.ptr, .{ .ACCMODE = .RDONLY }, 0);
-        if (linux.errno(fd_ro) == .SUCCESS) {
-            std.debug.print("  -> SUCCESS [RO] fd={}\n", .{fd_ro});
-            return @as(usize, @intCast(fd_ro)) + 0x10000;
-        }
+        const open_errno = linux.errno(fd);
 
-        // 2. Try basename in current working directory
-        const basename = if (std.mem.lastIndexOfScalar(u8, norm_slice, '/')) |s| norm_slice[s + 1 ..] else norm_slice;
-        if (basename.len > 0) {
-            var base_buf: [256]u8 = undefined;
-            const b_len = @min(base_buf.len - 1, basename.len);
-            @memcpy(base_buf[0..b_len], basename[0..b_len]);
-            base_buf[b_len] = 0;
-            const base_slice = base_buf[0..b_len:0];
+        // A path with a drive letter or a directory prefix the loader's cwd
+        // cannot resolve still names one of the game's own files: the game
+        // runs with the loader's cwd set to the install directory, so the
+        // basename resolves there. Only reading is retried this way -- a
+        // creation request for a nested path is answered by the kernel, not
+        // rewritten into a different directory.
+        if (!must_exist and !wants_write) {
+            const basename = if (std.mem.lastIndexOfScalar(u8, norm_slice, '/')) |s| norm_slice[s + 1 ..] else norm_slice;
+            if (basename.len > 0) {
+                var base_buf: [256]u8 = undefined;
+                const b_len = @min(base_buf.len - 1, basename.len);
+                @memcpy(base_buf[0..b_len], basename[0..b_len]);
+                base_buf[b_len] = 0;
+                const base_slice = base_buf[0..b_len:0];
 
-            const fd_b = linux.open(base_slice.ptr, .{ .ACCMODE = .RDONLY }, 0);
-            if (linux.errno(fd_b) == .SUCCESS) {
-                std.debug.print("  -> SUCCESS [Basename RO: {s}] fd={}\n", .{ base_slice, fd_b });
-                return @as(usize, @intCast(fd_b)) + 0x10000;
+                const read_flags: linux.O = .{ .ACCMODE = .RDONLY };
+                const fd_b = linux.open(base_slice.ptr, read_flags, 0);
+                if (linux.errno(fd_b) == .SUCCESS) {
+                    std.debug.print("  -> SUCCESS [Basename RO: {s}] fd={}\n", .{ base_slice, fd_b });
+                    g_last_error = 0;
+                    return @as(usize, @intCast(fd_b)) + 0x10000;
+                }
             }
         }
 
-        // 3. Fallback to target executable if requested
-        if (g_target_path_len > 0) {
-            const fd_t = linux.open(g_target_path[0..g_target_path_len:0].ptr, .{ .ACCMODE = .RDONLY }, 0);
-            if (linux.errno(fd_t) == .SUCCESS) {
-                std.debug.print("  -> SUCCESS [Target Executable RO] fd={}\n", .{fd_t});
-                return @as(usize, @intCast(fd_t)) + 0x10000;
-            }
-        }
+        // Every failure now names what actually went wrong.
+        g_last_error = switch (open_errno) {
+            .NOENT => ERROR_FILE_NOT_FOUND,
+            .ACCES => ERROR_ACCESS_DENIED,
+            .PERM => ERROR_ACCESS_DENIED,
+            .EXIST => ERROR_ALREADY_EXISTS,
+            else => ERROR_FILE_NOT_FOUND,
+        };
+        std.debug.print("  -> FAILED (kernel errno {d})\n", .{@intFromEnum(open_errno)});
+        return 0xFFFFFFFF; // INVALID_HANDLE_VALUE
     }
-    std.debug.print("  -> FAILED (not found)\n", .{});
-    g_last_error = 2; // ERROR_FILE_NOT_FOUND
+    std.debug.print("  -> FAILED (null name)\n", .{});
+    g_last_error = ERROR_FILE_NOT_FOUND;
     return 0xFFFFFFFF; // INVALID_HANDLE_VALUE
 }
 
@@ -1969,8 +2027,28 @@ fn GetFileAttributesA(lpFileName: ?[*:0]const u8) callconv(W) u32 {
 }
 
 fn DeleteFileA(lpFileName: ?[*:0]const u8) callconv(W) i32 {
-    _ = lpFileName;
-    return 1;
+    if (lpFileName) |p| {
+        var buf: [512]u8 = undefined;
+        var len: usize = 0;
+        while (p[len] != 0 and len < 511) : (len += 1) {
+            buf[len] = if (p[len] == '\\') '/' else p[len];
+        }
+        buf[len] = 0;
+        const rc = linux.unlink(buf[0..len:0].ptr);
+        if (linux.errno(rc) == .SUCCESS) {
+            std.debug.print("[WINS:Kernel32] DeleteFileA(\"{s}\") -> removed\n", .{buf[0..len]});
+            return 1;
+        }
+        g_last_error = switch (linux.errno(rc)) {
+            .NOENT => 2, // ERROR_FILE_NOT_FOUND
+            .ACCES => 5, // ERROR_ACCESS_DENIED
+            else => 5,
+        };
+        std.debug.print("[WINS:Kernel32] DeleteFileA(\"{s}\") -> failed (kernel errno {d})\n", .{ buf[0..len], @intFromEnum(linux.errno(rc)) });
+        return 0;
+    }
+    g_last_error = 2; // ERROR_FILE_NOT_FOUND
+    return 0;
 }
 
 fn MoveFileA(lpExistingFileName: ?[*:0]const u8, lpNewFileName: ?[*:0]const u8) callconv(W) i32 {
@@ -1983,9 +2061,38 @@ fn CopyFileA(lpExistingFileName: ?[*:0]const u8, lpNewFileName: ?[*:0]const u8, 
     return 1;
 }
 
+/// The directory is really made, or the answer says why it was not.
+///
+/// The stub returned 1 unconditionally, which is indistinguishable from a
+/// created directory: the game asked for its "My Games" folder, was told it
+/// had one, and then tried to write settings into a directory that does not
+/// exist. ERROR_ALREADY_EXISTS is the Win32 answer when the name is taken,
+/// not a failure.
 fn CreateDirectoryA(lpPathName: ?[*:0]const u8, lpSecurityAttributes: ?*anyopaque) callconv(W) i32 {
-    _ = lpPathName; _ = lpSecurityAttributes;
-    return 1;
+    _ = lpSecurityAttributes;
+    if (lpPathName) |p| {
+        var buf: [512]u8 = undefined;
+        var len: usize = 0;
+        while (p[len] != 0 and len < 511) : (len += 1) {
+            buf[len] = if (p[len] == '\\') '/' else p[len];
+        }
+        buf[len] = 0;
+        const rc = linux.mkdir(buf[0..len:0].ptr, 0o755);
+        if (linux.errno(rc) == .SUCCESS) {
+            std.debug.print("[WINS:Kernel32] CreateDirectoryA(\"{s}\") -> created\n", .{buf[0..len]});
+            return 1;
+        }
+        g_last_error = switch (linux.errno(rc)) {
+            .EXIST => 183, // ERROR_ALREADY_EXISTS: the directory is there.
+            .NOENT => 3, // ERROR_PATH_NOT_FOUND: a parent is missing.
+            .ACCES => 5, // ERROR_ACCESS_DENIED
+            else => 5,
+        };
+        std.debug.print("[WINS:Kernel32] CreateDirectoryA(\"{s}\") -> failed (kernel errno {d})\n", .{ buf[0..len], @intFromEnum(linux.errno(rc)) });
+        return 0;
+    }
+    g_last_error = 3; // ERROR_PATH_NOT_FOUND
+    return 0;
 }
 
 fn GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: ?[*]u8) callconv(W) u32 {
@@ -2012,28 +2119,239 @@ fn GetDriveTypeA(lpRootPathName: ?[*:0]const u8) callconv(W) u32 {
     return 3; // DRIVE_FIXED
 }
 
-fn GetPrivateProfileStringA(lpAppName: ?[*:0]const u8, lpKeyName: ?[*:0]const u8, lpDefault: ?[*:0]const u8, lpReturnedString: ?[*]u8, nSize: u32, lpFileName: ?[*:0]const u8) callconv(W) u32 {
-    _ = lpAppName; _ = lpKeyName; _ = lpFileName;
-    if (lpReturnedString == null or nSize == 0) return 0;
-    if (lpDefault) |def| {
-        const slice = std.mem.sliceTo(def, 0);
-        const len: u32 = @min(nSize - 1, @as(u32, @intCast(slice.len)));
-        @memcpy(lpReturnedString.?[0..len], slice[0..len]);
-        lpReturnedString.?[len] = 0;
-        return len;
+// ---------------------------------------------------------------------------
+// The guest's own ini files.
+//
+// GetPrivateProfile* answered with the caller's own default and never opened
+// the file, and WritePrivateProfileStringA reported success without writing a
+// byte. Fallout: New Vegas reads its whole display configuration -- adapter
+// index, resolution, fullscreen flag, the D3D device name -- out of
+// FalloutPrefs.ini through those functions and writes them back when the
+// settings change, so the game was running on the values it passed to itself
+// and the file it thought it was maintaining never appeared on disk.
+//
+// The format is the one Win32 reads: comments start with ';', a line in
+// brackets opens a section, and `key = value` is a setting. Section and key
+// names are matched case-insensitively, as Win32 does.
+const INI_MAX: usize = 64 * 1024;
+
+/// Every space and tab, and the carriage return a Windows line ending leaves
+/// behind, trimmed from both ends.
+fn iniTrim(line: []const u8) []const u8 {
+    var start: usize = 0;
+    var end: usize = line.len;
+    while (start < end and (line[start] == ' ' or line[start] == '\t' or line[start] == '\r')) start += 1;
+    while (end > start and (line[end - 1] == ' ' or line[end - 1] == '\t' or line[end - 1] == '\r')) end -= 1;
+    return line[start..end];
+}
+
+fn iniNameEq(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+/// The named file's contents, or 0 when it is not there.
+fn iniReadFile(path: []const u8, buf: []u8) usize {
+    if (path.len == 0 or path.len >= buf.len) return 0;
+    for (path, 0..) |c, i| buf[i] = if (c == '\\') '/' else c;
+    buf[path.len] = 0;
+    const slice = buf[0..path.len :0];
+    const fd = linux.open(slice.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return 0;
+    defer _ = linux.close(@intCast(fd));
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
+        if (linux.errno(n) != .SUCCESS) break;
+        if (n == 0) break;
+        total += @intCast(n);
     }
-    lpReturnedString.?[0] = 0;
-    return 0;
+    return total;
+}
+
+fn iniCopyOut(out: [*]u8, n: u32, value: []const u8) u32 {
+    const room: u32 = n - 1;
+    const len: u32 = @min(room, @as(u32, @intCast(value.len)));
+    @memcpy(out[0..len], value[0..len]);
+    out[len] = 0;
+    return len;
+}
+
+fn iniParseInt(value: []const u8) ?i32 {
+    const t = iniTrim(value);
+    if (t.len == 0) return null;
+    const parsed = std.fmt.parseInt(i64, t, 0) catch {
+        // Win32 accepts a trailing fragment ("640x480" is not one) by reading
+        // the leading digits; a value with digits followed by junk still
+        // yields those digits.
+        var end: usize = 0;
+        var neg = false;
+        if (t[0] == '-') {
+            neg = true;
+            end = 1;
+        }
+        while (end < t.len and t[end] >= '0' and t[end] <= '9') end += 1;
+        if (end == 0 or (end == 1 and neg)) return null;
+        return @intCast(std.fmt.parseInt(i64, t[0..end], 10) catch return null);
+    };
+    return @intCast(@min(@as(i64, std.math.maxInt(i32)), @max(@as(i64, std.math.minInt(i32)), parsed)));
+}
+
+/// The value for `key` inside `section`, or null when the file has neither.
+fn iniLookup(app: []const u8, key: []const u8, file: ?[*:0]const u8) ?[]const u8 {
+    if (file == null) return null;
+    var buf: [INI_MAX]u8 = undefined;
+    const n = iniReadFile(std.mem.sliceTo(file.?, 0), &buf);
+    if (n == 0) return null;
+    var in_section = false;
+    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (it.next()) |raw| {
+        const line = iniTrim(raw);
+        if (line.len == 0 or line[0] == ';') continue;
+        if (line[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+            in_section = iniNameEq(iniTrim(line[1..close]), app);
+            continue;
+        }
+        if (!in_section) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!iniNameEq(iniTrim(line[0..eq]), key)) continue;
+        return iniTrim(line[eq + 1 ..]);
+    }
+    return null;
+}
+
+/// Rewrite `content` in `scratch` with `key = value` inside `section`.
+///
+/// The section is appended when the file has none, and the key is appended to
+/// the section when it is not there. Returns the new length, or 0 when it does
+/// not fit. Writing back to the same file keeps the guest's own formatting for
+/// everything it did not ask to change.
+fn iniWriteValue(scratch: []u8, content_len: usize, app: []const u8, key: []const u8, value: []const u8) usize {
+    var out_len: usize = 0;
+    var in_section = false;
+    var replaced = false;
+    var it = std.mem.splitScalar(u8, scratch[0..content_len], '\n');
+    while (it.next()) |raw| {
+        if (out_len >= scratch.len) return 0;
+        const line = iniTrim(raw);
+        if (line.len > 0 and line[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, line, ']') orelse 0;
+            if (close > 0) in_section = iniNameEq(iniTrim(line[1..close]), app);
+        } else if (in_section and !replaced) {
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse 0;
+            if (eq > 0 and iniNameEq(iniTrim(line[0..eq]), key)) {
+                const replaced_line = std.fmt.bufPrint(scratch[out_len..], "{s}={s}\n", .{ key, value }) catch return 0;
+                out_len += replaced_line.len;
+                replaced = true;
+                continue;
+            }
+        }
+        const n = @min(raw.len, scratch.len - out_len);
+        @memcpy(scratch[out_len .. out_len + n], raw[0..n]);
+        out_len += n;
+        // splitScalar consumes the separator, so it is put back here.
+        if (out_len < scratch.len) {
+            scratch[out_len] = '\n';
+            out_len += 1;
+        } else return 0;
+    }
+    if (!replaced) {
+        // The section exists: the key goes in at its end. It does not: the
+        // section is created first, with the key inside it.
+        if (!in_section) {
+            const header = std.fmt.bufPrint(scratch[out_len..], "[{s}]\n", .{app}) catch return 0;
+            out_len += header.len;
+        }
+        const entry = std.fmt.bufPrint(scratch[out_len..], "{s}={s}\n", .{ key, value }) catch return 0;
+        out_len += entry.len;
+    }
+    return out_len;
+}
+
+fn iniFlushFile(path: []const u8, data: []const u8) i32 {
+    if (path.len == 0 or path.len >= 512) {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    }
+    var name_buf: [512]u8 = undefined;
+    for (path, 0..) |c, i| name_buf[i] = if (c == '\\') '/' else c;
+    name_buf[path.len] = 0;
+    const slice = name_buf[0..path.len :0];
+    const fd = linux.open(slice.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (linux.errno(fd) != .SUCCESS) {
+        g_last_error = 5; // ERROR_ACCESS_DENIED
+        return 0;
+    }
+    defer _ = linux.close(@intCast(fd));
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = linux.write(@intCast(fd), data[off..].ptr, data.len - off);
+        if (linux.errno(n) != .SUCCESS) {
+            g_last_error = 5; // ERROR_ACCESS_DENIED
+            return 0;
+        }
+        if (n == 0) break;
+        off += @intCast(n);
+    }
+    return 1;
+}
+
+fn GetPrivateProfileStringA(lpAppName: ?[*:0]const u8, lpKeyName: ?[*:0]const u8, lpDefault: ?[*:0]const u8, lpReturnedString: ?[*]u8, nSize: u32, lpFileName: ?[*:0]const u8) callconv(W) u32 {
+    if (lpReturnedString == null or nSize == 0) return 0;
+    const fallback: []const u8 = if (lpDefault) |d| std.mem.sliceTo(d, 0) else "";
+    if (lpAppName) |app| {
+        const app_name = std.mem.sliceTo(app, 0);
+        const key_name = if (lpKeyName) |k| std.mem.sliceTo(k, 0) else "";
+        if (iniLookup(app_name, key_name, lpFileName)) |value| {
+            return iniCopyOut(lpReturnedString.?, nSize, value);
+        }
+    }
+    return iniCopyOut(lpReturnedString.?, nSize, fallback);
 }
 
 fn GetPrivateProfileIntA(lpAppName: ?[*:0]const u8, lpKeyName: ?[*:0]const u8, nDefault: i32, lpFileName: ?[*:0]const u8) callconv(W) i32 {
-    _ = lpAppName; _ = lpKeyName; _ = lpFileName;
+    if (lpAppName) |app| {
+        const app_name = std.mem.sliceTo(app, 0);
+        const key_name = if (lpKeyName) |k| std.mem.sliceTo(k, 0) else "";
+        if (iniLookup(app_name, key_name, lpFileName)) |value| {
+            return iniParseInt(value) orelse nDefault;
+        }
+    }
     return nDefault;
 }
 
 fn WritePrivateProfileStringA(lpAppName: ?[*:0]const u8, lpKeyName: ?[*:0]const u8, lpString: ?[*:0]const u8, lpFileName: ?[*:0]const u8) callconv(W) i32 {
-    _ = lpAppName; _ = lpKeyName; _ = lpString; _ = lpFileName;
-    return 1;
+    if (lpAppName == null or lpFileName == null) return 0;
+    const app_name = std.mem.sliceTo(lpAppName.?, 0);
+    const file_name = std.mem.sliceTo(lpFileName.?, 0);
+    // A null key with a null value means "delete this section"; a null key with
+    // a value means "write this whole section". Neither is what a settings file
+    // does, and guessing would be worse than reporting the unsupported case.
+    if (lpKeyName == null or lpString == null) {
+        g_last_error = 50; // ERROR_NOT_SUPPORTED
+        return 0;
+    }
+    const key_name = std.mem.sliceTo(lpKeyName.?, 0);
+    const val = std.mem.sliceTo(lpString.?, 0);
+
+    var buf: [INI_MAX]u8 = undefined;
+    const have = iniReadFile(file_name, &buf);
+    var content: []u8 = buf[0..have];
+
+    // The section has to exist before a key can live in it, and the file has
+    // to end on a line boundary before anything can be appended.
+    if (content.len > 0 and content[content.len - 1] != '\n') {
+        if (content.len + 1 < buf.len) {
+            content = buf[0 .. have + 1];
+            content[have] = '\n';
+        }
+    }
+    const written = iniWriteValue(&buf, content.len, app_name, key_name, val);
+    if (written == 0) {
+        g_last_error = 5; // ERROR_ACCESS_DENIED
+        return 0;
+    }
+    return iniFlushFile(file_name, buf[0..written]);
 }
 
 const WIN32_FIND_DATAA = extern struct {
@@ -4102,6 +4420,34 @@ fn szWithTerminator(buf: []u8, s: []const u8) []const u8 {
 
 /// Win32 registry query, to the contract the caller actually uses.
 ///
+/// The directory the guest's image came from, separator-terminated so a
+/// caller can append a subpath straight onto it.
+///
+/// The loader knows the target's full path: it was named on the command line,
+/// and the working directory was changed into its own. An earlier version
+/// answered "Installed Path" with "./", a directory nobody measured, and the
+/// guest derives its whole file layout from that value: it asked, was handed
+/// the fabrication, and shut down immediately afterwards.
+///
+/// An empty slice means there is no target path at all, which the registry
+/// turns into ERROR_FILE_NOT_FOUND: the honest answer when there is nothing to
+/// point at.
+fn targetDirWithTerminator(buf: []u8) []const u8 {
+    const path = g_target_path[0..g_target_path_len];
+    if (path.len == 0) return buf[0..0];
+    const dir_end = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| s + 1 else 0;
+    if (dir_end == 0 or dir_end >= buf.len) {
+        // No separator in the path: the file sits in the working directory,
+        // which is where the loader changed to.
+        const rel = "./";
+        if (rel.len >= buf.len) return buf[0..0];
+        @memcpy(buf[0..rel.len], rel);
+        return buf[0..rel.len:0];
+    }
+    @memcpy(buf[0..dir_end], path[0..dir_end]);
+    return buf[0..dir_end:0];
+}
+
 /// The caller may pass a null data buffer to ask only for the size, and the
 /// reported size counts the terminator; when the buffer is too small the value
 /// is not copied and ERROR_MORE_DATA is returned. An earlier version wrote into
@@ -4149,8 +4495,20 @@ fn RegQueryValueExA(hKey: usize, lpValueName: ?[*:0]const u8, lpReserved: ?*u32,
         word = 1;
         bytes = std.mem.asBytes(&word);
     } else if (std.ascii.eqlIgnoreCase(name, "Installed Path")) {
+        // The directory the guest is actually running from.
+        //
+        // The stub answered "./", which is a fabricated directory rather than
+        // a measured one, and the guest's whole file layout is derived from
+        // this value: it asked for it, got "./", and shut down immediately
+        // afterwards. The loader set the working directory to the target's
+        // own and holds its full path, so the real answer is on hand.
+        const dir = targetDirWithTerminator(&sz_buf);
+        if (dir.len == 0) {
+            if (lpcbData) |cb| cb.* = 0;
+            return 2; // ERROR_FILE_NOT_FOUND
+        }
         reg_type = REG_SZ;
-        bytes = szWithTerminator(&sz_buf, "./");
+        bytes = dir;
     } else {
         if (lpcbData) |cb| cb.* = 0;
         return 2; // ERROR_FILE_NOT_FOUND

@@ -85,6 +85,9 @@ python3 "$REPO/tools/patch_probe_wait.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_abort.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_ticketargs.py" "$PROBE"
 python3 "$REPO/tools/patch_probe_dumpimages.py" "$PROBE"
+python3 "$REPO/tools/patch_probe_reg.py" "$PROBE"
+python3 "$REPO/tools/patch_probe_ini.py" "$PROBE"
+python3 "$REPO/tools/patch_probe_d3d9.py" "$PROBE"
 
 # Dynamic glibc i386, not static: the honest bridge needs dlopen to load the
 # REAL Steam client, and a static build cannot dlopen at all (measured:

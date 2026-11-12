@@ -18,14 +18,33 @@ pub const S_OK: HRESULT = 0;
 pub const S_FALSE: HRESULT = 1;
 pub const E_FAIL: HRESULT = -2147467259; // 0x80004005
 pub const E_NOINTERFACE: HRESULT = -2147467262; // 0x80004002
+pub const E_NOTIMPL: HRESULT = -2147467263; // 0x80004001
+pub const E_POINTER: HRESULT = -2147467263; // 0x80004003
 pub const E_OUTOFMEMORY: HRESULT = -2147024882; // 0x8007000E
+pub const D3DERR_INVALIDARG: HRESULT = -2147024809; // 0x80070057
+pub const D3DERR_NOTAVAILABLE: HRESULT = -2005530518; // 0x8876086A
 pub const D3D_OK: HRESULT = S_OK;
 
 pub const D3DFMT_A8R8G8B8: u32 = 21;
 pub const D3DFMT_X8R8G8B8: u32 = 22;
 pub const D3DFMT_D24S8: u32 = 75;
+pub const D3DFMT_D16: u32 = 80;
 pub const D3DFMT_INDEX16: u32 = 101;
 pub const D3DFMT_INDEX32: u32 = 102;
+
+// d3d9types.h
+pub const D3DUSAGE_RENDERTARGET: u32 = 0x00000001;
+pub const D3DUSAGE_DEPTHSTENCIL: u32 = 0x00000002;
+pub const D3DUSAGE_WRITEONLY: u32 = 0x00000008;
+pub const D3DUSAGE_DYNAMIC: u32 = 0x00000200;
+pub const D3DRTYPE_SURFACE: u32 = 1;
+pub const D3DRTYPE_VOLUME: u32 = 2;
+pub const D3DRTYPE_TEXTURE: u32 = 3;
+pub const D3DMULTISAMPLE_NONE: u32 = 0;
+pub const D3DDEVTYPE_HAL: u32 = 1;
+pub const D3DDEVTYPE_REF: u32 = 2;
+pub const D3DDEVTYPE_SW: u32 = 3;
+pub const D3DDEVTYPE_NULLREF: u32 = 4;
 
 pub const D3DCLEAR_TARGET: u32 = 0x00000001;
 pub const D3DCLEAR_ZBUFFER: u32 = 0x00000002;
@@ -170,13 +189,104 @@ pub const D3DCAPS9 = extern struct {
     DeclTypes: u32,
     NumSimultaneousRTs: u32,
     StretchRectFilterCaps: u32,
-    VS20Caps: [2]u32,
-    PS20Caps: [2]u32,
+    VS20Caps: D3DVSHADERCAPS2_0,
+    PS20Caps: D3DPSHADERCAPS2_0,
     VertexTextureFilterCaps: u32,
     MaxVShaderInstructionsExecuted: u32,
     MaxPShaderInstructionsExecuted: u32,
     MaxVertexShader30InstructionSlots: u32,
     MaxPixelShader30InstructionSlots: u32,
+};
+
+/// d3d9caps.h: D3DVSHADERCAPS2_0 and D3DPSHADERCAPS2_0. The tail of
+/// D3DCAPS9 holds these two by value, and they are four and five dwords, not
+/// two each. Getting that size wrong moves every field that follows them.
+pub const D3DVSHADERCAPS2_0 = extern struct {
+    Caps: u32,
+    DynamicFlowControlDepth: i32,
+    NumTemps: i32,
+    StaticFlowControlDepth: i32,
+};
+
+pub const D3DPSHADERCAPS2_0 = extern struct {
+    Caps: u32,
+    DynamicFlowControlDepth: i32,
+    NumTemps: i32,
+    StaticFlowControlDepth: i32,
+    NumInstructionSlots: i32,
+};
+
+pub const GUID = extern struct {
+    Data1: u32,
+    Data2: u16,
+    Data3: u16,
+    Data4: [8]u8,
+};
+
+/// The interface identifiers this module answers.
+///
+/// d3d9.h: IID_IDirect3D9 and IID_IDirect3DDevice9. A guest that asks for an
+/// interface the module does not implement must get E_NOINTERFACE: answering
+/// S_OK for an unknown identifier hands out an object whose vtable is shorter
+/// than the interface the guest believes it is holding, and the next call
+/// reads past the end of the table.
+pub const IID_IDirect3D9 = GUID{
+    .Data1 = 0x81BDCBCA,
+    .Data2 = 0x64D4,
+    .Data3 = 0x426D,
+    .Data4 = .{ 0xAE, 0x8D, 0xAD, 0x01, 0x47, 0xF4, 0x27, 0x5C },
+};
+pub const IID_IDirect3DDevice9 = GUID{
+    .Data1 = 0xD0223B96,
+    .Data2 = 0xBF7A,
+    .Data3 = 0x43FD,
+    .Data4 = .{ 0x92, 0xBD, 0xA4, 0x3B, 0x0D, 0x82, 0xB9, 0xEB },
+};
+
+/// Compares an interface identifier the guest handed over with one of ours.
+///
+/// The identifier is read through an align(1) pointer: the guest's buffer is
+/// its own, and this module does not get to decide how it is aligned.
+fn guidEql(a: *align(1) const GUID, b: *align(1) const GUID) bool {
+    if (a.Data1 != b.Data1) return false;
+    if (a.Data2 != b.Data2) return false;
+    if (a.Data3 != b.Data3) return false;
+    for (a.Data4, b.Data4) |x, y| {
+        if (x != y) return false;
+    }
+    return true;
+}
+
+/// d3d9types.h: D3DADAPTER_IDENTIFIER9. The guest reads the driver and the
+/// description out of this by offset, so the layout is the Windows one: two
+/// five-hundred-and-twelve byte strings, the device name, the driver version
+/// as a 64-bit value, and the ids.
+pub const D3DADAPTER_IDENTIFIER9 = extern struct {
+    Driver: [512]u8,
+    Description: [512]u8,
+    DeviceName: [32]u8,
+    DriverVersion: u64,
+    VendorId: u32,
+    DeviceId: u32,
+    SubSysId: u32,
+    Revision: u32,
+    DeviceIdentifier: GUID,
+    WHQLLevel: u32,
+};
+
+/// d3d9types.h: D3DDISPLAYMODE.
+///
+/// Four fields, sixteen bytes. There is no ScanLineOrdering member in the
+/// D3D9 struct: the guest keeps this one in a sixteen-byte stack slot that
+/// its own saved return address follows immediately, so writing twenty bytes
+/// here lands four bytes past the slot and destroys the return address. The
+/// guest then returns to zero and dies with EIP=0, which looks like a null
+/// call and is not one.
+pub const D3DDISPLAYMODE = extern struct {
+    Width: u32,
+    Height: u32,
+    RefreshRate: u32,
+    Format: u32,
 };
 
 pub const D3DVECTOR = extern struct {
@@ -1031,10 +1141,21 @@ pub const WinsD3DDevice9 = struct {
     }
 };
 
+/// IDirect3D9::QueryInterface.
+///
+/// Only the interfaces this module implements are answered. Any other
+/// identifier gets E_NOINTERFACE: answering S_OK hands the guest an object
+/// whose vtable is shorter than the interface the guest believes it holds,
+/// and the next call reads past the end of the table.
 fn d3d9_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = riid;
-    if (ppv) |p| p.* = this;
-    return S_OK;
+    if (riid == null or ppv == null) return E_POINTER;
+    const id: *align(1) const GUID = @ptrCast(riid.?);
+    if (guidEql(id, &IID_IDirect3D9)) {
+        ppv.?.* = this;
+        return S_OK;
+    }
+    std.debug.print("[WINS:D3D9] QueryInterface: this module implements only IDirect3D9; answering E_NOINTERFACE\n", .{});
+    return E_NOINTERFACE;
 }
 fn d3d9_AddRef(this: *anyopaque) callconv(W) u32 {
     const self: *WinsD3D9 = @ptrCast(@alignCast(this));
@@ -1049,6 +1170,81 @@ fn d3d9_Release(this: *anyopaque) callconv(W) u32 {
 fn d3d9_GetAdapterCount(this: *anyopaque) callconv(W) u32 {
     _ = this;
     return 1;
+}
+
+/// The one display mode this adapter offers.
+const kDisplayMode: D3DDISPLAYMODE = .{
+    .Width = 1280,
+    .Height = 720,
+    .RefreshRate = 60,
+    .Format = D3DFMT_X8R8G8B8,
+};
+
+fn fillAscii(dest: []u8, text: []const u8) void {
+    @memset(dest, 0);
+    const n = @min(dest.len, text.len);
+    @memcpy(dest[0..n], text[0..n]);
+}
+
+/// IDirect3D9::GetAdapterIdentifier.
+///
+/// This method has to write the structure: the guest reads the driver name
+/// and the description out of it by offset and then walks what it finds.
+/// Answering D3D_OK without writing it leaves the guest reading whatever was
+/// on its stack, which is what it was doing: the first dword it read back
+/// was 0xc03302eb and the next instruction dereferenced it.
+fn d3d9_GetAdapterIdentifier(this: *anyopaque, adapter: u32, flags: u32, pIdentifier: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = flags;
+    if (adapter != 0) return D3DERR_INVALIDARG;
+    // align(1): the caller's buffer is the guest's, and a trap on an
+    // unexpected alignment would turn a readable structure into a crash.
+    const out: ?*align(1) D3DADAPTER_IDENTIFIER9 = if (pIdentifier) |p| @ptrCast(p) else null;
+    const id = out orelse return E_POINTER;
+    var value: D3DADAPTER_IDENTIFIER9 = std.mem.zeroes(D3DADAPTER_IDENTIFIER9);
+    fillAscii(value.Driver[0..], "WINS Direct3D 9 Software Adapter");
+    fillAscii(value.Description[0..], "WINS Direct3D 9 software rasterizer");
+    fillAscii(value.DeviceName[0..], "\\.\\DISPLAY1");
+    value.DriverVersion = 0x0000000100000000;
+    value.VendorId = 0x8086;
+    value.DeviceId = 0x1237;
+    value.SubSysId = 0;
+    value.Revision = 0;
+    value.WHQLLevel = 0;
+    id.* = value;
+    return D3D_OK;
+}
+
+/// IDirect3D9::GetAdapterModeCount.
+fn d3d9_GetAdapterModeCount(this: *anyopaque, adapter: u32, format: u32) callconv(W) u32 {
+    _ = this;
+    if (adapter != 0) return 0;
+    // D3DFORMAT_UNKNOWN asks for every mode the adapter has.
+    if (format == 0 or format == kDisplayMode.Format) return 1;
+    return 0;
+}
+
+/// IDirect3D9::EnumAdapterModes. The guest reads the mode out of the
+/// structure by offset, so it has to be written.
+fn d3d9_EnumAdapterModes(this: *anyopaque, adapter: u32, format: u32, mode: u32, pMode: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    if (adapter != 0) return D3DERR_INVALIDARG;
+    if (mode != 0) return D3DERR_INVALIDARG;
+    if (format != 0 and format != kDisplayMode.Format) return D3DERR_INVALIDARG;
+    const out: ?*align(1) D3DDISPLAYMODE = if (pMode) |p| @ptrCast(p) else null;
+    const m = out orelse return E_POINTER;
+    m.* = kDisplayMode;
+    return D3D_OK;
+}
+
+/// IDirect3D9::GetAdapterDisplayMode.
+fn d3d9_GetAdapterDisplayMode(this: *anyopaque, adapter: u32, pMode: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    if (adapter != 0) return D3DERR_INVALIDARG;
+    const out: ?*align(1) D3DDISPLAYMODE = if (pMode) |p| @ptrCast(p) else null;
+    const m = out orelse return E_POINTER;
+    m.* = kDisplayMode;
+    return D3D_OK;
 }
 fn d3d9_GetDeviceCaps(this: *anyopaque, adapter: u32, dev_type: u32, pCaps: ?*D3DCAPS9) callconv(W) HRESULT {
     _ = this; _ = adapter; _ = dev_type;
@@ -1089,28 +1285,187 @@ fn d3d9_CreateDevice(
     ppDevice.?.* = @ptrCast(dev);
     return D3D_OK;
 }
-fn d3d9_Stub(this: *anyopaque) callconv(W) HRESULT {
+/// The formats this adapter can render into.
+///
+/// The software back buffer is 32-bit RGBA, which the guest sees as either of
+/// these. Everything else is refused rather than silently accepted: a guest
+/// that is told a format is available allocates it and then writes to it.
+fn isRenderTargetFormat(format: u32) bool {
+    return format == D3DFMT_A8R8G8B8 or format == D3DFMT_X8R8G8B8;
+}
+
+/// The depth/stencil formats this adapter can allocate.
+fn isDepthStencilFormat(format: u32) bool {
+    return format == D3DFMT_D24S8 or format == D3DFMT_D16;
+}
+
+/// IDirect3D9::CheckDeviceType.
+///
+/// d3d9.h: (Adapter, DevType, DisplayFormat, BackBufferFormat, Windowed).
+fn d3d9_CheckDeviceType(
+    this: *anyopaque,
+    adapter: u32,
+    dev_type: u32,
+    display_format: u32,
+    back_buffer_format: u32,
+    windowed: i32,
+) callconv(W) HRESULT {
     _ = this;
+    if (adapter != 0) return D3DERR_INVALIDARG;
+    if (dev_type != D3DDEVTYPE_HAL and dev_type != D3DDEVTYPE_REF) return D3DERR_INVALIDARG;
+    if (windowed != 0 and windowed != 1) return D3DERR_INVALIDARG;
+    if (!isRenderTargetFormat(display_format)) return D3DERR_INVALIDARG;
+    // A back buffer format of zero means "the same as the display format".
+    const want = if (back_buffer_format == 0) display_format else back_buffer_format;
+    if (!isRenderTargetFormat(want)) return D3DERR_INVALIDARG;
     return D3D_OK;
+}
+
+/// IDirect3D9::CheckDeviceFormat.
+///
+/// d3d9.h: (Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat).
+fn d3d9_CheckDeviceFormat(
+    this: *anyopaque,
+    adapter: u32,
+    dev_type: u32,
+    adapter_format: u32,
+    usage: u32,
+    rtype: u32,
+    check_format: u32,
+) callconv(W) HRESULT {
+    _ = this;
+    if (adapter != 0) return D3DERR_INVALIDARG;
+    if (dev_type != D3DDEVTYPE_HAL and dev_type != D3DDEVTYPE_REF) return D3DERR_INVALIDARG;
+    if (!isRenderTargetFormat(adapter_format)) return D3DERR_NOTAVAILABLE;
+    if ((usage & D3DUSAGE_RENDERTARGET) != 0) {
+        if (rtype != 0 and rtype != D3DRTYPE_SURFACE and rtype != D3DRTYPE_TEXTURE) {
+            return D3DERR_NOTAVAILABLE;
+        }
+        if (!isRenderTargetFormat(check_format)) return D3DERR_NOTAVAILABLE;
+        return D3D_OK;
+    }
+    if ((usage & D3DUSAGE_DEPTHSTENCIL) != 0) {
+        if (rtype != 0 and rtype != D3DRTYPE_SURFACE) return D3DERR_NOTAVAILABLE;
+        if (!isDepthStencilFormat(check_format)) return D3DERR_NOTAVAILABLE;
+        return D3D_OK;
+    }
+    return D3DERR_NOTAVAILABLE;
+}
+
+/// IDirect3D9::CheckDeviceMultiSampleType.
+///
+/// d3d9.h: (Adapter, DeviceType, SurfaceFormat, Windowed, MultiSampleType,
+/// pNumQualityLevels).
+///
+/// The count of quality levels is an output, and this guest reads it: it
+/// stores the byte in the capability record it builds for the mode and
+/// compares that record later, so leaving the word unset hands the guest
+/// whatever was on its stack and the mode it recorded is not the mode this
+/// adapter has.
+fn d3d9_CheckDeviceMultiSampleType(
+    this: *anyopaque,
+    adapter: u32,
+    dev_type: u32,
+    surface_format: u32,
+    windowed: i32,
+    multi_sample_type: u32,
+    p_quality_levels: ?*u32,
+) callconv(W) HRESULT {
+    _ = this;
+    _ = windowed;
+    if (adapter != 0) return D3DERR_INVALIDARG;
+    if (dev_type != D3DDEVTYPE_HAL and dev_type != D3DDEVTYPE_REF) return D3DERR_INVALIDARG;
+    if (!isRenderTargetFormat(surface_format)) return D3DERR_NOTAVAILABLE;
+    if (p_quality_levels) |p| p.* = 0;
+    // This adapter has no multisample buffers, so every count other than
+    // "none" is refused instead of answered with a number it cannot honour.
+    if (multi_sample_type != D3DMULTISAMPLE_NONE) return D3DERR_NOTAVAILABLE;
+    return D3D_OK;
+}
+
+/// IDirect3D9::CheckDepthStencilMatch.
+///
+/// d3d9.h: (Adapter, DeviceType, AdapterFormat, RenderTargetFormat,
+/// DepthStencilFormat).
+fn d3d9_CheckDepthStencilMatch(
+    this: *anyopaque,
+    adapter: u32,
+    dev_type: u32,
+    adapter_format: u32,
+    render_target_format: u32,
+    depth_stencil_format: u32,
+) callconv(W) HRESULT {
+    _ = this;
+    if (adapter != 0) return D3DERR_INVALIDARG;
+    if (dev_type != D3DDEVTYPE_HAL and dev_type != D3DDEVTYPE_REF) return D3DERR_INVALIDARG;
+    if (!isRenderTargetFormat(adapter_format)) return D3DERR_NOTAVAILABLE;
+    if (!isRenderTargetFormat(render_target_format)) return D3DERR_NOTAVAILABLE;
+    if (!isDepthStencilFormat(depth_stencil_format)) return D3DERR_NOTAVAILABLE;
+    return D3D_OK;
+}
+
+/// IDirect3D9::CheckDeviceFormatConversion.
+///
+/// d3d9.h: (Adapter, DeviceType, SourceFormat, TargetFormat). The software
+/// path converts between the two render target formats in software, so the
+/// answer is yes for that pair and no for everything else.
+fn d3d9_CheckDeviceFormatConversion(
+    this: *anyopaque,
+    adapter: u32,
+    dev_type: u32,
+    source_format: u32,
+    target_format: u32,
+) callconv(W) HRESULT {
+    _ = this;
+    if (adapter != 0) return D3DERR_INVALIDARG;
+    if (dev_type != D3DDEVTYPE_HAL and dev_type != D3DDEVTYPE_REF) return D3DERR_INVALIDARG;
+    if (!isRenderTargetFormat(source_format)) return D3DERR_NOTAVAILABLE;
+    if (!isRenderTargetFormat(target_format)) return D3DERR_NOTAVAILABLE;
+    return D3D_OK;
+}
+
+/// IDirect3D9::RegisterSoftwareDevice.
+///
+/// There is no software plug-in to register.
+fn d3d9_RegisterSoftwareDevice(this: *anyopaque, software: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = software;
+    std.debug.print("[WINS:D3D9] RegisterSoftwareDevice: this adapter has no software plug-ins; answering E_NOTIMPL\n", .{});
+    return E_NOTIMPL;
+}
+
+/// IDirect3D9::GetAdapterMonitor.
+///
+/// The guest asks for the monitor of an adapter it is about to create a
+/// device on. There is no X11 monitor behind this adapter yet, so the handle
+/// is null and the call says so.
+fn d3d9_GetAdapterMonitor(this: *anyopaque, adapter: u32) callconv(W) usize {
+    _ = this;
+    if (adapter != 0) {
+        std.debug.print("[WINS:D3D9] GetAdapterMonitor: adapter {d} does not exist\n", .{adapter});
+        return 0;
+    }
+    std.debug.print("[WINS:D3D9] GetAdapterMonitor: this adapter has no monitor yet; answering a null handle\n", .{});
+    return 0;
 }
 
 const g_d3d9_vtbl: IDirect3D9Vtbl = .{
     .QueryInterface = &d3d9_QueryInterface,
     .AddRef = &d3d9_AddRef,
     .Release = &d3d9_Release,
-    .RegisterSoftwareDevice = @ptrCast(&d3d9_Stub),
+    .RegisterSoftwareDevice = &d3d9_RegisterSoftwareDevice,
     .GetAdapterCount = &d3d9_GetAdapterCount,
-    .GetAdapterIdentifier = @ptrCast(&d3d9_Stub),
-    .GetAdapterModeCount = @ptrCast(&d3d9_GetAdapterCount),
-    .EnumAdapterModes = @ptrCast(&d3d9_Stub),
-    .GetAdapterDisplayMode = @ptrCast(&d3d9_Stub),
-    .CheckDeviceType = @ptrCast(&d3d9_Stub),
-    .CheckDeviceFormat = @ptrCast(&d3d9_Stub),
-    .CheckDeviceMultiSampleType = @ptrCast(&d3d9_Stub),
-    .CheckDepthStencilMatch = @ptrCast(&d3d9_Stub),
-    .CheckDeviceFormatConversion = @ptrCast(&d3d9_Stub),
+    .GetAdapterIdentifier = &d3d9_GetAdapterIdentifier,
+    .GetAdapterModeCount = &d3d9_GetAdapterModeCount,
+    .EnumAdapterModes = &d3d9_EnumAdapterModes,
+    .GetAdapterDisplayMode = &d3d9_GetAdapterDisplayMode,
+    .CheckDeviceType = &d3d9_CheckDeviceType,
+    .CheckDeviceFormat = &d3d9_CheckDeviceFormat,
+    .CheckDeviceMultiSampleType = &d3d9_CheckDeviceMultiSampleType,
+    .CheckDepthStencilMatch = &d3d9_CheckDepthStencilMatch,
+    .CheckDeviceFormatConversion = &d3d9_CheckDeviceFormatConversion,
     .GetDeviceCaps = &d3d9_GetDeviceCaps,
-    .GetAdapterMonitor = @ptrCast(&d3d9_Stub),
+    .GetAdapterMonitor = &d3d9_GetAdapterMonitor,
     .CreateDevice = &d3d9_CreateDevice,
 };
 
@@ -1432,131 +1787,917 @@ fn dev9_DrawIndexedPrimitive(
     return dev9_DrawPrimitive(this, prim_type, 0, prim_count);
 }
 
-fn dev9_Stub(this: *anyopaque) callconv(W) HRESULT {
+/// The IDirect3DDevice9 methods this module does not implement yet.
+///
+/// Same contract as d3d9_Stub: they answer D3D_OK without writing the
+/// caller's output, so they announce themselves instead of failing quietly.
+// Per-slot stubs for the published device object.
+//
+// Every unimplemented method of IDirect3DDevice9 used to be one shared
+// one-argument function. A guest that called GetDeviceCaps(this, pCaps)
+// through it left pCaps on the stack: the callee popped a single word, the
+// guest's ESP never came back, and the drift only surfaced thousands of
+// calls later as a wild jump. Each slot now points at a stub whose
+// signature matches its own declaration -- the first declared parameter is
+// `this` and the rest are the words the guest pushed -- so the guest's
+// stack stays whatever it was, and the method it asked for is printed so
+// the gap is audible instead of silent.
+
+fn dev9_TestCooperativeLevel(this: *anyopaque) callconv(W) HRESULT {
     _ = this;
-    return D3D_OK;
+    std.debug.print("[WINS:D3D9] device!TestCooperativeLevel is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
 }
 
+fn dev9_GetAvailableTextureMem(this: *anyopaque) callconv(W) u32 {
+    _ = this;
+    std.debug.print("[WINS:D3D9] device!GetAvailableTextureMem is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return 0;
+}
+
+fn dev9_EvictManagedResources(this: *anyopaque) callconv(W) HRESULT {
+    _ = this;
+    std.debug.print("[WINS:D3D9] device!EvictManagedResources is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetDirect3D(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetDirect3D is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetDeviceCaps(this: *anyopaque, p0: ?*D3DCAPS9) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetDeviceCaps is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetDisplayMode(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetDisplayMode is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetCreationParameters(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetCreationParameters is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetCursorProperties(this: *anyopaque, p0: u32, p1: u32, p2: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetCursorProperties is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetCursorPosition(this: *anyopaque, p0: i32, p1: i32, p2: u32) callconv(W) void {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetCursorPosition is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+}
+
+fn dev9_ShowCursor(this: *anyopaque, p0: i32) callconv(W) i32 {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!ShowCursor is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return 0;
+}
+
+fn dev9_CreateAdditionalSwapChain(this: *anyopaque, p0: ?*D3DPRESENT_PARAMETERS, p1: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!CreateAdditionalSwapChain is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetSwapChain(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetSwapChain is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetNumberOfSwapChains(this: *anyopaque) callconv(W) u32 {
+    _ = this;
+    std.debug.print("[WINS:D3D9] device!GetNumberOfSwapChains is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return 0;
+}
+
+fn dev9_Reset(this: *anyopaque, p0: ?*D3DPRESENT_PARAMETERS) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!Reset is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetBackBuffer(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    std.debug.print("[WINS:D3D9] device!GetBackBuffer is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetRasterStatus(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetRasterStatus is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetDialogBoxMode(this: *anyopaque, p0: i32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetDialogBoxMode is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetGammaRamp(this: *anyopaque, p0: u32, p1: u32, p2: ?*const anyopaque) callconv(W) void {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetGammaRamp is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+}
+
+fn dev9_GetGammaRamp(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) void {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetGammaRamp is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+}
+
+fn dev9_CreateVolumeTexture(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32, p7: ?*?*anyopaque, p8: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    _ = p4;
+    _ = p5;
+    _ = p6;
+    _ = p7;
+    _ = p8;
+    std.debug.print("[WINS:D3D9] device!CreateVolumeTexture is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_CreateCubeTexture(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: ?*?*anyopaque, p6: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    _ = p4;
+    _ = p5;
+    _ = p6;
+    std.debug.print("[WINS:D3D9] device!CreateCubeTexture is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_CreateRenderTarget(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: i32, p6: ?*?*anyopaque, p7: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    _ = p4;
+    _ = p5;
+    _ = p6;
+    _ = p7;
+    std.debug.print("[WINS:D3D9] device!CreateRenderTarget is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_CreateDepthStencilSurface(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: i32, p6: ?*?*anyopaque, p7: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    _ = p4;
+    _ = p5;
+    _ = p6;
+    _ = p7;
+    std.debug.print("[WINS:D3D9] device!CreateDepthStencilSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_UpdateSurface(this: *anyopaque, p0: ?*anyopaque, p1: ?*const D3DRECT, p2: ?*anyopaque, p3: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    std.debug.print("[WINS:D3D9] device!UpdateSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_UpdateTexture(this: *anyopaque, p0: ?*anyopaque, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!UpdateTexture is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetRenderTargetData(this: *anyopaque, p0: ?*anyopaque, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetRenderTargetData is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetFrontBufferData(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetFrontBufferData is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_StretchRect(this: *anyopaque, p0: ?*anyopaque, p1: ?*const D3DRECT, p2: ?*anyopaque, p3: ?*const D3DRECT, p4: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    _ = p4;
+    std.debug.print("[WINS:D3D9] device!StretchRect is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_ColorFill(this: *anyopaque, p0: ?*anyopaque, p1: ?*const D3DRECT, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!ColorFill is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_CreateOffscreenPlainSurface(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: ?*?*anyopaque, p5: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    _ = p4;
+    _ = p5;
+    std.debug.print("[WINS:D3D9] device!CreateOffscreenPlainSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetRenderTarget(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!SetRenderTarget is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetRenderTarget(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetRenderTarget is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetDepthStencilSurface(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetDepthStencilSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetDepthStencilSurface(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetDepthStencilSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetTransform(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!SetTransform is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetTransform(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetTransform is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_MultiplyTransform(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!MultiplyTransform is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetMaterial(this: *anyopaque, p0: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetMaterial is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetMaterial(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetMaterial is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetLight(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!SetLight is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetLight(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetLight is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_LightEnable(this: *anyopaque, p0: u32, p1: i32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!LightEnable is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetLightEnable(this: *anyopaque, p0: u32, p1: ?*i32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetLightEnable is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetClipPlane(this: *anyopaque, p0: u32, p1: ?*const f32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!SetClipPlane is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetClipPlane(this: *anyopaque, p0: u32, p1: ?*f32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetClipPlane is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_CreateStateBlock(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!CreateStateBlock is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_BeginStateBlock(this: *anyopaque) callconv(W) HRESULT {
+    _ = this;
+    std.debug.print("[WINS:D3D9] device!BeginStateBlock is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_EndStateBlock(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!EndStateBlock is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetClipStatus(this: *anyopaque, p0: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetClipStatus is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetClipStatus(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetClipStatus is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetTexture(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetTexture is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetTextureStageState(this: *anyopaque, p0: u32, p1: u32, p2: ?*u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!GetTextureStageState is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetTextureStageState(this: *anyopaque, p0: u32, p1: u32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetTextureStageState is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetSamplerState(this: *anyopaque, p0: u32, p1: u32, p2: ?*u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!GetSamplerState is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetSamplerState(this: *anyopaque, p0: u32, p1: u32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetSamplerState is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_ValidateDevice(this: *anyopaque, p0: ?*u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!ValidateDevice is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetPaletteEntries(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!SetPaletteEntries is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetPaletteEntries(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetPaletteEntries is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetCurrentTexturePalette(this: *anyopaque, p0: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetCurrentTexturePalette is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetCurrentTexturePalette(this: *anyopaque, p0: ?*u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetCurrentTexturePalette is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetScissorRect(this: *anyopaque, p0: ?*const D3DRECT) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetScissorRect is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetScissorRect(this: *anyopaque, p0: ?*D3DRECT) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetScissorRect is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetSoftwareVertexProcessing(this: *anyopaque, p0: i32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetSoftwareVertexProcessing is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetSoftwareVertexProcessing(this: *anyopaque) callconv(W) i32 {
+    _ = this;
+    std.debug.print("[WINS:D3D9] device!GetSoftwareVertexProcessing is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return 0;
+}
+
+fn dev9_SetNPatchMode(this: *anyopaque, p0: f32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetNPatchMode is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetNPatchMode(this: *anyopaque) callconv(W) f32 {
+    _ = this;
+    std.debug.print("[WINS:D3D9] device!GetNPatchMode is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return 0;
+}
+
+fn dev9_DrawPrimitiveUP(this: *anyopaque, p0: u32, p1: u32, p2: ?*const anyopaque, p3: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    std.debug.print("[WINS:D3D9] device!DrawPrimitiveUP is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_DrawIndexedPrimitiveUP(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: ?*const anyopaque, p5: u32, p6: ?*const anyopaque, p7: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    _ = p4;
+    _ = p5;
+    _ = p6;
+    _ = p7;
+    std.debug.print("[WINS:D3D9] device!DrawIndexedPrimitiveUP is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_ProcessVertices(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: ?*anyopaque, p4: ?*anyopaque, p5: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    _ = p4;
+    _ = p5;
+    std.debug.print("[WINS:D3D9] device!ProcessVertices is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_CreateVertexDeclaration(this: *anyopaque, p0: ?*const anyopaque, p1: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!CreateVertexDeclaration is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetVertexDeclaration(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetVertexDeclaration is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetVertexDeclaration(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetVertexDeclaration is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetFVF(this: *anyopaque, p0: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!SetFVF is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetFVF(this: *anyopaque, p0: ?*u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetFVF is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetVertexShader(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetVertexShader is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetVertexShaderConstantF(this: *anyopaque, p0: u32, p1: ?*f32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!GetVertexShaderConstantF is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetVertexShaderConstantI(this: *anyopaque, p0: u32, p1: ?*const i32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetVertexShaderConstantI is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetVertexShaderConstantI(this: *anyopaque, p0: u32, p1: ?*i32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!GetVertexShaderConstantI is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetVertexShaderConstantB(this: *anyopaque, p0: u32, p1: ?*const i32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetVertexShaderConstantB is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetVertexShaderConstantB(this: *anyopaque, p0: u32, p1: ?*i32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!GetVertexShaderConstantB is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetStreamSource(this: *anyopaque, p0: u32, p1: ?*?*anyopaque, p2: ?*u32, p3: ?*u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    _ = p3;
+    std.debug.print("[WINS:D3D9] device!GetStreamSource is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetStreamSourceFreq(this: *anyopaque, p0: u32, p1: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!SetStreamSourceFreq is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetStreamSourceFreq(this: *anyopaque, p0: u32, p1: ?*u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!GetStreamSourceFreq is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetIndices(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetIndices is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetPixelShader(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!GetPixelShader is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetPixelShaderConstantF(this: *anyopaque, p0: u32, p1: ?*f32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!GetPixelShaderConstantF is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetPixelShaderConstantI(this: *anyopaque, p0: u32, p1: ?*const i32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetPixelShaderConstantI is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetPixelShaderConstantI(this: *anyopaque, p0: u32, p1: ?*i32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!GetPixelShaderConstantI is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_SetPixelShaderConstantB(this: *anyopaque, p0: u32, p1: ?*const i32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!SetPixelShaderConstantB is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_GetPixelShaderConstantB(this: *anyopaque, p0: u32, p1: ?*i32, p2: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!GetPixelShaderConstantB is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_DrawRectPatch(this: *anyopaque, p0: u32, p1: ?*const f32, p2: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!DrawRectPatch is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_DrawTriPatch(this: *anyopaque, p0: u32, p1: ?*const f32, p2: ?*const anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    _ = p2;
+    std.debug.print("[WINS:D3D9] device!DrawTriPatch is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_DeletePatch(this: *anyopaque, p0: u32) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    std.debug.print("[WINS:D3D9] device!DeletePatch is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
+
+fn dev9_CreateQuery(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = this;
+    _ = p0;
+    _ = p1;
+    std.debug.print("[WINS:D3D9] device!CreateQuery is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    return E_NOTIMPL;
+}
 const g_device9_vtbl: IDirect3DDevice9Vtbl = .{
     .QueryInterface = &dev9_QueryInterface,
     .AddRef = &dev9_AddRef,
     .Release = &dev9_Release,
-    .TestCooperativeLevel = @ptrCast(&dev9_Stub),
-    .GetAvailableTextureMem = @ptrCast(&dev9_Stub),
-    .EvictManagedResources = @ptrCast(&dev9_Stub),
-    .GetDirect3D = @ptrCast(&dev9_Stub),
-    .GetDeviceCaps = @ptrCast(&dev9_Stub),
-    .GetDisplayMode = @ptrCast(&dev9_Stub),
-    .GetCreationParameters = @ptrCast(&dev9_Stub),
-    .SetCursorProperties = @ptrCast(&dev9_Stub),
-    .SetCursorPosition = @ptrCast(&dev9_Stub),
-    .ShowCursor = @ptrCast(&dev9_Stub),
-    .CreateAdditionalSwapChain = @ptrCast(&dev9_Stub),
-    .GetSwapChain = @ptrCast(&dev9_Stub),
-    .GetNumberOfSwapChains = @ptrCast(&dev9_Stub),
-    .Reset = @ptrCast(&dev9_Stub),
+    .TestCooperativeLevel = @ptrCast(&dev9_TestCooperativeLevel),
+    .GetAvailableTextureMem = @ptrCast(&dev9_GetAvailableTextureMem),
+    .EvictManagedResources = @ptrCast(&dev9_EvictManagedResources),
+    .GetDirect3D = @ptrCast(&dev9_GetDirect3D),
+    .GetDeviceCaps = @ptrCast(&dev9_GetDeviceCaps),
+    .GetDisplayMode = @ptrCast(&dev9_GetDisplayMode),
+    .GetCreationParameters = @ptrCast(&dev9_GetCreationParameters),
+    .SetCursorProperties = @ptrCast(&dev9_SetCursorProperties),
+    .SetCursorPosition = @ptrCast(&dev9_SetCursorPosition),
+    .ShowCursor = @ptrCast(&dev9_ShowCursor),
+    .CreateAdditionalSwapChain = @ptrCast(&dev9_CreateAdditionalSwapChain),
+    .GetSwapChain = @ptrCast(&dev9_GetSwapChain),
+    .GetNumberOfSwapChains = @ptrCast(&dev9_GetNumberOfSwapChains),
+    .Reset = @ptrCast(&dev9_Reset),
     .Present = &dev9_Present,
-    .GetBackBuffer = @ptrCast(&dev9_Stub),
-    .GetRasterStatus = @ptrCast(&dev9_Stub),
-    .SetDialogBoxMode = @ptrCast(&dev9_Stub),
-    .SetGammaRamp = @ptrCast(&dev9_Stub),
-    .GetGammaRamp = @ptrCast(&dev9_Stub),
+    .GetBackBuffer = @ptrCast(&dev9_GetBackBuffer),
+    .GetRasterStatus = @ptrCast(&dev9_GetRasterStatus),
+    .SetDialogBoxMode = @ptrCast(&dev9_SetDialogBoxMode),
+    .SetGammaRamp = @ptrCast(&dev9_SetGammaRamp),
+    .GetGammaRamp = @ptrCast(&dev9_GetGammaRamp),
     .CreateTexture = &dev9_CreateTexture,
-    .CreateVolumeTexture = @ptrCast(&dev9_Stub),
-    .CreateCubeTexture = @ptrCast(&dev9_Stub),
+    .CreateVolumeTexture = @ptrCast(&dev9_CreateVolumeTexture),
+    .CreateCubeTexture = @ptrCast(&dev9_CreateCubeTexture),
     .CreateVertexBuffer = &dev9_CreateVertexBuffer,
     .CreateIndexBuffer = &dev9_CreateIndexBuffer,
-    .CreateRenderTarget = @ptrCast(&dev9_Stub),
-    .CreateDepthStencilSurface = @ptrCast(&dev9_Stub),
-    .UpdateSurface = @ptrCast(&dev9_Stub),
-    .UpdateTexture = @ptrCast(&dev9_Stub),
-    .GetRenderTargetData = @ptrCast(&dev9_Stub),
-    .GetFrontBufferData = @ptrCast(&dev9_Stub),
-    .StretchRect = @ptrCast(&dev9_Stub),
-    .ColorFill = @ptrCast(&dev9_Stub),
-    .CreateOffscreenPlainSurface = @ptrCast(&dev9_Stub),
-    .SetRenderTarget = @ptrCast(&dev9_Stub),
-    .GetRenderTarget = @ptrCast(&dev9_Stub),
-    .SetDepthStencilSurface = @ptrCast(&dev9_Stub),
-    .GetDepthStencilSurface = @ptrCast(&dev9_Stub),
+    .CreateRenderTarget = @ptrCast(&dev9_CreateRenderTarget),
+    .CreateDepthStencilSurface = @ptrCast(&dev9_CreateDepthStencilSurface),
+    .UpdateSurface = @ptrCast(&dev9_UpdateSurface),
+    .UpdateTexture = @ptrCast(&dev9_UpdateTexture),
+    .GetRenderTargetData = @ptrCast(&dev9_GetRenderTargetData),
+    .GetFrontBufferData = @ptrCast(&dev9_GetFrontBufferData),
+    .StretchRect = @ptrCast(&dev9_StretchRect),
+    .ColorFill = @ptrCast(&dev9_ColorFill),
+    .CreateOffscreenPlainSurface = @ptrCast(&dev9_CreateOffscreenPlainSurface),
+    .SetRenderTarget = @ptrCast(&dev9_SetRenderTarget),
+    .GetRenderTarget = @ptrCast(&dev9_GetRenderTarget),
+    .SetDepthStencilSurface = @ptrCast(&dev9_SetDepthStencilSurface),
+    .GetDepthStencilSurface = @ptrCast(&dev9_GetDepthStencilSurface),
     .BeginScene = &dev9_BeginScene,
     .EndScene = &dev9_EndScene,
     .Clear = &dev9_Clear,
-    .SetTransform = @ptrCast(&dev9_Stub),
-    .GetTransform = @ptrCast(&dev9_Stub),
-    .MultiplyTransform = @ptrCast(&dev9_Stub),
+    .SetTransform = @ptrCast(&dev9_SetTransform),
+    .GetTransform = @ptrCast(&dev9_GetTransform),
+    .MultiplyTransform = @ptrCast(&dev9_MultiplyTransform),
     .SetViewport = &dev9_SetViewport,
     .GetViewport = &dev9_GetViewport,
-    .SetMaterial = @ptrCast(&dev9_Stub),
-    .GetMaterial = @ptrCast(&dev9_Stub),
-    .SetLight = @ptrCast(&dev9_Stub),
-    .GetLight = @ptrCast(&dev9_Stub),
-    .LightEnable = @ptrCast(&dev9_Stub),
-    .GetLightEnable = @ptrCast(&dev9_Stub),
-    .SetClipPlane = @ptrCast(&dev9_Stub),
-    .GetClipPlane = @ptrCast(&dev9_Stub),
+    .SetMaterial = @ptrCast(&dev9_SetMaterial),
+    .GetMaterial = @ptrCast(&dev9_GetMaterial),
+    .SetLight = @ptrCast(&dev9_SetLight),
+    .GetLight = @ptrCast(&dev9_GetLight),
+    .LightEnable = @ptrCast(&dev9_LightEnable),
+    .GetLightEnable = @ptrCast(&dev9_GetLightEnable),
+    .SetClipPlane = @ptrCast(&dev9_SetClipPlane),
+    .GetClipPlane = @ptrCast(&dev9_GetClipPlane),
     .SetRenderState = &dev9_SetRenderState,
     .GetRenderState = &dev9_GetRenderState,
-    .CreateStateBlock = @ptrCast(&dev9_Stub),
-    .BeginStateBlock = @ptrCast(&dev9_Stub),
-    .EndStateBlock = @ptrCast(&dev9_Stub),
-    .SetClipStatus = @ptrCast(&dev9_Stub),
-    .GetClipStatus = @ptrCast(&dev9_Stub),
-    .GetTexture = @ptrCast(&dev9_Stub),
+    .CreateStateBlock = @ptrCast(&dev9_CreateStateBlock),
+    .BeginStateBlock = @ptrCast(&dev9_BeginStateBlock),
+    .EndStateBlock = @ptrCast(&dev9_EndStateBlock),
+    .SetClipStatus = @ptrCast(&dev9_SetClipStatus),
+    .GetClipStatus = @ptrCast(&dev9_GetClipStatus),
+    .GetTexture = @ptrCast(&dev9_GetTexture),
     .SetTexture = &dev9_SetTexture,
-    .GetTextureStageState = @ptrCast(&dev9_Stub),
-    .SetTextureStageState = @ptrCast(&dev9_Stub),
-    .GetSamplerState = @ptrCast(&dev9_Stub),
-    .SetSamplerState = @ptrCast(&dev9_Stub),
-    .ValidateDevice = @ptrCast(&dev9_Stub),
-    .SetPaletteEntries = @ptrCast(&dev9_Stub),
-    .GetPaletteEntries = @ptrCast(&dev9_Stub),
-    .SetCurrentTexturePalette = @ptrCast(&dev9_Stub),
-    .GetCurrentTexturePalette = @ptrCast(&dev9_Stub),
-    .SetScissorRect = @ptrCast(&dev9_Stub),
-    .GetScissorRect = @ptrCast(&dev9_Stub),
-    .SetSoftwareVertexProcessing = @ptrCast(&dev9_Stub),
-    .GetSoftwareVertexProcessing = @ptrCast(&dev9_Stub),
-    .SetNPatchMode = @ptrCast(&dev9_Stub),
-    .GetNPatchMode = @ptrCast(&dev9_Stub),
+    .GetTextureStageState = @ptrCast(&dev9_GetTextureStageState),
+    .SetTextureStageState = @ptrCast(&dev9_SetTextureStageState),
+    .GetSamplerState = @ptrCast(&dev9_GetSamplerState),
+    .SetSamplerState = @ptrCast(&dev9_SetSamplerState),
+    .ValidateDevice = @ptrCast(&dev9_ValidateDevice),
+    .SetPaletteEntries = @ptrCast(&dev9_SetPaletteEntries),
+    .GetPaletteEntries = @ptrCast(&dev9_GetPaletteEntries),
+    .SetCurrentTexturePalette = @ptrCast(&dev9_SetCurrentTexturePalette),
+    .GetCurrentTexturePalette = @ptrCast(&dev9_GetCurrentTexturePalette),
+    .SetScissorRect = @ptrCast(&dev9_SetScissorRect),
+    .GetScissorRect = @ptrCast(&dev9_GetScissorRect),
+    .SetSoftwareVertexProcessing = @ptrCast(&dev9_SetSoftwareVertexProcessing),
+    .GetSoftwareVertexProcessing = @ptrCast(&dev9_GetSoftwareVertexProcessing),
+    .SetNPatchMode = @ptrCast(&dev9_SetNPatchMode),
+    .GetNPatchMode = @ptrCast(&dev9_GetNPatchMode),
     .DrawPrimitive = &dev9_DrawPrimitive,
     .DrawIndexedPrimitive = &dev9_DrawIndexedPrimitive,
-    .DrawPrimitiveUP = @ptrCast(&dev9_Stub),
-    .DrawIndexedPrimitiveUP = @ptrCast(&dev9_Stub),
-    .ProcessVertices = @ptrCast(&dev9_Stub),
-    .CreateVertexDeclaration = @ptrCast(&dev9_Stub),
-    .SetVertexDeclaration = @ptrCast(&dev9_Stub),
-    .GetVertexDeclaration = @ptrCast(&dev9_Stub),
-    .SetFVF = @ptrCast(&dev9_Stub),
-    .GetFVF = @ptrCast(&dev9_Stub),
+    .DrawPrimitiveUP = @ptrCast(&dev9_DrawPrimitiveUP),
+    .DrawIndexedPrimitiveUP = @ptrCast(&dev9_DrawIndexedPrimitiveUP),
+    .ProcessVertices = @ptrCast(&dev9_ProcessVertices),
+    .CreateVertexDeclaration = @ptrCast(&dev9_CreateVertexDeclaration),
+    .SetVertexDeclaration = @ptrCast(&dev9_SetVertexDeclaration),
+    .GetVertexDeclaration = @ptrCast(&dev9_GetVertexDeclaration),
+    .SetFVF = @ptrCast(&dev9_SetFVF),
+    .GetFVF = @ptrCast(&dev9_GetFVF),
     .CreateVertexShader = &dev9_CreateVertexShader,
     .SetVertexShader = &dev9_SetVertexShader,
-    .GetVertexShader = @ptrCast(&dev9_Stub),
+    .GetVertexShader = @ptrCast(&dev9_GetVertexShader),
     .SetVertexShaderConstantF = &dev9_SetVertexShaderConstantF,
-    .GetVertexShaderConstantF = @ptrCast(&dev9_Stub),
-    .SetVertexShaderConstantI = @ptrCast(&dev9_Stub),
-    .GetVertexShaderConstantI = @ptrCast(&dev9_Stub),
-    .SetVertexShaderConstantB = @ptrCast(&dev9_Stub),
-    .GetVertexShaderConstantB = @ptrCast(&dev9_Stub),
+    .GetVertexShaderConstantF = @ptrCast(&dev9_GetVertexShaderConstantF),
+    .SetVertexShaderConstantI = @ptrCast(&dev9_SetVertexShaderConstantI),
+    .GetVertexShaderConstantI = @ptrCast(&dev9_GetVertexShaderConstantI),
+    .SetVertexShaderConstantB = @ptrCast(&dev9_SetVertexShaderConstantB),
+    .GetVertexShaderConstantB = @ptrCast(&dev9_GetVertexShaderConstantB),
     .SetStreamSource = &dev9_SetStreamSource,
-    .GetStreamSource = @ptrCast(&dev9_Stub),
-    .SetStreamSourceFreq = @ptrCast(&dev9_Stub),
-    .GetStreamSourceFreq = @ptrCast(&dev9_Stub),
+    .GetStreamSource = @ptrCast(&dev9_GetStreamSource),
+    .SetStreamSourceFreq = @ptrCast(&dev9_SetStreamSourceFreq),
+    .GetStreamSourceFreq = @ptrCast(&dev9_GetStreamSourceFreq),
     .SetIndices = &dev9_SetIndices,
-    .GetIndices = @ptrCast(&dev9_Stub),
+    .GetIndices = @ptrCast(&dev9_GetIndices),
     .CreatePixelShader = &dev9_CreatePixelShader,
     .SetPixelShader = &dev9_SetPixelShader,
-    .GetPixelShader = @ptrCast(&dev9_Stub),
+    .GetPixelShader = @ptrCast(&dev9_GetPixelShader),
     .SetPixelShaderConstantF = &dev9_SetPixelShaderConstantF,
-    .GetPixelShaderConstantF = @ptrCast(&dev9_Stub),
-    .SetPixelShaderConstantI = @ptrCast(&dev9_Stub),
-    .GetPixelShaderConstantI = @ptrCast(&dev9_Stub),
-    .SetPixelShaderConstantB = @ptrCast(&dev9_Stub),
-    .GetPixelShaderConstantB = @ptrCast(&dev9_Stub),
-    .DrawRectPatch = @ptrCast(&dev9_Stub),
-    .DrawTriPatch = @ptrCast(&dev9_Stub),
-    .DeletePatch = @ptrCast(&dev9_Stub),
-    .CreateQuery = @ptrCast(&dev9_Stub),
+    .GetPixelShaderConstantF = @ptrCast(&dev9_GetPixelShaderConstantF),
+    .SetPixelShaderConstantI = @ptrCast(&dev9_SetPixelShaderConstantI),
+    .GetPixelShaderConstantI = @ptrCast(&dev9_GetPixelShaderConstantI),
+    .SetPixelShaderConstantB = @ptrCast(&dev9_SetPixelShaderConstantB),
+    .GetPixelShaderConstantB = @ptrCast(&dev9_GetPixelShaderConstantB),
+    .DrawRectPatch = @ptrCast(&dev9_DrawRectPatch),
+    .DrawTriPatch = @ptrCast(&dev9_DrawTriPatch),
+    .DeletePatch = @ptrCast(&dev9_DeletePatch),
+    .CreateQuery = @ptrCast(&dev9_CreateQuery),
 };
 
 // ============================================================================

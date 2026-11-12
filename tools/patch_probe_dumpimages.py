@@ -29,11 +29,12 @@ NL = chr(92) + "n"
 s = target.read_text()
 
 
-def dump_block(out_path, lo_expr, hi_expr, label):
+def dump_block(path_expr, lo_expr, hi_expr, label):
     return [
         "        // PROBE ONLY: " + label,
         "        {",
-        '            const out_path = "' + out_path + '";',
+        "            var name_buf: [256:0]u8 = undefined;",
+        "            const out_path = " + path_expr + ";",
         "            const lo: usize = " + lo_expr + ";",
         "            const hi: usize = " + hi_expr + ";",
         "            const fd = linux.open(out_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);",
@@ -67,7 +68,7 @@ helper = [
     "    if (g_guest_base != 0 and g_guest_end > g_guest_base) {",
 ]
 helper += dump_block(
-    "/tmp/opencode/wins-ceg/guest_image_entry.bin",
+    'std.fmt.bufPrintZ(&name_buf, "/tmp/opencode/wins-ceg/guest_image_{s}.bin", .{tag}) catch name_buf[0..0 :0]',
     "g_guest_base",
     "g_guest_end",
     "the live guest image (the CEG decrypts it at runtime)",
@@ -77,7 +78,7 @@ helper += [
     "    {",
 ]
 helper += dump_block(
-    "/tmp/opencode/wins-ceg/stub_image_entry.bin",
+    'std.fmt.bufPrintZ(&name_buf, "/tmp/opencode/wins-ceg/stub_image_{s}.bin", .{tag}) catch name_buf[0..0 :0]',
     "0x10000000",
     "0x10063000",
     "the image the guest built at 0x10000000 (the CEG's own code)",
@@ -96,6 +97,10 @@ s = s.replace(anchor, "\n".join(helper) + anchor, 1)
 # 2. ExitProcess: dump, then show the stack around the return address.
 # ---------------------------------------------------------------------------
 call = [
+    "    // PROBE ONLY: the renderer writes its decision fields only after the",
+    "    // engine the loader can see has been handed back, and releases them on",
+    "    // the way out -- so the object is looked up here, one moment before.",
+    "    d3d9.probe_find_renderer();",
     "    // PROBE ONLY: the evidence, and the chain that led here.",
     '    probeDumpImages("exit");',
     "    {",
@@ -108,48 +113,20 @@ call = [
     "            const w = @as(*const u32, @ptrFromInt(sp + i * 4)).*;",
     '            std.debug.print("[WINS:Probe]   [+0x{x:0>2}] 0x{x:0>8}' + NL + '", .{ i * 4, w });',
     "        }",
+    "        // The exit is a decision the guest made, and the decision lives in",
+    "        // the frames above this one. The guest image spans 0x400000..0x147b000,",
+    "        // so any word in that window on the way up is a return address into",
+    "        // its own code: that names the chain that produced the exit.",
+    "        //",
+    "        // The walk starts at the wrapper's own ESP, not above the window",
+    "        // already printed: the guest's return address sits at +0x44 and the",
+    "        // frame it leads to at +0x4c, both below the 0x60 the window ends at.",
+    "        var off: usize = 0;",
+    "        while (off < 0x2000) : (off += 4) {",
+    "            const w = @as(*const u32, @ptrFromInt(sp + off)).*;",
+    "            if (w >= 0x400000 and w < 0x1480000) {",
+    '                std.debug.print("[WINS:Probe] chain +0x{x:0>3}: 0x{x:0>8}' + NL + '", .{ off, w });',
+    "            }",
+    "        }",
     "    }",
 ]
-call_anchor = "    const caller = @returnAddress();"
-assert call_anchor in s, "caller anchor not found"
-s = s.replace(call_anchor, "\n".join(call) + "\n" + call_anchor, 1)
-
-# ---------------------------------------------------------------------------
-# 3. The same dump at the moment the guest is entered, so a change between
-#    entry and exit can be seen.
-# ---------------------------------------------------------------------------
-entry_anchor = "        brkGuestEntry();"
-assert entry_anchor in s, "guest entry anchor not found"
-s = s.replace(
-    entry_anchor,
-    '        probeDumpImages("entry");\n' + entry_anchor,
-    1,
-)
-
-# ---------------------------------------------------------------------------
-# 4. Every allocation the guest makes. The loader honours a caller-supplied
-#    address, so a guest that re-maps its own image leaves no trace in the
-#    map file unless the allocation is written down.
-# ---------------------------------------------------------------------------
-alloc_anchor = "fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(W) ?*anyopaque {"
-assert alloc_anchor in s, "VirtualAlloc anchor not found"
-alloc_log = [
-    "    // PROBE ONLY: what the guest asked the kernel for.",
-    '    std.debug.print("[WINS:Probe] VirtualAlloc(addr=0x{x}, size={d}, prot=0x{x})' + NL + '", .{ @intFromPtr(lpAddress), dwSize, flProtect });',
-]
-s = s.replace(alloc_anchor, alloc_anchor + "\n" + "\n".join(alloc_log), 1)
-
-# ---------------------------------------------------------------------------
-# 5. A failed GetProcAddress names the module it came from; say which
-#    mapping that address is in, so the asking code can be found.
-# ---------------------------------------------------------------------------
-not_found = "        g_last_error = 127; // ERROR_PROC_NOT_FOUND"
-assert not_found in s, "GetProcAddress failure anchor not found"
-s = s.replace(
-    not_found,
-    "        describeAddr(@returnAddress());\n" + not_found,
-    1,
-)
-
-target.write_text(s)
-print("probe: live image dumps (entry and exit) + allocation log patched in")
