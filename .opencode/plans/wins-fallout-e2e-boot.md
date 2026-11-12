@@ -98,7 +98,7 @@ en el ensayo aislado. Criterio de éxito final observable: el log del ensayo e2e
 
 ### M6 — Ensayo e2e real (sin concesiones de sonda)
 - **Objetivo:** Medir hasta dónde llega el binario real con todos los fixes.
-- **Rutas:** build del loader + `/tmp/wins-resume/run_isolated.py`.
+- **Rutas:** build del loader + `/tmp/wins-resume/run_real.py` (bwrap aislado + `WINS_STEAM_PID`/`WINS_STEAM_EXE`).
 - **Pasos:**
   1. Rebuild del loader winrun32 real con los fixes (sin `native/probe/`).
   2. Correr el ensayo aislado contra la copia de `/tmp/wins-resume/game` con el Steam real.
@@ -106,6 +106,10 @@ en el ensayo aislado. Criterio de éxito final observable: el log del ensayo e2e
 - **Aceptación:** el log muestra `CreateDevice` OK y caps del device respondidas sin probes; commit final con todos los fixes.
 - **Prueba:** corrida del ensayo + `sha256sum` del log.
 - **Rollback:** `git revert` de los commits M1–M5.
+- **Estado medido (2026-11-12 ~11:40):**
+  - Run directo en host: el handshake Steam OK (`ISteamClient010 rc=0`, ticket 238 bytes), pero crash nondeterminista en guest `0xaa10a0` y a veces `malloc(): invalid size (unsorted)` — causa raíz: el heap brk del loader (randomizado) cae dentro de la ventana de la imagen `0x00400000..` y el MAP_FIXED la destruye. **Corregido en commit 11ce203** (re-exec con `ADDR_NO_RANDOMIZE` + reserva PROT_NONE de `[0x00400000,+64MB)`); los aborts de heap desaparecieron.
+  - Run bajo bwrap: con `WINS_STEAM_PID`/`WINS_STEAM_EXE` (commiteado en d25d6dd) el loader localiza al cliente (`/proc/<pid>/exe` no es legible dentro del user-ns), pero `CreateSteamPipe() -> pipe=0` porque **el proceso Steam ya no está corriendo** (`ps` no muestra ningún proceso steam; `~/.steam/steam.pid` quedó stale). Falta reabrir Steam para seguir.
+  - `/proc` dentro del sandbox: `comm` se lee, `readlink /proc/<pid>/exe` falla por el user-ns → por eso existe el override de entorno.
 
 ## Dependencias
 - `M0` → `M1`, `M2`, `M3`, `M4`, `M5` (independientes entre sí) → `M6`.
