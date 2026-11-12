@@ -66,10 +66,18 @@ fn UnhandledExceptionFilter(info: usize) callconv(W) u32 {
     return 1; // EXCEPTION_EXECUTE_HANDLER
 }
 
-fn RaiseException(code: u32, flags: u32, nargs: u32, args: ?[*]const usize) callconv(W) noreturn {
+/// MS_VC_EXCEPTION (0x406d1388) is how MSVC names threads: it is raised and
+/// handled in-process, and execution continues after the call site. Ending
+/// the guest on it kills every program that sets a thread name.
+pub fn isThreadNamingException(code: u32) bool {
+    return code == 0x406d1388;
+}
+
+fn RaiseException(code: u32, flags: u32, nargs: u32, args: ?[*]const usize) callconv(W) void {
     _ = flags;
     _ = nargs;
     _ = args;
+    if (isThreadNamingException(code)) return; // handled in-process; continue
     linux.exit_group(@bitCast(code));
 }
 

@@ -1141,9 +1141,13 @@ fn TerminateProcess(hProcess: usize, uExitCode: u32) callconv(W) i32 {
     ExitProcess(uExitCode);
 }
 
-fn RaiseException(dwExceptionCode: u32, dwExceptionFlags: u32, nNumberOfArguments: u32, lpArguments: ?[*]const usize) callconv(W) noreturn {
+fn RaiseException(dwExceptionCode: u32, dwExceptionFlags: u32, nNumberOfArguments: u32, lpArguments: ?[*]const usize) callconv(W) void {
     _ = dwExceptionFlags; _ = nNumberOfArguments; _ = lpArguments;
     std.debug.print("[WINS:Kernel32] RaiseException(0x{x:0>8})\n", .{dwExceptionCode});
+    if (kernel32_mod.isThreadNamingException(dwExceptionCode)) {
+        std.debug.print("[WINS:Kernel32] thread-naming exception; continuing\n", .{});
+        return;
+    }
     linux.exit_group(1);
 }
 
@@ -4356,9 +4360,15 @@ fn SHGetFolderPathA(hwnd: usize, csidl: i32, hToken: usize, dwFlags: u32, pszPat
     return 0; // S_OK
 }
 
+/// Nothing is ever launched, so the honest answer is a failure code: Windows
+/// reports ShellExecuteA success only with a return value > 32. Answering
+/// success here made guests believe a launcher opened and exit silently
+/// right after (the FalloutNV GPU-name-mismatch path).
+const SE_ERR_FNF: usize = 2; // nothing was executed
+
 fn ShellExecuteA(hwnd: usize, lpOperation: ?[*:0]const u8, lpFile: ?[*:0]const u8, lpParameters: ?[*:0]const u8, lpDirectory: ?[*:0]const u8, nShowCmd: i32) callconv(W) usize {
     _ = hwnd; _ = lpOperation; _ = lpFile; _ = lpParameters; _ = lpDirectory; _ = nShowCmd;
-    return 42; // Success
+    return SE_ERR_FNF;
 }
 
 // Built lazily: the guest's argv comes from a runtime string, so a container-level
@@ -4638,10 +4648,102 @@ fn timeGetTime() callconv(W) u32 {
     return GetTickCount();
 }
 
+// ============================================================================
+// DirectInput8 — minimal real object (this machine reports no input devices)
+// ============================================================================
+
+const DI_OK: i32 = 0;
+const DIERR_GENERIC: i32 = @bitCast(@as(u32, 0x80004005)); // E_FAIL
+
+/// IDirectInput8W vtable: IUnknown first, then the eight methods in
+/// declaration order. The guest calls by offset with stdcall stack cleanup,
+/// so both the order and the arity must match the real interface.
+const WinsDirectInput8Vtbl = struct {
+    QueryInterface: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) i32,
+    AddRef: *const fn (*anyopaque) callconv(W) u32,
+    Release: *const fn (*anyopaque) callconv(W) u32,
+    CreateDevice: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque, ?*anyopaque) callconv(W) i32,
+    EnumDevices: *const fn (*anyopaque, u32, ?*anyopaque, ?*anyopaque, u32) callconv(W) i32,
+    GetDeviceInfo: *const fn (*anyopaque, ?*const anyopaque, ?*anyopaque) callconv(W) i32,
+    RunControlPanel: *const fn (*anyopaque, usize, u32) callconv(W) i32,
+    Initialize: *const fn (*anyopaque, usize, u32) callconv(W) i32,
+    FindDevice: *const fn (*anyopaque, ?*const anyopaque, ?[*:0]const u8, ?*anyopaque) callconv(W) i32,
+    EnumDevicesBySemantics: *const fn (*anyopaque, ?[*:0]const u8, ?*anyopaque, ?*anyopaque, ?*anyopaque, u32) callconv(W) i32,
+};
+
+const WinsDirectInput8 = struct {
+    vtbl: *const WinsDirectInput8Vtbl,
+    ref_count: u32,
+};
+
+fn di8_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) i32 {
+    _ = riid;
+    const out = ppv orelse return @bitCast(@as(u32, 0x80070057)); // E_INVALIDARG
+    const self: *WinsDirectInput8 = @ptrCast(@alignCast(this));
+    _ = self.vtbl.AddRef(self);
+    out.* = this;
+    return DI_OK;
+}
+fn di8_AddRef(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsDirectInput8 = @ptrCast(@alignCast(this));
+    self.ref_count += 1;
+    return self.ref_count;
+}
+fn di8_Release(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsDirectInput8 = @ptrCast(@alignCast(this));
+    self.ref_count -= 1;
+    return self.ref_count;
+}
+fn di8_CreateDevice(this: *anyopaque, guid: ?*const anyopaque, ppv: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) i32 {
+    _ = this; _ = guid; _ = outer;
+    if (ppv) |p| p.* = null;
+    return DIERR_GENERIC; // no input devices on this machine
+}
+fn di8_EnumDevices(this: *anyopaque, dev_type: u32, cb: ?*anyopaque, ref: ?*anyopaque, flags: u32) callconv(W) i32 {
+    _ = this; _ = dev_type; _ = cb; _ = ref; _ = flags;
+    return DI_OK; // zero devices: the callback is never invoked
+}
+fn di8_GetDeviceInfo(this: *anyopaque, guid: ?*const anyopaque, inst: ?*anyopaque) callconv(W) i32 {
+    _ = this; _ = guid; _ = inst;
+    return DIERR_GENERIC;
+}
+fn di8_RunControlPanel(this: *anyopaque, hwnd: usize, flags: u32) callconv(W) i32 {
+    _ = this; _ = hwnd; _ = flags;
+    return DIERR_GENERIC;
+}
+fn di8_Initialize(this: *anyopaque, hinst: usize, version: u32) callconv(W) i32 {
+    _ = this; _ = hinst; _ = version;
+    return DI_OK;
+}
+fn di8_FindDevice(this: *anyopaque, guid: ?*const anyopaque, name: ?[*:0]const u8, out: ?*anyopaque) callconv(W) i32 {
+    _ = this; _ = guid; _ = name; _ = out;
+    return DIERR_GENERIC;
+}
+fn di8_EnumDevicesBySemantics(this: *anyopaque, name: ?[*:0]const u8, fmt: ?*anyopaque, cb: ?*anyopaque, ref: ?*anyopaque, flags: u32) callconv(W) i32 {
+    _ = this; _ = name; _ = fmt; _ = cb; _ = ref; _ = flags;
+    return DI_OK; // zero devices
+}
+
+const g_di8_vtbl = WinsDirectInput8Vtbl{
+    .QueryInterface = &di8_QueryInterface,
+    .AddRef = &di8_AddRef,
+    .Release = &di8_Release,
+    .CreateDevice = &di8_CreateDevice,
+    .EnumDevices = &di8_EnumDevices,
+    .GetDeviceInfo = &di8_GetDeviceInfo,
+    .RunControlPanel = &di8_RunControlPanel,
+    .Initialize = &di8_Initialize,
+    .FindDevice = &di8_FindDevice,
+    .EnumDevicesBySemantics = &di8_EnumDevicesBySemantics,
+};
+
 fn DirectInput8Create(hinst: usize, dwVersion: u32, riidltf: ?*anyopaque, ppvOut: ?*?*anyopaque, punkOuter: ?*anyopaque) callconv(W) i32 {
     _ = hinst; _ = dwVersion; _ = riidltf; _ = punkOuter;
-    if (ppvOut) |p| p.* = null;
-    return 0; // DI_OK
+    const out = ppvOut orelse return @bitCast(@as(u32, 0x80070057)); // E_INVALIDARG
+    const obj = std.heap.page_allocator.create(WinsDirectInput8) catch return @bitCast(@as(u32, 0x8007000E)); // E_OUTOFMEMORY
+    obj.* = .{ .vtbl = &g_di8_vtbl, .ref_count = 1 };
+    out.* = @ptrCast(obj);
+    return DI_OK;
 }
 
 fn InitCommonControlsEx(picce: ?*anyopaque) callconv(W) i32 {
@@ -5731,4 +5833,32 @@ pub fn main(init: std.process.Init) !void {
     } else if (unresolved_slots > 0) {
         std.debug.print("[WINS:winrun32] NOT_DEMONSTRATED: guest code ran with {d} import slot(s) bound to the stub.\n", .{unresolved_slots});
     }
+}
+
+// ============================================================================
+// Unit Tests (Embedded Verification)
+// ============================================================================
+
+test "thread-naming exception (0x406d1388) is continuable, others are not" {
+    try std.testing.expect(kernel32_mod.isThreadNamingException(0x406d1388));
+    try std.testing.expect(!kernel32_mod.isThreadNamingException(0xc0000005));
+    try std.testing.expect(!kernel32_mod.isThreadNamingException(0x406d1337));
+}
+
+test "ShellExecuteA reports failure (<=32) when nothing is executed" {
+    const rc = ShellExecuteA(0, null, "definitely-not-here.exe", null, null, 1);
+    try std.testing.expect(rc <= 32);
+}
+
+test "DirectInput8Create returns DI_OK with a real object, not NULL" {
+    var obj: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(i32, 0), DirectInput8Create(0, 0x0800, null, &obj, null));
+    try std.testing.expect(obj != null);
+    const di8: *WinsDirectInput8 = @ptrCast(@alignCast(obj.?));
+    try std.testing.expectEqual(@as(u32, 2), di8.vtbl.AddRef(di8));
+    try std.testing.expectEqual(@as(u32, 1), di8.vtbl.Release(di8));
+    try std.testing.expectEqual(@as(i32, 0), di8.vtbl.EnumDevices(di8, 0, null, null, 0));
+    var dev: ?*anyopaque = null;
+    try std.testing.expectEqual(DIERR_GENERIC, di8.vtbl.CreateDevice(di8, null, &dev, null));
+    try std.testing.expect(dev == null);
 }
