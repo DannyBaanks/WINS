@@ -19,7 +19,7 @@ pub const S_FALSE: HRESULT = 1;
 pub const E_FAIL: HRESULT = -2147467259; // 0x80004005
 pub const E_NOINTERFACE: HRESULT = -2147467262; // 0x80004002
 pub const E_NOTIMPL: HRESULT = -2147467263; // 0x80004001
-pub const E_POINTER: HRESULT = -2147467263; // 0x80004003
+pub const E_POINTER: HRESULT = -2147467261; // 0x80004003 (was -2147467263 = E_NOTIMPL)
 pub const E_OUTOFMEMORY: HRESULT = -2147024882; // 0x8007000E
 pub const D3DERR_INVALIDARG: HRESULT = -2147024809; // 0x80070057
 pub const D3DERR_NOTAVAILABLE: HRESULT = -2005530518; // 0x8876086A
@@ -243,6 +243,60 @@ pub const IID_IDirect3DDevice9 = GUID{
     .Data2 = 0xBF7A,
     .Data3 = 0x43FD,
     .Data4 = .{ 0x92, 0xBD, 0xA4, 0x3B, 0x0D, 0x82, 0xB9, 0xEB },
+};
+pub const IID_IDirect3DResource9 = GUID{
+    .Data1 = 0x05EEC05D,
+    .Data2 = 0x8F7D,
+    .Data3 = 0x4362,
+    .Data4 = .{ 0xB9, 0x99, 0xD1, 0xBA, 0xF3, 0x57, 0xC7, 0x04 },
+};
+pub const IID_IDirect3DBaseTexture9 = GUID{
+    .Data1 = 0x580CA87E,
+    .Data2 = 0x1D3C,
+    .Data3 = 0x4D54,
+    .Data4 = .{ 0x99, 0x1D, 0xB7, 0xD3, 0xE3, 0xC2, 0x98, 0xCE },
+};
+pub const IID_IDirect3DTexture9 = GUID{
+    .Data1 = 0x85C31227,
+    .Data2 = 0x3DE5,
+    .Data3 = 0x4F00,
+    .Data4 = .{ 0x9B, 0x3A, 0xF1, 0x1A, 0xC3, 0x8C, 0x18, 0xB5 },
+};
+pub const IID_IUnknown = GUID{
+    .Data1 = 0x00000000,
+    .Data2 = 0x0000,
+    .Data3 = 0x0000,
+    .Data4 = .{ 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 },
+};
+pub const IID_IDirect3DVertexDeclaration9 = GUID{
+    .Data1 = 0xDD13C59C,
+    .Data2 = 0x36FA,
+    .Data3 = 0x4098,
+    .Data4 = .{ 0xA8, 0xFB, 0xC7, 0xED, 0x39, 0xDC, 0x85, 0x46 },
+};
+
+/// d3d9types.h: D3DVERTEXELEMENT9 (8 bytes). D3DDECL_END() is Stream 0xFF,
+/// Type D3DDECLTYPE_UNUSED (17).
+pub const D3DVERTEXELEMENT9 = extern struct {
+    Stream: u16,
+    Offset: u16,
+    Type: u8,
+    Method: u8,
+    Usage: u8,
+    UsageIndex: u8,
+};
+const kDeclTypeUnused: u8 = 17;
+const kMaxDeclLength = 64; // MAXD3DDECLLENGTH
+fn isDeclEnd(e: D3DVERTEXELEMENT9) bool {
+    return e.Stream == 0xFF and e.Type == kDeclTypeUnused;
+}
+
+pub const IDirect3DVertexDeclaration9Vtbl = extern struct {
+    QueryInterface: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(W) u32,
+    Release: *const fn (*anyopaque) callconv(W) u32,
+    GetDevice: *const fn (*anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    GetDeclaration: *const fn (*anyopaque, ?*D3DVERTEXELEMENT9, ?*u32) callconv(W) HRESULT,
 };
 
 /// Compares an interface identifier the guest handed over with one of ours.
@@ -797,6 +851,39 @@ const g_ib9_vtbl: IDirect3DIndexBuffer9Vtbl = .{
     .GetDesc = &ib_GetDesc,
 };
 
+pub const D3DFMT_DXT1: u32 = 0x31545844; // 'DXT1'
+pub const D3DFMT_DXT3: u32 = 0x33545844; // 'DXT3'
+pub const D3DFMT_DXT5: u32 = 0x35545844; // 'DXT5'
+
+pub const SurfaceLayout = struct { pitch: u32, size: usize };
+
+/// Storage layout of a colour surface/texture level, or null when the format has
+/// none here (depth/stencil, 24-bit, YUV, unknown). Rows are `pitch` bytes; DXT is
+/// stored as 4x4 blocks (8 bytes for DXT1, 16 for DXT3/DXT5) and its pitch is one
+/// row of blocks, as in D3D9 where LockRect on a compressed level returns that.
+/// This is STORAGE only: nothing here decodes or samples texels.
+pub fn surfaceLayout(format: u32, width: u32, height: u32) ?SurfaceLayout {
+    const block: u32 = switch (format) {
+        D3DFMT_DXT1 => 8,
+        D3DFMT_DXT3, D3DFMT_DXT5 => 16,
+        else => 0,
+    };
+    if (block != 0) {
+        const bw = @max(1, (width + 3) / 4);
+        const bh = @max(1, (height + 3) / 4);
+        return .{ .pitch = bw * block, .size = @as(usize, bw * block) * bh };
+    }
+    const bpp: u32 = switch (format) {
+        21, 22, 31, 32, 33, 62, 112, 114 => 4, // A8R8G8B8 X8R8G8B8 A2B10G10R10 A8B8G8R8 X8B8G8R8 X8L8V8U8 G16R16F R32F
+        23, 24, 25, 26, 30, 51, 60, 61, 111 => 2, // R5G6B5 X1R5G5B5 A1R5G5B5 A4R4G4B4 X4R4G4B4 A8L8 V8U8 L6V5U5 R16F
+        28, 50 => 1, // A8 L8
+        113, 115 => 8, // A16B16G16R16F G32R32F
+        116 => 16, // A32B32G32R32F
+        else => return null,
+    };
+    return .{ .pitch = width * bpp, .size = @as(usize, width * bpp) * height };
+}
+
 // Surface 9
 pub const WinsSurface9 = struct {
     vtbl: *const IDirect3DSurface9Vtbl,
@@ -837,8 +924,11 @@ pub const WinsSurface9 = struct {
 
     pub fn create(allocator: std.mem.Allocator, width: u32, height: u32, format: u32) !*WinsSurface9 {
         const surf = try allocator.create(WinsSurface9);
-        const pitch: i32 = @intCast(width * 4);
-        const total_size: usize = @intCast(pitch * @as(i32, @intCast(height)));
+        // Colour formats get their real layout; everything else (depth/stencil)
+        // keeps 4 bytes per pixel.
+        const lay: SurfaceLayout = surfaceLayout(format, width, height) orelse .{ .pitch = width * 4, .size = @as(usize, width * 4) * height };
+        const pitch: i32 = @intCast(lay.pitch);
+        const total_size: usize = lay.size;
         const mem = try allocator.alloc(u8, total_size);
         @memset(mem, 0);
         surf.* = .{
@@ -951,10 +1041,23 @@ pub const WinsTexture9 = struct {
     }
 };
 
+/// IUnknown, IDirect3DResource9, IDirect3DBaseTexture9 and IDirect3DTexture9 are
+/// implemented by a 2D texture; anything else is E_NOINTERFACE, and a successful
+/// query takes a reference.
 fn tex_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = riid;
-    if (ppv) |p| p.* = this;
-    return S_OK;
+    const self: *WinsTexture9 = @ptrCast(@alignCast(this));
+    const out = ppv orelse return E_POINTER;
+    out.* = null;
+    const r = riid orelse return E_POINTER;
+    const id: *align(1) const GUID = @ptrCast(r);
+    if (guidEql(id, &IID_IUnknown) or guidEql(id, &IID_IDirect3DResource9) or
+        guidEql(id, &IID_IDirect3DBaseTexture9) or guidEql(id, &IID_IDirect3DTexture9))
+    {
+        self.ref_count += 1;
+        out.* = this;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
 }
 fn tex_AddRef(this: *anyopaque) callconv(W) u32 {
     const self: *WinsTexture9 = @ptrCast(@alignCast(this));
@@ -1153,13 +1256,70 @@ fn defaultSamplerStates() [16][kSampSlots]u32 {
     return s;
 }
 
+/// IDirect3DVertexDeclaration9: an immutable copy of the element list, END included.
+pub const WinsVertexDecl9 = struct {
+    vtbl: *const IDirect3DVertexDeclaration9Vtbl align(16),
+    ref_count: u32,
+    device: *WinsD3DDevice9,
+    elements: []D3DVERTEXELEMENT9,
+};
+
+fn vdecl_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsVertexDecl9 = @ptrCast(@alignCast(this));
+    const out = ppv orelse return E_POINTER;
+    out.* = null;
+    const r = riid orelse return E_POINTER;
+    const id: *align(1) const GUID = @ptrCast(r);
+    if (guidEql(id, &IID_IUnknown) or guidEql(id, &IID_IDirect3DVertexDeclaration9)) {
+        self.ref_count += 1;
+        out.* = this;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+fn vdecl_AddRef(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsVertexDecl9 = @ptrCast(@alignCast(this));
+    self.ref_count += 1;
+    return self.ref_count;
+}
+fn vdecl_Release(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsVertexDecl9 = @ptrCast(@alignCast(this));
+    if (self.ref_count > 0) self.ref_count -= 1;
+    return self.ref_count;
+}
+fn vdecl_GetDevice(this: *anyopaque, ppDevice: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsVertexDecl9 = @ptrCast(@alignCast(this));
+    const out = ppDevice orelse return D3DERR_INVALIDCALL;
+    self.device.ref_count += 1;
+    out.* = self.device;
+    return D3D_OK;
+}
+/// With a null buffer only the count (END included) is returned.
+fn vdecl_GetDeclaration(this: *anyopaque, pElement: ?*D3DVERTEXELEMENT9, pNumElements: ?*u32) callconv(W) HRESULT {
+    const self: *WinsVertexDecl9 = @ptrCast(@alignCast(this));
+    const n = pNumElements orelse return D3DERR_INVALIDCALL;
+    n.* = @intCast(self.elements.len);
+    if (pElement) |dst| {
+        const out: [*]D3DVERTEXELEMENT9 = @ptrCast(dst);
+        @memcpy(out[0..self.elements.len], self.elements);
+    }
+    return D3D_OK;
+}
+const g_vdecl9_vtbl: IDirect3DVertexDeclaration9Vtbl = .{
+    .QueryInterface = &vdecl_QueryInterface,
+    .AddRef = &vdecl_AddRef,
+    .Release = &vdecl_Release,
+    .GetDevice = &vdecl_GetDevice,
+    .GetDeclaration = &vdecl_GetDeclaration,
+};
+
 // COM contract: the guest reads the vtable pointer at offset 0 of every object it
 // is handed. A plain Zig `struct` may be reordered by the compiler, so this is
 // asserted at compile time for every COM-visible object. (Adding unrelated fields
 // to WinsD3DDevice9 once moved `vtbl` away from offset 0: the guest then read a
 // NULL vtable and crashed, while tests that go through fields still passed.)
 comptime {
-    for (.{ WinsD3D9, WinsD3DDevice9, WinsSurface9, WinsTexture9, WinsVertexBuffer9, WinsIndexBuffer9, WinsShader9, WinsD3DXBuffer }) |T| {
+    for (.{ WinsD3D9, WinsD3DDevice9, WinsSurface9, WinsTexture9, WinsVertexBuffer9, WinsIndexBuffer9, WinsShader9, WinsD3DXBuffer, WinsVertexDecl9 }) |T| {
         if (@offsetOf(T, "vtbl") != 0) @compileError("COM object " ++ @typeName(T) ++ " must keep vtbl at offset 0");
     }
 }
@@ -1184,6 +1344,7 @@ pub const WinsD3DDevice9 = struct {
     tex_stage_states: [kMaxTextureStages][kTssSlots]u32,
     rt_surface: ?*WinsSurface9,
     ds_surface: ?*WinsSurface9,
+    vertex_decl: ?*WinsVertexDecl9,
     sampler_states: [16][kSampSlots]u32,
     streams: [16]?*WinsVertexBuffer9,
     stream_strides: [16]u32,
@@ -1230,6 +1391,7 @@ pub const WinsD3DDevice9 = struct {
             .tex_stage_states = defaultTextureStageStates(),
             .rt_surface = null,
             .ds_surface = null,
+            .vertex_decl = null,
             .sampler_states = defaultSamplerStates(),
             .streams = [_]?*WinsVertexBuffer9{null} ** 16,
             .stream_strides = [_]u32{0} ** 16,
@@ -1432,12 +1594,12 @@ fn d3d9_CheckDeviceType(
     return D3D_OK;
 }
 
-/// Texture formats backed by WinsTexture9/WinsSurface9, which store 4 bytes per
-/// pixel: the 32-bit D3DFMT_A8R8G8B8 (21) and D3DFMT_X8R8G8B8 (22). The 16-bit
-/// formats (R5G6B5 = 23, X1R5G5B5 = 24, A1R5G5B5 = 25, A4R4G4B4 = 26), A8, L8 and
-/// the DXT family would need their own storage and sampling, so they are refused.
+/// Texture formats WinsTexture9 can back: every colour format surfaceLayout knows
+/// (32/16/8-bit, V8U8, the float formats and DXT1/3/5). Backing means creating the
+/// storage with the right pitch and size and returning it from LockRect; nothing
+/// decodes or samples texels (the rasterizer samples no texture at all yet).
 fn isTextureFormat(format: u32) bool {
-    return format == D3DFMT_A8R8G8B8 or format == D3DFMT_X8R8G8B8;
+    return surfaceLayout(format, 1, 1) != null;
 }
 
 /// IDirect3D9::CheckDeviceFormat.
@@ -1596,10 +1758,23 @@ const g_d3d9_vtbl: IDirect3D9Vtbl = .{
 // IDirect3DDevice9 Methods
 // ============================================================================
 
+/// Only IUnknown and IDirect3DDevice9 are implemented. Any other identifier, in
+/// particular IDirect3DDevice9Ex ({B18B10CE-2649-405A-870F-95F777D4313A}, which
+/// FalloutNV asks for to detect Ex support), gets E_NOINTERFACE and a null
+/// pointer: answering S_OK hands out an object whose vtable is shorter than the
+/// interface the guest believes it holds. Reference: Wine's d3d9 does the same.
 fn dev9_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = riid;
-    if (ppv) |p| p.* = this;
-    return S_OK;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppv orelse return E_POINTER;
+    out.* = null;
+    const r = riid orelse return E_POINTER;
+    const id: *align(1) const GUID = @ptrCast(r);
+    if (guidEql(id, &IID_IUnknown) or guidEql(id, &IID_IDirect3DDevice9)) {
+        self.ref_count += 1;
+        out.* = this;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
 }
 fn dev9_AddRef(this: *anyopaque) callconv(W) u32 {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
@@ -1944,11 +2119,12 @@ fn dev9_EvictManagedResources(this: *anyopaque) callconv(W) HRESULT {
     return E_NOTIMPL;
 }
 
-fn dev9_GetDirect3D(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
+fn dev9_GetDirect3D(this: *anyopaque, ppD3D9: ?*?*anyopaque) callconv(W) HRESULT {
     _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!GetDirect3D is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const out = ppD3D9 orelse return D3DERR_INVALIDCALL;
+    g_global_d3d9.ref_count += 1;
+    out.* = &g_global_d3d9;
+    return D3D_OK;
 }
 
 fn dev9_GetDeviceCaps(this: *anyopaque, p0: ?*D3DCAPS9) callconv(W) HRESULT {
@@ -1956,12 +2132,13 @@ fn dev9_GetDeviceCaps(this: *anyopaque, p0: ?*D3DCAPS9) callconv(W) HRESULT {
     return d3d9_GetDeviceCaps(this, dev.adapter, dev.device_type, p0);
 }
 
-fn dev9_GetDisplayMode(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+/// The adapter's single display mode (see kDisplayMode); one implicit swap chain.
+fn dev9_GetDisplayMode(this: *anyopaque, swap_chain: u32, pMode: ?*anyopaque) callconv(W) HRESULT {
     _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!GetDisplayMode is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const out: *align(1) D3DDISPLAYMODE = if (pMode) |p| @ptrCast(p) else return D3DERR_INVALIDCALL;
+    if (swap_chain != 0) return D3DERR_INVALIDCALL;
+    out.* = kDisplayMode;
+    return D3D_OK;
 }
 
 fn dev9_GetCreationParameters(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
@@ -2126,18 +2303,21 @@ fn dev9_CreateRenderTarget(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32,
     return E_NOTIMPL;
 }
 
-fn dev9_CreateDepthStencilSurface(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: i32, p6: ?*?*anyopaque, p7: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    _ = p4;
-    _ = p5;
-    _ = p6;
-    _ = p7;
-    std.debug.print("[WINS:D3D9] device!CreateDepthStencilSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// A depth/stencil surface of its own (not the device's auto depth buffer): 4 bytes per
+/// pixel like every surface here, not lockable, default pool. Multisampling and
+/// non-depth formats are refused rather than accepted and ignored.
+fn dev9_CreateDepthStencilSurface(this: *anyopaque, width: u32, height: u32, format: u32, multi_sample: u32, multi_sample_quality: u32, discard: i32, ppSurface: ?*?*anyopaque, pSharedHandle: ?*anyopaque) callconv(W) HRESULT {
+    _ = discard; _ = pSharedHandle; _ = multi_sample_quality;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppSurface orelse return D3DERR_INVALIDCALL;
+    if (width == 0 or height == 0 or !isDepthStencilFormat(format)) return D3DERR_INVALIDCALL;
+    if (multi_sample != D3DMULTISAMPLE_NONE) return D3DERR_NOTAVAILABLE;
+    const s = WinsSurface9.create(self.allocator, width, height, format) catch return E_OUTOFMEMORY;
+    s.usage = D3DUSAGE_DEPTHSTENCIL;
+    s.pool = 0; // D3DPOOL_DEFAULT
+    s.lockable = false;
+    out.* = s;
+    return D3D_OK;
 }
 
 fn dev9_UpdateSurface(this: *anyopaque, p0: ?*anyopaque, p1: ?*const D3DRECT, p2: ?*anyopaque, p3: ?*const anyopaque) callconv(W) HRESULT {
@@ -2512,26 +2692,43 @@ fn dev9_ProcessVertices(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: ?*anyop
     return E_NOTIMPL;
 }
 
-fn dev9_CreateVertexDeclaration(this: *anyopaque, p0: ?*const anyopaque, p1: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!CreateVertexDeclaration is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// Copies the element list up to and including D3DDECL_END. A list without END
+/// within MAXD3DDECLLENGTH elements, or with an element type above UNUSED, is invalid.
+fn dev9_CreateVertexDeclaration(this: *anyopaque, pElements: ?*const anyopaque, ppDecl: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppDecl orelse return D3DERR_INVALIDCALL;
+    const src_raw = pElements orelse return D3DERR_INVALIDCALL;
+    const src: [*]align(1) const D3DVERTEXELEMENT9 = @ptrCast(src_raw);
+    var n: usize = 0;
+    while (n < kMaxDeclLength) : (n += 1) {
+        if (isDeclEnd(src[n])) break;
+        if (src[n].Type > kDeclTypeUnused) return D3DERR_INVALIDCALL;
+    } else return D3DERR_INVALIDCALL;
+    const els = self.allocator.alloc(D3DVERTEXELEMENT9, n + 1) catch return E_OUTOFMEMORY;
+    for (0..n + 1) |i| els[i] = src[i];
+    const d = self.allocator.create(WinsVertexDecl9) catch return E_OUTOFMEMORY;
+    d.* = .{ .vtbl = &g_vdecl9_vtbl, .ref_count = 1, .device = self, .elements = els };
+    out.* = d;
+    return D3D_OK;
 }
 
-fn dev9_SetVertexDeclaration(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!SetVertexDeclaration is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_SetVertexDeclaration(this: *anyopaque, pDecl: ?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const new: ?*WinsVertexDecl9 = if (pDecl) |p| @ptrCast(@alignCast(p)) else null;
+    if (new) |n| n.ref_count += 1;
+    if (self.vertex_decl) |old| {
+        if (old.ref_count > 0) old.ref_count -= 1;
+    }
+    self.vertex_decl = new;
+    return D3D_OK;
 }
 
-fn dev9_GetVertexDeclaration(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!GetVertexDeclaration is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_GetVertexDeclaration(this: *anyopaque, ppDecl: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppDecl orelse return D3DERR_INVALIDCALL;
+    if (self.vertex_decl) |d| d.ref_count += 1;
+    out.* = self.vertex_decl;
+    return D3D_OK;
 }
 
 fn dev9_SetFVF(this: *anyopaque, p0: u32) callconv(W) HRESULT {
@@ -3586,9 +3783,14 @@ test "CheckDeviceFormat: plain textures are available exactly for the formats Cr
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, tex, D3DFMT_A8R8G8B8));
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, tex, D3DFMT_X8R8G8B8));
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DYNAMIC, tex, D3DFMT_A8R8G8B8));
-    // Negative controls: 16-bit (23..26), A8 (28), L8 (50), V8U8 (60), DXT1/3/5 and
-    // an unknown value are NOT backed, so they must not be advertised.
-    const refused = [_]u32{ 23, 24, 25, 26, 28, 50, 60, 827611204, 861165636, 894720068, 0xdeadbeef };
+    // Every format with a storage layout is available: the ones FalloutNV probes.
+    const backed = [_]u32{ 21, 22, 23, 24, 25, 26, 28, 32, 50, 60, 61, 62, 111, 112, 113, 114, 115, 116, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5 };
+    for (backed) |f| {
+        try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, tex, f));
+    }
+    // Negative controls: formats without a layout here (UNKNOWN, 24-bit R8G8B8, the
+    // depth formats, UYVY, garbage) are NOT backed, so they must not be advertised.
+    const refused = [_]u32{ 0, 20, 29, 75, 80, 0x59565955, 0xdeadbeef };
     for (refused) |f| {
         try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, tex, f));
     }
@@ -3609,4 +3811,195 @@ test "CheckDeviceFormat: plain textures are available exactly for the formats Cr
     const t9: *WinsTexture9 = @ptrCast(@alignCast(tex_raw.?));
     try std.testing.expectEqual(@as(i32, 8 * 4), t9.surface.pitch);
     try std.testing.expectEqual(@as(usize, 8 * 4 * 4), t9.surface.data.len);
+}
+
+fn testDevice(d3d: *WinsD3D9) !*WinsD3DDevice9 {
+    var params: D3DPRESENT_PARAMETERS = undefined;
+    @memset(std.mem.asBytes(&params), 0);
+    params.BackBufferWidth = 32;
+    params.BackBufferHeight = 32;
+    params.Windowed = 1;
+    var dev_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CreateDevice(d3d, 0, 1, 0, 0, &params, &dev_raw));
+    return @ptrCast(@alignCast(dev_raw.?));
+}
+
+test "E_POINTER is 0x80004003 and distinct from E_NOTIMPL" {
+    try std.testing.expectEqual(@as(u32, 0x80004003), @as(u32, @bitCast(E_POINTER)));
+    try std.testing.expect(E_POINTER != E_NOTIMPL);
+}
+
+test "device QueryInterface answers only IUnknown and IDirect3DDevice9 (Ex is refused)" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    const ex = GUID{ .Data1 = 0xB18B10CE, .Data2 = 0x2649, .Data3 = 0x405A, .Data4 = .{ 0x87, 0x0F, 0x95, 0xF7, 0x77, 0xD4, 0x31, 0x3A } };
+    var out: ?*anyopaque = @ptrFromInt(0x1234);
+    // Negative control: the identifier FalloutNV really asks for is refused, pointer cleared.
+    try std.testing.expectEqual(E_NOINTERFACE, dev.vtbl.QueryInterface(dev, &ex, &out));
+    try std.testing.expect(out == null);
+    const before = dev.ref_count;
+    try std.testing.expectEqual(S_OK, dev.vtbl.QueryInterface(dev, &IID_IDirect3DDevice9, &out));
+    try std.testing.expect(out == @as(?*anyopaque, dev));
+    try std.testing.expectEqual(before + 1, dev.ref_count); // a successful QI takes a reference
+    try std.testing.expectEqual(S_OK, dev.vtbl.QueryInterface(dev, &IID_IUnknown, &out));
+    try std.testing.expectEqual(E_POINTER, dev.vtbl.QueryInterface(dev, &IID_IUnknown, null));
+}
+
+test "device GetDirect3D and GetDisplayMode" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    var p: ?*anyopaque = null;
+    const refs = g_global_d3d9.ref_count;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetDirect3D(dev, &p));
+    try std.testing.expect(p == @as(?*anyopaque, &g_global_d3d9));
+    try std.testing.expectEqual(refs + 1, g_global_d3d9.ref_count);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetDirect3D(dev, null));
+    // The mode record is exactly 16 bytes: the guest keeps it in a 16-byte stack slot.
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(D3DDISPLAYMODE));
+    var m: D3DDISPLAYMODE = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetDisplayMode(dev, 0, &m));
+    try std.testing.expectEqual(@as(u32, 1280), m.Width);
+    try std.testing.expectEqual(@as(u32, 720), m.Height);
+    try std.testing.expectEqual(D3DFMT_X8R8G8B8, m.Format);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetDisplayMode(dev, 1, &m));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetDisplayMode(dev, 0, null));
+}
+
+test "CreateDepthStencilSurface: real, unlockable, validated" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    var s_raw: ?*anyopaque = null;
+    // The exact call FalloutNV makes (and Wine accepts): 1280x720 D24S8, no multisampling.
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateDepthStencilSurface(dev, 1280, 720, D3DFMT_D24S8, 0, 0, 0, &s_raw, null));
+    const s: *WinsSurface9 = @ptrCast(@alignCast(s_raw.?));
+    var desc: D3DSURFACE_DESC = undefined;
+    try std.testing.expectEqual(D3D_OK, s.vtbl.GetDesc(s, &desc));
+    try std.testing.expectEqual(@as(u32, 1280), desc.Width);
+    try std.testing.expectEqual(@as(u32, 720), desc.Height);
+    try std.testing.expectEqual(D3DFMT_D24S8, desc.Format);
+    try std.testing.expectEqual(D3DUSAGE_DEPTHSTENCIL, desc.Usage);
+    try std.testing.expectEqual(@as(u32, 0), desc.Pool);
+    var lr: D3DLOCKED_RECT = undefined;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, s.vtbl.LockRect(s, &lr, null, 0));
+    // Refusals: colour format, zero size, null out pointer, multisampling.
+    var o2: ?*anyopaque = null;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateDepthStencilSurface(dev, 64, 64, D3DFMT_A8R8G8B8, 0, 0, 0, &o2, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateDepthStencilSurface(dev, 0, 64, D3DFMT_D24S8, 0, 0, 0, &o2, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateDepthStencilSurface(dev, 64, 64, D3DFMT_D24S8, 0, 0, 0, null, null));
+    try std.testing.expectEqual(D3DERR_NOTAVAILABLE, dev.vtbl.CreateDepthStencilSurface(dev, 64, 64, D3DFMT_D24S8, 2, 0, 0, &o2, null));
+    try std.testing.expect(o2 == null);
+}
+
+test "vertex declarations: create copies the list, Get/Set round trip, invalid lists refused" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    const end = D3DVERTEXELEMENT9{ .Stream = 0xFF, .Offset = 0, .Type = kDeclTypeUnused, .Method = 0, .Usage = 0, .UsageIndex = 0 };
+    var els = [_]D3DVERTEXELEMENT9{
+        .{ .Stream = 0, .Offset = 0, .Type = 2, .Method = 0, .Usage = 0, .UsageIndex = 0 }, // FLOAT3 POSITION
+        .{ .Stream = 0, .Offset = 12, .Type = 4, .Method = 0, .Usage = 10, .UsageIndex = 0 }, // D3DCOLOR COLOR
+        end,
+    };
+    var d_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateVertexDeclaration(dev, &els, &d_raw));
+    els[0].Offset = 99; // the copy must not alias the caller's array
+    const d: *WinsVertexDecl9 = @ptrCast(@alignCast(d_raw.?));
+    var n: u32 = 0;
+    try std.testing.expectEqual(D3D_OK, d.vtbl.GetDeclaration(d, null, &n));
+    try std.testing.expectEqual(@as(u32, 3), n); // two elements plus END
+    var back: [3]D3DVERTEXELEMENT9 = undefined;
+    try std.testing.expectEqual(D3D_OK, d.vtbl.GetDeclaration(d, &back[0], &n));
+    try std.testing.expectEqual(@as(u16, 0), back[0].Offset);
+    try std.testing.expectEqual(@as(u8, 10), back[1].Usage);
+    try std.testing.expect(isDeclEnd(back[2]));
+    // Set/Get round trip with reference counting.
+    var cur: ?*anyopaque = @ptrFromInt(0x1);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetVertexDeclaration(dev, &cur));
+    try std.testing.expect(cur == null); // nothing set yet
+    const r0 = d.ref_count;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetVertexDeclaration(dev, d));
+    try std.testing.expectEqual(r0 + 1, d.ref_count);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetVertexDeclaration(dev, &cur));
+    try std.testing.expect(cur == @as(?*anyopaque, d));
+    try std.testing.expectEqual(r0 + 2, d.ref_count);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetVertexDeclaration(dev, null));
+    try std.testing.expectEqual(r0 + 1, d.ref_count); // device's reference dropped
+    // Declaration QueryInterface: IUnknown / own IID yes, the device IID no.
+    var q: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, d.vtbl.QueryInterface(d, &IID_IDirect3DVertexDeclaration9, &q));
+    try std.testing.expectEqual(E_NOINTERFACE, d.vtbl.QueryInterface(d, &IID_IDirect3DDevice9, &q));
+    // Invalid lists: no END, END too late, bad element type, null pointers.
+    var no_end = [_]D3DVERTEXELEMENT9{.{ .Stream = 0, .Offset = 0, .Type = 2, .Method = 0, .Usage = 0, .UsageIndex = 0 }} ** kMaxDeclLength;
+    var o2: ?*anyopaque = null;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateVertexDeclaration(dev, &no_end, &o2));
+    var bad_type = [_]D3DVERTEXELEMENT9{ .{ .Stream = 0, .Offset = 0, .Type = 40, .Method = 0, .Usage = 0, .UsageIndex = 0 }, end };
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateVertexDeclaration(dev, &bad_type, &o2));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateVertexDeclaration(dev, null, &o2));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateVertexDeclaration(dev, &els, null));
+    try std.testing.expect(o2 == null);
+}
+
+test "surface layouts: pitch and size per format, DXT as 4x4 blocks" {
+    // 32-bit, 16-bit, 8-bit
+    try std.testing.expectEqual(@as(u32, 256), surfaceLayout(21, 64, 8).?.pitch);
+    try std.testing.expectEqual(@as(usize, 2048), surfaceLayout(21, 64, 8).?.size);
+    try std.testing.expectEqual(@as(u32, 4), surfaceLayout(23, 2, 1).?.pitch); // R5G6B5 2x1: what FalloutNV probes with
+    try std.testing.expectEqual(@as(usize, 4), surfaceLayout(23, 2, 1).?.size);
+    try std.testing.expectEqual(@as(u32, 3), surfaceLayout(28, 3, 5).?.pitch); // A8
+    try std.testing.expectEqual(@as(usize, 15), surfaceLayout(28, 3, 5).?.size);
+    try std.testing.expectEqual(@as(u32, 16), surfaceLayout(116, 1, 1).?.pitch); // A32B32G32R32F
+    // DXT: one row of 4x4 blocks; sizes round up to whole blocks, never below one block.
+    try std.testing.expectEqual(@as(u32, 128), surfaceLayout(D3DFMT_DXT1, 64, 64).?.pitch);
+    try std.testing.expectEqual(@as(usize, 2048), surfaceLayout(D3DFMT_DXT1, 64, 64).?.size);
+    try std.testing.expectEqual(@as(u32, 256), surfaceLayout(D3DFMT_DXT5, 64, 64).?.pitch);
+    try std.testing.expectEqual(@as(usize, 4096), surfaceLayout(D3DFMT_DXT5, 64, 64).?.size);
+    try std.testing.expectEqual(@as(usize, 32), surfaceLayout(D3DFMT_DXT5, 5, 3).?.size); // 2x1 blocks
+    try std.testing.expectEqual(@as(usize, 8), surfaceLayout(D3DFMT_DXT1, 1, 1).?.size);
+    // Negative controls: no colour layout for depth, 24-bit, unknown.
+    try std.testing.expect(surfaceLayout(75, 8, 8) == null);
+    try std.testing.expect(surfaceLayout(20, 8, 8) == null);
+    try std.testing.expect(surfaceLayout(0, 8, 8) == null);
+}
+
+test "CreateTexture backs what it advertises, with the real layout" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    var t_raw: ?*anyopaque = null;
+    // FalloutNV's first texture under Wine: 2x1 R5G6B5.
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 2, 1, 1, 0, 23, 1, &t_raw, null));
+    const small: *WinsTexture9 = @ptrCast(@alignCast(t_raw.?));
+    try std.testing.expectEqual(@as(i32, 4), small.surface.pitch);
+    try std.testing.expectEqual(@as(usize, 4), small.surface.data.len);
+    // The loader's usual texture: DXT5 64x64, locked and filled like a .dds upload.
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 64, 64, 1, 0, D3DFMT_DXT5, 1, &t_raw, null));
+    const dxt: *WinsTexture9 = @ptrCast(@alignCast(t_raw.?));
+    try std.testing.expectEqual(@as(i32, 256), dxt.surface.pitch);
+    try std.testing.expectEqual(@as(usize, 4096), dxt.surface.data.len);
+    var lr: D3DLOCKED_RECT = undefined;
+    try std.testing.expectEqual(D3D_OK, dxt.surface.vtbl.LockRect(dxt.surface, &lr, null, 0));
+    try std.testing.expectEqual(@as(i32, 256), lr.Pitch);
+    @memset(@as([*]u8, @ptrCast(lr.pBits))[0..4096], 0xAB);
+    try std.testing.expectEqual(@as(u8, 0xAB), dxt.surface.data[4095]);
+    // Depth/stencil surfaces keep their 4-byte storage.
+    var ds: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateDepthStencilSurface(dev, 8, 8, D3DFMT_D24S8, 0, 0, 0, &ds, null));
+    const d: *WinsSurface9 = @ptrCast(@alignCast(ds.?));
+    try std.testing.expectEqual(@as(i32, 32), d.pitch);
+}
+
+test "texture QueryInterface: IUnknown/Resource/BaseTexture/Texture yes (with a reference), Device9 no" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    var t_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 4, 4, 1, 0, 21, 1, &t_raw, null));
+    const tex: *WinsTexture9 = @ptrCast(@alignCast(t_raw.?));
+    var q: ?*anyopaque = null;
+    const ids = [_]*const GUID{ &IID_IUnknown, &IID_IDirect3DResource9, &IID_IDirect3DBaseTexture9, &IID_IDirect3DTexture9 };
+    for (ids) |id| {
+        const before = tex.ref_count;
+        try std.testing.expectEqual(S_OK, tex.vtbl.QueryInterface(tex, id, &q));
+        try std.testing.expect(q == @as(?*anyopaque, tex));
+        try std.testing.expectEqual(before + 1, tex.ref_count);
+    }
+    try std.testing.expectEqual(E_NOINTERFACE, tex.vtbl.QueryInterface(tex, &IID_IDirect3DDevice9, &q));
+    try std.testing.expect(q == null);
 }
