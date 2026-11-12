@@ -23,16 +23,21 @@ whose first pointer was null. At its first growth from four to eight entries,
 the first pointer was nonzero before the reallocation and zero afterwards.
 The guest's size lookup returned zero for the old pointer, and the call then
 entered `winrun32.HeapReAlloc`, whose unknown-block path allocates a fresh block
-without copying. This establishes the immediate data-loss path, not why the
-guest passed that address to the CRT heap or which allocator owns it. Blindly
-copying an unknown number of bytes is not a safe fix.
+without copying. At that point the guest's ownership lookup bucket, indexed by
+the pointer's high byte, pointed to a different pool in the same high-byte
+range. This establishes the immediate data-loss path and a pool lookup mismatch,
+not what caused the mismatch. Blindly copying an unknown number of bytes is not
+a safe fix.
 
 The raw local traces are temporary, not canonical permanent evidence:
 
 - `/tmp/wins-resume/sandbox-output/trace-guest-va-codex.log`, SHA-256
   `76f8f7895071c7990951a948b3fa3cea3ff12e7428db3529b7e364622eb1b932`.
-- `/tmp/wins-resume/sandbox-output/trace-resize-codex.log`, SHA-256
-  `7a9042bed7d605f53d10c779ef2150a4e2e62ee357b0c47766350d6e9494cb74`.
+- `/tmp/wins-va-investigation/trace-resize-buckets.log`, SHA-256
+  `652949eb47518ccd552ec5c9deb78343068d376d38ee3bea0f83a556ff302385`.
+  This extends and supersedes the earlier temporary resize trace: that scratch
+  path was inadvertently overwritten, so its previous hash is no longer
+  verifiable.
 
 The test does not demonstrate that the game runs, that the earlier `VirtualAlloc`
 bug caused its crash, or that Wine exactly matches Windows. Original proprietary
