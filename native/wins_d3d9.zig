@@ -1432,6 +1432,14 @@ fn d3d9_CheckDeviceType(
     return D3D_OK;
 }
 
+/// Texture formats backed by WinsTexture9/WinsSurface9, which store 4 bytes per
+/// pixel: the 32-bit D3DFMT_A8R8G8B8 (21) and D3DFMT_X8R8G8B8 (22). The 16-bit
+/// formats (R5G6B5 = 23, X1R5G5B5 = 24, A1R5G5B5 = 25, A4R4G4B4 = 26), A8, L8 and
+/// the DXT family would need their own storage and sampling, so they are refused.
+fn isTextureFormat(format: u32) bool {
+    return format == D3DFMT_A8R8G8B8 or format == D3DFMT_X8R8G8B8;
+}
+
 /// IDirect3D9::CheckDeviceFormat.
 ///
 /// d3d9.h: (Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat).
@@ -1460,6 +1468,10 @@ fn d3d9_CheckDeviceFormat(
         if (!isDepthStencilFormat(check_format)) return D3DERR_NOTAVAILABLE;
         return D3D_OK;
     }
+    // A plain 2D texture (optionally DYNAMIC). Only what CreateTexture can back:
+    // volume/cube textures, auto-generated mipmaps and every other usage flag are
+    // not implemented, and neither are the 16-bit and compressed formats.
+    if (rtype == D3DRTYPE_TEXTURE and (usage & ~D3DUSAGE_DYNAMIC) == 0 and isTextureFormat(check_format)) return D3D_OK;
     return D3DERR_NOTAVAILABLE;
 }
 
@@ -3565,4 +3577,36 @@ test "no depth/stencil surface when the device was created without one" {
     var ds: ?*anyopaque = null;
     try std.testing.expectEqual(D3DERR_NOTFOUND, dev.vtbl.GetDepthStencilSurface(dev, &ds));
     try std.testing.expect(ds == null);
+}
+
+test "CheckDeviceFormat: plain textures are available exactly for the formats CreateTexture backs" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const tex = D3DRTYPE_TEXTURE;
+    // Backed formats are available, with or without DYNAMIC.
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, tex, D3DFMT_A8R8G8B8));
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, tex, D3DFMT_X8R8G8B8));
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DYNAMIC, tex, D3DFMT_A8R8G8B8));
+    // Negative controls: 16-bit (23..26), A8 (28), L8 (50), V8U8 (60), DXT1/3/5 and
+    // an unknown value are NOT backed, so they must not be advertised.
+    const refused = [_]u32{ 23, 24, 25, 26, 28, 50, 60, 827611204, 861165636, 894720068, 0xdeadbeef };
+    for (refused) |f| {
+        try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, tex, f));
+    }
+    // Other resource types and usages that are not implemented are refused.
+    try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, 4, D3DFMT_A8R8G8B8)); // volume texture
+    try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0x400, tex, D3DFMT_A8R8G8B8)); // AUTOGENMIPMAP
+    // What is advertised can actually be created, 4 bytes per pixel.
+    var params: D3DPRESENT_PARAMETERS = undefined;
+    @memset(std.mem.asBytes(&params), 0);
+    params.BackBufferWidth = 16;
+    params.BackBufferHeight = 16;
+    params.Windowed = 1;
+    var dev_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CreateDevice(d3d, 0, 1, 0, 0, &params, &dev_raw));
+    const dev: *WinsD3DDevice9 = @ptrCast(@alignCast(dev_raw.?));
+    var tex_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 8, 4, 1, 0, D3DFMT_A8R8G8B8, 1, &tex_raw, null));
+    const t9: *WinsTexture9 = @ptrCast(@alignCast(tex_raw.?));
+    try std.testing.expectEqual(@as(i32, 8 * 4), t9.surface.pitch);
+    try std.testing.expectEqual(@as(usize, 8 * 4 * 4), t9.surface.data.len);
 }
