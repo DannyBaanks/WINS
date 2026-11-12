@@ -8,6 +8,7 @@ import sys
 import os
 import argparse
 import json
+import threading
 
 # Ensure core is on path
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +21,7 @@ from core.recipes.dotnet import DotNetRecipe
 from core.tester import CleanroomTester
 from core.healers.companion_binaries import CompanionBinaryHealer
 from core.port_context import PortContext
+from core.local_addon import LocalAddonProject, MetaServer, sync_local_addon, discover_control_port
 
 RECIPES = [
     ElectronRecipe(),
@@ -157,6 +159,64 @@ def cmd_port_context(args):
         print(f"    - {line.strip()}")
     print("")
 
+def cmd_local_addon(args):
+    """Publishes the port context as a native local addon (skill catalog)."""
+    context = PortContext(
+        app_id=args.app_id,
+        app_title=args.title,
+        install_dir=args.install_dir,
+        slug=args.slug,
+    )
+    addon_root = os.path.expanduser(args.addon_root)
+    project = LocalAddonProject(addon_root=addon_root, addon_id=args.addon_id,
+                                slug=args.slug, display_name=args.title or args.addon_id)
+    server = MetaServer(project, port=args.port)
+    meta_port = server.start()
+    written = project.write(context.render_skill(), meta_port, corpus_body=context.render())
+
+    if not args.json:
+        print(f"\n[WINS LOCAL ADDON] {written['addon_id']}")
+        print(f"  Source dir: {written['source_dir']}")
+        print(f"  Meta URL:   {written['meta_url']}")
+        print(f"  Skill:      {written['skill_path']}")
+
+    sync_result = None
+    if args.sync:
+        control_port = discover_control_port(args.log_dir, args.control_name)
+        unix_sock = os.path.expanduser(args.unix_socket) if args.unix_socket else None
+        if unix_sock and os.path.exists(unix_sock):
+            sync_result = sync_local_addon(args.addon_id, unix_socket_path=unix_sock)
+        elif control_port:
+            sync_result = sync_local_addon(args.addon_id, control_port=control_port)
+        else:
+            message = ("No operator local API reachable "
+                       "(start the operator with the WINS bridge or pass --unix-socket).")
+            if not args.json:
+                print(f"[WINS:LOCALADDON] {message}")
+            sync_result = {"error": {"message": message}}
+    if sync_result is not None and not args.json:
+        error = (sync_result.get("error") or {})
+        data = (error.get("data") or {})
+        print(f"  Sync:       {error.get('message') or 'ok'}")
+        for diag in (data.get("diagnostics") or []):
+            print(f"    - {diag.get('code')}: {diag.get('summary')}")
+            excerpt = diag.get("log_excerpt")
+            if excerpt:
+                print(f"      {excerpt[:500]}")
+
+    if not args.keep_serving:
+        server.stop()
+    else:
+        print(f"  Serving meta on 127.0.0.1:{meta_port} (Ctrl+C to stop)")
+        try:
+            while True:
+                threading.Event().wait(3600)
+        except KeyboardInterrupt:
+            server.stop()
+
+    if args.json:
+        print(json.dumps({"written": written, "sync": sync_result}, indent=2))
+
 def cmd_list(args):
     print("\nAvailable WINS Transmutation Recipes:")
     for r in RECIPES:
@@ -224,6 +284,26 @@ def main():
     p_ctx.add_argument("--slug", default="wins-port-context", help="Skill slug (default: wins-port-context)")
     p_ctx.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
     p_ctx.set_defaults(func=cmd_port_context)
+
+    # local-addon
+    p_la = subparsers.add_parser(
+        "local-addon",
+        help="Publish the port context as a native local addon (meta server + operator sync)",
+    )
+    p_la.add_argument("--app-id", required=True, help="Application id (e.g. manus)")
+    p_la.add_argument("--title", default=None, help="Human readable addon title")
+    p_la.add_argument("--install-dir", default=None, help="Ported application install directory")
+    p_la.add_argument("--addon-id", default="desktop-local-wins-port-context", help="Local addon id")
+    p_la.add_argument("--addon-root", default="~/.config/Manus/operator-addons", help="Operator addon root")
+    p_la.add_argument("--slug", default="wins-port-context", help="Skill slug inside the addon")
+    p_la.add_argument("--port", type=int, default=0, help="Meta server port (0 = ephemeral)")
+    p_la.add_argument("--sync", action="store_true", help="Ask the operator to sync the addon (addon.local.sync)")
+    p_la.add_argument("--unix-socket", default=None, help="Operator local API unix socket (native Linux operators)")
+    p_la.add_argument("--log-dir", default="~/.cache/wins/logs", help="Directory holding the bridge control port file")
+    p_la.add_argument("--control-name", default="manus-computer-operator", help="Bridge name used for the control port file")
+    p_la.add_argument("--keep-serving", action="store_true", help="Keep the meta server running after the sync")
+    p_la.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_la.set_defaults(func=cmd_local_addon)
 
     if len(sys.argv) == 1:
         print(BANNER)

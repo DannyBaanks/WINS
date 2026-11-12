@@ -150,6 +150,26 @@ re-applied at any time and is covered by the test suite.
 wins heal-bin <app-dir> --dry-run --json   # report only, machine readable
 ```
 
+### 5. Publish the Host Corpus as a Native Local Addon
+
+Applications with an addon system (Manus Desktop and friends) only let the
+agent see what their **skill catalog** contains. `wins local-addon` turns the
+port context into a real addon package:
+
+```bash
+wins local-addon --app-id manus --install-dir ~/.local/share/manus-desktop \
+                 --addon-root ~/.config/Manus/operator-addons --sync
+```
+
+It writes the addon source (manifest, `SKILL.md`, a tiny MCP server exposing
+the corpus as a `host_context` tool), serves the addon metadata over a
+loopback HTTP endpoint and asks the operator to synchronise it
+(`addon.local.sync`).
+
+The operator is reached through the **host control channel** of the WINS
+companion bridge (see below), so no privileged port or extra process is
+needed.
+
 ---
 
 ## 📊 Supported Runtimes & Roadmap
