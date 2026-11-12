@@ -2051,13 +2051,91 @@ fn DeleteFileA(lpFileName: ?[*:0]const u8) callconv(W) i32 {
     return 0;
 }
 
+/// Move and copy, or an answer that says why not.
+///
+/// Both used to return 1 unconditionally. A guest that moves a file and is
+/// told it worked finds the old name still there and the new one absent, and
+/// nothing in the return value distinguishes that from success. Neither is on
+/// the path Fallout: New Vegas takes (measured: zero calls), so they are here
+/// to stop claiming work that was never done, not because a symptom named
+/// them.
+fn winNormPathZ(path: ?[*:0]const u8, buf: []u8) ?[:0]u8 {
+    if (path == null) return null;
+    const src = std.mem.sliceTo(path.?, 0);
+    if (src.len >= buf.len) return null;
+    for (src, 0..) |c, i| buf[i] = if (c == '\\') '/' else c;
+    buf[src.len] = 0;
+    return buf[0..src.len :0];
+}
+
 fn MoveFileA(lpExistingFileName: ?[*:0]const u8, lpNewFileName: ?[*:0]const u8) callconv(W) i32 {
-    _ = lpExistingFileName; _ = lpNewFileName;
-    return 1;
+    var from_buf: [512]u8 = undefined;
+    var to_buf: [512]u8 = undefined;
+    const from = winNormPathZ(lpExistingFileName, &from_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    };
+    const to = winNormPathZ(lpNewFileName, &to_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    };
+    const rc = linux.rename(from.ptr, to.ptr);
+    if (linux.errno(rc) == .SUCCESS) return 1;
+    g_last_error = switch (linux.errno(rc)) {
+        .NOENT => 2, // ERROR_FILE_NOT_FOUND
+        .ACCES => 5, // ERROR_ACCESS_DENIED
+        .EXIST => 183, // ERROR_ALREADY_EXISTS
+        else => 5,
+    };
+    return 0;
 }
 
 fn CopyFileA(lpExistingFileName: ?[*:0]const u8, lpNewFileName: ?[*:0]const u8, bFailIfExists: i32) callconv(W) i32 {
-    _ = lpExistingFileName; _ = lpNewFileName; _ = bFailIfExists;
+    var from_buf: [512]u8 = undefined;
+    var to_buf: [512]u8 = undefined;
+    const from = winNormPathZ(lpExistingFileName, &from_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    };
+    const to = winNormPathZ(lpNewFileName, &to_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    };
+    const src_fd = linux.open(from.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(src_fd) != .SUCCESS) {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    }
+    defer _ = linux.close(@intCast(src_fd));
+
+    var dst_flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true };
+    if (bFailIfExists != 0) dst_flags.EXCL = true;
+    const dst_fd = linux.open(to.ptr, dst_flags, 0o644);
+    if (linux.errno(dst_fd) != .SUCCESS) {
+        g_last_error = switch (linux.errno(dst_fd)) {
+            .EXIST => 183, // ERROR_ALREADY_EXISTS: the caller asked to fail on it.
+            .ACCES => 5, // ERROR_ACCESS_DENIED
+            .NOENT => 3, // ERROR_PATH_NOT_FOUND
+            else => 5,
+        };
+        return 0;
+    }
+    defer _ = linux.close(@intCast(dst_fd));
+
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = linux.read(@intCast(src_fd), &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        var off: usize = 0;
+        while (off < n) {
+            const w = linux.write(@intCast(dst_fd), buf[off..].ptr, @as(usize, @intCast(n)) - off);
+            if (linux.errno(w) != .SUCCESS or w == 0) {
+                g_last_error = 5; // ERROR_ACCESS_DENIED
+                return 0;
+            }
+            off += @intCast(w);
+        }
+    }
     return 1;
 }
 
