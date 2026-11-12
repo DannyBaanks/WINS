@@ -922,6 +922,13 @@ pub const WinsSurface9 = struct {
         return surf;
     }
 
+    /// Frees the pixel storage (when owned) and the object itself.
+    pub fn destroy(self: *WinsSurface9) void {
+        const a = self.allocator;
+        if (self.owns_data) a.free(self.data);
+        a.destroy(self);
+    }
+
     pub fn create(allocator: std.mem.Allocator, width: u32, height: u32, format: u32) !*WinsSurface9 {
         const surf = try allocator.create(WinsSurface9);
         // Colour formats get their real layout; everything else (depth/stencil)
@@ -1019,25 +1026,65 @@ pub const WinsTexture9 = struct {
     usage: u32,
     format: u32,
     pool: u32,
+    /// Level 0 (kept as its own field: it is what most callers want).
     surface: *WinsSurface9,
+    /// One surface per mip level, each with its own size, pitch and storage.
+    surfaces: []*WinsSurface9,
     allocator: std.mem.Allocator,
 
+    /// Number of levels in a full mip chain down to 1x1: 1 + floor(log2(max(w, h))).
+    pub fn fullChain(width: u32, height: u32) u32 {
+        return 1 + (31 - @clz(@max(width, height)));
+    }
+
+    /// `levels == 0` asks for the full chain; more levels than the chain holds,
+    /// a zero dimension or a format without a storage layout is D3DERR_INVALIDCALL.
     pub fn create(allocator: std.mem.Allocator, width: u32, height: u32, levels: u32, usage: u32, format: u32, pool: u32) !*WinsTexture9 {
+        if (width == 0 or height == 0 or surfaceLayout(format, 1, 1) == null) return error.InvalidCall;
+        const full = fullChain(width, height);
+        const n: u32 = if (levels == 0) full else levels;
+        if (n > full) return error.InvalidCall;
         const tex = try allocator.create(WinsTexture9);
-        const surf = try WinsSurface9.create(allocator, width, height, format);
+        errdefer allocator.destroy(tex);
+        const surfs = try allocator.alloc(*WinsSurface9, n);
+        errdefer allocator.free(surfs);
+        var made: usize = 0;
+        errdefer for (surfs[0..made]) |s| s.destroy();
+        while (made < n) : (made += 1) {
+            const w = @max(1, width >> @intCast(made));
+            const h = @max(1, height >> @intCast(made));
+            const s = try WinsSurface9.create(allocator, w, h, format);
+            s.usage = usage;
+            s.pool = pool;
+            surfs[made] = s;
+        }
         tex.* = .{
             .vtbl = &g_tex9_vtbl,
             .ref_count = 1,
             .width = width,
             .height = height,
-            .levels = if (levels > 0) levels else 1,
+            .levels = n,
             .usage = usage,
             .format = format,
             .pool = pool,
-            .surface = surf,
+            .surface = surfs[0],
+            .surfaces = surfs,
             .allocator = allocator,
         };
         return tex;
+    }
+
+    /// Frees the texture and its levels, unless the guest still holds a level
+    /// surface it took with GetSurfaceLevel (then it is left alone: a leak, not a
+    /// use-after-free).
+    pub fn destroy(self: *WinsTexture9) void {
+        for (self.surfaces) |s| {
+            if (s.ref_count > 1) return;
+        }
+        const a = self.allocator;
+        for (self.surfaces) |s| s.destroy();
+        a.free(self.surfaces);
+        a.destroy(self);
     }
 };
 
@@ -1067,32 +1114,46 @@ fn tex_AddRef(this: *anyopaque) callconv(W) u32 {
 fn tex_Release(this: *anyopaque) callconv(W) u32 {
     const self: *WinsTexture9 = @ptrCast(@alignCast(this));
     if (self.ref_count > 0) self.ref_count -= 1;
-    return self.ref_count;
+    const left = self.ref_count;
+    if (left == 0) self.destroy();
+    return left;
+}
+fn tex_GetType(this: *anyopaque) callconv(W) u32 {
+    _ = this;
+    return D3DRTYPE_TEXTURE;
 }
 fn tex_GetLevelCount(this: *anyopaque) callconv(W) u32 {
     const self: *WinsTexture9 = @ptrCast(@alignCast(this));
-    return self.levels;
+    return @intCast(self.surfaces.len);
 }
 fn tex_GetLevelDesc(this: *anyopaque, level: u32, pDesc: ?*D3DSURFACE_DESC) callconv(W) HRESULT {
-    _ = level;
     const self: *WinsTexture9 = @ptrCast(@alignCast(this));
-    return self.surface.vtbl.GetDesc(self.surface, pDesc);
+    if (level >= self.surfaces.len) return D3DERR_INVALIDCALL;
+    const s = self.surfaces[level];
+    return s.vtbl.GetDesc(s, pDesc);
 }
+/// Hands out the level's surface with a reference of its own, as D3D9 does.
 fn tex_GetSurfaceLevel(this: *anyopaque, level: u32, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = level;
     const self: *WinsTexture9 = @ptrCast(@alignCast(this));
-    if (ppSurface) |ps| ps.* = @ptrCast(self.surface);
+    const out = ppSurface orelse return D3DERR_INVALIDCALL;
+    out.* = null;
+    if (level >= self.surfaces.len) return D3DERR_INVALIDCALL;
+    const s = self.surfaces[level];
+    s.ref_count += 1;
+    out.* = s;
     return D3D_OK;
 }
 fn tex_LockRect(this: *anyopaque, level: u32, pLocked: ?*D3DLOCKED_RECT, pRect: ?*const D3DRECT, flags: u32) callconv(W) HRESULT {
-    _ = level;
     const self: *WinsTexture9 = @ptrCast(@alignCast(this));
-    return self.surface.vtbl.LockRect(self.surface, pLocked, pRect, flags);
+    if (level >= self.surfaces.len) return D3DERR_INVALIDCALL;
+    const s = self.surfaces[level];
+    return s.vtbl.LockRect(s, pLocked, pRect, flags);
 }
 fn tex_UnlockRect(this: *anyopaque, level: u32) callconv(W) HRESULT {
-    _ = level;
     const self: *WinsTexture9 = @ptrCast(@alignCast(this));
-    return self.surface.vtbl.UnlockRect(self.surface);
+    if (level >= self.surfaces.len) return D3DERR_INVALIDCALL;
+    const s = self.surfaces[level];
+    return s.vtbl.UnlockRect(s);
 }
 
 const g_tex9_vtbl: IDirect3DTexture9Vtbl = .{
@@ -1106,7 +1167,7 @@ const g_tex9_vtbl: IDirect3DTexture9Vtbl = .{
     .SetPriority = @ptrCast(&vb_Stub),
     .GetPriority = @ptrCast(&vb_Stub),
     .PreLoad = @ptrCast(&vb_Stub),
-    .GetType = @ptrCast(&vb_Stub),
+    .GetType = &tex_GetType,
     .SetLOD = @ptrCast(&vb_Stub),
     .GetLOD = @ptrCast(&vb_Stub),
     .GetLevelCount = &tex_GetLevelCount,
@@ -1891,7 +1952,7 @@ fn dev9_CreateTexture(
     _ = pSharedHandle;
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (ppTexture == null) return E_FAIL;
-    const tex = WinsTexture9.create(self.allocator, Width, Height, Levels, Usage, Format, Pool) catch return E_OUTOFMEMORY;
+    const tex = WinsTexture9.create(self.allocator, Width, Height, Levels, Usage, Format, Pool) catch |e| return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
     ppTexture.?.* = @ptrCast(tex);
     return D3D_OK;
 }
@@ -4002,4 +4063,98 @@ test "texture QueryInterface: IUnknown/Resource/BaseTexture/Texture yes (with a 
     }
     try std.testing.expectEqual(E_NOINTERFACE, tex.vtbl.QueryInterface(tex, &IID_IDirect3DDevice9, &q));
     try std.testing.expect(q == null);
+}
+
+test "mip chain: one real surface per level, with its own size, pitch and storage" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    var t_raw: ?*anyopaque = null;
+    // What FalloutNV asks for: 256x256 DXT1 with the full nine levels.
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 256, 256, 9, 0, D3DFMT_DXT1, 1, &t_raw, null));
+    const tex: *WinsTexture9 = @ptrCast(@alignCast(t_raw.?));
+    try std.testing.expectEqual(@as(u32, 9), tex.vtbl.GetLevelCount(tex));
+    try std.testing.expectEqual(@as(u32, D3DRTYPE_TEXTURE), tex.vtbl.GetType(tex));
+    const sizes = [_]usize{ 32768, 8192, 2048, 512, 128, 32, 8, 8, 8 }; // 4x4 blocks, never below one
+    const pitches = [_]i32{ 512, 256, 128, 64, 32, 16, 8, 8, 8 };
+    var level: u32 = 0;
+    while (level < 9) : (level += 1) {
+        var desc: D3DSURFACE_DESC = undefined;
+        try std.testing.expectEqual(D3D_OK, tex.vtbl.GetLevelDesc(tex, level, &desc));
+        try std.testing.expectEqual(@max(1, @as(u32, 256) >> @intCast(level)), desc.Width);
+        try std.testing.expectEqual(@max(1, @as(u32, 256) >> @intCast(level)), desc.Height);
+        try std.testing.expectEqual(@as(u32, 1), desc.Type); // a level is a SURFACE
+        var s_raw: ?*anyopaque = null;
+        try std.testing.expectEqual(D3D_OK, tex.vtbl.GetSurfaceLevel(tex, level, &s_raw));
+        const s: *WinsSurface9 = @ptrCast(@alignCast(s_raw.?));
+        try std.testing.expectEqual(sizes[level], s.data.len);
+        try std.testing.expectEqual(@as(u32, 2), s.ref_count); // owned by the texture + this reference
+        var lr: D3DLOCKED_RECT = undefined;
+        try std.testing.expectEqual(D3D_OK, tex.vtbl.LockRect(tex, level, &lr, null, 0));
+        try std.testing.expectEqual(pitches[level], lr.Pitch);
+        try std.testing.expect(@intFromPtr(lr.pBits) == @intFromPtr(s.data.ptr));
+        @memset(s.data, @intCast(0x10 + level));
+        try std.testing.expectEqual(D3D_OK, tex.vtbl.UnlockRect(tex, level));
+    }
+    // Levels do not share storage: each still holds the byte written to it.
+    level = 0;
+    while (level < 9) : (level += 1) {
+        try std.testing.expectEqual(@as(u8, @intCast(0x10 + level)), tex.surfaces[level].data[0]);
+    }
+    // Out-of-range levels are refused and clear the out pointer.
+    var o: ?*anyopaque = @ptrFromInt(0x1);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, tex.vtbl.GetSurfaceLevel(tex, 9, &o));
+    try std.testing.expect(o == null);
+    var lr2: D3DLOCKED_RECT = undefined;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, tex.vtbl.LockRect(tex, 9, &lr2, null, 0));
+    var d2: D3DSURFACE_DESC = undefined;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, tex.vtbl.GetLevelDesc(tex, 99, &d2));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, tex.vtbl.GetSurfaceLevel(tex, 0, null));
+}
+
+test "CreateTexture level counts: 0 means the full chain, too many or zero sizes or unknown formats are refused" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    var t_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 256, 64, 0, 0, 21, 1, &t_raw, null));
+    var tex: *WinsTexture9 = @ptrCast(@alignCast(t_raw.?));
+    try std.testing.expectEqual(@as(u32, 9), tex.vtbl.GetLevelCount(tex)); // log2(256) + 1
+    var d: D3DSURFACE_DESC = undefined;
+    try std.testing.expectEqual(D3D_OK, tex.vtbl.GetLevelDesc(tex, 3, &d));
+    try std.testing.expectEqual(@as(u32, 32), d.Width); // 256 >> 3
+    try std.testing.expectEqual(@as(u32, 8), d.Height); // 64 >> 3
+    try std.testing.expectEqual(D3D_OK, tex.vtbl.GetLevelDesc(tex, 8, &d));
+    try std.testing.expectEqual(@as(u32, 1), d.Width);
+    try std.testing.expectEqual(@as(u32, 1), d.Height); // height reached 1 earlier and stays 1
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 1, 1, 0, 0, 21, 1, &t_raw, null));
+    try std.testing.expectEqual(@as(u32, 1), @as(*WinsTexture9, @ptrCast(@alignCast(t_raw.?))).levels);
+    var bad: ?*anyopaque = null;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateTexture(dev, 16, 16, 6, 0, 21, 1, &bad, null)); // 5 levels at most
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateTexture(dev, 0, 16, 1, 0, 21, 1, &bad, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateTexture(dev, 16, 16, 1, 0, D3DFMT_D24S8, 1, &bad, null)); // depth is not a texture format
+    try std.testing.expect(bad == null);
+    tex = @ptrCast(@alignCast(t_raw.?));
+}
+
+test "texture level counts match fullChain" {
+    try std.testing.expectEqual(@as(u32, 1), WinsTexture9.fullChain(1, 1));
+    try std.testing.expectEqual(@as(u32, 2), WinsTexture9.fullChain(2, 1));
+    try std.testing.expectEqual(@as(u32, 9), WinsTexture9.fullChain(256, 256));
+    try std.testing.expectEqual(@as(u32, 10), WinsTexture9.fullChain(1000, 3)); // floor(log2(1000)) + 1
+    try std.testing.expectEqual(@as(u32, 13), WinsTexture9.fullChain(4096, 4096));
+}
+
+test "releasing a texture frees every level (no leak, no double free)" {
+    // std.testing.allocator fails the test on any leak or double free.
+    const tex = try WinsTexture9.create(std.testing.allocator, 64, 32, 0, 0, D3DFMT_DXT5, 1);
+    try std.testing.expectEqual(@as(u32, 0), tex.vtbl.Release(tex));
+    // A level surface the guest still holds keeps the texture alive instead of
+    // dangling: it is a leak to be fixed by releasing the surface, never a crash.
+    const keep = try WinsTexture9.create(std.testing.allocator, 8, 8, 2, 0, 21, 1);
+    var s_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, keep.vtbl.GetSurfaceLevel(keep, 1, &s_raw));
+    try std.testing.expectEqual(@as(u32, 0), keep.vtbl.Release(keep));
+    const held: *WinsSurface9 = @ptrCast(@alignCast(s_raw.?));
+    try std.testing.expectEqual(@as(u32, 2), held.ref_count); // still valid to touch
+    held.ref_count = 1; // the guest releases its reference
+    keep.destroy(); // now the whole texture can go
 }

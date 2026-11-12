@@ -2783,11 +2783,23 @@ fn _XcptFilter(xcpt: u32, exc: ?*const anyopaque) callconv(C) i32 {
 /// returning EXCEPTION_CONTINUE_SEARCH unconditionally, which it currently does.
 /// Until then, returning is wrong but no alternative is available; a
 /// non-returning stub would take `7zr b` down with it.
+/// Head of the SEH chain of the thread that is running: TIB[0], read through FS on
+/// the i386 loader (every guest thread has its own TIB), or from the one recorded TIB
+/// elsewhere.
+fn sehChainHead() usize {
+    if (comptime @import("builtin").cpu.arch == .x86) {
+        return asm volatile ("movl %%fs:0, %[r]"
+            : [r] "=r" (-> usize),
+        );
+    }
+    return @as(*const usize, @ptrFromInt(guest_tib_base)).*;
+}
+
 /// Walk the guest's SEH chain: TIB[0] holds the head, each registration record is
 /// {prev: *const reg, handler: usize}, and the chain ends at 0xFFFFFFFF.
 pub fn walkSehChain(depth_limit: usize) usize {
     if (guest_tib_base == 0) return 0;
-    var node: usize = @as(*const usize, @ptrFromInt(guest_tib_base)).*;
+    var node: usize = sehChainHead();
     var depth: usize = 0;
     while (node != 0xFFFFFFFF and node > 0x1000 and node + 8 < 0xFFFFF000 and depth < depth_limit) : (depth += 1) {
         const next: usize = @as(*const usize, @ptrFromInt(node)).*;
@@ -2942,7 +2954,7 @@ fn _CxxThrowException(exc: ?*const anyopaque, dp: ?*const anyopaque) callconv(C)
     // across a call is no longer readable -- dereferencing it faults. A handler
     // that answers EXCEPTION_CONTINUE_SEARCH pops nothing, so the head is
     // unchanged and the walk must follow the saved node's own prev field.
-    var node: usize = @as(*const usize, @ptrFromInt(guest_tib_base)).*;
+    var node: usize = sehChainHead();
     var depth: usize = 0;
     while (depth < 16) : (depth += 1) {
         if (node == 0xFFFFFFFF or node <= 0x1000 or node + 8 >= 0xFFFFF000) {

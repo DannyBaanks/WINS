@@ -20,6 +20,7 @@ const dsound_mod = @import("wins_dsound.zig");
 // winrun_gui_support and x11_window are NOT imported: they need static libX11,
 // which is unavailable for the i386 target this loader builds for.
 const ordinals_mod = @import("winrun_ordinals.zig");
+const threads_mod = @import("winrun_threads.zig");
 
 const W: std.builtin.CallingConvention = .winapi;
 
@@ -754,6 +755,13 @@ fn currentProtection(addr: usize) u32 {
 const TLS_SLOT_COUNT = 64;
 var g_tls_index_array: [TLS_SLOT_COUNT]usize align(16) = [_]usize{0} ** TLS_SLOT_COUNT;
 var g_tls_block: []u8 = &[_]u8{};
+/// What a new thread needs to build its own static TLS block: the image's template,
+/// its zero fill, the index the loader assigned, and the TLS callbacks.
+var g_tls_tpl_start: usize = 0;
+var g_tls_tpl_len: usize = 0;
+var g_tls_zero_fill: usize = 0;
+var g_tls_idx: usize = 0;
+var g_tls_callbacks_va: usize = 0;
 
 fn setupGuestTls(allocator: std.mem.Allocator, image_base: usize, tls_rva: u32, tls_size: u32) void {
     if (tls_rva == 0 or tls_size < 24) return;
@@ -778,6 +786,11 @@ fn setupGuestTls(allocator: std.mem.Allocator, image_base: usize, tls_rva: u32, 
     g_tls_index_array[0] = @intFromPtr(&g_tls_index_array);
     if (index < TLS_SLOT_COUNT) g_tls_index_array[index] = @intFromPtr(block.ptr);
     g_tls_block = block;
+    g_tls_tpl_start = start_va;
+    g_tls_tpl_len = template_len;
+    g_tls_zero_fill = zero_fill;
+    g_tls_idx = index;
+    g_tls_callbacks_va = callbacks_va;
 
     // The image carries the index it was given, at the address its TLS
     // directory names; the guest reads it from there.
@@ -1203,20 +1216,30 @@ fn TlsFree(dwTlsIndex: u32) callconv(W) i32 {
     return 0;
 }
 
+/// Runs the start routine on a real thread (see winrun_threads.zig). The thread gets
+/// its own TEB, FS segment and static TLS block from guestThreadInit.
 fn CreateThread(lpThreadAttributes: ?*anyopaque, dwStackSize: usize, lpStartAddress: ?*anyopaque, lpParameter: ?*anyopaque, dwCreationFlags: u32, lpThreadId: ?*u32) callconv(W) usize {
-    _ = lpThreadAttributes; _ = dwStackSize; _ = lpStartAddress; _ = lpParameter; _ = dwCreationFlags;
-    if (lpThreadId) |tid| tid.* = 2;
-    return 0x4001; // Valid thread handle
+    _ = lpThreadAttributes;
+    const start: threads_mod.StartFn = @ptrCast(lpStartAddress orelse {
+        g_last_error = 87; // ERROR_INVALID_PARAMETER
+        return 0;
+    });
+    const h = threads_mod.createThread(dwStackSize, start, lpParameter, dwCreationFlags, lpThreadId);
+    if (h == 0) g_last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+    std.debug.print("[WINS:Kernel32] CreateThread(start=0x{x}, flags=0x{x}) -> 0x{x}\n", .{ @intFromPtr(lpStartAddress), dwCreationFlags, h });
+    return h;
 }
 
 fn ResumeThread(hThread: usize) callconv(W) u32 {
-    _ = hThread;
-    return 1;
+    // Handles this loader does not track (the SteamStub scans its own threads with
+    // OpenThread/SuspendThread/ResumeThread) keep the answer they always had.
+    if (!threads_mod.isOurs(hThread)) return 1;
+    return threads_mod.resumeThread(hThread);
 }
 
 fn SuspendThread(hThread: usize) callconv(W) u32 {
-    _ = hThread;
-    return 0;
+    if (!threads_mod.isOurs(hThread)) return 0; // as before: the stub's thread scan must not fail
+    return threads_mod.suspendThread(hThread);
 }
 
 fn SetThreadPriority(hThread: usize, nPriority: i32) callconv(W) i32 {
@@ -1230,13 +1253,16 @@ fn SetThreadIdealProcessor(hThread: usize, dwIdealProcessor: u32) callconv(W) u3
 }
 
 fn ExitThread(dwExitCode: u32) callconv(W) noreturn {
-    _ = dwExitCode;
+    // A thread started by CreateThread ends alone; on the main thread this ends
+    // the process, as before.
+    _ = threads_mod.exitCurrentThread(dwExitCode);
     linux.exit_group(0);
 }
 
 fn GetExitCodeThread(hThread: usize, lpExitCode: ?*u32) callconv(W) i32 {
-    _ = hThread;
-    if (lpExitCode) |code| code.* = 0;
+    const out = lpExitCode orelse return 0;
+    if (threads_mod.getExitCode(hThread, out)) |ok| return if (ok) 1 else 0;
+    out.* = 0; // a handle this loader does not track (pseudo handles)
     return 1;
 }
 
@@ -1251,75 +1277,33 @@ const CriticalSection = extern struct {
 };
 
 fn InitializeCriticalSection(lpCriticalSection: ?*anyopaque) callconv(W) void {
-    if (lpCriticalSection) |p| {
-        const cs: *CriticalSection = @ptrCast(@alignCast(p));
-        cs.DebugInfo = 0;
-        cs.LockCount = -1;
-        cs.RecursionCount = 0;
-        cs.OwningThread = 0;
-        cs.LockSemaphore = 0;
-        cs.SpinCount = 0;
-    }
+    if (lpCriticalSection) |p| threads_mod.csInit(@ptrCast(@alignCast(p)), 0);
 }
 
 fn InitializeCriticalSectionAndSpinCount(lpCriticalSection: ?*anyopaque, dwSpinCount: u32) callconv(W) i32 {
     if (lpCriticalSection) |p| {
-        const cs: *CriticalSection = @ptrCast(@alignCast(p));
-        cs.DebugInfo = 0;
-        cs.LockCount = -1;
-        cs.RecursionCount = 0;
-        cs.OwningThread = 0;
-        cs.LockSemaphore = 0;
-        cs.SpinCount = dwSpinCount;
+        threads_mod.csInit(@ptrCast(@alignCast(p)), dwSpinCount);
         return 1;
     }
     return 0;
 }
 
 fn EnterCriticalSection(lpCriticalSection: ?*anyopaque) callconv(W) void {
-    if (lpCriticalSection) |p| {
-        const cs: *CriticalSection = @ptrCast(@alignCast(p));
-        const tid: u32 = 1;
-        if (cs.LockCount >= 0 and cs.OwningThread == tid) {
-            cs.RecursionCount += 1;
-            cs.LockCount += 1;
-        } else {
-            cs.LockCount += 1;
-            cs.OwningThread = tid;
-            cs.RecursionCount = 1;
-        }
-    }
+    if (lpCriticalSection) |p| threads_mod.csEnter(@ptrCast(@alignCast(p)));
 }
 
 fn TryEnterCriticalSection(lpCriticalSection: ?*anyopaque) callconv(W) i32 {
-    if (lpCriticalSection) |p| {
-        const cs: *CriticalSection = @ptrCast(@alignCast(p));
-        const tid: u32 = 1;
-        if (cs.LockCount == -1 or cs.OwningThread == tid) {
-            EnterCriticalSection(lpCriticalSection);
-            return 1;
-        }
-    }
+    if (lpCriticalSection) |p| return if (threads_mod.csTryEnter(@ptrCast(@alignCast(p)))) 1 else 0;
     return 0;
 }
 
 fn LeaveCriticalSection(lpCriticalSection: ?*anyopaque) callconv(W) void {
-    if (lpCriticalSection) |p| {
-        const cs: *CriticalSection = @ptrCast(@alignCast(p));
-        if (cs.RecursionCount > 1) {
-            cs.RecursionCount -= 1;
-            cs.LockCount -= 1;
-        } else {
-            cs.OwningThread = 0;
-            cs.RecursionCount = 0;
-            cs.LockCount = -1;
-        }
-    }
+    if (lpCriticalSection) |p| threads_mod.csLeave(@ptrCast(@alignCast(p)));
 }
 
 fn DeleteCriticalSection(lpCriticalSection: ?*anyopaque) callconv(W) void {
     if (lpCriticalSection) |p| {
-        const cs: *CriticalSection = @ptrCast(@alignCast(p));
+        const cs: *threads_mod.CriticalSection = @ptrCast(@alignCast(p));
         cs.LockCount = -1;
         cs.RecursionCount = 0;
         cs.OwningThread = 0;
@@ -1336,10 +1320,11 @@ fn dummySuccess(p: ?*anyopaque) callconv(W) i32 {
 }
 
 fn CreateEventA(lpEventAttributes: ?*anyopaque, bManualReset: i32, bInitialState: i32, lpName: ?[*:0]const u8) callconv(W) usize {
-    _ = lpEventAttributes; _ = bManualReset; _ = bInitialState;
-    const name = if (lpName) |n| std.mem.sliceTo(n, 0) else "null";
-    std.debug.print("[WINS:Kernel32] CreateEventA(\"{s}\")\n", .{name});
-    return 0x2001;
+    _ = lpEventAttributes;
+    const name: ?[]const u8 = if (lpName) |n| std.mem.sliceTo(n, 0) else null;
+    const h = threads_mod.createEvent(bManualReset != 0, bInitialState != 0, name);
+    if (name != null) std.debug.print("[WINS:Kernel32] CreateEventA(\"{s}\") -> 0x{x}\n", .{ name.?, h });
+    return h;
 }
 
 fn OpenEventA(dwDesiredAccess: u32, bInheritHandle: i32, lpName: ?[*:0]const u8) callconv(W) usize {
@@ -1367,26 +1352,60 @@ fn OpenEventA(dwDesiredAccess: u32, bInheritHandle: i32, lpName: ?[*:0]const u8)
 }
 
 fn CreateMutexA(lpMutexAttributes: ?*anyopaque, bInitialOwner: i32, lpName: ?[*:0]const u8) callconv(W) usize {
-    _ = lpMutexAttributes; _ = bInitialOwner; _ = lpName;
-    return 0x2002;
+    _ = lpMutexAttributes;
+    const name: ?[]const u8 = if (lpName) |n| std.mem.sliceTo(n, 0) else null;
+    return threads_mod.createMutex(bInitialOwner != 0, name);
 }
 
 fn CreateSemaphoreA(lpSemaphoreAttributes: ?*anyopaque, lInitialCount: i32, lMaximumCount: i32, lpName: ?[*:0]const u8) callconv(W) usize {
-    _ = lpSemaphoreAttributes; _ = lInitialCount; _ = lMaximumCount; _ = lpName;
-    return 0x2003;
+    _ = lpSemaphoreAttributes;
+    const name: ?[]const u8 = if (lpName) |n| std.mem.sliceTo(n, 0) else null;
+    const h = threads_mod.createSemaphore(lInitialCount, lMaximumCount, name);
+    if (h == 0) g_last_error = 87; // ERROR_INVALID_PARAMETER
+    return h;
+}
+
+fn ReleaseSemaphore(hSemaphore: usize, lReleaseCount: i32, lpPreviousCount: ?*i32) callconv(W) i32 {
+    if (!threads_mod.isOurs(hSemaphore)) return 1; // legacy handle: as before
+    if (threads_mod.releaseSemaphore(hSemaphore, lReleaseCount, lpPreviousCount)) return 1;
+    g_last_error = 298; // ERROR_TOO_MANY_POSTS
+    return 0;
+}
+
+fn ReleaseMutex(hMutex: usize) callconv(W) i32 {
+    if (!threads_mod.isOurs(hMutex)) return 1;
+    if (threads_mod.releaseMutex(hMutex)) return 1;
+    g_last_error = 288; // ERROR_NOT_OWNER
+    return 0;
+}
+
+fn PulseEvent(hEvent: usize) callconv(W) i32 {
+    return if (threads_mod.pulseEvent(hEvent)) 1 else 0;
+}
+
+fn SwitchToThread() callconv(W) i32 {
+    _ = linux.sched_yield();
+    return 1;
 }
 
 fn SetEvent(hEvent: usize) callconv(W) i32 {
-    std.debug.print("[WINS:Kernel32] SetEvent(0x{x})\n", .{hEvent});
-    return 1;
+    if (!threads_mod.isOurs(hEvent)) return 1; // legacy handles (Steam bridge): as before
+    if (threads_mod.setEvent(hEvent)) return 1;
+    g_last_error = 6; // ERROR_INVALID_HANDLE (not an event)
+    return 0;
 }
 
 fn ResetEvent(hEvent: usize) callconv(W) i32 {
-    std.debug.print("[WINS:Kernel32] ResetEvent(0x{x})\n", .{hEvent});
-    return 1;
+    if (!threads_mod.isOurs(hEvent)) return 1;
+    if (threads_mod.resetEvent(hEvent)) return 1;
+    g_last_error = 6;
+    return 0;
 }
 
 fn WaitForSingleObject(hHandle: usize, dwMilliseconds: u32) callconv(W) u32 {
+    // Handles created by this loader's real sync objects block and wake for real.
+    if (threads_mod.waitOne(hHandle, dwMilliseconds)) |r| return r;
+    // Anything else keeps the old behaviour (Steam bridge handles, constants).
     std.debug.print("[WINS:Kernel32] WaitForSingleObject(0x{x}, {d})\n", .{ hHandle, dwMilliseconds });
     // This shim used to be the DRM responder: it read a token out of shared memory
     // and wrote it into the guest's target address, then reported success as though
@@ -1403,8 +1422,12 @@ fn WaitForSingleObject(hHandle: usize, dwMilliseconds: u32) callconv(W) u32 {
 }
 
 fn WaitForMultipleObjects(nCount: u32, lpHandles: ?[*]const usize, bWaitAll: i32, dwMilliseconds: u32) callconv(W) u32 {
-    _ = nCount; _ = lpHandles; _ = bWaitAll; _ = dwMilliseconds;
-    return 0; // WAIT_OBJECT_0
+    if (lpHandles) |hs| {
+        if (nCount > 0 and nCount <= threads_mod.MAXIMUM_WAIT_OBJECTS) {
+            if (threads_mod.waitMany(hs[0..nCount], bWaitAll != 0, dwMilliseconds)) |r| return r;
+        }
+    }
+    return 0; // WAIT_OBJECT_0 for handles that are not ours (legacy behaviour)
 }
 
 fn Sleep(dwMilliseconds: u32) callconv(W) void {
@@ -1820,6 +1843,7 @@ fn ReadFile(hFile: usize, lpBuffer: ?[*]u8, nNumberOfBytesToRead: u32, lpNumberO
 }
 
 fn CloseHandle(hObject: usize) callconv(W) i32 {
+    if (threads_mod.closeHandle(hObject)) return 1;
     if (hObject >= 0x10000 and hObject < 0x20000) {
         const fd: i32 = @intCast(hObject - 0x10000);
         _ = linux.close(fd);
@@ -4918,12 +4942,14 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (std.mem.eql(u8, name, "DeleteCriticalSection")) return @ptrCast(&DeleteCriticalSection);
         if (std.mem.eql(u8, name, "CreateEventA")) return @ptrCast(&CreateEventA);
         if (std.mem.eql(u8, name, "OpenEventA")) return @ptrCast(&OpenEventA);
-        if (std.mem.eql(u8, name, "SetEvent")) return @ptrCast(&dummySuccess);
-        if (std.mem.eql(u8, name, "ResetEvent")) return @ptrCast(&dummySuccess);
+        if (std.mem.eql(u8, name, "SetEvent")) return @ptrCast(&SetEvent);
+        if (std.mem.eql(u8, name, "PulseEvent")) return @ptrCast(&PulseEvent);
+        if (std.mem.eql(u8, name, "SwitchToThread")) return @ptrCast(&SwitchToThread);
+        if (std.mem.eql(u8, name, "ResetEvent")) return @ptrCast(&ResetEvent);
         if (std.mem.eql(u8, name, "CreateMutexA")) return @ptrCast(&CreateMutexA);
-        if (std.mem.eql(u8, name, "ReleaseMutex")) return @ptrCast(&dummySuccess);
+        if (std.mem.eql(u8, name, "ReleaseMutex")) return @ptrCast(&ReleaseMutex);
         if (std.mem.eql(u8, name, "CreateSemaphoreA")) return @ptrCast(&CreateSemaphoreA);
-        if (std.mem.eql(u8, name, "ReleaseSemaphore")) return @ptrCast(&dummySuccess);
+        if (std.mem.eql(u8, name, "ReleaseSemaphore")) return @ptrCast(&ReleaseSemaphore);
         if (std.mem.eql(u8, name, "WaitForSingleObject")) return @ptrCast(&WaitForSingleObject);
         if (std.mem.eql(u8, name, "WaitForMultipleObjects")) return @ptrCast(&WaitForMultipleObjects);
         if (std.mem.eql(u8, name, "InterlockedIncrement")) return @ptrCast(&InterlockedIncrement);
@@ -5347,6 +5373,67 @@ fn isGuestStack(a: usize) bool {
     return a >= g_guest_stack_end and a <= g_guest_stack_base;
 }
 
+
+/// Runs on every thread started by CreateThread, before the guest's start routine:
+/// gives it its own TEB (TIB at FS:0, self pointer, ids, PEB, stack bounds), its own
+/// static TLS array and block (TEB+0x2c, a fresh copy of the image's template), loads
+/// FS through set_thread_area, then runs the TLS callbacks with DLL_THREAD_ATTACH.
+fn guestThreadInit(obj: *threads_mod.Object) void {
+    const gpa = std.heap.page_allocator;
+    const teb = gpa.alignedAlloc(u32, .@"16", 1024) catch return threadInitFailed("TEB");
+    @memset(teb, 0);
+    var probe: u32 = 0;
+    const top = (@intFromPtr(&probe) + 0x1000) & ~@as(usize, 0xFFF);
+    const size = @max(obj.stack_size, 1 << 20);
+    teb[0] = 0xFFFFFFFF; // SEH chain end
+    teb[1] = @intCast(top); // stack base
+    teb[2] = @intCast(top - size); // stack limit
+    teb[6] = @intFromPtr(teb.ptr); // self
+    teb[8] = @intCast(linux.getpid());
+    teb[9] = obj.tid;
+    teb[12] = @intFromPtr(&g_peb_buffer);
+
+    const arr = gpa.alloc(usize, TLS_SLOT_COUNT) catch return threadInitFailed("TLS array");
+    @memset(arr, 0);
+    arr[0] = @intFromPtr(arr.ptr);
+    const total = g_tls_tpl_len + g_tls_zero_fill;
+    if (total > 0 and g_tls_idx > 0 and g_tls_idx < TLS_SLOT_COUNT) {
+        const block = gpa.alloc(u8, total) catch return threadInitFailed("TLS block");
+        @memcpy(block[0..g_tls_tpl_len], @as([*]const u8, @ptrFromInt(g_tls_tpl_start))[0..g_tls_tpl_len]);
+        @memset(block[g_tls_tpl_len..], 0);
+        arr[g_tls_idx] = @intFromPtr(block.ptr);
+    }
+    teb[0x2c / 4] = @intFromPtr(arr.ptr);
+
+    var desc = UserDesc{
+        .entry_number = std.math.maxInt(c_uint),
+        .base_addr = @intFromPtr(teb.ptr),
+        .limit = 0xFFFFF,
+        .flags = 0x51, // seg_32bit, limit_in_pages, useable
+    };
+    if (linux.syscall1(.set_thread_area, @intFromPtr(&desc)) != 0) return threadInitFailed("set_thread_area");
+    const selector: u16 = @intCast((desc.entry_number << 3) | 3);
+    asm volatile ("mov %[sel], %%fs"
+        :
+        : [sel] "r" (selector),
+    );
+
+    if (g_tls_callbacks_va != 0) {
+        const cbs: [*]const u32 = @ptrFromInt(g_tls_callbacks_va);
+        var i: usize = 0;
+        while (i < 64) : (i += 1) {
+            if (cbs[i] == 0) break;
+            const cb: *const fn (usize, u32, ?*anyopaque) callconv(W) void = @ptrFromInt(cbs[i]);
+            cb(g_guest_base, 2, null); // DLL_THREAD_ATTACH
+        }
+    }
+}
+
+fn threadInitFailed(what: []const u8) noreturn {
+    std.debug.print("[WINS:Thread] cannot set up the new thread's {s}\n", .{what});
+    linux.exit_group(126);
+}
+
 fn setupTib() !void {
     // Offset 0x00: SEH frame (0xFFFFFFFF = end of chain)
     g_tib_buffer[0] = 0xFFFFFFFF;
@@ -5382,6 +5469,7 @@ fn setupTib() !void {
     if (rc != 0) return error.SetThreadAreaFailed;
 
     msvcrt_mod.guest_tib_base = @intFromPtr(&g_tib_buffer);
+    threads_mod.g_thread_init = &guestThreadInit;
 
     const selector: u16 = @intCast((desc.entry_number << 3) | 3);
     asm volatile ("mov %[sel], %%fs"
@@ -5963,4 +6051,111 @@ test "DirectInput8Create returns DI_OK with a real object, not NULL" {
     var dev: ?*anyopaque = null;
     try std.testing.expectEqual(DIERR_GENERIC, di8.vtbl.CreateDevice(di8, null, &dev, null));
     try std.testing.expect(dev == null);
+}
+
+const ThreadProbe = struct { teb: u32 = 0, tid: u32 = 0, tls_arr: u32 = 0, tls_block: u32 = 0, seh: u32 = 0 };
+
+fn fsDword(comptime off: []const u8) u32 {
+    return asm volatile ("movl %%fs:" ++ off ++ ", %[r]"
+        : [r] "=r" (-> u32),
+    );
+}
+
+fn probeThread(p: ?*anyopaque) callconv(W) u32 {
+    const pr: *ThreadProbe = @ptrCast(@alignCast(p.?));
+    pr.teb = fsDword("0x18");
+    pr.tid = fsDword("0x24");
+    pr.tls_arr = fsDword("0x2c");
+    pr.seh = fsDword("0");
+    const arr: [*]const usize = @ptrFromInt(pr.tls_arr);
+    pr.tls_block = @intCast(arr[g_tls_idx]);
+    const blk: [*]u8 = @ptrFromInt(pr.tls_block);
+    blk[0] +%= 1; // changes this thread's copy only
+    return 0;
+}
+
+test "guest threads get their own TEB, tid and static TLS block" {
+    var tpl = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    g_tls_tpl_start = @intFromPtr(&tpl);
+    g_tls_tpl_len = tpl.len;
+    g_tls_zero_fill = 8;
+    g_tls_idx = 1;
+    g_tls_callbacks_va = 0;
+    threads_mod.g_thread_init = &guestThreadInit;
+    defer threads_mod.g_thread_init = null;
+    var a = ThreadProbe{};
+    var b = ThreadProbe{};
+    var ta: u32 = 0;
+    var tb: u32 = 0;
+    const fp: ?*anyopaque = @ptrCast(@constCast(&probeThread));
+    const h1 = CreateThread(null, 0, fp, &a, 0, &ta);
+    const h2 = CreateThread(null, 0, fp, &b, 0, &tb);
+    try std.testing.expect(h1 != 0 and h2 != 0);
+    try std.testing.expectEqual(@as(u32, 0), WaitForSingleObject(h1, 5000));
+    try std.testing.expectEqual(@as(u32, 0), WaitForSingleObject(h2, 5000));
+    // Each thread has its own TEB; FS:0x18 is the TEB's own address and FS:0x24 the thread id.
+    try std.testing.expect(a.teb != 0 and b.teb != 0 and a.teb != b.teb);
+    try std.testing.expectEqual(ta, a.tid);
+    try std.testing.expectEqual(tb, b.tid);
+    try std.testing.expect(ta != tb);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), a.seh); // fresh, empty SEH chain
+    // Own TLS array (slot 0 points at itself) and own block, copied from the template.
+    try std.testing.expect(a.tls_arr != b.tls_arr and a.tls_block != b.tls_block);
+    const arr_a: [*]const usize = @ptrFromInt(a.tls_arr);
+    try std.testing.expectEqual(a.tls_arr, @as(u32, @intCast(arr_a[0])));
+    const blk_a: [*]const u8 = @ptrFromInt(a.tls_block);
+    const blk_b: [*]const u8 = @ptrFromInt(b.tls_block);
+    try std.testing.expectEqual(@as(u8, 0x12), blk_a[0]); // 0x11 + this thread's own increment
+    try std.testing.expectEqual(@as(u8, 0x12), blk_b[0]); // not 0x13: the blocks are independent
+    try std.testing.expectEqual(@as(u8, 0x22), blk_a[1]); // rest of the template copied
+    try std.testing.expectEqual(@as(u8, 0x88), blk_a[7]);
+    try std.testing.expectEqual(@as(u8, 0), blk_a[8]); // zero fill
+    try std.testing.expectEqual(@as(u8, 0), blk_a[15]);
+    try std.testing.expectEqual(@as(u8, 0x11), tpl[0]); // the image's template is untouched
+    try std.testing.expectEqual(@as(i32, 1), CloseHandle(h1));
+    try std.testing.expectEqual(@as(i32, 1), CloseHandle(h2));
+}
+
+test "kernel32 wrappers: real sync objects, real wait results, legacy handles unchanged" {
+    const e = CreateEventA(null, 1, 0, null);
+    try std.testing.expect(e != 0);
+    try std.testing.expectEqual(@as(u32, 258), WaitForSingleObject(e, 10)); // really times out
+    try std.testing.expectEqual(@as(i32, 1), SetEvent(e));
+    try std.testing.expectEqual(@as(u32, 0), WaitForSingleObject(e, 10));
+    try std.testing.expectEqual(@as(i32, 1), ResetEvent(e));
+    try std.testing.expectEqual(@as(u32, 258), WaitForSingleObject(e, 0));
+
+    const s = CreateSemaphoreA(null, 0, 2, null);
+    try std.testing.expectEqual(@as(i32, 1), ReleaseSemaphore(s, 1, null));
+    try std.testing.expectEqual(@as(i32, 0), ReleaseSemaphore(s, 5, null)); // would exceed the maximum
+    const hs = [_]usize{ e, s };
+    try std.testing.expectEqual(@as(u32, 1), WaitForMultipleObjects(2, &hs, 0, 100)); // semaphore is index 1
+    try std.testing.expectEqual(@as(u32, 258), WaitForMultipleObjects(2, &hs, 0, 10)); // nothing left
+    try std.testing.expectEqual(@as(i32, 0), SetEvent(s)); // a semaphore is not an event
+    try std.testing.expectEqual(@as(u32, 6), g_last_error); // ERROR_INVALID_HANDLE
+
+    // Legacy handles keep the answers they always had.
+    try std.testing.expectEqual(@as(i32, 1), SetEvent(0x30000002));
+    try std.testing.expectEqual(@as(i32, 1), ReleaseMutex(0x2002));
+    try std.testing.expectEqual(@as(i32, 1), CloseHandle(0x4001));
+
+    const m = CreateMutexA(null, 0, null);
+    try std.testing.expectEqual(@as(u32, 0), WaitForSingleObject(m, 0));
+    try std.testing.expectEqual(@as(i32, 1), ReleaseMutex(m));
+    try std.testing.expectEqual(@as(i32, 0), ReleaseMutex(m)); // no longer the owner
+    try std.testing.expectEqual(@as(u32, 288), g_last_error); // ERROR_NOT_OWNER
+    try std.testing.expectEqual(@as(i32, 1), CloseHandle(e));
+    try std.testing.expectEqual(@as(i32, 1), CloseHandle(s));
+    try std.testing.expectEqual(@as(i32, 1), CloseHandle(m));
+}
+
+test "thread control on handles this loader does not track keeps its legacy answers" {
+    // The SteamStub calls these on handles from OpenThread; an error here aborts the
+    // game with "Application load error" before it reaches Direct3D.
+    try std.testing.expectEqual(@as(u32, 0), SuspendThread(0x4001));
+    try std.testing.expectEqual(@as(u32, 1), ResumeThread(0x4001));
+    try std.testing.expectEqual(@as(u32, 0), SuspendThread(0xFFFFFFFE)); // GetCurrentThread() pseudo handle
+    var code: u32 = 55;
+    try std.testing.expectEqual(@as(i32, 1), GetExitCodeThread(0x4001, &code));
+    try std.testing.expectEqual(@as(u32, 0), code);
 }
