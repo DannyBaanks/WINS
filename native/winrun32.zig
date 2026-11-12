@@ -860,6 +860,21 @@ const STEAM_APPID: u32 = 22380;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// glibc's environment vector, used to re-exec self with one extra variable.
 extern var environ: [*:null]?[*:0]u8;
+
+/// First byte of this executable's own ELF image (linker-provided).
+extern const __ehdr_start: u8;
+
+/// Size of the PROT_NONE window to reserve at `base`, given where this loader's
+/// own image starts (`loader_lo`). The shipped build links the loader at
+/// 0x02000000 (see tools/build_probe.sh), which lies INSIDE the default
+/// [0x00400000, +64 MB) window: reserving all of it with MAP_FIXED replaced the
+/// loader's own pages and killed it with SIGSEGV before main printed anything.
+/// The window therefore ends where the loader begins. 0 means: reserve nothing.
+fn imageWindowReserveSize(base: usize, want: usize, loader_lo: usize) usize {
+    if (loader_lo > base and loader_lo < base + want) return loader_lo - base;
+    if (loader_lo == base) return 0;
+    return want;
+}
 var g_steam_appid: u32 = 0;
 var g_target_path: [512]u8 = [_]u8{0} ** 512;
 var g_target_path_len: usize = 0;
@@ -5413,9 +5428,10 @@ pub fn main(init: std.process.Init) !void {
     // reservation with MAP_FIXED, so the guest still lands at its ImageBase.
     {
         const reserve_base: usize = 0x00400000;
-        const reserve_size: usize = 64 * 1024 * 1024;
-        const rflags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };
-        const reserved = linux.mmap(@ptrFromInt(reserve_base), reserve_size, linux.PROT{}, rflags, -1, 0);
+        const reserve_size: usize = imageWindowReserveSize(reserve_base, 64 * 1024 * 1024, @intFromPtr(&__ehdr_start));
+        // FIXED_NOREPLACE: never silently replace anything already mapped.
+        const rflags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true };
+        const reserved = if (reserve_size == 0) @as(usize, @bitCast(-@as(isize, @intFromEnum(linux.E.INVAL)))) else linux.mmap(@ptrFromInt(reserve_base), reserve_size, linux.PROT{}, rflags, -1, 0);
         if (linux.errno(reserved) != .SUCCESS) {
             std.debug.print("  [Memory] image-window reservation at 0x{x:0>8} failed: {} (continuing unprotected)\n", .{ reserve_base, linux.errno(reserved) });
         } else {
@@ -5911,6 +5927,24 @@ test "thread-naming exception (0x406d1388) is continuable, others are not" {
     try std.testing.expect(kernel32_mod.isThreadNamingException(0x406d1388));
     try std.testing.expect(!kernel32_mod.isThreadNamingException(0xc0000005));
     try std.testing.expect(!kernel32_mod.isThreadNamingException(0x406d1337));
+}
+
+test "image-window reservation never covers the loader's own image" {
+    const base: usize = 0x00400000;
+    const want: usize = 64 * 1024 * 1024;
+    // Shipped layout: loader linked at 0x02000000, inside [base, base+want).
+    const shipped = imageWindowReserveSize(base, want, 0x02000000);
+    try std.testing.expectEqual(@as(usize, 0x02000000 - 0x00400000), shipped);
+    try std.testing.expect(base + shipped <= 0x02000000);
+    // Negative control: the old fixed 64 MB window DID reach the loader.
+    try std.testing.expect(base + want > 0x02000000);
+    // Unshipped layout (loader below the window) and far-above layout keep the full window.
+    try std.testing.expectEqual(want, imageWindowReserveSize(base, want, 0x00010000));
+    try std.testing.expectEqual(want, imageWindowReserveSize(base, want, 0x20000000));
+    // Loader exactly at the window base: nothing to reserve.
+    try std.testing.expectEqual(@as(usize, 0), imageWindowReserveSize(base, want, base));
+    // The window must still hold the whole 16.5 MB Fallout image in the shipped layout.
+    try std.testing.expect(shipped >= 0x0147b000 - 0x00400000);
 }
 
 test "ShellExecuteA reports failure (<=32) when nothing is executed" {
