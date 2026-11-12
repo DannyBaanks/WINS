@@ -807,6 +807,33 @@ pub const WinsSurface9 = struct {
     pitch: i32,
     data: []u8,
     allocator: std.mem.Allocator,
+    /// False when `data` belongs to someone else (the device's back/depth buffer).
+    owns_data: bool = true,
+    usage: u32 = 0,
+    pool: u32 = 1, // D3DPOOL_MANAGED
+    /// Depth/stencil surfaces are not lockable in D3D9 (LockRect -> D3DERR_INVALIDCALL).
+    lockable: bool = true,
+
+    /// A surface over memory owned elsewhere, e.g. the device's back buffer: the
+    /// guest and the rasterizer then see the very same pixels, with no copy.
+    pub fn wrap(allocator: std.mem.Allocator, width: u32, height: u32, format: u32, bytes: []u8, usage: u32, pool: u32, lockable: bool) !*WinsSurface9 {
+        const surf = try allocator.create(WinsSurface9);
+        surf.* = .{
+            .vtbl = &g_surf9_vtbl,
+            .ref_count = 1,
+            .width = width,
+            .height = height,
+            .format = format,
+            .pitch = @intCast(width * 4),
+            .data = bytes,
+            .allocator = allocator,
+            .owns_data = false,
+            .usage = usage,
+            .pool = pool,
+            .lockable = lockable,
+        };
+        return surf;
+    }
 
     pub fn create(allocator: std.mem.Allocator, width: u32, height: u32, format: u32) !*WinsSurface9 {
         const surf = try allocator.create(WinsSurface9);
@@ -846,6 +873,7 @@ fn surf_Release(this: *anyopaque) callconv(W) u32 {
 fn surf_LockRect(this: *anyopaque, pLocked: ?*D3DLOCKED_RECT, pRect: ?*const D3DRECT, flags: u32) callconv(W) HRESULT {
     _ = flags; _ = pRect;
     const self: *WinsSurface9 = @ptrCast(@alignCast(this));
+    if (!self.lockable) return D3DERR_INVALIDCALL;
     if (pLocked) |l| {
         l.Pitch = self.pitch;
         l.pBits = self.data.ptr;
@@ -862,9 +890,9 @@ fn surf_GetDesc(this: *anyopaque, pDesc: ?*D3DSURFACE_DESC) callconv(W) HRESULT 
         d.Width = self.width;
         d.Height = self.height;
         d.Format = self.format;
-        d.Type = 3; // D3DRTYPE_SURFACE
-        d.Usage = 0;
-        d.Pool = 1; // D3DPOOL_MANAGED
+        d.Type = 1; // D3DRTYPE_SURFACE (3 is D3DRTYPE_TEXTURE)
+        d.Usage = self.usage;
+        d.Pool = self.pool;
         d.MultiSampleType = 0;
         d.MultiSampleQuality = 0;
     }
@@ -1077,8 +1105,69 @@ pub const WinsD3D9 = struct {
     }
 };
 
+/// D3DERR_INVALIDCALL (0x8876086C).
+pub const D3DERR_INVALIDCALL: HRESULT = -2005530516;
+/// D3DERR_NOTFOUND (0x88760866).
+pub const D3DERR_NOTFOUND: HRESULT = -2005530522;
+
+/// Texture stages (D3DTSS_*) and samplers (D3DSAMP_*) whose state this device
+/// stores. The caps MaxTextureBlendStages / MaxSimultaneousTextures are derived
+/// from kMaxTextureStages, so the device can never advertise more stages than
+/// it keeps state for. Storing state is what is implemented: the software
+/// rasterizer samples only bound texture 0 and does not yet evaluate stage
+/// operations, so multi-texture blending is NOT_DEMONSTRATED.
+pub const kMaxTextureStages: u32 = 8;
+const kTssSlots = 33; // D3DTSS_COLOROP (1) .. D3DTSS_CONSTANT (32)
+const kSampSlots = 14; // D3DSAMP_ADDRESSU (1) .. D3DSAMP_DMAPOFFSET (13)
+
+/// Documented D3D9 power-on defaults for texture stage state.
+fn defaultTextureStageStates() [kMaxTextureStages][kTssSlots]u32 {
+    var s = [_][kTssSlots]u32{[_]u32{0} ** kTssSlots} ** kMaxTextureStages;
+    for (0..kMaxTextureStages) |i| {
+        s[i][1] = if (i == 0) 4 else 1; // COLOROP: MODULATE on stage 0, DISABLE elsewhere
+        s[i][2] = 2; // COLORARG1: TEXTURE
+        s[i][3] = 1; // COLORARG2: CURRENT
+        s[i][4] = if (i == 0) 2 else 1; // ALPHAOP: SELECTARG1 on stage 0, DISABLE elsewhere
+        s[i][5] = 2; // ALPHAARG1: TEXTURE
+        s[i][6] = 1; // ALPHAARG2: CURRENT
+        s[i][11] = @intCast(i); // TEXCOORDINDEX
+        s[i][26] = 1; // COLORARG0: CURRENT
+        s[i][27] = 1; // ALPHAARG0: CURRENT
+        s[i][28] = 1; // RESULTARG: CURRENT
+    }
+    return s;
+}
+
+/// Documented D3D9 power-on defaults for sampler state.
+fn defaultSamplerStates() [16][kSampSlots]u32 {
+    var s = [_][kSampSlots]u32{[_]u32{0} ** kSampSlots} ** 16;
+    for (0..16) |i| {
+        s[i][1] = 1; // ADDRESSU: WRAP
+        s[i][2] = 1; // ADDRESSV: WRAP
+        s[i][3] = 1; // ADDRESSW: WRAP
+        s[i][5] = 1; // MAGFILTER: POINT
+        s[i][6] = 1; // MINFILTER: POINT
+        s[i][7] = 0; // MIPFILTER: NONE
+        s[i][10] = 1; // MAXANISOTROPY
+    }
+    return s;
+}
+
+// COM contract: the guest reads the vtable pointer at offset 0 of every object it
+// is handed. A plain Zig `struct` may be reordered by the compiler, so this is
+// asserted at compile time for every COM-visible object. (Adding unrelated fields
+// to WinsD3DDevice9 once moved `vtbl` away from offset 0: the guest then read a
+// NULL vtable and crashed, while tests that go through fields still passed.)
+comptime {
+    for (.{ WinsD3D9, WinsD3DDevice9, WinsSurface9, WinsTexture9, WinsVertexBuffer9, WinsIndexBuffer9, WinsShader9, WinsD3DXBuffer }) |T| {
+        if (@offsetOf(T, "vtbl") != 0) @compileError("COM object " ++ @typeName(T) ++ " must keep vtbl at offset 0");
+    }
+}
+
 pub const WinsD3DDevice9 = struct {
-    vtbl: *const IDirect3DDevice9Vtbl,
+    // Largest alignment in the struct, so the compiler keeps it first (see the
+    // comptime check above); the guest dereferences offset 0 as the vtable.
+    vtbl: *const IDirect3DDevice9Vtbl align(16),
     ref_count: u32,
     adapter: u32,
     device_type: u32,
@@ -1092,6 +1181,10 @@ pub const WinsD3DDevice9 = struct {
     vs_consts: [256][4]f32,
     ps_consts: [224][4]f32,
     render_states: [256]u32,
+    tex_stage_states: [kMaxTextureStages][kTssSlots]u32,
+    rt_surface: ?*WinsSurface9,
+    ds_surface: ?*WinsSurface9,
+    sampler_states: [16][kSampSlots]u32,
     streams: [16]?*WinsVertexBuffer9,
     stream_strides: [16]u32,
     stream_offsets: [16]u32,
@@ -1134,6 +1227,10 @@ pub const WinsD3DDevice9 = struct {
             .vs_consts = [_][4]f32{[_]f32{ 0, 0, 0, 0 }} ** 256,
             .ps_consts = [_][4]f32{[_]f32{ 0, 0, 0, 0 }} ** 224,
             .render_states = [_]u32{0} ** 256,
+            .tex_stage_states = defaultTextureStageStates(),
+            .rt_surface = null,
+            .ds_surface = null,
+            .sampler_states = defaultSamplerStates(),
             .streams = [_]?*WinsVertexBuffer9{null} ** 16,
             .stream_strides = [_]u32{0} ** 16,
             .stream_offsets = [_]u32{0} ** 16,
@@ -1276,6 +1373,9 @@ fn d3d9_GetDeviceCaps(this: *anyopaque, adapter: u32, dev_type: u32, pCaps: ?*D3
         caps.MaxVertexShader30InstructionSlots = 32768;
         caps.MaxPixelShader30InstructionSlots = 32768;
         caps.NumSimultaneousRTs = 4;
+        // Derived from what the device stores state for (see kMaxTextureStages).
+        caps.MaxTextureBlendStages = kMaxTextureStages;
+        caps.MaxSimultaneousTextures = kMaxTextureStages;
     }
     return D3D_OK;
 }
@@ -1912,14 +2012,34 @@ fn dev9_Reset(this: *anyopaque, p0: ?*D3DPRESENT_PARAMETERS) callconv(W) HRESULT
     return E_NOTIMPL;
 }
 
-fn dev9_GetBackBuffer(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    std.debug.print("[WINS:D3D9] device!GetBackBuffer is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// The device's persistent render-target surface: wraps the back buffer the
+/// rasterizer draws into. Created on first use; callers receive a counted reference.
+fn deviceRenderTarget(self: *WinsD3DDevice9) ?*WinsSurface9 {
+    if (self.rt_surface == null) {
+        const fmt: u32 = if (self.params.BackBufferFormat != 0) self.params.BackBufferFormat else D3DFMT_X8R8G8B8;
+        self.rt_surface = WinsSurface9.wrap(self.allocator, self.viewport.Width, self.viewport.Height, fmt, std.mem.sliceAsBytes(self.backbuffer), D3DUSAGE_RENDERTARGET, 0, true) catch return null;
+    }
+    return self.rt_surface;
+}
+
+fn deviceDepthStencil(self: *WinsD3DDevice9) ?*WinsSurface9 {
+    if (self.params.EnableAutoDepthStencil == 0) return null;
+    if (self.ds_surface == null) {
+        self.ds_surface = WinsSurface9.wrap(self.allocator, self.viewport.Width, self.viewport.Height, self.params.AutoDepthStencilFormat, std.mem.sliceAsBytes(self.depthbuffer), D3DUSAGE_DEPTHSTENCIL, 0, false) catch return null;
+    }
+    return self.ds_surface;
+}
+
+fn dev9_GetBackBuffer(this: *anyopaque, swap_chain: u32, back_buffer: u32, buf_type: u32, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppSurface orelse return D3DERR_INVALIDCALL;
+    const count: u32 = if (self.params.BackBufferCount == 0) 1 else self.params.BackBufferCount;
+    // D3DBACKBUFFER_TYPE_MONO (0) only; a single implicit swap chain; one buffer.
+    if (swap_chain != 0 or buf_type != 0 or back_buffer >= count or back_buffer != 0) return D3DERR_INVALIDCALL;
+    const s = deviceRenderTarget(self) orelse return E_OUTOFMEMORY;
+    s.ref_count += 1;
+    out.* = s;
+    return D3D_OK;
 }
 
 fn dev9_GetRasterStatus(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
@@ -2082,12 +2202,14 @@ fn dev9_SetRenderTarget(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) 
     return E_NOTIMPL;
 }
 
-fn dev9_GetRenderTarget(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!GetRenderTarget is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_GetRenderTarget(this: *anyopaque, index: u32, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppSurface orelse return D3DERR_INVALIDCALL;
+    if (index != 0) return D3DERR_NOTFOUND; // one render target; MRT is not implemented
+    const s = deviceRenderTarget(self) orelse return E_OUTOFMEMORY;
+    s.ref_count += 1;
+    out.* = s;
+    return D3D_OK;
 }
 
 fn dev9_SetDepthStencilSurface(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
@@ -2097,11 +2219,13 @@ fn dev9_SetDepthStencilSurface(this: *anyopaque, p0: ?*anyopaque) callconv(W) HR
     return E_NOTIMPL;
 }
 
-fn dev9_GetDepthStencilSurface(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!GetDepthStencilSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_GetDepthStencilSurface(this: *anyopaque, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppSurface orelse return D3DERR_INVALIDCALL;
+    const s = deviceDepthStencil(self) orelse return D3DERR_NOTFOUND;
+    s.ref_count += 1;
+    out.* = s;
+    return D3D_OK;
 }
 
 fn dev9_SetTransform(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) HRESULT {
@@ -2233,40 +2357,34 @@ fn dev9_GetTexture(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRE
     return E_NOTIMPL;
 }
 
-fn dev9_GetTextureStageState(this: *anyopaque, p0: u32, p1: u32, p2: ?*u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    std.debug.print("[WINS:D3D9] device!GetTextureStageState is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_GetTextureStageState(this: *anyopaque, stage: u32, ty: u32, pValue: ?*u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = pValue orelse return D3DERR_INVALIDCALL;
+    if (stage >= kMaxTextureStages or ty == 0 or ty >= kTssSlots) return D3DERR_INVALIDCALL;
+    out.* = self.tex_stage_states[stage][ty];
+    return D3D_OK;
 }
 
-fn dev9_SetTextureStageState(this: *anyopaque, p0: u32, p1: u32, p2: u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    std.debug.print("[WINS:D3D9] device!SetTextureStageState is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_SetTextureStageState(this: *anyopaque, stage: u32, ty: u32, value: u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (stage >= kMaxTextureStages or ty == 0 or ty >= kTssSlots) return D3DERR_INVALIDCALL;
+    self.tex_stage_states[stage][ty] = value;
+    return D3D_OK;
 }
 
-fn dev9_GetSamplerState(this: *anyopaque, p0: u32, p1: u32, p2: ?*u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    std.debug.print("[WINS:D3D9] device!GetSamplerState is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_GetSamplerState(this: *anyopaque, sampler: u32, ty: u32, pValue: ?*u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = pValue orelse return D3DERR_INVALIDCALL;
+    if (sampler >= 16 or ty == 0 or ty >= kSampSlots) return D3DERR_INVALIDCALL;
+    out.* = self.sampler_states[sampler][ty];
+    return D3D_OK;
 }
 
-fn dev9_SetSamplerState(this: *anyopaque, p0: u32, p1: u32, p2: u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    std.debug.print("[WINS:D3D9] device!SetSamplerState is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_SetSamplerState(this: *anyopaque, sampler: u32, ty: u32, value: u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (sampler >= 16 or ty == 0 or ty >= kSampSlots) return D3DERR_INVALIDCALL;
+    self.sampler_states[sampler][ty] = value;
+    return D3D_OK;
 }
 
 fn dev9_ValidateDevice(this: *anyopaque, p0: ?*u32) callconv(W) HRESULT {
@@ -3315,4 +3433,136 @@ test "format 23 (A8B8G8R8) is accepted wherever 22 (X8R8G8B8) is" {
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, D3DFMT_A8B8G8R8));
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceType(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DFMT_A8B8G8R8, 1));
     try std.testing.expectEqual(@as(u32, 1), d3d.vtbl.GetAdapterModeCount(d3d, 0, D3DFMT_A8B8G8R8));
+}
+
+test "texture stage / sampler state: D3D9 defaults, round trip, range checks, caps match storage" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    var params: D3DPRESENT_PARAMETERS = undefined;
+    @memset(std.mem.asBytes(&params), 0);
+    params.BackBufferWidth = 64;
+    params.BackBufferHeight = 64;
+    params.Windowed = 1;
+    var dev_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CreateDevice(d3d, 0, 1, 0, 0, &params, &dev_raw));
+    const dev: *WinsD3DDevice9 = @ptrCast(@alignCast(dev_raw.?));
+    var v: u32 = 0xdead;
+
+    // Documented defaults: stage 0 MODULATE/SELECTARG1, other stages DISABLE.
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTextureStageState(dev, 0, 1, &v));
+    try std.testing.expectEqual(@as(u32, 4), v);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTextureStageState(dev, 1, 1, &v));
+    try std.testing.expectEqual(@as(u32, 1), v);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTextureStageState(dev, 3, 11, &v)); // TEXCOORDINDEX = stage
+    try std.testing.expectEqual(@as(u32, 3), v);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetSamplerState(dev, 2, 5, &v)); // MAGFILTER
+    try std.testing.expectEqual(@as(u32, 1), v);
+
+    // Round trip, and each slot is independent of its neighbours.
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTextureStageState(dev, 1, 1, 4));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTextureStageState(dev, 1, 1, &v));
+    try std.testing.expectEqual(@as(u32, 4), v);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTextureStageState(dev, 0, 1, &v));
+    try std.testing.expectEqual(@as(u32, 4), v);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTextureStageState(dev, 2, 1, &v));
+    try std.testing.expectEqual(@as(u32, 1), v); // untouched
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetSamplerState(dev, 15, 6, 2));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetSamplerState(dev, 15, 6, &v));
+    try std.testing.expectEqual(@as(u32, 2), v);
+
+    // Out-of-range stage / type / sampler / null out-pointer are refused, not accepted.
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetTextureStageState(dev, kMaxTextureStages, 1, 1));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetTextureStageState(dev, 0, 0, 1));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetTextureStageState(dev, 0, kTssSlots, 1));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetTextureStageState(dev, 0, 1, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetSamplerState(dev, 16, 1, 1));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetSamplerState(dev, 0, kSampSlots, &v));
+
+    // The caps never advertise more stages than the device stores state for,
+    // and satisfy the engine's gate (>= 2 stages and >= 2 simultaneous textures).
+    var caps: D3DCAPS9 = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetDeviceCaps(dev, &caps));
+    try std.testing.expect(caps.MaxTextureBlendStages >= 2 and caps.MaxSimultaneousTextures >= 2);
+    try std.testing.expect(caps.MaxTextureBlendStages <= dev.tex_stage_states.len);
+    try std.testing.expect(caps.MaxSimultaneousTextures <= dev.tex_stage_states.len);
+    // Negative control: the last advertised stage really is usable, the next is refused.
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTextureStageState(dev, caps.MaxTextureBlendStages - 1, 1, 1));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetTextureStageState(dev, caps.MaxTextureBlendStages, 1, 1));
+}
+
+test "render target / back buffer / depth surfaces wrap the device's own memory" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    var params: D3DPRESENT_PARAMETERS = undefined;
+    @memset(std.mem.asBytes(&params), 0);
+    params.BackBufferWidth = 64;
+    params.BackBufferHeight = 32;
+    params.BackBufferFormat = D3DFMT_X8R8G8B8;
+    params.Windowed = 1;
+    params.EnableAutoDepthStencil = 1;
+    params.AutoDepthStencilFormat = 75; // D3DFMT_D24S8
+    var dev_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CreateDevice(d3d, 0, 1, 0, 0, &params, &dev_raw));
+    const dev: *WinsD3DDevice9 = @ptrCast(@alignCast(dev_raw.?));
+
+    // GetRenderTarget(0) and GetBackBuffer(0,0,MONO) return the same surface object.
+    var rt: ?*anyopaque = null;
+    var bb: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderTarget(dev, 0, &rt));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetBackBuffer(dev, 0, 0, 0, &bb));
+    try std.testing.expect(rt != null and rt == bb);
+    const s: *WinsSurface9 = @ptrCast(@alignCast(rt.?));
+    try std.testing.expectEqual(@as(u32, 3), s.ref_count); // the device's own + one per Get call
+
+    // Description: a render-target surface, in the default pool, device-sized.
+    var desc: D3DSURFACE_DESC = undefined;
+    try std.testing.expectEqual(D3D_OK, s.vtbl.GetDesc(s, &desc));
+    try std.testing.expectEqual(@as(u32, 64), desc.Width);
+    try std.testing.expectEqual(@as(u32, 32), desc.Height);
+    try std.testing.expectEqual(D3DFMT_X8R8G8B8, desc.Format);
+    try std.testing.expectEqual(@as(u32, 1), desc.Type); // D3DRTYPE_SURFACE
+    try std.testing.expectEqual(D3DUSAGE_RENDERTARGET, desc.Usage);
+    try std.testing.expectEqual(@as(u32, 0), desc.Pool); // D3DPOOL_DEFAULT
+
+    // Same memory as the rasterizer's back buffer, in both directions.
+    var lr: D3DLOCKED_RECT = undefined;
+    try std.testing.expectEqual(D3D_OK, s.vtbl.LockRect(s, &lr, null, 0));
+    try std.testing.expectEqual(@as(i32, 64 * 4), lr.Pitch);
+    try std.testing.expect(@intFromPtr(lr.pBits) == @intFromPtr(dev.backbuffer.ptr));
+    const px: [*]u32 = @ptrCast(@alignCast(lr.pBits));
+    px[5] = 0xff112233;
+    try std.testing.expectEqual(@as(u32, 0xff112233), dev.backbuffer[5]);
+    dev.backbuffer[7] = 0xff445566;
+    try std.testing.expectEqual(@as(u32, 0xff445566), px[7]);
+
+    // Only one target / one buffer / mono / swap chain 0: everything else is refused.
+    var other: ?*anyopaque = null;
+    try std.testing.expectEqual(D3DERR_NOTFOUND, dev.vtbl.GetRenderTarget(dev, 1, &other));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetBackBuffer(dev, 0, 1, 0, &other));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetBackBuffer(dev, 1, 0, 0, &other));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetBackBuffer(dev, 0, 0, 1, &other));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetRenderTarget(dev, 0, null));
+    try std.testing.expect(other == null);
+
+    // Depth/stencil: present because the device was created with one, and not lockable.
+    var ds: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetDepthStencilSurface(dev, &ds));
+    const d: *WinsSurface9 = @ptrCast(@alignCast(ds.?));
+    try std.testing.expectEqual(D3D_OK, d.vtbl.GetDesc(d, &desc));
+    try std.testing.expectEqual(D3DUSAGE_DEPTHSTENCIL, desc.Usage);
+    try std.testing.expectEqual(@as(u32, 75), desc.Format);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, d.vtbl.LockRect(d, &lr, null, 0));
+}
+
+test "no depth/stencil surface when the device was created without one" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    var params: D3DPRESENT_PARAMETERS = undefined;
+    @memset(std.mem.asBytes(&params), 0);
+    params.BackBufferWidth = 16;
+    params.BackBufferHeight = 16;
+    params.Windowed = 1;
+    var dev_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CreateDevice(d3d, 0, 1, 0, 0, &params, &dev_raw));
+    const dev: *WinsD3DDevice9 = @ptrCast(@alignCast(dev_raw.?));
+    var ds: ?*anyopaque = null;
+    try std.testing.expectEqual(D3DERR_NOTFOUND, dev.vtbl.GetDepthStencilSurface(dev, &ds));
+    try std.testing.expect(ds == null);
 }
