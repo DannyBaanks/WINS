@@ -77,7 +77,8 @@ The triage engine inspects target binaries in two stages:
    * Neutralizes Windows-specific auto-updater feeds.
 4. **Runtime Provisioning:** Binds the application logic to a verified native Linux Electron runtime (matching the upstream version).
 5. **MCP Subsystem Wiring:** Automatically discovers and symlinks host development tools (`bun`, `uv`, `uvx`) into the application's internal resources path, enabling full Model Context Protocol (MCP) tool execution.
-6. **Desktop Integration:** Registers modern user-space launchers in `~/.local/bin` and desktop shortcuts with high-resolution icons in `~/.local/share/applications`.
+6. **Companion Binary Healing:** Audits the Windows-only companion executables shipped in `resources/bin` and restores the spawn seam they provide (native ELF re-binding, otherwise a hardened micro-Wine shim) — see §2.6.
+7. **Desktop Integration:** Registers modern user-space launchers in `~/.local/bin` and desktop shortcuts with high-resolution icons in `~/.local/share/applications`.
 
 ### 2.4 The Native Module Healer (`core/healers/native_modules.py`)
 Resolves native C++ binary addons (`.node`) using a dual-healing architecture:
@@ -95,7 +96,33 @@ Resolves native C++ binary addons (`.node`) using a dual-healing architecture:
 3. **Native Host Wiring:** Symlinks host Linux native shared objects (`libhostpolicy.so`, `libcoreclr.so`, `libSystem.Native.so`).
 4. **Avalonia X11 Activation:** Configures `AVALONIA_PLATFORM=x11` and globalization invariant mode for cross-platform GUI rendering.
 
-### 2.6 The Cleanroom Diagnostic Engine (`core/tester.py`)
+### 2.6 The Companion Binary Healer (`core/healers/companion_binaries.py`)
+Runtime-wrapped applications rarely ship a single binary: the Electron main
+process spawns **companion executables** shipped beside the payload
+(`resources/bin/*.exe` — device agents, sidecars, utility hosts, import
+panels). On Linux the main process spawns them **without the `.exe`
+extension**, so a naive transmutation silently breaks the connector (the app
+reports the device as disconnected and cannot serve its local file API).
+
+The healer restores that seam with two strategies, always native-first:
+1. **Native ELF re-binding:** a Linux build of the helper is resolved (local
+   cache `~/.cache/wins/companions/`, or a vendor Linux package declared in
+   `core/recipes/manifests/*.json` / `~/.config/wins/native-manifest.json`)
+   and installed under the extension-less host name, replacing the PE.
+2. **Micro-Wine shim:** when no native build exists (pure Win32 PE helpers),
+   a hardened launcher is generated that re-hosts the PE under an isolated
+   Wine prefix. The shim relays the local file API that the desktop passes on
+   fd 3 (`fd3 -> socat -> TCP loopback -> bridge under Wine -> named pipe`),
+   hands the operator a valid Windows `PARENT_PID` from the bridge handshake
+   (the desktop PID is a Linux PID and is invalid under Wine), converts the
+   host path variables to Windows form and keeps the bridge alive for the
+   lifetime of the helper.
+
+Because the shim is produced by the toolchain instead of being hand-written
+per application, it stays reproducible and repairable: `wins heal-bin <dir>`
+re-applies it to an existing installation at any time.
+
+### 2.7 The Cleanroom Diagnostic Engine (`core/tester.py`)
 Executes transmuted applications in an isolated subprocess with telemetry logging:
 * Real-time stream parsing for FFI failures, dlopen errors, missing modules, and unhandled rejections.
 * Analyzes execution health (`HEALTHY_RUNNING`, `CLEAN_EXIT`, `CRITICAL_ANOMALIES_DETECTED`).

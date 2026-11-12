@@ -18,6 +18,7 @@ from core.recipes.electron import ElectronRecipe
 from core.recipes.pyinstaller import PyInstallerRecipe
 from core.recipes.dotnet import DotNetRecipe
 from core.tester import CleanroomTester
+from core.healers.companion_binaries import CompanionBinaryHealer
 
 RECIPES = [
     ElectronRecipe(),
@@ -69,6 +70,9 @@ def cmd_transmute(args):
     options = {
         "bin_dir": args.bin_dir,
         "electron_version": args.electron_version,
+        "app_id": args.app_id,
+        "arch": args.arch,
+        "allow_wine_fallback": not args.no_wine_fallback,
     }
 
     print(f"[WINS] Selected Recipe: {matched_recipe.name} ({matched_recipe.description})")
@@ -100,6 +104,33 @@ def cmd_test(args):
         print(f"  -> {act}")
     print("")
 
+def cmd_heal_bin(args):
+    """Heals Windows-only companion executables of an (already transmuted) app."""
+    healer = CompanionBinaryHealer(arch=args.arch)
+    report = healer.heal(
+        args.target,
+        app_id=args.app_id,
+        allow_wine_fallback=not args.no_wine_fallback,
+        dry_run=args.dry_run,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    print(f"\n[WINS COMPANION HEAL] {report['target']}")
+    print(f"  Bin dir:      {report['bin_dir']}")
+    print(f"  PE helpers:   {report['scanned']}")
+    print(f"  Native ELF:   {len(report['healed_native'])}")
+    print(f"  Micro-Wine:   {len(report['wine_shimmed'])}")
+    print(f"  Already ELF:  {len(report['already_native'])}\n")
+    for item in report["healed_native"]:
+        print(f"  - [native] {item['name']} <- {item['source']}")
+    for item in report["wine_shimmed"]:
+        print(f"  - [shim]   {item['name']} -> {item['path']}")
+    for err in report["errors"]:
+        print(f"  - [error]  {err}")
+    print("")
+
 def cmd_list(args):
     print("\nAvailable WINS Transmutation Recipes:")
     for r in RECIPES:
@@ -122,6 +153,9 @@ def main():
     p_trans.add_argument("--dest", "--out", dest="dest", help="Destination directory (default: ~/.local/share/<app>-desktop)")
     p_trans.add_argument("--bin-dir", default="~/.local/bin", help="Launcher bin directory")
     p_trans.add_argument("--electron-version", default="35.1.4", help="Target Electron runtime version")
+    p_trans.add_argument("--app-id", default=None, help="Application id used to resolve native Linux companion builds")
+    p_trans.add_argument("--arch", default="x64", help="Target architecture for native builds (default: x64)")
+    p_trans.add_argument("--no-wine-fallback", action="store_true", help="Do not generate micro-Wine shims for PE companions")
     p_trans.set_defaults(func=cmd_transmute)
 
     # test
@@ -135,6 +169,19 @@ def main():
     # list
     p_list = subparsers.add_parser("list", help="List available transmutation recipes")
     p_list.set_defaults(func=cmd_list)
+
+    # heal-bin
+    p_heal = subparsers.add_parser(
+        "heal-bin",
+        help="Heal Windows-only companion executables of an installed app (native ELF first, micro-Wine shim otherwise)",
+    )
+    p_heal.add_argument("target", help="App install dir, resources dir or bin dir containing the companion .exe files")
+    p_heal.add_argument("--app-id", default=None, help="Application id used to resolve native Linux builds (manifest lookup)")
+    p_heal.add_argument("--arch", default="x64", help="Target architecture for native builds (default: x64)")
+    p_heal.add_argument("--no-wine-fallback", action="store_true", help="Fail instead of generating a micro-Wine shim")
+    p_heal.add_argument("--dry-run", action="store_true", help="Report what would be done without writing")
+    p_heal.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_heal.set_defaults(func=cmd_heal_bin)
 
     if len(sys.argv) == 1:
         print(BANNER)

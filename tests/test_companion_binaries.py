@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+WINS Test Suite - Companion Binary Healer Unit Tests
+"""
+
+import unittest
+import os
+import sys
+import json
+import tempfile
+import shutil
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+
+from core.healers.companion_binaries import CompanionBinaryHealer
+
+PE_HEADER = b"MZ\x90\x00\x03\x00\x00\x00"
+ELF_HEADER = b"\x7fELF\x02\x01\x01\x00"
+
+
+class TestCompanionBinaryHealer(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.mkdtemp(prefix="wins-test-companion-")
+        self.bin_dir = os.path.join(self.scratch, "resources", "bin")
+        os.makedirs(self.bin_dir, exist_ok=True)
+        self.healer = CompanionBinaryHealer(
+            cache_dir=os.path.join(self.scratch, "cache"),
+            manifest_paths=[],
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def _write_pe(self, name):
+        path = os.path.join(self.bin_dir, name)
+        with open(path, "wb") as f:
+            f.write(PE_HEADER + b"\x00" * 64)
+        return path
+
+    def _write_elf(self, path, executable=True):
+        with open(path, "wb") as f:
+            f.write(ELF_HEADER + b"\x00" * 64)
+        if executable:
+            os.chmod(path, 0o755)
+        return path
+
+    # ------------------------------------------------------------ detection
+    def test_host_name_strips_exe_suffix(self):
+        self.assertEqual(self.healer.host_name("/x/manus-computer-operator.exe"),
+                         "manus-computer-operator")
+
+    def test_finds_only_pe_companions(self):
+        self._write_pe("agent.exe")
+        self._write_pe("sidecar.exe")
+        with open(os.path.join(self.bin_dir, "notes.txt"), "w") as f:
+            f.write("not a binary")
+        found = self.healer.find_companion_exes(self.bin_dir)
+        self.assertEqual(len(found), 2)
+        self.assertTrue(all(f.endswith(".exe") for f in found))
+
+    def test_locate_bin_dir_from_install_root(self):
+        self._write_pe("agent.exe")
+        located = self.healer.locate_bin_dir(os.path.join(self.scratch, "resources"))
+        self.assertEqual(os.path.realpath(located), os.path.realpath(self.bin_dir))
+
+    # -------------------------------------------------------- native healing
+    def test_native_elf_from_cache_is_installed(self):
+        self._write_pe("agent.exe")
+        cache_dir = os.path.join(self.healer.cache_dir, "myapp")
+        os.makedirs(cache_dir, exist_ok=True)
+        self._write_elf(os.path.join(cache_dir, "agent.linux-x64"))
+
+        report = self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+
+        self.assertEqual(report["scanned"], 1)
+        self.assertEqual(len(report["healed_native"]), 1)
+        host = os.path.join(self.bin_dir, "agent")
+        self.assertTrue(os.path.isfile(host))
+        self.assertTrue(self.healer.is_elf(host))
+        self.assertTrue(os.access(host, os.X_OK))
+        # the original PE stays untouched
+        self.assertTrue(self.healer.is_pe(os.path.join(self.bin_dir, "agent.exe")))
+
+    def test_native_elf_from_manifest(self):
+        self._write_pe("agent.exe")
+        native_elf = os.path.join(self.scratch, "agent-linux")
+        self._write_elf(native_elf)
+
+        manifest = os.path.join(self.scratch, "manifest.json")
+        with open(manifest, "w") as f:
+            json.dump({
+                "apps": {
+                    "myapp": {
+                        "linux_package": {
+                            "url": "file://" + native_elf,
+                            "kind": "raw",
+                        },
+                        "binaries": {"agent": "agent"},
+                    }
+                }
+            }, f)
+
+        healer = CompanionBinaryHealer(
+            cache_dir=os.path.join(self.scratch, "cache"),
+            manifest_paths=[manifest],
+        )
+        report = healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+
+        self.assertEqual(len(report["healed_native"]), 1)
+        host = os.path.join(self.bin_dir, "agent")
+        self.assertTrue(healer.is_elf(host))
+        self.assertEqual(len(report["wine_shimmed"]), 0)
+
+    def test_already_native_helper_is_skipped(self):
+        self._write_pe("agent.exe")
+        self._write_elf(os.path.join(self.bin_dir, "agent"))
+
+        report = self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+
+        self.assertEqual(len(report["already_native"]), 1)
+        self.assertEqual(len(report["healed_native"]), 0)
+        self.assertEqual(len(report["wine_shimmed"]), 0)
+
+    # ----------------------------------------------------------- wine shim
+    def test_wine_shim_generated_when_no_native_build(self):
+        self._write_pe("agent.exe")
+
+        report = self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+
+        self.assertEqual(len(report["wine_shimmed"]), 1)
+        host = os.path.join(self.bin_dir, "agent")
+        self.assertTrue(os.path.isfile(host))
+        self.assertTrue(os.access(host, os.X_OK))
+        with open(host) as f:
+            content = f.read()
+        self.assertIn("WINS companion shim for agent", content)
+        self.assertIn("MANUS_OPERATOR_LOCAL_API_FD", content)
+        self.assertIn("PARENT_PID", content)
+        self.assertIn("exec wine", content)
+        # bridge helper is materialised next to the shim
+        self.assertTrue(os.path.isfile(os.path.join(self.bin_dir, ".wins-bridge-agent.js")))
+
+    def test_existing_launcher_is_backed_up_before_replacement(self):
+        self._write_pe("agent.exe")
+        host = os.path.join(self.bin_dir, "agent")
+        with open(host, "w") as f:
+            f.write("#!/bin/sh\n# hand written\n")
+
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+
+        self.assertTrue(os.path.isfile(host + ".wins-prev"))
+        with open(host + ".wins-prev") as f:
+            self.assertIn("hand written", f.read())
+
+    def test_wine_fallback_can_be_disabled(self):
+        self._write_pe("agent.exe")
+
+        report = self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp",
+                                  allow_wine_fallback=False)
+
+        self.assertEqual(len(report["wine_shimmed"]), 0)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.bin_dir, "agent")))
+
+    def test_shim_is_valid_bash(self):
+        self._write_pe("agent.exe")
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+        host = os.path.join(self.bin_dir, "agent")
+        res = os.system(f"bash -n '{host}'")
+        self.assertEqual(res, 0, "generated shim must be syntactically valid bash")
+
+
+if __name__ == "__main__":
+    unittest.main()
