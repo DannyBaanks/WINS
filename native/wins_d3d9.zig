@@ -2448,11 +2448,15 @@ fn dev9_CreateOffscreenPlainSurface(this: *anyopaque, p0: u32, p1: u32, p2: u32,
 }
 
 fn dev9_SetRenderTarget(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!SetRenderTarget is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (p0 != 0 or p1 == null) return D3DERR_INVALIDCALL;
+    const backbuffer = deviceRenderTarget(self) orelse return E_OUTOFMEMORY;
+    // The software rasterizer currently renders only into its implicit back
+    // buffer. Accept rebinding that actual surface; do not pretend arbitrary
+    // render targets work until drawing and ownership are implemented for them.
+    if (p1.? != @as(*anyopaque, @ptrCast(backbuffer))) return E_NOTIMPL;
+    self.viewport = .{ .X = 0, .Y = 0, .Width = backbuffer.width, .Height = backbuffer.height, .MinZ = 0, .MaxZ = 1 };
+    return D3D_OK;
 }
 
 fn dev9_GetRenderTarget(this: *anyopaque, index: u32, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
@@ -2466,9 +2470,10 @@ fn dev9_GetRenderTarget(this: *anyopaque, index: u32, ppSurface: ?*?*anyopaque) 
 }
 
 fn dev9_SetDepthStencilSurface(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!SetDepthStencilSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const depth = deviceDepthStencil(self) orelse return E_NOTIMPL;
+    if (p0 != null and p0.? == @as(*anyopaque, @ptrCast(depth))) return D3D_OK;
+    // Other surfaces and unbinding require tracking active depth storage.
     return E_NOTIMPL;
 }
 
@@ -3781,6 +3786,14 @@ test "render target / back buffer / depth surfaces wrap the device's own memory"
     try std.testing.expect(rt != null and rt == bb);
     const s: *WinsSurface9 = @ptrCast(@alignCast(rt.?));
     try std.testing.expectEqual(@as(u32, 3), s.ref_count); // the device's own + one per Get call
+    dev.viewport.Width = 10;
+    dev.viewport.Height = 10;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderTarget(dev, 0, bb));
+    try std.testing.expectEqual(@as(u32, 64), dev.viewport.Width);
+    try std.testing.expectEqual(@as(u32, 32), dev.viewport.Height);
+    try std.testing.expectEqual(@as(u32, 3), s.ref_count);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetRenderTarget(dev, 0, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetRenderTarget(dev, 1, bb));
 
     // Description: a render-target surface, in the default pool, device-sized.
     var desc: D3DSURFACE_DESC = undefined;
@@ -3816,6 +3829,8 @@ test "render target / back buffer / depth surfaces wrap the device's own memory"
     var ds: ?*anyopaque = null;
     try std.testing.expectEqual(D3D_OK, dev.vtbl.GetDepthStencilSurface(dev, &ds));
     const d: *WinsSurface9 = @ptrCast(@alignCast(ds.?));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetDepthStencilSurface(dev, ds));
+    try std.testing.expectEqual(E_NOTIMPL, dev.vtbl.SetDepthStencilSurface(dev, null));
     try std.testing.expectEqual(D3D_OK, d.vtbl.GetDesc(d, &desc));
     try std.testing.expectEqual(D3DUSAGE_DEPTHSTENCIL, desc.Usage);
     try std.testing.expectEqual(@as(u32, 75), desc.Format);
