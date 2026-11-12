@@ -514,6 +514,7 @@ fn rangeIsGuestOwned(lo: usize, hi: usize) bool {
         if (r.size != 0 and lo >= r.base and hi <= r.base + r.size) return true;
     }
     if (g_guest_base != 0 and lo >= g_guest_base and hi <= g_guest_end) return true;
+    if (g_image_reserve_base != 0 and lo >= g_image_reserve_base and hi <= g_image_reserve_end) return true;
     if (g_guest_stack_base != 0 and lo >= g_guest_stack_end and hi <= g_guest_stack_base) return true;
     return false;
 }
@@ -857,6 +858,8 @@ const STEAM_APPID: u32 = 22380;
 
 /// Written once from main, from the environment Steam provides.
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+/// glibc's environment vector, used to re-exec self with one extra variable.
+extern var environ: [*:null]?[*:0]u8;
 var g_steam_appid: u32 = 0;
 var g_target_path: [512]u8 = [_]u8{0} ** 512;
 var g_target_path_len: usize = 0;
@@ -5283,6 +5286,11 @@ var g_peb_buffer: [128]u32 align(16) = [_]u32{0} ** 128;
 var g_guest_base: usize = 0;
 var g_guest_end: usize = 0;
 var g_guest_stack_base: usize = 0;
+/// The PROT_NONE window reserved at startup so the loader's brk heap cannot
+/// grow into the guest image range (see main). Our own reservation, so
+/// rangeIsGuestOwned must not report it as foreign.
+var g_image_reserve_base: usize = 0;
+var g_image_reserve_end: usize = 0;
 var g_guest_stack_end: usize = 0;
 
 /// No-op hook placed immediately before the jump into guest code. It exists so a
@@ -5372,6 +5380,50 @@ fn setupTib() !void {
 // ============================================================================
 
 pub fn main(init: std.process.Init) !void {
+    // brk randomisation can place this process's own heap inside the guest
+    // image window (0x00400000..) before main even runs; the image's
+    // MAP_FIXED mapping would then destroy live heap chunks and the loader
+    // aborts much later inside malloc ("malloc(): invalid size (unsorted)").
+    // Re-exec once with ADDR_NO_RANDOMIZE (inherited across execve) so the
+    // heap starts right after the loader's bss, below the image window, and
+    // the reservation below can hold for the whole run. Allocations here use
+    // page_allocator (mmap-backed) so this block itself never touches brk.
+    if (getenv("WINS_FIXED_VA") == null) {
+        _ = linux.syscall1(.personality, @as(usize, 0x0040000)); // ADDR_NO_RANDOMIZE
+        const args = init.minimal.args.toSlice(std.heap.page_allocator) catch return;
+        var argv_list = std.ArrayList(?[*:0]const u8).empty;
+        defer argv_list.deinit(std.heap.page_allocator);
+        for (args) |a| argv_list.append(std.heap.page_allocator, @ptrCast(a)) catch return;
+        argv_list.append(std.heap.page_allocator, null) catch return;
+        var env_list = std.ArrayList(?[*:0]const u8).empty;
+        defer env_list.deinit(std.heap.page_allocator);
+        var n: usize = 0;
+        while (environ[n] != null) : (n += 1) {}
+        for (0..n) |i| env_list.append(std.heap.page_allocator, environ[i]) catch return;
+        env_list.append(std.heap.page_allocator, "WINS_FIXED_VA=1") catch return;
+        env_list.append(std.heap.page_allocator, null) catch return;
+        _ = linux.execve("/proc/self/exe", @ptrCast(argv_list.items.ptr), @ptrCast(env_list.items.ptr));
+        return; // execve returns only on failure
+    }
+
+    // Reserve the guest-image window BEFORE the loader's own heap can grow
+    // into it. brk() cannot extend into an already-mapped range, so glibc
+    // falls back to mmap for later allocations and the loader's heap stays
+    // intact. The real image mapping below replaces the lower part of this
+    // reservation with MAP_FIXED, so the guest still lands at its ImageBase.
+    {
+        const reserve_base: usize = 0x00400000;
+        const reserve_size: usize = 64 * 1024 * 1024;
+        const rflags = linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };
+        const reserved = linux.mmap(@ptrFromInt(reserve_base), reserve_size, linux.PROT{}, rflags, -1, 0);
+        if (linux.errno(reserved) != .SUCCESS) {
+            std.debug.print("  [Memory] image-window reservation at 0x{x:0>8} failed: {} (continuing unprotected)\n", .{ reserve_base, linux.errno(reserved) });
+        } else {
+            g_image_reserve_base = reserve_base;
+            g_image_reserve_end = reserve_base + reserve_size;
+        }
+    }
+
     // The real Steam client is loaded LATER, once the guest's image window is
     // reserved (see the image mapping below). The order matters and was
     // measured, not guessed:
