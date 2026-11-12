@@ -549,7 +549,6 @@ fn protectForeignMemory() void {
 }
 
 fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(W) ?*anyopaque {
-    _ = flAllocationType;
     if (dwSize == 0) {
         g_last_error = 87; // ERROR_INVALID_PARAMETER
         return null;
@@ -559,6 +558,34 @@ fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, fl
         .WRITE = (flProtect & 0x44) != 0,
         .EXEC = (flProtect & 0xF0) != 0,
     };
+    // Committing an already reserved range must preserve its contents. Mapping
+    // anonymous memory with MAP_FIXED here silently replaced previously
+    // committed pages with zeroes. Only protect pages within a reservation we
+    // own; never remap another component's memory.
+    if (lpAddress != null and (flAllocationType & 0x3000) == 0x1000) {
+        const address = @intFromPtr(lpAddress.?);
+        const end = std.math.add(usize, address, dwSize) catch {
+            g_last_error = 487;
+            return null;
+        };
+        if (end > std.math.maxInt(usize) - 4095) {
+            g_last_error = 487;
+            return null;
+        }
+        const start_page = address & ~@as(usize, 4095);
+        const end_page = std.mem.alignForward(usize, end, 4096);
+        for (g_reservations) |r| {
+            if (r.size != 0 and start_page >= r.base and end_page <= r.base + std.mem.alignForward(usize, r.size, 4096)) {
+                if (linux.errno(linux.mprotect(@ptrFromInt(start_page), end_page - start_page, prot)) != .SUCCESS) {
+                    g_last_error = 487;
+                    return null;
+                }
+                return @ptrFromInt(start_page);
+            }
+        }
+        g_last_error = 487; // ERROR_INVALID_ADDRESS: no matching reservation
+        return null;
+    }
     // A caller-supplied address must not silently unmap whatever the kernel
     // already put there. An earlier version raised MAP_FIXED whenever lpAddress
     // was non-null -- a destroy-what-is-there primitive -- and the real client
@@ -6010,6 +6037,19 @@ pub fn main(init: std.process.Init) !void {
 // ============================================================================
 // Unit Tests (Embedded Verification)
 // ============================================================================
+
+test "VirtualAlloc recommit preserves existing contents and refuses an unreserved range" {
+    const page = VirtualAlloc(null, 8192, 0x3000, 0x04) orelse return error.AllocationFailed;
+    defer _ = VirtualFree(page, 0, 0x8000);
+    const bytes: [*]u8 = @ptrCast(page);
+    bytes[0] = 0x41;
+    bytes[4096] = 0x42;
+    const second: *anyopaque = @ptrCast(bytes + 4096);
+    try std.testing.expectEqual(second, VirtualAlloc(second, 4096, 0x1000, 0x04).?);
+    try std.testing.expectEqual(@as(u8, 0x41), bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x42), bytes[4096]);
+    try std.testing.expect(VirtualAlloc(@ptrFromInt(0x10000), 4096, 0x1000, 0x04) == null);
+}
 
 test "thread-naming exception (0x406d1388) is continuable, others are not" {
     try std.testing.expect(kernel32_mod.isThreadNamingException(0x406d1388));
