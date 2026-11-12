@@ -52,8 +52,13 @@ const srv = net.createServer((c) => {
     const p = net.connect(pipe);
     p.once('connect', () => {
       c.pipe(p); p.pipe(c);
-      p.on('close', () => { c.destroy(); process.exit(0); });
-      c.on('close', () => { p.destroy(); process.exit(0); });
+      // 'end' fires when the operator closes the pipe; exit promptly instead
+      // of lingering until the idle timeout.
+      const done = () => { try { p.destroy(); c.destroy(); } catch (e) {} process.exit(0); };
+      p.on('close', done);
+      p.on('end', done);
+      c.on('close', done);
+      c.on('end', done);
     });
     p.once('error', (e) => {
       if (Date.now() > deadline) { console.error('bridge: ' + e.message); process.exit(1); }
@@ -84,6 +89,15 @@ unset PARENT_PID
 unset MANUS_MCP_STDIO_PARENT_PID
 
 export NODE_OPTIONS="--experimental-sqlite --no-warnings"
+
+# The operator aborts at startup with "unsupported native runtime mode" for any
+# MANUS_OPERATOR_NATIVE_RUNTIME value other than the empty string or "off".
+# The desktop forwards that variable from the host environment, so a stray
+# export in the user's shell would kill the connector (device reported as
+# disconnected). Sanitize it here.
+if [ -n "${MANUS_OPERATOR_NATIVE_RUNTIME-}" ] && [ "${MANUS_OPERATOR_NATIVE_RUNTIME}" != "off" ]; then
+    unset MANUS_OPERATOR_NATIVE_RUNTIME
+fi
 
 # The Windows build of the operator validates MANUS_OPERATOR_MANUS_JS_RUNTIME
 # with a drive-letter absolute path; a Linux path (process.execPath) is
@@ -429,7 +443,14 @@ class CompanionBinaryHealer:
             f.write(shim)
         os.chmod(host_path, 0o755)
         bridge_path = os.path.join(os.path.dirname(host_path), f".wins-bridge-{name}.js")
-        if not os.path.isfile(bridge_path):
+        bridge_current = ""
+        if os.path.isfile(bridge_path):
+            try:
+                with open(bridge_path, "r", encoding="utf-8") as f:
+                    bridge_current = f.read()
+            except Exception:
+                bridge_current = ""
+        if bridge_current != BRIDGE_JS:
             with open(bridge_path, "w", encoding="utf-8") as f:
                 f.write(BRIDGE_JS)
         return host_path

@@ -170,6 +170,48 @@ class TestCompanionBinaryHealer(unittest.TestCase):
         res = os.system(f"bash -n '{host}'")
         self.assertEqual(res, 0, "generated shim must be syntactically valid bash")
 
+    def test_shim_sanitizes_unsupported_native_runtime_mode(self):
+        self._write_pe("agent.exe")
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+        host = os.path.join(self.bin_dir, "agent")
+        with open(host) as f:
+            content = f.read()
+        self.assertIn("MANUS_OPERATOR_NATIVE_RUNTIME", content)
+        self.assertIn('!= "off"', content)
+
+    def test_shim_survives_unset_path_variables(self):
+        """`set -u` plus indirect expansion must not abort on unset variables."""
+        self._write_pe("agent.exe")
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+        host = os.path.join(self.bin_dir, "agent")
+        # The shim would exec wine; stub wine and winepath out and assert it
+        # gets past the path-conversion stage instead of dying on an unset
+        # variable.
+        stub_dir = os.path.join(self.scratch, "stub")
+        os.makedirs(stub_dir, exist_ok=True)
+        for tool in ("wine", "winepath"):
+            stub = os.path.join(stub_dir, tool)
+            with open(stub, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(stub, 0o755)
+        res = os.system(
+            f"env -i PATH={stub_dir}:/usr/bin:/bin HOME={self.scratch} bash '{host}' start 2>&1 "
+            f"| grep -q 'variable sin asignar'"
+        )
+        self.assertNotEqual(res, 0, "shim must not fail on unset variables")
+
+    def test_bridge_helper_is_refreshed_when_content_changes(self):
+        self._write_pe("agent.exe")
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+        bridge = os.path.join(self.bin_dir, ".wins-bridge-agent.js")
+        with open(bridge, "w") as f:
+            f.write("// stale\n")
+        self.healer.heal(os.path.join(self.scratch, "resources"), app_id="myapp")
+        with open(bridge) as f:
+            content = f.read()
+        self.assertIn("MANUS_BRIDGE_PIPE", content)
+        self.assertNotEqual(content, "// stale\n")
+
 
 if __name__ == "__main__":
     unittest.main()
