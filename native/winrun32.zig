@@ -4425,6 +4425,22 @@ fn recordClientExe(pid: u32) void {
 }
 
 fn steamClientLocate() struct { pid: u32 } {
+    // Explicit override for sandboxed runs: inside a namespace where
+    // /proc/<pid>/exe is not readable, the caller names the client's PID and
+    // executable instead of the loader scanning /proc and guessing.
+    if (getenv("WINS_STEAM_PID")) |p| {
+        const pid = std.fmt.parseInt(u32, std.mem.sliceTo(p, 0), 10) catch 0;
+        if (pid != 0) {
+            if (getenv("WINS_STEAM_EXE")) |exe| {
+                const s = std.mem.sliceTo(exe, 0);
+                const n = @min(s.len, g_steam_exe_buf.len - 1);
+                @memcpy(g_steam_exe_buf[0..n], s[0..n]);
+                g_steam_exe_buf[n] = 0;
+                g_steam_exe_done = true;
+            } else if (!g_steam_exe_done) recordClientExe(pid);
+            return .{ .pid = pid };
+        }
+    }
     var dir_buf: [16 * 1024]u8 align(@alignOf(linux.dirent64)) = undefined;
     const fd = linux.open("/proc", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return .{ .pid = 0 };
