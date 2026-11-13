@@ -17,6 +17,7 @@ const msvcrt_mod = @import("winrun_msvcrt.zig");
 const vorbis_mod = @import("winrun_vorbis.zig");
 const extra_dlls_mod = @import("winrun_extra_dlls.zig");
 const dsound_mod = @import("wins_dsound.zig");
+const dshow_mod = @import("wins_dshow.zig");
 // winrun_gui_support and x11_window are NOT imported: they need static libX11,
 // which is unavailable for the i386 target this loader builds for.
 const ordinals_mod = @import("winrun_ordinals.zig");
@@ -4831,14 +4832,19 @@ fn printGuid(tag: []const u8, g: ?*const anyopaque) void {
     std.debug.print("{s}={{{x:0>8}-{x:0>4}-{x:0>4}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}}}", .{ tag, d1, d2, d3, p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15] });
 }
 
-/// No COM class is registered in this loader, so the honest answer is
-/// REGDB_E_CLASSNOTREG with *ppv = NULL. It used to answer S_OK with a NULL
-/// interface: FalloutNV asks for DirectShow (Proton oracle: quartz.dll loads
-/// right after Data\Music\Special\MainTitle.mp3 is opened), believed it got
-/// a filter graph and faulted reading NULL (EIP 0x83101e, EAX 0).
+/// The one COM class this loader implements is DirectShow's filter graph
+/// (wins_dshow.zig): FalloutNV plays its music through it and faulted
+/// reading NULL (EIP 0x83101e) when the answer was S_OK with a NULL
+/// interface. Every other class answers REGDB_E_CLASSNOTREG with *ppv = NULL.
 const REGDB_E_CLASSNOTREG: i32 = @bitCast(@as(u32, 0x80040154));
 fn CoCreateInstance(rclsid: ?*anyopaque, pUnkOuter: ?*anyopaque, dwClsContext: u32, riid: ?*anyopaque, ppv: ?*?*anyopaque) callconv(W) i32 {
-    _ = pUnkOuter;
+    if (dshow_mod.isFilterGraph(rclsid)) {
+        const hr = dshow_mod.createFilterGraph(pUnkOuter, riid, ppv);
+        std.debug.print("[WINS:Ole32] CoCreateInstance(CLSID_FilterGraph", .{});
+        printGuid(" iid", riid);
+        std.debug.print(") -> 0x{x}\n", .{@as(u32, @bitCast(hr))});
+        return hr;
+    }
     if (ppv) |p| p.* = null;
     std.debug.print("[WINS:Ole32] CoCreateInstance(", .{});
     printGuid("clsid", rclsid);
@@ -6811,9 +6817,9 @@ test "lstrcatA appends; -1 lengths count the whole string plus its NUL" {
     try std.testing.expectEqual(@as(i32, 0), LCMapStringA(0, 0, "x", -1, &d, 32));
 }
 
-test "CoCreateInstance: no class is registered, so it fails and never hands out NULL as success" {
-    // CLSID_FilterGraph {e436ebb3-524f-11ce-9f53-0020af0ba770}, the class FalloutNV asks for.
-    const clsid = [16]u8{ 0xb3, 0xeb, 0x36, 0xe4, 0x4f, 0x52, 0xce, 0x11, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70 };
+test "CoCreateInstance: unregistered classes fail and never hand out NULL as success" {
+    // CLSID_MemoryAllocator {1e651cc0-b199-11d0-8212-00c04fc32c45}: not implemented here.
+    const clsid = [16]u8{ 0xc0, 0x1c, 0x65, 0x1e, 0x99, 0xb1, 0xd0, 0x11, 0x82, 0x12, 0x00, 0xc0, 0x4f, 0xc3, 0x2c, 0x45 };
     var out: ?*anyopaque = @ptrFromInt(0x1234);
     const hr = CoCreateInstance(@constCast(@ptrCast(&clsid)), null, 1, @constCast(@ptrCast(&clsid)), &out);
     try std.testing.expect(hr < 0);
