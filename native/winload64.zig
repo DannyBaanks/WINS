@@ -22,7 +22,7 @@
 //! exception still ends the process.
 //!
 //!   usage: winload64 --pin ROOT.dll=HEX [--pin DEP.dll=HEX ...] [--dll-dir DIR] [--check]
-//!                    ROOT.dll [--call [DLL!]EXPORT [--arg N ...] [--ret u32|i32|u64|str]] ...
+//!                    ROOT.dll [--call [DLL!]EXPORT [--arg N | --arg-str S ...] [--ret u32|i32|u64|str|outstr]] ...
 //!   exit codes: 2 usage, 3 refused, 4 unresolved imports, 5 malformed image,
 //!               6 mapping failed, 7 DllMain/TLS init failed,
 //!               8 a trapped (unimplemented) import was called (--trap-unresolved),
@@ -978,6 +978,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             const v = std.fmt.parseInt(i64, args[i], 0) catch die(.usage, "bad --arg {s}", .{args[i]});
             try calls.items[calls.items.len - 1].args.append(a, @bitCast(v));
+        } else if (std.mem.eql(u8, arg, "--arg-str") and more and calls.items.len > 0) {
+            // Two args: pointer to a NUL-terminated copy of the string, then its length.
+            i += 1;
+            const z = try a.dupeZ(u8, args[i]);
+            try calls.items[calls.items.len - 1].args.append(a, @intFromPtr(z.ptr));
+            try calls.items[calls.items.len - 1].args.append(a, z.len);
         } else if (std.mem.eql(u8, arg, "--ret") and more and calls.items.len > 0) {
             i += 1;
             calls.items[calls.items.len - 1].ret = std.meta.stringToEnum(@TypeOf(calls.items[0].ret), args[i]) orelse die(.usage, "bad --ret {s}", .{args[i]});
