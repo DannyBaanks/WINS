@@ -33,7 +33,7 @@ pub const D3D_OK: HRESULT = S_OK;
 
 pub const D3DFMT_A8R8G8B8: u32 = 21;
 pub const D3DFMT_X8R8G8B8: u32 = 22;
-pub const D3DFMT_A8B8G8R8: u32 = 23;
+pub const D3DFMT_A8B8G8R8: u32 = 32;
 pub const D3DFMT_D24S8: u32 = 75;
 pub const D3DFMT_D16: u32 = 80;
 pub const D3DFMT_INDEX16: u32 = 101;
@@ -1610,6 +1610,7 @@ fn d3d9_Release(this: *anyopaque) callconv(W) u32 {
 }
 fn d3d9_GetAdapterCount(this: *anyopaque) callconv(W) u32 {
     _ = this;
+    std.debug.print("[WINS:D3D9] GetAdapterCount() -> 1\n", .{});
     return 1;
 }
 
@@ -1636,7 +1637,7 @@ fn fillAscii(dest: []u8, text: []const u8) void {
 /// was 0xc03302eb and the next instruction dereferenced it.
 fn d3d9_GetAdapterIdentifier(this: *anyopaque, adapter: u32, flags: u32, pIdentifier: ?*anyopaque) callconv(W) HRESULT {
     _ = this;
-    _ = flags;
+    std.debug.print("[WINS:D3D9] GetAdapterIdentifier(adapter={d}, flags=0x{x})\n", .{ adapter, flags });
     if (adapter != 0) return D3DERR_INVALIDARG;
     // align(1): the caller's buffer is the guest's, and a trap on an
     // unexpected alignment would turn a readable structure into a crash.
@@ -1644,11 +1645,15 @@ fn d3d9_GetAdapterIdentifier(this: *anyopaque, adapter: u32, flags: u32, pIdenti
     const id = out orelse return E_POINTER;
     var value: D3DADAPTER_IDENTIFIER9 = std.mem.zeroes(D3DADAPTER_IDENTIFIER9);
     fillAscii(value.Driver[0..], "WINS Direct3D 9 Software Adapter");
-    fillAscii(value.Description[0..], "WINS Direct3D 9 software rasterizer");
+    // Fallout NV stores D3DADAPTER_IDENTIFIER9.Description as sD3DDevice in
+    // FalloutPrefs.ini and launches its separate launcher when the current
+    // description differs. Keep the host adapter identity here even though
+    // WINS rasterizes in software, so an existing profile remains selectable.
+    fillAscii(value.Description[0..], "AMD Radeon 760M Graphics (RADV PHOENIX)");
     fillAscii(value.DeviceName[0..], "\\.\\DISPLAY1");
     value.DriverVersion = 0x0000000100000000;
-    value.VendorId = 0x8086;
-    value.DeviceId = 0x1237;
+    value.VendorId = 0x1002;
+    value.DeviceId = 0x1900;
     value.SubSysId = 0;
     value.Revision = 0;
     value.WHQLLevel = 0;
@@ -1659,9 +1664,16 @@ fn d3d9_GetAdapterIdentifier(this: *anyopaque, adapter: u32, flags: u32, pIdenti
 /// IDirect3D9::GetAdapterModeCount.
 fn d3d9_GetAdapterModeCount(this: *anyopaque, adapter: u32, format: u32) callconv(W) u32 {
     _ = this;
-    if (adapter != 0) return 0;
+    if (adapter != 0) {
+        std.debug.print("[WINS:D3D9] GetAdapterModeCount(adapter={d}, format={d}) -> 0\n", .{ adapter, format });
+        return 0;
+    }
     // D3DFORMAT_UNKNOWN asks for every mode the adapter has.
-    if (format == 0 or isRenderTargetFormat(format)) return 1;
+    if (format == 0 or isRenderTargetFormat(format)) {
+        std.debug.print("[WINS:D3D9] GetAdapterModeCount(adapter={d}, format={d}) -> 1\n", .{ adapter, format });
+        return 1;
+    }
+    std.debug.print("[WINS:D3D9] GetAdapterModeCount(adapter={d}, format={d}) -> 0\n", .{ adapter, format });
     return 0;
 }
 
@@ -1669,18 +1681,22 @@ fn d3d9_GetAdapterModeCount(this: *anyopaque, adapter: u32, format: u32) callcon
 /// structure by offset, so it has to be written.
 fn d3d9_EnumAdapterModes(this: *anyopaque, adapter: u32, format: u32, mode: u32, pMode: ?*anyopaque) callconv(W) HRESULT {
     _ = this;
+    std.debug.print("[WINS:D3D9] EnumAdapterModes(adapter={d}, format={d}, mode={d})\n", .{ adapter, format, mode });
     if (adapter != 0) return D3DERR_INVALIDARG;
     if (mode != 0) return D3DERR_INVALIDARG;
     if (format != 0 and !isRenderTargetFormat(format)) return D3DERR_INVALIDARG;
     const out: ?*align(1) D3DDISPLAYMODE = if (pMode) |p| @ptrCast(p) else null;
     const m = out orelse return E_POINTER;
-    m.* = kDisplayMode;
+    var value = kDisplayMode;
+    value.Format = if (format == 0) kDisplayMode.Format else format;
+    m.* = value;
     return D3D_OK;
 }
 
 /// IDirect3D9::GetAdapterDisplayMode.
 fn d3d9_GetAdapterDisplayMode(this: *anyopaque, adapter: u32, pMode: ?*anyopaque) callconv(W) HRESULT {
     _ = this;
+    std.debug.print("[WINS:D3D9] GetAdapterDisplayMode(adapter={d})\n", .{adapter});
     if (adapter != 0) return D3DERR_INVALIDARG;
     const out: ?*align(1) D3DDISPLAYMODE = if (pMode) |p| @ptrCast(p) else null;
     const m = out orelse return E_POINTER;
@@ -1689,7 +1705,7 @@ fn d3d9_GetAdapterDisplayMode(this: *anyopaque, adapter: u32, pMode: ?*anyopaque
 }
 fn d3d9_GetDeviceCaps(this: *anyopaque, adapter: u32, dev_type: u32, pCaps: ?*D3DCAPS9) callconv(W) HRESULT {
     _ = this;
-    _ = adapter;
+    std.debug.print("[WINS:D3D9] GetDeviceCaps(adapter={d}, type={d}, out={})\n", .{ adapter, dev_type, pCaps != null });
     if (pCaps) |caps| {
         @memset(std.mem.asBytes(caps), 0);
         caps.DeviceType = dev_type;
@@ -1729,11 +1745,20 @@ fn d3d9_CreateDevice(
     ppDevice: ?*?*anyopaque,
 ) callconv(W) HRESULT {
     _ = this;
-    _ = hFocusWindow;
     _ = behavior_flags;
     if (ppDevice == null or pParams == null) return E_FAIL;
+    const params = pParams.?.*;
+    std.debug.print("[WINS:D3D9] CreateDevice(adapter={d}, type={d}, hwnd=0x{x}, size={d}x{d}, format={d}, windowed={d})\n", .{
+        adapter,
+        dev_type,
+        hFocusWindow,
+        params.BackBufferWidth,
+        params.BackBufferHeight,
+        params.BackBufferFormat,
+        params.Windowed,
+    });
     const gpa = std.heap.page_allocator;
-    const dev = WinsD3DDevice9.init(gpa, adapter, dev_type, pParams.?.*) catch return E_OUTOFMEMORY;
+    const dev = WinsD3DDevice9.init(gpa, adapter, dev_type, params) catch return E_OUTOFMEMORY;
     ppDevice.?.* = @ptrCast(dev);
     return D3D_OK;
 }
@@ -1764,6 +1789,7 @@ fn d3d9_CheckDeviceType(
     windowed: i32,
 ) callconv(W) HRESULT {
     _ = this;
+    std.debug.print("[WINS:D3D9] CheckDeviceType(adapter={d}, type={d}, display={d}, back={d}, windowed={d})\n", .{ adapter, dev_type, display_format, back_buffer_format, windowed });
     if (adapter != 0) return D3DERR_INVALIDARG;
     if (dev_type != D3DDEVTYPE_HAL and dev_type != D3DDEVTYPE_REF) return D3DERR_INVALIDARG;
     if (windowed != 0 and windowed != 1) return D3DERR_INVALIDARG;
@@ -3458,7 +3484,7 @@ const g_device9_vtbl: IDirect3DDevice9Vtbl = .{
 var g_global_d3d9: WinsD3D9 = WinsD3D9.init();
 
 pub export fn Direct3DCreate9(sdk_version: u32) callconv(W) ?*anyopaque {
-    _ = sdk_version;
+    std.debug.print("[WINS:D3D9] Direct3DCreate9(sdk_version={d})\n", .{sdk_version});
     return @ptrCast(&g_global_d3d9);
 }
 
@@ -4100,11 +4126,12 @@ test "adapter caps advertise hardware transform and lighting (software T&L)" {
     try std.testing.expect(caps.DevCaps & D3DDEVCAPS_HWTRANSFORMLIGHT != 0);
 }
 
-test "format 23 (A8B8G8R8) is accepted wherever 22 (X8R8G8B8) is" {
+test "format 32 (A8B8G8R8) is accepted wherever 22 (X8R8G8B8) is" {
     const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, D3DFMT_A8B8G8R8));
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceType(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DFMT_A8B8G8R8, 1));
     try std.testing.expectEqual(@as(u32, 1), d3d.vtbl.GetAdapterModeCount(d3d, 0, D3DFMT_A8B8G8R8));
+    try std.testing.expectEqual(@as(u32, 0), d3d.vtbl.GetAdapterModeCount(d3d, 0, 23));
 }
 
 test "texture stage / sampler state: D3D9 defaults, round trip, range checks, caps match storage" {

@@ -3730,6 +3730,7 @@ fn ensureSubVt() void {
             g_sub_vt[k][i] = @intFromPtr(stubFor(i));
         }
     }
+    g_sub_vt[SubUser][1] = @intFromPtr(&sub_BLoggedOn);
     g_sub_vt[SubUser][2] = @intFromPtr(&sub_GetSteamID);
     g_sub_vt[SubUtils][9] = @intFromPtr(&sub_GetAppID);
     g_sub_vt[SubAppTicket][0] = @intFromPtr(&sub_GetAppOwnershipTicketData);
@@ -3781,6 +3782,17 @@ const SubGeneric: usize = 3;
 var g_guest_pipe: u32 = 0;
 var g_guest_user: u32 = 0;
 var g_guest_appid: u32 = 0;
+
+/// ISteamUser slot 1: BLoggedOn(). Steam's result must come from the active
+/// client so Fallout follows the same login decision as the native interface.
+/// Adapt the guest's x86 thiscall to the real client's aligned Linux cdecl.
+fn sub_BLoggedOn(self: usize) callconv(Tc) u32 {
+    const slot = realSlot(self, 1);
+    if (slot == 0) return 0;
+    const logged_on: u32 = @truncate(callAligned1(slot, realOf(self)));
+    std.debug.print("[WINS:Steam] ISteamUser016::BLoggedOn() -> {d} (from the real client)\n", .{logged_on});
+    return logged_on;
+}
 
 /// One ticket fetch in the real client's own shape.
 ///
@@ -4074,7 +4086,12 @@ fn SteamFriends() callconv(W) usize {
 }
 
 fn SteamUserStats() callconv(W) usize {
-    if (g_flat.stats == 0) g_flat.stats = steamFlatIface(&[_][*:0]const u8{ "SteamUserStats012", "SteamUserStats011", "SteamUserStats010" }, SubGeneric);
+    if (g_flat.stats == 0) g_flat.stats = steamFlatIface(&[_][*:0]const u8{
+        "STEAMUSERSTATS_INTERFACE_VERSION007",
+        "SteamUserStats012",
+        "SteamUserStats011",
+        "SteamUserStats010",
+    }, SubGeneric);
     return g_flat.stats;
 }
 
@@ -4418,7 +4435,12 @@ fn SHGetFolderPathA(hwnd: usize, csidl: i32, hToken: usize, dwFlags: u32, pszPat
 const SE_ERR_FNF: usize = 2; // nothing was executed
 
 fn ShellExecuteA(hwnd: usize, lpOperation: ?[*:0]const u8, lpFile: ?[*:0]const u8, lpParameters: ?[*:0]const u8, lpDirectory: ?[*:0]const u8, nShowCmd: i32) callconv(W) usize {
-    _ = hwnd; _ = lpOperation; _ = lpFile; _ = lpParameters; _ = lpDirectory; _ = nShowCmd;
+    _ = hwnd;
+    const operation = if (lpOperation) |p| std.mem.sliceTo(p, 0) else "";
+    const file = if (lpFile) |p| std.mem.sliceTo(p, 0) else "";
+    const parameters = if (lpParameters) |p| std.mem.sliceTo(p, 0) else "";
+    const directory = if (lpDirectory) |p| std.mem.sliceTo(p, 0) else "";
+    std.debug.print("[WINS:ShellExecuteA] operation=\"{s}\" file=\"{s}\" params=\"{s}\" dir=\"{s}\" show={d}\n", .{ operation, file, parameters, directory, nShowCmd });
     return SE_ERR_FNF;
 }
 
@@ -4612,8 +4634,9 @@ fn targetDirWithTerminator(buf: []u8) []const u8 {
 /// call it -- localised with the startup probe, which runs the identical
 /// dlopen and CreateInterface before any guest code and succeeds.
 fn RegQueryValueExA(hKey: usize, lpValueName: ?[*:0]const u8, lpReserved: ?*u32, lpType: ?*u32, lpData: ?[*]u8, lpcbData: ?*u32) callconv(W) i32 {
-    _ = hKey; _ = lpReserved;
+    _ = lpReserved;
     const name = if (lpValueName) |vn| std.mem.sliceTo(vn, 0) else "";
+    std.debug.print("[WINS:Advapi32] RegQueryValueExA(0x{x}, \"{s}\")\n", .{ hKey, name });
     const ERROR_SUCCESS: i32 = 0;
     const ERROR_MORE_DATA: i32 = 234;
     const REG_NONE: u32 = 0;
@@ -4649,7 +4672,7 @@ fn RegQueryValueExA(hKey: usize, lpValueName: ?[*:0]const u8, lpReserved: ?*u32,
         reg_type = REG_DWORD;
         word = 1;
         bytes = std.mem.asBytes(&word);
-    } else if (std.ascii.eqlIgnoreCase(name, "Installed Path")) {
+    } else if (std.ascii.eqlIgnoreCase(name, "Installed Path") or std.ascii.eqlIgnoreCase(name, "sBasePath")) {
         // The directory the guest is actually running from.
         //
         // The stub answered "./", which is a fabricated directory rather than
@@ -4665,6 +4688,7 @@ fn RegQueryValueExA(hKey: usize, lpValueName: ?[*:0]const u8, lpReserved: ?*u32,
         reg_type = REG_SZ;
         bytes = dir;
     } else {
+        std.debug.print("[WINS:Advapi32] RegQueryValueExA(\"{s}\") -> ERROR_FILE_NOT_FOUND\n", .{name});
         if (lpcbData) |cb| cb.* = 0;
         return 2; // ERROR_FILE_NOT_FOUND
     }
