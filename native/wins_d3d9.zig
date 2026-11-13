@@ -9,6 +9,12 @@ const linux = std.os.linux;
 
 pub const W: std.builtin.CallingConvention = .winapi;
 
+// The Fallout guest reaches this D3D9 object through both the Win32 COM stack
+// ABI and an x86 C++ thiscall path. The latter puts `this` in ECX and leaves
+// only explicit parameters on the stack. These adapters are selected at the
+// affected vtable entries and compare ECX/stack `this` against the live object.
+pub export var wins_d3d9_device_self: u32 = 0;
+
 // ============================================================================
 // D3D9 Types & Enums
 // ============================================================================
@@ -70,6 +76,77 @@ pub const D3DVIEWPORT9 = extern struct {
     MinZ: f32,
     MaxZ: f32,
 };
+
+pub const D3DCOLORVALUE = extern struct {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+};
+
+pub const D3DMATERIAL9 = extern struct {
+    Diffuse: D3DCOLORVALUE,
+    Ambient: D3DCOLORVALUE,
+    Specular: D3DCOLORVALUE,
+    Emissive: D3DCOLORVALUE,
+    Power: f32,
+};
+
+pub const D3DLIGHT9 = extern struct {
+    Type: u32,
+    Diffuse: D3DCOLORVALUE,
+    Specular: D3DCOLORVALUE,
+    Ambient: D3DCOLORVALUE,
+    Position: D3DVECTOR,
+    Direction: D3DVECTOR,
+    Range: f32,
+    Falloff: f32,
+    Attenuation0: f32,
+    Attenuation1: f32,
+    Attenuation2: f32,
+    Theta: f32,
+    Phi: f32,
+};
+
+pub const D3DLIGHT_POINT: u32 = 1;
+pub const D3DLIGHT_SPOT: u32 = 2;
+pub const D3DLIGHT_DIRECTIONAL: u32 = 3;
+pub const kMaxDeviceLights: usize = 8;
+
+const D3DLightState9 = struct {
+    light: D3DLIGHT9,
+    enabled: bool,
+};
+
+fn defaultMaterial9() D3DMATERIAL9 {
+    const white = D3DCOLORVALUE{ .r = 1, .g = 1, .b = 1, .a = 1 };
+    const black = D3DCOLORVALUE{ .r = 0, .g = 0, .b = 0, .a = 0 };
+    return .{
+        .Diffuse = white,
+        .Ambient = white,
+        .Specular = black,
+        .Emissive = black,
+        .Power = 0,
+    };
+}
+
+fn defaultLight9() D3DLIGHT9 {
+    return .{
+        .Type = D3DLIGHT_DIRECTIONAL,
+        .Diffuse = .{ .r = 1, .g = 1, .b = 1, .a = 0 },
+        .Specular = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+        .Ambient = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+        .Position = .{ .x = 0, .y = 0, .z = 0 },
+        .Direction = .{ .x = 0, .y = 0, .z = 1 },
+        .Range = 0,
+        .Falloff = 0,
+        .Attenuation0 = 0,
+        .Attenuation1 = 0,
+        .Attenuation2 = 0,
+        .Theta = 0,
+        .Phi = 0,
+    };
+}
 
 pub const D3DRECT = extern struct {
     x1: i32,
@@ -361,6 +438,24 @@ pub const D3DVECTOR4 = extern struct {
 pub const D3DMATRIX = extern struct {
     m: [4][4]f32,
 };
+
+const kTransformStateCount = 512;
+
+fn d3dIdentityMatrix() D3DMATRIX {
+    return .{ .m = .{
+        .{ 1, 0, 0, 0 },
+        .{ 0, 1, 0, 0 },
+        .{ 0, 0, 1, 0 },
+        .{ 0, 0, 0, 1 },
+    } };
+}
+
+fn d3dTransformStateIndex(state: u32) ?usize {
+    if (state == 2 or state == 3 or (state >= 16 and state <= 23) or (state >= 256 and state < kTransformStateCount)) {
+        return @intCast(state);
+    }
+    return null;
+}
 
 pub const D3DXPLANE = extern struct {
     a: f32,
@@ -898,6 +993,8 @@ pub const WinsSurface9 = struct {
     owns_data: bool = true,
     usage: u32 = 0,
     pool: u32 = 1, // D3DPOOL_MANAGED
+    owner_device: ?*anyopaque = null,
+    multi_sample_type: u32 = 0,
     /// Depth/stencil surfaces are not lockable in D3D9 (LockRect -> D3DERR_INVALIDCALL).
     lockable: bool = true,
 
@@ -968,7 +1065,8 @@ fn surf_Release(this: *anyopaque) callconv(W) u32 {
     return self.ref_count;
 }
 fn surf_LockRect(this: *anyopaque, pLocked: ?*D3DLOCKED_RECT, pRect: ?*const D3DRECT, flags: u32) callconv(W) HRESULT {
-    _ = flags; _ = pRect;
+    _ = flags;
+    _ = pRect;
     const self: *WinsSurface9 = @ptrCast(@alignCast(this));
     if (!self.lockable) return D3DERR_INVALIDCALL;
     if (pLocked) |l| {
@@ -980,6 +1078,10 @@ fn surf_LockRect(this: *anyopaque, pLocked: ?*D3DLOCKED_RECT, pRect: ?*const D3D
 fn surf_UnlockRect(this: *anyopaque) callconv(W) HRESULT {
     _ = this;
     return D3D_OK;
+}
+fn surf_GetType(this: *anyopaque) callconv(W) u32 {
+    _ = this;
+    return D3DRTYPE_SURFACE;
 }
 fn surf_GetDesc(this: *anyopaque, pDesc: ?*D3DSURFACE_DESC) callconv(W) HRESULT {
     const self: *WinsSurface9 = @ptrCast(@alignCast(this));
@@ -1007,7 +1109,7 @@ const g_surf9_vtbl: IDirect3DSurface9Vtbl = .{
     .SetPriority = @ptrCast(&vb_Stub),
     .GetPriority = @ptrCast(&vb_Stub),
     .PreLoad = @ptrCast(&vb_Stub),
-    .GetType = @ptrCast(&vb_Stub),
+    .GetType = &surf_GetType,
     .GetContainer = @ptrCast(&vb_Stub),
     .GetDesc = &surf_GetDesc,
     .LockRect = &surf_LockRect,
@@ -1394,17 +1496,22 @@ pub const WinsD3DDevice9 = struct {
     device_type: u32,
     params: D3DPRESENT_PARAMETERS,
     viewport: D3DVIEWPORT9,
+    material: D3DMATERIAL9,
+    transform_states: [kTransformStateCount]D3DMATRIX,
+    lights: std.AutoHashMapUnmanaged(u32, D3DLightState9),
     in_scene: bool,
     frame_count: u64,
     draw_call_count: u64,
-    backbuffer: []u32,   // Screen pixels in ARGB format
-    depthbuffer: []f32,  // 32-bit floating point depth buffer
+    backbuffer: []u32, // Screen pixels in ARGB format
+    depthbuffer: []f32, // 32-bit floating point depth buffer
     vs_consts: [256][4]f32,
     ps_consts: [224][4]f32,
     render_states: [256]u32,
     tex_stage_states: [kMaxTextureStages][kTssSlots]u32,
     rt_surface: ?*WinsSurface9,
     ds_surface: ?*WinsSurface9,
+    bound_ds_surface: ?*WinsSurface9,
+    depth_stencil_explicit: bool,
     vertex_decl: ?*WinsVertexDecl9,
     sampler_states: [16][kSampSlots]u32,
     streams: [16]?*WinsVertexBuffer9,
@@ -1441,6 +1548,9 @@ pub const WinsD3DDevice9 = struct {
                 .MinZ = 0.0,
                 .MaxZ = 1.0,
             },
+            .material = defaultMaterial9(),
+            .transform_states = [_]D3DMATRIX{d3dIdentityMatrix()} ** kTransformStateCount,
+            .lights = .empty,
             .in_scene = false,
             .frame_count = 0,
             .draw_call_count = 0,
@@ -1452,6 +1562,8 @@ pub const WinsD3DDevice9 = struct {
             .tex_stage_states = defaultTextureStageStates(),
             .rt_surface = null,
             .ds_surface = null,
+            .bound_ds_surface = null,
+            .depth_stencil_explicit = false,
             .vertex_decl = null,
             .sampler_states = defaultSamplerStates(),
             .streams = [_]?*WinsVertexBuffer9{null} ** 16,
@@ -1463,6 +1575,9 @@ pub const WinsD3DDevice9 = struct {
             .active_ps = null,
             .allocator = allocator,
         };
+        if (comptime @sizeOf(usize) == 4) {
+            wins_d3d9_device_self = @intCast(@intFromPtr(dev));
+        }
         return dev;
     }
 };
@@ -1573,7 +1688,8 @@ fn d3d9_GetAdapterDisplayMode(this: *anyopaque, adapter: u32, pMode: ?*anyopaque
     return D3D_OK;
 }
 fn d3d9_GetDeviceCaps(this: *anyopaque, adapter: u32, dev_type: u32, pCaps: ?*D3DCAPS9) callconv(W) HRESULT {
-    _ = this; _ = adapter;
+    _ = this;
+    _ = adapter;
     if (pCaps) |caps| {
         @memset(std.mem.asBytes(caps), 0);
         caps.DeviceType = dev_type;
@@ -1587,12 +1703,13 @@ fn d3d9_GetDeviceCaps(this: *anyopaque, adapter: u32, dev_type: u32, pCaps: ?*D3
         caps.MaxTextureRepeat = 8192;
         caps.MaxTextureAspectRatio = 8192;
         caps.MaxAnisotropy = 16;
+        caps.MaxActiveLights = kMaxDeviceLights;
         caps.MaxPrimitiveCount = 1048576;
         caps.MaxVertexIndex = 1048576;
         caps.MaxStreams = 16;
         caps.MaxStreamStride = 256;
         caps.VertexShaderVersion = 0xFFFE0300; // vs_3_0
-        caps.PixelShaderVersion = 0xFFFF0300;  // ps_3_0
+        caps.PixelShaderVersion = 0xFFFF0300; // ps_3_0
         caps.MaxVertexShader30InstructionSlots = 32768;
         caps.MaxPixelShader30InstructionSlots = 32768;
         caps.NumSimultaneousRTs = 4;
@@ -1611,7 +1728,9 @@ fn d3d9_CreateDevice(
     pParams: ?*D3DPRESENT_PARAMETERS,
     ppDevice: ?*?*anyopaque,
 ) callconv(W) HRESULT {
-    _ = this; _ = hFocusWindow; _ = behavior_flags;
+    _ = this;
+    _ = hFocusWindow;
+    _ = behavior_flags;
     if (ppDevice == null or pParams == null) return E_FAIL;
     const gpa = std.heap.page_allocator;
     const dev = WinsD3DDevice9.init(gpa, adapter, dev_type, pParams.?.*) catch return E_OUTOFMEMORY;
@@ -1844,16 +1963,21 @@ fn dev9_AddRef(this: *anyopaque) callconv(W) u32 {
 }
 fn dev9_Release(this: *anyopaque) callconv(W) u32 {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
-    if (self.ref_count > 0) self.ref_count -= 1;
+    if (self.ref_count > 0) {
+        self.ref_count -= 1;
+        if (self.ref_count == 0) self.lights.deinit(self.allocator);
+    }
     return self.ref_count;
 }
 fn dev9_BeginScene(this: *anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.in_scene) return D3DERR_INVALIDCALL;
     self.in_scene = true;
     return D3D_OK;
 }
 fn dev9_EndScene(this: *anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (!self.in_scene) return D3DERR_INVALIDCALL;
     self.in_scene = false;
     return D3D_OK;
 }
@@ -1866,7 +1990,9 @@ fn dev9_Clear(
     z: f32,
     stencil: u32,
 ) callconv(W) HRESULT {
-    _ = count; _ = pRects; _ = stencil;
+    _ = count;
+    _ = pRects;
+    _ = stencil;
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if ((flags & D3DCLEAR_TARGET) != 0) {
         @memset(self.backbuffer, color);
@@ -1883,7 +2009,10 @@ fn dev9_Present(
     hWindow: usize,
     pDirty: ?*const anyopaque,
 ) callconv(W) HRESULT {
-    _ = pSource; _ = pDest; _ = hWindow; _ = pDirty;
+    _ = pSource;
+    _ = pDest;
+    _ = hWindow;
+    _ = pDirty;
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     self.frame_count += 1;
     return D3D_OK;
@@ -2142,7 +2271,10 @@ fn dev9_DrawIndexedPrimitive(
     start_index: u32,
     prim_count: u32,
 ) callconv(W) HRESULT {
-    _ = base_vertex_idx; _ = min_vertex_idx; _ = num_vertices; _ = start_index;
+    _ = base_vertex_idx;
+    _ = min_vertex_idx;
+    _ = num_vertices;
+    _ = start_index;
     return dev9_DrawPrimitive(this, prim_type, 0, prim_count);
 }
 
@@ -2164,8 +2296,7 @@ fn dev9_DrawIndexedPrimitive(
 
 fn dev9_TestCooperativeLevel(this: *anyopaque) callconv(W) HRESULT {
     _ = this;
-    std.debug.print("[WINS:D3D9] device!TestCooperativeLevel is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    return D3D_OK;
 }
 
 fn dev9_GetAvailableTextureMem(this: *anyopaque) callconv(W) u32 {
@@ -2268,6 +2399,7 @@ fn deviceRenderTarget(self: *WinsD3DDevice9) ?*WinsSurface9 {
     if (self.rt_surface == null) {
         const fmt: u32 = if (self.params.BackBufferFormat != 0) self.params.BackBufferFormat else D3DFMT_X8R8G8B8;
         self.rt_surface = WinsSurface9.wrap(self.allocator, self.viewport.Width, self.viewport.Height, fmt, std.mem.sliceAsBytes(self.backbuffer), D3DUSAGE_RENDERTARGET, 0, true) catch return null;
+        self.rt_surface.?.owner_device = @ptrCast(self);
     }
     return self.rt_surface;
 }
@@ -2276,8 +2408,14 @@ fn deviceDepthStencil(self: *WinsD3DDevice9) ?*WinsSurface9 {
     if (self.params.EnableAutoDepthStencil == 0) return null;
     if (self.ds_surface == null) {
         self.ds_surface = WinsSurface9.wrap(self.allocator, self.viewport.Width, self.viewport.Height, self.params.AutoDepthStencilFormat, std.mem.sliceAsBytes(self.depthbuffer), D3DUSAGE_DEPTHSTENCIL, 0, false) catch return null;
+        self.ds_surface.?.owner_device = @ptrCast(self);
     }
     return self.ds_surface;
+}
+
+fn deviceBoundDepthStencil(self: *WinsD3DDevice9) ?*WinsSurface9 {
+    if (self.depth_stencil_explicit) return self.bound_ds_surface;
+    return deviceDepthStencil(self);
 }
 
 fn dev9_GetBackBuffer(this: *anyopaque, swap_chain: u32, back_buffer: u32, buf_type: u32, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
@@ -2368,7 +2506,9 @@ fn dev9_CreateRenderTarget(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32,
 /// pixel like every surface here, not lockable, default pool. Multisampling and
 /// non-depth formats are refused rather than accepted and ignored.
 fn dev9_CreateDepthStencilSurface(this: *anyopaque, width: u32, height: u32, format: u32, multi_sample: u32, multi_sample_quality: u32, discard: i32, ppSurface: ?*?*anyopaque, pSharedHandle: ?*anyopaque) callconv(W) HRESULT {
-    _ = discard; _ = pSharedHandle; _ = multi_sample_quality;
+    _ = discard;
+    _ = pSharedHandle;
+    _ = multi_sample_quality;
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     const out = ppSurface orelse return D3DERR_INVALIDCALL;
     if (width == 0 or height == 0 or !isDepthStencilFormat(format)) return D3DERR_INVALIDCALL;
@@ -2377,6 +2517,8 @@ fn dev9_CreateDepthStencilSurface(this: *anyopaque, width: u32, height: u32, for
     s.usage = D3DUSAGE_DEPTHSTENCIL;
     s.pool = 0; // D3DPOOL_DEFAULT
     s.lockable = false;
+    s.owner_device = this;
+    s.multi_sample_type = multi_sample;
     out.* = s;
     return D3D_OK;
 }
@@ -2471,35 +2613,73 @@ fn dev9_GetRenderTarget(this: *anyopaque, index: u32, ppSurface: ?*?*anyopaque) 
 
 fn dev9_SetDepthStencilSurface(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
-    const depth = deviceDepthStencil(self) orelse return E_NOTIMPL;
-    if (p0 != null and p0.? == @as(*anyopaque, @ptrCast(depth))) return D3D_OK;
-    // Other surfaces and unbinding require tracking active depth storage.
-    return E_NOTIMPL;
+    const active = deviceBoundDepthStencil(self);
+    if (p0) |raw_surface| {
+        const surface: *WinsSurface9 = @ptrCast(@alignCast(raw_surface));
+        if (surface.vtbl != &g_surf9_vtbl or surface.owner_device != this) return D3DERR_INVALIDCALL;
+        if ((surface.usage & D3DUSAGE_DEPTHSTENCIL) == 0 or surface.pool != 0 or !isDepthStencilFormat(surface.format)) return D3DERR_INVALIDCALL;
+        if (surface.multi_sample_type != 0) return D3DERR_INVALIDCALL;
+        const render_target = deviceRenderTarget(self) orelse return E_OUTOFMEMORY;
+        if (surface.width != render_target.width or surface.height != render_target.height or surface.multi_sample_type != render_target.multi_sample_type) return D3DERR_INVALIDCALL;
+
+        if (active) |current| {
+            if (current == surface) {
+                if (!self.depth_stencil_explicit) {
+                    surface.ref_count += 1;
+                    self.bound_ds_surface = surface;
+                    self.depth_stencil_explicit = true;
+                }
+                return D3D_OK;
+            }
+        }
+
+        surface.ref_count += 1;
+        if (self.depth_stencil_explicit) {
+            if (self.bound_ds_surface) |previous| {
+                if (previous.ref_count > 0) previous.ref_count -= 1;
+            }
+        }
+        self.bound_ds_surface = surface;
+        self.depth_stencil_explicit = true;
+        return D3D_OK;
+    }
+
+    if (self.depth_stencil_explicit) {
+        if (self.bound_ds_surface) |previous| {
+            if (previous.ref_count > 0) previous.ref_count -= 1;
+        }
+    }
+    self.bound_ds_surface = null;
+    self.depth_stencil_explicit = true;
+    return D3D_OK;
 }
 
 fn dev9_GetDepthStencilSurface(this: *anyopaque, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     const out = ppSurface orelse return D3DERR_INVALIDCALL;
-    const s = deviceDepthStencil(self) orelse return D3DERR_NOTFOUND;
+    out.* = null;
+    const s = deviceBoundDepthStencil(self) orelse return D3DERR_NOTFOUND;
     s.ref_count += 1;
     out.* = s;
     return D3D_OK;
 }
 
 fn dev9_SetTransform(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!SetTransform is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const state = d3dTransformStateIndex(p0) orelse return D3DERR_INVALIDCALL;
+    const source = p1 orelse return D3DERR_INVALIDCALL;
+    const matrix: *const D3DMATRIX = @ptrCast(@alignCast(source));
+    self.transform_states[state] = matrix.*;
+    return D3D_OK;
 }
 
 fn dev9_GetTransform(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!GetTransform is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const state = d3dTransformStateIndex(p0) orelse return D3DERR_INVALIDCALL;
+    const destination = p1 orelse return D3DERR_INVALIDCALL;
+    const matrix: *D3DMATRIX = @ptrCast(@alignCast(destination));
+    matrix.* = self.transform_states[state];
+    return D3D_OK;
 }
 
 fn dev9_MultiplyTransform(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) HRESULT {
@@ -2511,49 +2691,145 @@ fn dev9_MultiplyTransform(this: *anyopaque, p0: u32, p1: ?*const anyopaque) call
 }
 
 fn dev9_SetMaterial(this: *anyopaque, p0: ?*const anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!SetMaterial is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const source = p0 orelse return D3DERR_INVALIDCALL;
+    var value: D3DMATERIAL9 = undefined;
+    @memcpy(std.mem.asBytes(&value), @as([*]const u8, @ptrCast(source))[0..@sizeOf(D3DMATERIAL9)]);
+    self.material = value;
+    return D3D_OK;
 }
 
 fn dev9_GetMaterial(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!GetMaterial is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const destination = p0 orelse return D3DERR_INVALIDCALL;
+    @memcpy(@as([*]u8, @ptrCast(destination))[0..@sizeOf(D3DMATERIAL9)], std.mem.asBytes(&self.material));
+    return D3D_OK;
 }
 
 fn dev9_SetLight(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!SetLight is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const source = p1 orelse return D3DERR_INVALIDCALL;
+    var value: D3DLIGHT9 = undefined;
+    @memcpy(std.mem.asBytes(&value), @as([*]const u8, @ptrCast(source))[0..@sizeOf(D3DLIGHT9)]);
+    if (value.Type < D3DLIGHT_POINT or value.Type > D3DLIGHT_DIRECTIONAL) return D3DERR_INVALIDCALL;
+    if (self.lights.getPtr(p0)) |state| {
+        state.light = value;
+    } else {
+        self.lights.put(self.allocator, p0, .{ .light = value, .enabled = false }) catch return E_OUTOFMEMORY;
+    }
+    return D3D_OK;
+}
+
+pub export fn wins_d3d9_thunk_begin_scene(this: *anyopaque) callconv(W) HRESULT {
+    return dev9_BeginScene(this);
+}
+
+pub export fn wins_d3d9_thunk_get_material(this: *anyopaque, out: ?*anyopaque) callconv(W) HRESULT {
+    return dev9_GetMaterial(this, out);
+}
+
+pub export fn wins_d3d9_thunk_set_light(this: *anyopaque, index: u32, light: ?*const anyopaque) callconv(W) HRESULT {
+    return dev9_SetLight(this, index, light);
+}
+
+// Bridge both x86 call forms seen on the same IDirect3DDevice9 vtable. For a
+// thiscall invocation, ECX is the live device and ESP starts at the first
+// explicit argument. For stdcall, this is the first stack argument. The helper
+// calls remain stdcall; each bridge returns with the cleanup required by the
+// guest-side call form.
+fn dev9_BeginScene_dual() callconv(.naked) void {
+    if (comptime @sizeOf(usize) == 4) {
+        asm volatile (
+            \\ movl wins_d3d9_device_self, %%eax
+            \\ cmpl %%eax, %%ecx
+            \\ jne 1f
+            \\ cmpl %%eax, 4(%%esp)
+            \\ je 1f
+            \\ pushl %%ecx
+            \\ call wins_d3d9_thunk_begin_scene
+            \\ ret
+            \\ 1:
+            \\ pushl 4(%%esp)
+            \\ call wins_d3d9_thunk_begin_scene
+            \\ ret $4
+        );
+    } else {
+        asm volatile ("ret");
+    }
+}
+
+fn dev9_GetMaterial_dual() callconv(.naked) void {
+    if (comptime @sizeOf(usize) == 4) {
+        asm volatile (
+            \\ movl wins_d3d9_device_self, %%eax
+            \\ cmpl %%eax, %%ecx
+            \\ jne 1f
+            \\ cmpl %%eax, 4(%%esp)
+            \\ je 1f
+            \\ pushl 4(%%esp)
+            \\ pushl %%ecx
+            \\ call wins_d3d9_thunk_get_material
+            \\ ret $4
+            \\ 1:
+            \\ pushl 8(%%esp)
+            \\ pushl 8(%%esp)
+            \\ call wins_d3d9_thunk_get_material
+            \\ ret $8
+        );
+    } else {
+        asm volatile ("ret");
+    }
+}
+
+fn dev9_SetLight_dual() callconv(.naked) void {
+    if (comptime @sizeOf(usize) == 4) {
+        asm volatile (
+            \\ movl wins_d3d9_device_self, %%eax
+            \\ cmpl %%eax, %%ecx
+            \\ jne 1f
+            \\ cmpl %%eax, 4(%%esp)
+            \\ je 1f
+            \\ pushl 8(%%esp)
+            \\ pushl 8(%%esp)
+            \\ pushl %%ecx
+            \\ call wins_d3d9_thunk_set_light
+            \\ ret $8
+            \\ 1:
+            \\ pushl 12(%%esp)
+            \\ pushl 12(%%esp)
+            \\ pushl 12(%%esp)
+            \\ call wins_d3d9_thunk_set_light
+            \\ ret $12
+        );
+    } else {
+        asm volatile ("ret");
+    }
 }
 
 fn dev9_GetLight(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!GetLight is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const destination = p1 orelse return D3DERR_INVALIDCALL;
+    const state = self.lights.get(p0) orelse return D3DERR_INVALIDCALL;
+    @memcpy(@as([*]u8, @ptrCast(destination))[0..@sizeOf(D3DLIGHT9)], std.mem.asBytes(&state.light));
+    return D3D_OK;
 }
 
 fn dev9_LightEnable(this: *anyopaque, p0: u32, p1: i32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!LightEnable is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.lights.getPtr(p0)) |state| {
+        state.enabled = p1 != 0;
+    } else {
+        self.lights.put(self.allocator, p0, .{ .light = defaultLight9(), .enabled = p1 != 0 }) catch return E_OUTOFMEMORY;
+    }
+    return D3D_OK;
 }
 
 fn dev9_GetLightEnable(this: *anyopaque, p0: u32, p1: ?*i32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!GetLightEnable is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = p1 orelse return D3DERR_INVALIDCALL;
+    const state = self.lights.get(p0) orelse return D3DERR_INVALIDCALL;
+    out.* = if (state.enabled) 1 else 0;
+    return D3D_OK;
 }
 
 fn dev9_SetClipPlane(this: *anyopaque, p0: u32, p1: ?*const f32) callconv(W) HRESULT {
@@ -3022,7 +3298,7 @@ const g_device9_vtbl: IDirect3DDevice9Vtbl = .{
     .GetRenderTarget = @ptrCast(&dev9_GetRenderTarget),
     .SetDepthStencilSurface = @ptrCast(&dev9_SetDepthStencilSurface),
     .GetDepthStencilSurface = @ptrCast(&dev9_GetDepthStencilSurface),
-    .BeginScene = &dev9_BeginScene,
+    .BeginScene = if (@sizeOf(usize) == 4) @ptrCast(&dev9_BeginScene_dual) else &dev9_BeginScene,
     .EndScene = &dev9_EndScene,
     .Clear = &dev9_Clear,
     .SetTransform = @ptrCast(&dev9_SetTransform),
@@ -3031,8 +3307,8 @@ const g_device9_vtbl: IDirect3DDevice9Vtbl = .{
     .SetViewport = &dev9_SetViewport,
     .GetViewport = &dev9_GetViewport,
     .SetMaterial = @ptrCast(&dev9_SetMaterial),
-    .GetMaterial = @ptrCast(&dev9_GetMaterial),
-    .SetLight = @ptrCast(&dev9_SetLight),
+    .GetMaterial = if (@sizeOf(usize) == 4) @ptrCast(&dev9_GetMaterial_dual) else @ptrCast(&dev9_GetMaterial),
+    .SetLight = if (@sizeOf(usize) == 4) @ptrCast(&dev9_SetLight_dual) else @ptrCast(&dev9_SetLight),
     .GetLight = @ptrCast(&dev9_GetLight),
     .LightEnable = @ptrCast(&dev9_LightEnable),
     .GetLightEnable = @ptrCast(&dev9_GetLightEnable),
@@ -3118,7 +3394,8 @@ pub export fn D3DPERF_SetOptions(options: u32) callconv(W) void {
 }
 
 pub export fn D3DPERF_BeginEvent(col: u32, wszName: ?[*:0]const u16) callconv(W) i32 {
-    _ = col; _ = wszName;
+    _ = col;
+    _ = wszName;
     return 0;
 }
 
@@ -3187,10 +3464,22 @@ pub export fn D3DXMatrixInverse(
     const out = pOut orelse return null;
     const m = pM orelse return null;
 
-    const m00 = m.m[0][0]; const m01 = m.m[0][1]; const m02 = m.m[0][2]; const m03 = m.m[0][3];
-    const m10 = m.m[1][0]; const m11 = m.m[1][1]; const m12 = m.m[1][2]; const m13 = m.m[1][3];
-    const m20 = m.m[2][0]; const m21 = m.m[2][1]; const m22 = m.m[2][2]; const m23 = m.m[2][3];
-    const m30 = m.m[3][0]; const m31 = m.m[3][1]; const m32 = m.m[3][2]; const m33 = m.m[3][3];
+    const m00 = m.m[0][0];
+    const m01 = m.m[0][1];
+    const m02 = m.m[0][2];
+    const m03 = m.m[0][3];
+    const m10 = m.m[1][0];
+    const m11 = m.m[1][1];
+    const m12 = m.m[1][2];
+    const m13 = m.m[1][3];
+    const m20 = m.m[2][0];
+    const m21 = m.m[2][1];
+    const m22 = m.m[2][2];
+    const m23 = m.m[2][3];
+    const m30 = m.m[3][0];
+    const m31 = m.m[3][1];
+    const m32 = m.m[3][2];
+    const m33 = m.m[3][3];
 
     const s0 = m00 * m11 - m01 * m10;
     const s1 = m00 * m12 - m02 * m10;
@@ -3288,7 +3577,9 @@ pub export fn D3DXVec3Normalize(
         out.y = v.y * inv_len;
         out.z = v.z * inv_len;
     } else {
-        out.x = 0; out.y = 0; out.z = 0;
+        out.x = 0;
+        out.y = 0;
+        out.z = 0;
     }
     return out;
 }
@@ -3361,7 +3652,10 @@ pub export fn D3DXPlaneNormalize(
         out.c = p.c * inv_len;
         out.d = p.d * inv_len;
     } else {
-        out.a = 0; out.b = 0; out.c = 0; out.d = 0;
+        out.a = 0;
+        out.b = 0;
+        out.c = 0;
+        out.d = 0;
     }
     return out;
 }
@@ -3420,7 +3714,12 @@ pub export fn D3DXAssembleShader(
     ppShader: ?*?*anyopaque,
     ppErrorMsgs: ?*?*anyopaque,
 ) callconv(W) HRESULT {
-    _ = pSrcData; _ = SrcDataLen; _ = pDefines; _ = pInclude; _ = Flags; _ = ppErrorMsgs;
+    _ = pSrcData;
+    _ = SrcDataLen;
+    _ = pDefines;
+    _ = pInclude;
+    _ = Flags;
+    _ = ppErrorMsgs;
     if (ppShader == null) return E_FAIL;
     const gpa = std.heap.page_allocator;
     const buf = WinsD3DXBuffer.create(gpa, 16) catch return E_OUTOFMEMORY;
@@ -3455,7 +3754,14 @@ pub export fn D3DXCompileShader(
     ppErrorMsgs: ?*?*anyopaque,
     ppConstantTable: ?*?*anyopaque,
 ) callconv(W) HRESULT {
-    _ = pSrcData; _ = SrcDataLen; _ = pDefines; _ = pInclude; _ = pFunctionName; _ = pProfile; _ = Flags; _ = ppErrorMsgs;
+    _ = pSrcData;
+    _ = SrcDataLen;
+    _ = pDefines;
+    _ = pInclude;
+    _ = pFunctionName;
+    _ = pProfile;
+    _ = Flags;
+    _ = ppErrorMsgs;
     if (ppConstantTable) |pct| pct.* = null;
     if (ppShader == null) return E_FAIL;
     const gpa = std.heap.page_allocator;
@@ -3553,7 +3859,14 @@ pub export fn D3DXLoadSurfaceFromSurface(
     Filter: u32,
     ColorKey: u32,
 ) callconv(W) HRESULT {
-    _ = pDestSurface; _ = pDestPalette; _ = pDestRect; _ = pSrcSurface; _ = pSrcPalette; _ = pSrcRect; _ = Filter; _ = ColorKey;
+    _ = pDestSurface;
+    _ = pDestPalette;
+    _ = pDestRect;
+    _ = pSrcSurface;
+    _ = pSrcPalette;
+    _ = pSrcRect;
+    _ = Filter;
+    _ = ColorKey;
     return D3D_OK;
 }
 
@@ -3563,7 +3876,10 @@ pub export fn D3DXSaveTextureToFileA(
     pSrcTexture: ?*anyopaque,
     pSrcPalette: ?*const anyopaque,
 ) callconv(W) HRESULT {
-    _ = pDestFile; _ = DestFormat; _ = pSrcTexture; _ = pSrcPalette;
+    _ = pDestFile;
+    _ = DestFormat;
+    _ = pSrcTexture;
+    _ = pSrcPalette;
     return D3D_OK;
 }
 
@@ -3592,7 +3908,7 @@ test "Direct3DCreate9 and device initialization" {
     const caps_rc = d3d9.vtbl.GetDeviceCaps(d3d9, 0, 1, &caps);
     try std.testing.expectEqual(D3D_OK, caps_rc);
     try std.testing.expectEqual(@as(u32, 0xFFFE0300), caps.VertexShaderVersion); // vs_3_0
-    try std.testing.expectEqual(@as(u32, 0xFFFF0300), caps.PixelShaderVersion);  // ps_3_0
+    try std.testing.expectEqual(@as(u32, 0xFFFF0300), caps.PixelShaderVersion); // ps_3_0
     try std.testing.expectEqual(@as(u32, 8192), caps.MaxTextureWidth);
 
     // Create Device
@@ -3632,16 +3948,24 @@ test "Direct3DCreate9 and device initialization" {
     // Write a triangle in NDC coordinates:
     // (0, 0.5, 0.5), (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5)
     const verts: [*]f32 = @ptrCast(@alignCast(lock_ptr.?));
-    verts[0] = 0.0;   verts[1] = 0.5;   verts[2] = 0.5;
-    verts[3] = -0.5;  verts[4] = -0.5;  verts[5] = 0.5;
-    verts[6] = 0.5;   verts[7] = -0.5;  verts[8] = 0.5;
+    verts[0] = 0.0;
+    verts[1] = 0.5;
+    verts[2] = 0.5;
+    verts[3] = -0.5;
+    verts[4] = -0.5;
+    verts[5] = 0.5;
+    verts[6] = 0.5;
+    verts[7] = -0.5;
+    verts[8] = 0.5;
     try std.testing.expectEqual(D3D_OK, vb.vtbl.Unlock(vb));
 
     // Bind Vertex Buffer and Draw Primitive
     try std.testing.expectEqual(D3D_OK, dev.vtbl.SetStreamSource(dev, 0, vb, 0, 12));
     try std.testing.expectEqual(D3D_OK, dev.vtbl.BeginScene(dev));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.BeginScene(dev));
     try std.testing.expectEqual(D3D_OK, dev.vtbl.DrawPrimitive(dev, 4, 0, 1)); // 1 triangle
     try std.testing.expectEqual(D3D_OK, dev.vtbl.EndScene(dev));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.EndScene(dev));
     try std.testing.expectEqual(D3D_OK, dev.vtbl.Present(dev, null, null, 0, null));
 
     try std.testing.expectEqual(@as(u64, 1), dev.draw_call_count);
@@ -3786,6 +4110,7 @@ test "render target / back buffer / depth surfaces wrap the device's own memory"
     try std.testing.expect(rt != null and rt == bb);
     const s: *WinsSurface9 = @ptrCast(@alignCast(rt.?));
     try std.testing.expectEqual(@as(u32, 3), s.ref_count); // the device's own + one per Get call
+    try std.testing.expectEqual(D3DRTYPE_SURFACE, s.vtbl.GetType(s));
     dev.viewport.Width = 10;
     dev.viewport.Height = 10;
     try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderTarget(dev, 0, bb));
@@ -3830,11 +4155,46 @@ test "render target / back buffer / depth surfaces wrap the device's own memory"
     try std.testing.expectEqual(D3D_OK, dev.vtbl.GetDepthStencilSurface(dev, &ds));
     const d: *WinsSurface9 = @ptrCast(@alignCast(ds.?));
     try std.testing.expectEqual(D3D_OK, dev.vtbl.SetDepthStencilSurface(dev, ds));
-    try std.testing.expectEqual(E_NOTIMPL, dev.vtbl.SetDepthStencilSurface(dev, null));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetDepthStencilSurface(dev, null));
+    try std.testing.expectEqual(D3DERR_NOTFOUND, dev.vtbl.GetDepthStencilSurface(dev, &ds));
+    try std.testing.expect(ds == null);
     try std.testing.expectEqual(D3D_OK, d.vtbl.GetDesc(d, &desc));
     try std.testing.expectEqual(D3DUSAGE_DEPTHSTENCIL, desc.Usage);
     try std.testing.expectEqual(@as(u32, 75), desc.Format);
     try std.testing.expectEqual(D3DERR_INVALIDCALL, d.vtbl.LockRect(d, &lr, null, 0));
+}
+
+test "SetDepthStencilSurface binds caller-created surfaces, retains them, and unbinds null" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+
+    var depth_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateDepthStencilSurface(dev, 32, 32, D3DFMT_D24S8, 0, 0, 0, &depth_raw, null));
+    const depth: *WinsSurface9 = @ptrCast(@alignCast(depth_raw.?));
+    try std.testing.expectEqual(@as(u32, 1), depth.ref_count);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetDepthStencilSurface(dev, depth));
+    try std.testing.expectEqual(@as(u32, 2), depth.ref_count);
+
+    var current: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetDepthStencilSurface(dev, &current));
+    try std.testing.expectEqual(@intFromPtr(depth), @intFromPtr(current.?));
+    try std.testing.expectEqual(@as(u32, 3), depth.ref_count);
+    try std.testing.expectEqual(@as(u32, 2), depth.vtbl.Release(depth));
+
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetDepthStencilSurface(dev, null));
+    try std.testing.expectEqual(@as(u32, 1), depth.ref_count);
+    current = depth;
+    try std.testing.expectEqual(D3DERR_NOTFOUND, dev.vtbl.GetDepthStencilSurface(dev, &current));
+    try std.testing.expect(current == null);
+
+    // A same-device depth surface still has to match the active render target.
+    var wrong_size: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateDepthStencilSurface(dev, 16, 32, D3DFMT_D24S8, 0, 0, 0, &wrong_size, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetDepthStencilSurface(dev, wrong_size));
+
+    var backbuffer: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetBackBuffer(dev, 0, 0, 0, &backbuffer));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetDepthStencilSurface(dev, backbuffer));
 }
 
 test "no depth/stencil surface when the device was created without one" {
@@ -3898,6 +4258,32 @@ fn testDevice(d3d: *WinsD3D9) !*WinsD3DDevice9 {
     var dev_raw: ?*anyopaque = null;
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CreateDevice(d3d, 0, 1, 0, 0, &params, &dev_raw));
     return @ptrCast(@alignCast(dev_raw.?));
+}
+
+test "device cooperative and transform state match D3D9" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.TestCooperativeLevel(dev));
+
+    const identity = d3dIdentityMatrix();
+    var got: D3DMATRIX = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTransform(dev, 2, &got));
+    try std.testing.expectEqual(identity, got);
+
+    const view = D3DMATRIX{ .m = .{
+        .{ 1, 0, 0, 4 },
+        .{ 0, 1, 0, 5 },
+        .{ 0, 0, 1, 6 },
+        .{ 0, 0, 0, 1 },
+    } };
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTransform(dev, 2, &view));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTransform(dev, 2, &got));
+    try std.testing.expectEqual(view, got);
+
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetTransform(dev, 1, &view));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetTransform(dev, 24, &got));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetTransform(dev, 2, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetTransform(dev, 2, null));
 }
 
 test "E_POINTER is 0x80004003 and distinct from E_NOTIMPL" {
@@ -4172,4 +4558,75 @@ test "releasing a texture frees every level (no leak, no double free)" {
     try std.testing.expectEqual(@as(u32, 2), held.ref_count); // still valid to touch
     held.ref_count = 1; // the guest releases its reference
     keep.destroy(); // now the whole texture can go
+}
+
+test "material and light state round-trip with D3D9 validation" {
+    try std.testing.expectEqual(@as(usize, 68), @sizeOf(D3DMATERIAL9));
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(D3DLIGHT9));
+
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    var caps: D3DCAPS9 = undefined;
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.GetDeviceCaps(d3d, 0, D3DDEVTYPE_HAL, &caps));
+    try std.testing.expectEqual(@as(u32, kMaxDeviceLights), caps.MaxActiveLights);
+
+    var material: D3DMATERIAL9 = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetMaterial(dev, &material));
+    try std.testing.expectEqual(@as(f32, 1), material.Diffuse.r);
+    try std.testing.expectEqual(@as(f32, 1), material.Ambient.a);
+    try std.testing.expectEqual(@as(f32, 0), material.Specular.r);
+    try std.testing.expectEqual(@as(f32, 0), material.Power);
+    material.Diffuse = .{ .r = 0.25, .g = 0.5, .b = 0.75, .a = 1 };
+    material.Ambient.r = 0.125;
+    material.Power = 8;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetMaterial(dev, &material));
+    var material_read: D3DMATERIAL9 = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetMaterial(dev, &material_read));
+    try std.testing.expectEqual(material, material_read);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetMaterial(dev, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetMaterial(dev, null));
+
+    var light = std.mem.zeroes(D3DLIGHT9);
+    light.Type = D3DLIGHT_POINT;
+    light.Diffuse = .{ .r = 0.25, .g = 0.5, .b = 0.75, .a = 1 };
+    light.Position.x = 1;
+    light.Range = 20;
+    light.Attenuation0 = 1;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetLight(dev, 0, &light));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetLight(dev, 0, &light));
+    var light_read: D3DLIGHT9 = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetLight(dev, 0, &light_read));
+    try std.testing.expectEqual(light, light_read);
+
+    var bad_light = light;
+    bad_light.Type = 99;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetLight(dev, 0, &bad_light));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetLight(dev, 0, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetLight(dev, 0, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetLight(dev, 1, &light_read));
+
+    // SetLight stores sparse DWORD indexes; MaxActiveLights describes how many
+    // may be active, not the largest index. Fallout uses a pointer-like key.
+    const game_light_index: u32 = 0x0b002488;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetLight(dev, game_light_index, &light));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetLight(dev, game_light_index, &light_read));
+    try std.testing.expectEqual(light, light_read);
+
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.LightEnable(dev, 0, 1));
+    var enabled: i32 = 0;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetLightEnable(dev, 0, &enabled));
+    try std.testing.expectEqual(@as(i32, 1), enabled);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.LightEnable(dev, 0, 0));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetLightEnable(dev, 0, &enabled));
+    try std.testing.expectEqual(@as(i32, 0), enabled);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetLightEnable(dev, 0, null));
+
+    const high_enable_index: u32 = 0xd002488;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.LightEnable(dev, high_enable_index, 1));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetLightEnable(dev, high_enable_index, &enabled));
+    try std.testing.expectEqual(@as(i32, 1), enabled);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetLight(dev, high_enable_index, &light_read));
+    try std.testing.expectEqual(D3DLIGHT_DIRECTIONAL, light_read.Type);
+    try std.testing.expectEqual(@as(f32, 1), light_read.Diffuse.r);
+    try std.testing.expectEqual(@as(u32, 0), dev.vtbl.Release(dev));
 }
