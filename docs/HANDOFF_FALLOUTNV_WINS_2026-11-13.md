@@ -268,3 +268,41 @@ no sale PCM a ningún dispositivo. Un frame visible sigue NOT_DEMONSTRATED.
 Loader instalado en el tool de Steam: sha256 8ad6b1fd…248f
 (build `/tmp/wins-find.uCMKz1oy/build-com`). Backup del de Codex:
 `dist/winrun32.prev-24683df` (04878ba1…6ac2).
+
+## Continuación Claude Code (2026-11-13 noche) — DirectShow + música: c3149de, 2812aa9
+
+### Fase 1: FilterGraph nativo (c3149de)
+Forma medida con Proton `+quartz` (`~/.cache/wins-oracle/logs/quartz-trace-20261113.log`):
+el juego crea un FilterGraph, AGREGA SU PROPIO filtro fuente, hace `Render()` de su
+pin (`MEDIATYPE_Stream/MPEG1Audio`, modo pull vía `IAsyncReader`), pide
+IMediaControl/IMediaEvent/IMediaPosition/IBasicAudio, hace fade de volumen,
+Pause, Run y luego sondea GetEvent(0) + duración/posición cada frame.
+`native/wins_dshow.zig` implementa el graph, un reloj de referencia y un renderer
+cuyo pin de entrada se conecta al pin del juego, lee el MP3 por IAsyncReader y
+recorre sus tramas. Probe `native/testdata/dshow_probe.c` (un filtro estilo
+CBaseFilter/CAsyncOutputPin sobre un fixture generado, sin datos del juego):
+rojo → verde **63/63 idénticas** con Proton. Duraciones = Wine: fixture 528 ms,
+MainTitle.mp3 125352 ms.
+
+### Fase 2a: música audible (2812aa9)
+`native/wins_audio.zig`: puentes dlopen a libmpg123 i386 (decodificar) y
+libpulse-simple i386 (salida; PipeWire responde). Un hilo nativo por graph
+sigue el reloj (pausa/seek/loop) y el volumen. Oráculo del decodificador:
+vs ffmpeg 25344 tramas, desfase 0, SNR 96 dB. En el juego: 6016896 tramas
+decodificadas, stream "WINS" activo en la salida ALC245 (wpctl).
+
+### Bloqueo actual (NO resuelto): la ventana nunca está activa
+Bucle principal (imagen descifrada, 0x86b301..0x86b669): PeekMessage/Translate/
+Dispatch y luego `if (GetActiveWindow() != hwnd) { ... Sleep(50) }`. WINS devuelve
+HWND 0x20001 desde CreateWindowExA y 0x10002 desde GetActiveWindow, así que el
+juego duerme a 20 Hz para siempre. Toda la capa de ventanas de USER32 es falsa
+(no hay tabla de ventanas, nunca se llama al wndproc, ni cola de mensajes, ni estado
+de activación). El window proc del juego es 0x86a0a0. Siguiente paso: tabla
+de clases/ventanas, cola de mensajes real (Send/Post/Peek/Get/Dispatch → wndproc),
+mensajes de creación/activación, activación/foco, todo comparado con Wine con un probe;
+después superficie X11 + Present.
+
+### Fase 2b pendiente: efectos (DirectSound)
+`wins_dsound.zig` sigue en silencio (su nota y separation_gate lo exigen). El
+juego aún no crea buffers en esta corrida (no hay interacción sin ventana), así que
+el mezclador se hará y medirá cuando la ventana esté activa.
