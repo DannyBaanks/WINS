@@ -4820,10 +4820,31 @@ fn CoUninitialize() callconv(W) void {}
 
 fn CoFreeUnusedLibraries() callconv(W) void {}
 
+fn printGuid(tag: []const u8, g: ?*const anyopaque) void {
+    const p: [*]const u8 = @ptrCast(g orelse {
+        std.debug.print("{s}=null", .{tag});
+        return;
+    });
+    const d1 = std.mem.readInt(u32, p[0..4], .little);
+    const d2 = std.mem.readInt(u16, p[4..6], .little);
+    const d3 = std.mem.readInt(u16, p[6..8], .little);
+    std.debug.print("{s}={{{x:0>8}-{x:0>4}-{x:0>4}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}}}", .{ tag, d1, d2, d3, p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15] });
+}
+
+/// No COM class is registered in this loader, so the honest answer is
+/// REGDB_E_CLASSNOTREG with *ppv = NULL. It used to answer S_OK with a NULL
+/// interface: FalloutNV asks for DirectShow (Proton oracle: quartz.dll loads
+/// right after Data\Music\Special\MainTitle.mp3 is opened), believed it got
+/// a filter graph and faulted reading NULL (EIP 0x83101e, EAX 0).
+const REGDB_E_CLASSNOTREG: i32 = @bitCast(@as(u32, 0x80040154));
 fn CoCreateInstance(rclsid: ?*anyopaque, pUnkOuter: ?*anyopaque, dwClsContext: u32, riid: ?*anyopaque, ppv: ?*?*anyopaque) callconv(W) i32 {
-    _ = rclsid; _ = pUnkOuter; _ = dwClsContext; _ = riid;
+    _ = pUnkOuter;
     if (ppv) |p| p.* = null;
-    return 0; // S_OK
+    std.debug.print("[WINS:Ole32] CoCreateInstance(", .{});
+    printGuid("clsid", rclsid);
+    printGuid(" iid", riid);
+    std.debug.print(" ctx=0x{x}) -> REGDB_E_CLASSNOTREG\n", .{dwClsContext});
+    return REGDB_E_CLASSNOTREG;
 }
 
 fn CoTaskMemAlloc(cb: usize) callconv(W) ?*anyopaque {
@@ -6788,4 +6809,14 @@ test "lstrcatA appends; -1 lengths count the whole string plus its NUL" {
     try std.testing.expectEqual(@as(i32, 16), LCMapStringA(0, 0x200, "Data\\Update.bsa", -1, &d, 32));
     try std.testing.expectEqualStrings("DATA\\UPDATE.BSA", std.mem.sliceTo(@as([*:0]u8, @ptrCast(&d)), 0));
     try std.testing.expectEqual(@as(i32, 0), LCMapStringA(0, 0, "x", -1, &d, 32));
+}
+
+test "CoCreateInstance: no class is registered, so it fails and never hands out NULL as success" {
+    // CLSID_FilterGraph {e436ebb3-524f-11ce-9f53-0020af0ba770}, the class FalloutNV asks for.
+    const clsid = [16]u8{ 0xb3, 0xeb, 0x36, 0xe4, 0x4f, 0x52, 0xce, 0x11, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70 };
+    var out: ?*anyopaque = @ptrFromInt(0x1234);
+    const hr = CoCreateInstance(@constCast(@ptrCast(&clsid)), null, 1, @constCast(@ptrCast(&clsid)), &out);
+    try std.testing.expect(hr < 0);
+    try std.testing.expectEqual(REGDB_E_CLASSNOTREG, hr);
+    try std.testing.expect(out == null);
 }
