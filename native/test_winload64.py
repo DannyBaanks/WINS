@@ -26,6 +26,7 @@ SEQ = [  # (target, args, ret) - same order as fixture_host.zig
     (f'{A}!fix_tls_get', [], 'u32'), (f'{A}!fix_tls_bump', [], 'u32'), (f'{A}!fix_tls_get', [], 'u32'),
     ('fixb_add_twice', [40, 1], 'i32'), ('fixb_tls_from_a', [], 'u32'),
     ('fixb_tls_own', [], 'u32'), ('fixb_tls_own_bump', [], 'u32'), (f'{A}!fix_tls_get', [], 'u32'),
+    (f'{A}!fix_crt_format', [-7, 42], 'str'),
 ]
 
 
@@ -41,7 +42,9 @@ class WinLoad64Tests(unittest.TestCase):
         cls.dlls = cls.work / 'dlls'
         cls.dlls.mkdir()
         lib = ['-dynamic', '-target', 'x86_64-windows-gnu', '-O', 'ReleaseSmall', '-fstrip']
-        zig('build-lib', *lib, str(FIX / 'fixture_a.zig'), f'-femit-bin={cls.dlls / A}',
+        # Minimal msvcrt import library (malloc/free/_snprintf) without pulling in a CRT.
+        zig('dlltool', '-d', str(FIX / 'msvcrt_min.def'), '-l', str(cls.work / 'msvcrt.lib'), '-m', 'i386:x86-64', cwd=cls.work)
+        zig('build-lib', *lib, str(FIX / 'fixture_a.zig'), f'-L{cls.work}', f'-femit-bin={cls.dlls / A}',
             f'-femit-implib={cls.work / "fixture_a.lib"}', cwd=cls.work)
         zig('build-lib', *lib, str(FIX / 'fixture_b.zig'), f'-L{cls.work}', '-lfixture_a',
             f'-femit-bin={cls.dlls / "fixture_b.dll"}', cwd=cls.work)
@@ -75,13 +78,16 @@ class WinLoad64Tests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('wine'), 'Wine (the oracle) required')
     def test_identical_to_wine_and_defect_detected(self):
-        w = subprocess.run(['bwrap', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv',
-                            '--ro-bind', '/usr', '/usr', '--ro-bind', '/etc', '/etc', '--symlink', 'usr/bin', '/bin',
-                            '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc',
-                            '--dev', '/dev', '--tmpfs', '/tmp', '--bind', str(self.dlls), '/work',
-                            '--setenv', 'HOME', '/tmp', '--setenv', 'WINEPREFIX', '/work/prefix',
-                            '--setenv', 'WINEDEBUG', '-all', '--chdir', '/work', '--', '/usr/bin/wine',
-                            '/work/fixture_host.exe'], capture_output=True, text=True, timeout=600)
+        box = ['bwrap', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv',
+               '--ro-bind', '/usr', '/usr', '--ro-bind', '/etc', '/etc', '--symlink', 'usr/bin', '/bin',
+               '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc',
+               '--dev', '/dev', '--tmpfs', '/tmp', '--bind', str(self.dlls), '/work',
+               '--setenv', 'HOME', '/tmp', '--setenv', 'WINEPREFIX', '/work/prefix',
+               '--setenv', 'WINEDEBUG', '-all', '--chdir', '/work', '--']
+        # A brand-new prefix finishes configuring on its first run and can swallow that
+        # program's output: initialise it first, then run the host.
+        subprocess.run(box + ['/usr/bin/wine', 'wineboot', '-u'], capture_output=True, timeout=600)
+        w = subprocess.run(box + ['/usr/bin/wine', '/work/fixture_host.exe'], capture_output=True, text=True, timeout=600)
         oracle = [l for l in (w.stdout + w.stderr).splitlines() if l.startswith('call ')]
         self.assertEqual(len(oracle), len(SEQ), w.stderr[-2000:])
         self.assertEqual(self.calls('winload64'), oracle)

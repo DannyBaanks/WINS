@@ -24,7 +24,9 @@
 //!   usage: winload64 --pin ROOT.dll=HEX [--pin DEP.dll=HEX ...] [--dll-dir DIR] [--check]
 //!                    ROOT.dll [--call [DLL!]EXPORT [--arg N ...] [--ret u32|i32|u64|str]] ...
 //!   exit codes: 2 usage, 3 refused, 4 unresolved imports, 5 malformed image,
-//!               6 mapping failed, 7 DllMain/TLS init failed.
+//!               6 mapping failed, 7 DllMain/TLS init failed,
+//!               8 a trapped (unimplemented) import was called (--trap-unresolved),
+//!               9 the loaded code crashed (crash report on stderr).
 const std = @import("std");
 const linux = std.os.linux;
 const winrun = @import("winrun_impl.zig").Impl(.none);
@@ -85,23 +87,447 @@ const Image = struct {
     state: enum { mapped, binding, bound, initialized } = .mapped,
 };
 
-/// Delay imports that resolve to nothing are bound to one of these traps; the
-/// trap reports which import was called and exits (Windows would raise there).
-const max_traps = 64;
+/// Delay imports that resolve to nothing (and, with --trap-unresolved, ANY unresolved
+/// import) are bound to one of these traps; the trap reports which import was called
+/// and exits 8. --trap-unresolved is a diagnostic instrument to find which missing
+/// functions a DLL really calls; it never makes a run count as supported.
+const max_traps = 1024;
 var trap_names: [max_traps][]const u8 = undefined;
 var n_traps: usize = 0;
 fn trapCall(comptime k: usize) *const fn () callconv(W) noreturn {
     return &struct {
         fn f() callconv(W) noreturn {
-            die(.unresolved, "called unimplemented delay import {s}", .{trap_names[k]});
+            std.debug.print("winload64: TRAP called unimplemented import {s}\n", .{trap_names[k]});
+            std.process.exit(8);
         }
     }.f;
 }
 const trap_table = blk: {
+    @setEvalBranchQuota(20 * max_traps);
     var t: [max_traps]*const fn () callconv(W) noreturn = undefined;
     for (0..max_traps) |k| t[k] = trapCall(k);
     break :blk t;
 };
+
+var trap_all = false;
+
+// ---------------------------------------------------------------- module registry
+// GetModuleHandle*/LoadLibrary*/GetProcAddress over (a) the images winload64 mapped
+// and (b) the system DLLs WINS emulates (pseudo-handles; never dereferenced by us).
+// They take precedence over winrun's single-image stubs (GetProcAddress there is a
+// stub that returns 0, GetModuleHandle only answers NULL).
+var g_ld: ?*Loader = null;
+
+const system_dlls = [_][]const u8{
+    "kernel32.dll", "kernelbase.dll", "ntdll.dll",    "user32.dll",   "gdi32.dll",    "advapi32.dll",
+    "ws2_32.dll",   "wsock32.dll",    "crypt32.dll",  "bcrypt.dll",   "ncrypt.dll",   "ole32.dll",
+    "oleaut32.dll", "shell32.dll",    "shlwapi.dll",  "iphlpapi.dll", "winhttp.dll",  "dbghelp.dll",
+    "winmm.dll",    "powrprof.dll",   "propsys.dll",  "ucrtbase.dll", "msvcrt.dll",   "version.dll",
+    "secur32.dll",  "dnsapi.dll",     "wintrust.dll", "userenv.dll",  "comctl32.dll", "imm32.dll",
+};
+/// Pseudo-handle for system DLL k: high, page-aligned, distinct, never a real mapping.
+fn sysHandle(k: usize) usize {
+    return 0x7FFE_0000_0000 + (k << 20);
+}
+
+const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
+
+fn setLastError(code: u32) void {
+    const f = winrun.lookup("kernel32.dll", "SetLastError") orelse return;
+    (@as(*const fn (u32) callconv(W) void, @ptrFromInt(f)))(code);
+}
+
+/// "C:\x\KERNEL32" -> "kernel32.dll"; api-sets fold onto their host DLL.
+fn moduleKey(buf: []u8, raw: []const u8) []const u8 {
+    var name = raw;
+    if (std.mem.lastIndexOfAny(u8, name, "\\/")) |i| name = name[i + 1 ..];
+    const n = @min(name.len, buf.len - 4);
+    _ = std.ascii.lowerString(buf[0..n], name[0..n]);
+    var out = buf[0..n];
+    if (std.mem.indexOfScalar(u8, out, '.') == null) {
+        @memcpy(buf[n..][0..4], ".dll");
+        out = buf[0 .. n + 4];
+    }
+    if (std.mem.startsWith(u8, out, "api-ms-win-crt-")) return "ucrtbase.dll";
+    if (std.mem.startsWith(u8, out, "api-ms-win-") or std.mem.startsWith(u8, out, "ext-ms-win-")) return "kernel32.dll";
+    return out;
+}
+
+fn handleFor(key: []const u8) usize {
+    const ld = g_ld orelse return 0;
+    if (ld.find(key)) |k| return ld.images.items[k].base;
+    for (system_dlls, 0..) |d, k| if (std.mem.eql(u8, d, key)) return sysHandle(k);
+    return 0;
+}
+
+fn utf16Key(buf: []u8, w: [*:0]const u16) []const u8 {
+    var tmp: [260]u8 = undefined;
+    var n: usize = 0;
+    while (w[n] != 0 and n < tmp.len) : (n += 1) tmp[n] = if (w[n] < 0x80) @intCast(w[n]) else '?';
+    return moduleKey(buf, tmp[0..n]);
+}
+
+fn rootBase() usize {
+    const ld = g_ld orelse return 0;
+    return ld.images.items[0].base;
+}
+
+fn moduleByName(key: []const u8, what: []const u8) usize {
+    const h = handleFor(key);
+    if (h == 0) {
+        std.debug.print("winload64: {s}({s}) -> not loaded/emulated (ERROR_MOD_NOT_FOUND)\n", .{ what, key });
+        setLastError(ERROR_MOD_NOT_FOUND);
+    }
+    return h;
+}
+
+fn GetModuleHandleW(name: ?[*:0]const u16) callconv(W) usize {
+    var b: [272]u8 = undefined;
+    return if (name) |n| moduleByName(utf16Key(&b, n), "GetModuleHandleW") else rootBase();
+}
+fn GetModuleHandleA(name: ?[*:0]const u8) callconv(W) usize {
+    var b: [272]u8 = undefined;
+    return if (name) |n| moduleByName(moduleKey(&b, std.mem.span(n)), "GetModuleHandleA") else rootBase();
+}
+fn GetModuleHandleExW(flags: u32, name: ?*const anyopaque, out: ?*usize) callconv(W) i32 {
+    const FROM_ADDRESS: u32 = 0x4;
+    var h: usize = 0;
+    if (flags & FROM_ADDRESS != 0) {
+        const addr = @intFromPtr(name);
+        if (g_ld) |ld| for (ld.images.items) |im| {
+            if (addr >= im.base and addr < im.base + im.img.len) h = im.base;
+        };
+        if (h == 0) setLastError(ERROR_MOD_NOT_FOUND);
+    } else h = GetModuleHandleW(@ptrCast(@alignCast(name)));
+    if (out) |o| o.* = h;
+    return @intFromBool(h != 0);
+}
+fn LoadLibraryW(name: ?[*:0]const u16) callconv(W) usize {
+    var b: [272]u8 = undefined;
+    return if (name) |n| moduleByName(utf16Key(&b, n), "LoadLibraryW") else 0;
+}
+fn LoadLibraryA(name: ?[*:0]const u8) callconv(W) usize {
+    var b: [272]u8 = undefined;
+    return if (name) |n| moduleByName(moduleKey(&b, std.mem.span(n)), "LoadLibraryA") else 0;
+}
+fn LoadLibraryExW(name: ?[*:0]const u16, file: usize, flags: u32) callconv(W) usize {
+    _ = file;
+    _ = flags;
+    return LoadLibraryW(name);
+}
+fn LoadLibraryExA(name: ?[*:0]const u8, file: usize, flags: u32) callconv(W) usize {
+    _ = file;
+    _ = flags;
+    return LoadLibraryA(name);
+}
+fn FreeLibrary(h: usize) callconv(W) i32 {
+    _ = h;
+    return 1; // images stay mapped for the process lifetime
+}
+fn GetProcAddress(h: usize, name: ?[*:0]const u8) callconv(W) usize {
+    const ld = g_ld orelse return 0;
+    var symbuf: [16]u8 = undefined;
+    const sym: []const u8 = if (@intFromPtr(name) < 0x10000)
+        std.fmt.bufPrint(&symbuf, "#{d}", .{@intFromPtr(name)}) catch unreachable
+    else
+        std.mem.span(name.?);
+    var lib: ?[]const u8 = null;
+    for (ld.images.items) |im| if (im.base == h) {
+        lib = im.name;
+    };
+    if (lib == null) for (system_dlls, 0..) |d, k| if (sysHandle(k) == h) {
+        lib = d;
+    };
+    const l = lib orelse {
+        setLastError(ERROR_MOD_NOT_FOUND);
+        return 0;
+    };
+    const addr = ld.resolve(l, sym, 0) orelse {
+        std.debug.print("winload64: GetProcAddress({s}, {s}) -> not implemented (ERROR_PROC_NOT_FOUND)\n", .{ l, sym });
+        setLastError(ERROR_PROC_NOT_FOUND);
+        return 0;
+    };
+    return addr;
+}
+
+// ---------------------------------------------------------------- virtual memory
+// Windows semantics over mmap: regions reserved at 64 KiB granularity (MEM_RESERVE =
+// PROT_NONE + NORESERVE), pages committed/decommitted inside a region with their own
+// protection, MEM_RELEASE only at a region base, VirtualQuery/VirtualProtect answer
+// from the same bookkeeping. Chromium's PartitionAlloc relies on all of it.
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_DECOMMIT: u32 = 0x4000;
+const MEM_RELEASE: u32 = 0x8000;
+const MEM_FREE: u32 = 0x10000;
+const MEM_PRIVATE: u32 = 0x20000;
+const MEM_IMAGE: u32 = 0x1000000;
+const ERROR_INVALID_ADDRESS: u32 = 487;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+const GRAN: usize = 64 * 1024;
+const PAGE: usize = 4096;
+
+const Region = struct {
+    base: usize,
+    size: usize,
+    alloc_protect: u32,
+    pages: []u8, // per page: 0 = reserved, else the Windows PAGE_* protection (committed)
+};
+var regions: std.ArrayList(Region) = .empty;
+var vm_lock: std.atomic.Mutex = .unlocked;
+fn vmLock() void {
+    while (!vm_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn vmAlloc() std.mem.Allocator {
+    return std.heap.page_allocator;
+}
+
+fn linuxProt(p: u32) linux.PROT {
+    return switch (p & 0xff) {
+        0x01 => .{}, // PAGE_NOACCESS
+        0x02 => .{ .READ = true },
+        0x04, 0x08 => .{ .READ = true, .WRITE = true },
+        0x10, 0x20 => .{ .READ = true, .EXEC = true },
+        0x40, 0x80 => .{ .READ = true, .WRITE = true, .EXEC = true },
+        else => .{ .READ = true, .WRITE = true },
+    };
+}
+
+fn regionOf(addr: usize) ?*Region {
+    for (regions.items) |*r| if (addr >= r.base and addr < r.base + r.size) return r;
+    return null;
+}
+
+fn reserve(at: usize, size: usize, prot: u32) ?*Region {
+    const len = std.mem.alignForward(usize, size, PAGE);
+    var base: usize = 0;
+    const flags: linux.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true, .FIXED_NOREPLACE = at != 0 };
+    if (at != 0) {
+        if (at % GRAN != 0) return null;
+        const rc = linux.mmap(@ptrFromInt(at), len, .{}, flags, -1, 0);
+        if (linux.errno(rc) != .SUCCESS or rc != at) return null;
+        base = rc;
+    } else {
+        // Over-reserve and trim so the region starts on the 64 KiB allocation granularity.
+        const rc = linux.mmap(null, len + GRAN, .{}, flags, -1, 0);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        base = std.mem.alignForward(usize, rc, GRAN);
+        if (base > rc) _ = linux.munmap(@ptrFromInt(rc), base - rc);
+        const tail = rc + len + GRAN - (base + len);
+        if (tail > 0) _ = linux.munmap(@ptrFromInt(base + len), tail);
+    }
+    const pages = vmAlloc().alloc(u8, len / PAGE) catch {
+        _ = linux.munmap(@ptrFromInt(base), len);
+        return null;
+    };
+    @memset(pages, 0);
+    regions.append(vmAlloc(), .{ .base = base, .size = len, .alloc_protect = prot, .pages = pages }) catch return null;
+    return &regions.items[regions.items.len - 1];
+}
+
+fn VirtualAlloc(addr: ?*anyopaque, size: usize, kind: u32, prot: u32) callconv(W) ?*anyopaque {
+    vmLock();
+    defer vm_lock.unlock();
+    if (size == 0 or kind & (MEM_COMMIT | MEM_RESERVE) == 0) {
+        setLastError(ERROR_INVALID_PARAMETER);
+        return null;
+    }
+    const want = @intFromPtr(addr);
+    var r: *Region = undefined;
+    var start: usize = undefined;
+    if (want != 0 and regionOf(want) != null and kind & MEM_RESERVE == 0) {
+        r = regionOf(want).?; // commit inside an existing reservation
+        start = want & ~(PAGE - 1);
+    } else if (kind & MEM_RESERVE != 0 or want == 0) {
+        r = reserve(if (want != 0) want & ~(GRAN - 1) else 0, size + (want & (GRAN - 1)), prot) orelse {
+            setLastError(if (want != 0) ERROR_INVALID_ADDRESS else ERROR_NOT_ENOUGH_MEMORY);
+            return null;
+        };
+        start = if (want != 0) want & ~(PAGE - 1) else r.base;
+        if (kind & MEM_COMMIT == 0) return @ptrFromInt(r.base);
+    } else {
+        setLastError(ERROR_INVALID_ADDRESS);
+        return null;
+    }
+    const end = std.mem.alignForward(usize, (if (want != 0) want else r.base) + size, PAGE);
+    if (end > r.base + r.size) {
+        setLastError(ERROR_INVALID_ADDRESS);
+        return null;
+    }
+    if (linux.errno(linux.mprotect(@ptrFromInt(start), end - start, linuxProt(prot))) != .SUCCESS) {
+        setLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return null;
+    }
+    var pg = (start - r.base) / PAGE;
+    while (pg < (end - r.base) / PAGE) : (pg += 1) r.pages[pg] = @truncate(if (prot & 0xff == 0) 4 else prot);
+    return @ptrFromInt(if (want != 0) start else r.base);
+}
+
+fn VirtualFree(addr: ?*anyopaque, size: usize, kind: u32) callconv(W) i32 {
+    vmLock();
+    defer vm_lock.unlock();
+    const a = @intFromPtr(addr);
+    const r = regionOf(a) orelse {
+        setLastError(ERROR_INVALID_ADDRESS);
+        return 0;
+    };
+    if (kind & MEM_RELEASE != 0) {
+        if (size != 0 or a != r.base) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        _ = linux.munmap(@ptrFromInt(r.base), r.size);
+        vmAlloc().free(r.pages);
+        _ = regions.swapRemove(@divExact(@intFromPtr(r) - @intFromPtr(regions.items.ptr), @sizeOf(Region)));
+        return 1;
+    }
+    if (kind & MEM_DECOMMIT != 0) {
+        const start = a & ~(PAGE - 1);
+        const end = if (size == 0) r.base + r.size else std.mem.alignForward(usize, a + size, PAGE);
+        if (end > r.base + r.size) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        // Drop the contents (next commit reads zeroes) and make the pages inaccessible.
+        _ = linux.madvise(@ptrFromInt(start), end - start, linux.MADV.DONTNEED);
+        _ = linux.mprotect(@ptrFromInt(start), end - start, .{});
+        @memset(r.pages[(start - r.base) / PAGE .. (end - r.base) / PAGE], 0);
+        return 1;
+    }
+    setLastError(ERROR_INVALID_PARAMETER);
+    return 0;
+}
+
+fn VirtualProtect(addr: ?*anyopaque, size: usize, prot: u32, old: ?*u32) callconv(W) i32 {
+    vmLock();
+    defer vm_lock.unlock();
+    const a = @intFromPtr(addr);
+    const start = a & ~(PAGE - 1);
+    const end = std.mem.alignForward(usize, a + @max(size, 1), PAGE);
+    if (regionOf(a)) |r| {
+        if (end > r.base + r.size) {
+            setLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
+        const first = r.pages[(start - r.base) / PAGE];
+        if (first == 0) {
+            setLastError(ERROR_INVALID_ADDRESS); // reserved, not committed
+            return 0;
+        }
+        if (old) |o| o.* = first;
+        if (linux.errno(linux.mprotect(@ptrFromInt(start), end - start, linuxProt(prot))) != .SUCCESS) return 0;
+        @memset(r.pages[(start - r.base) / PAGE .. (end - r.base) / PAGE], @truncate(prot));
+        return 1;
+    }
+    // Outside our regions (image sections, stacks): honour it, report RW as the old value.
+    if (old) |o| o.* = 0x04;
+    return @intFromBool(linux.errno(linux.mprotect(@ptrFromInt(start), end - start, linuxProt(prot))) == .SUCCESS);
+}
+
+/// MEMORY_BASIC_INFORMATION (x64, 48 bytes).
+const MBI = extern struct { BaseAddress: usize, AllocationBase: usize, AllocationProtect: u32, PartitionId: u16, _p: u16 = 0, RegionSize: usize, State: u32, Protect: u32, Type: u32, _q: u32 = 0 };
+
+fn VirtualQuery(addr: ?*const anyopaque, out: ?*MBI, len: usize) callconv(W) usize {
+    if (out == null or len < @sizeOf(MBI)) {
+        setLastError(24); // ERROR_BAD_LENGTH
+        return 0;
+    }
+    vmLock();
+    defer vm_lock.unlock();
+    const a = @intFromPtr(addr) & ~(PAGE - 1);
+    var m: MBI = .{ .BaseAddress = a, .AllocationBase = 0, .AllocationProtect = 0, .PartitionId = 0, .RegionSize = PAGE, .State = MEM_FREE, .Protect = 0x01, .Type = 0 };
+    if (regionOf(a)) |r| {
+        var pg = (a - r.base) / PAGE;
+        const st = r.pages[pg];
+        const first = pg;
+        while (pg < r.pages.len and r.pages[pg] == st) pg += 1; // run of identical pages
+        m = .{ .BaseAddress = a, .AllocationBase = r.base, .AllocationProtect = r.alloc_protect, .PartitionId = 0, .RegionSize = (pg - first) * PAGE, .State = if (st == 0) MEM_RESERVE else MEM_COMMIT, .Protect = if (st == 0) 0 else st, .Type = MEM_PRIVATE };
+    } else if (g_ld) |ld| {
+        for (ld.images.items) |im| if (a >= im.base and a < im.base + im.img.len) {
+            m = .{ .BaseAddress = a, .AllocationBase = im.base, .AllocationProtect = 0x80, .PartitionId = 0, .RegionSize = im.base + im.img.len - a, .State = MEM_COMMIT, .Protect = 0x20, .Type = MEM_IMAGE };
+        };
+        if (m.State == MEM_FREE and a != 0) {
+            // Not ours: committed RW private memory if mapped (stack, heap), else free.
+            const probe = linux.madvise(@ptrFromInt(a), PAGE, linux.MADV.NORMAL);
+            if (linux.errno(probe) == .SUCCESS) m = .{ .BaseAddress = a, .AllocationBase = a, .AllocationProtect = 0x04, .PartitionId = 0, .RegionSize = PAGE, .State = MEM_COMMIT, .Protect = 0x04, .Type = MEM_PRIVATE };
+        }
+    }
+    out.?.* = m;
+    return @sizeOf(MBI);
+}
+
+fn VirtualLock(addr: ?*anyopaque, size: usize) callconv(W) i32 {
+    _ = addr;
+    _ = size;
+    return 1; // advisory: pages stay resident enough for a cleanroom process
+}
+fn VirtualUnlock(addr: ?*anyopaque, size: usize) callconv(W) i32 {
+    _ = addr;
+    _ = size;
+    return 1;
+}
+
+fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
+    var b: [272]u8 = undefined;
+    if (@import("winload64_sync.zig").lookup(moduleKey(&b, lib), sym)) |a| return a;
+    if (!std.mem.eql(u8, moduleKey(&b, lib), "kernel32.dll") and !std.ascii.eqlIgnoreCase(lib, "kernelbase.dll")) return null;
+    const table = .{
+        .{ "GetModuleHandleW", &GetModuleHandleW },   .{ "GetModuleHandleA", &GetModuleHandleA },
+        .{ "GetModuleHandleExW", &GetModuleHandleExW }, .{ "LoadLibraryW", &LoadLibraryW },
+        .{ "LoadLibraryA", &LoadLibraryA },           .{ "LoadLibraryExW", &LoadLibraryExW },
+        .{ "LoadLibraryExA", &LoadLibraryExA },       .{ "FreeLibrary", &FreeLibrary },
+        .{ "GetProcAddress", &GetProcAddress },       .{ "VirtualAlloc", &VirtualAlloc },
+        .{ "VirtualFree", &VirtualFree },             .{ "VirtualProtect", &VirtualProtect },
+        .{ "VirtualQuery", &VirtualQuery },           .{ "VirtualLock", &VirtualLock },
+        .{ "VirtualUnlock", &VirtualUnlock },
+    };
+    inline for (table) |e| if (std.mem.eql(u8, sym, e[0])) return @intFromPtr(e[1]);
+    return null;
+}
+
+// ---------------------------------------------------------------- crash report
+// A fault inside a loaded image (e.g. MSVC __fastfail = `int 0x29`) is reported as
+// signal, RIP and fault address mapped to IMAGE+RVA, the general registers, and the
+// stack words that point into executable sections (candidate return addresses).
+// Exit 9. Instrument only: a crash report never makes a run count as supported.
+var crash_images: []const Image = &.{};
+
+fn where(buf: []u8, addr: u64) []const u8 {
+    for (crash_images) |im| if (addr >= im.base and addr < im.base + im.img.len)
+        return std.fmt.bufPrint(buf, "{s}+0x{x}", .{ im.name, addr - im.base }) catch "?";
+    return std.fmt.bufPrint(buf, "0x{x}", .{addr}) catch "?";
+}
+
+fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    _ = info;
+    const g: [*]const u64 = @ptrFromInt(@intFromPtr(ctx.?) + 40); // ucontext.uc_mcontext.gregs
+    const rip = g[16];
+    const rsp = g[15];
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    std.debug.print("winload64: CRASH signal {d} at {s} (trapno={d} err=0x{x} cr2={s})\n", .{ @intFromEnum(sig), where(&b1, rip), g[20], g[19], where(&b2, g[22]) });
+    std.debug.print("  rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n  rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n  r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x}\n", .{ g[13], g[11], g[14], g[12], g[9], g[8], g[10], rsp, g[0], g[1], g[2], g[3] });
+    std.debug.print("  stack words pointing into executable sections (candidate return addresses):\n", .{});
+    var n: usize = 0;
+    var k: usize = 0;
+    while (k < 1024 and n < 24) : (k += 1) {
+        const v = @as(*const u64, @ptrFromInt(rsp + k * 8)).*;
+        for (crash_images) |im| if (v >= im.base and v < im.base + im.img.len and inExec(im.secs, v - im.base)) {
+            std.debug.print("    [rsp+0x{x}] {s}\n", .{ k * 8, where(&b1, v) });
+            n += 1;
+        };
+    }
+    std.process.exit(9);
+}
+
+fn installCrashReport(images: []const Image) void {
+    crash_images = images;
+    var act: linux.Sigaction = .{ .handler = .{ .sigaction = &onCrash }, .mask = std.mem.zeroes(linux.sigset_t), .flags = linux.SA.SIGINFO | linux.SA.ONSTACK };
+    for ([_]linux.SIG{ .SEGV, .BUS, .ILL, .FPE, .TRAP }) |s| _ = linux.sigaction(s, &act, null);
+}
 
 const Loader = struct {
     a: std.mem.Allocator,
@@ -370,6 +796,7 @@ const Loader = struct {
                 die(.refused, "{s} is in --dll-dir but not pinned (--pin {s}=SHA256); nothing executed", .{ lib, lib });
             } else |_| {}
         }
+        if (registryOverride(lib, sym)) |addr| return addr;
         const shim_lib = shimLibrary(lib);
         if (sym.len > 1 and sym[0] == '#') {
             const ord = std.fmt.parseInt(u16, sym[1..], 10) catch return null;
@@ -420,7 +847,7 @@ const Loader = struct {
                     if (self.resolve(lib, sym, 0)) |addr| {
                         std.mem.writeInt(u64, im.img[at..][0..8], addr, .little);
                         self.n_imports += 1;
-                    } else if (delay and n_traps < max_traps) {
+                    } else if ((delay or trap_all) and n_traps < max_traps) {
                         trap_names[n_traps] = std.fmt.allocPrint(self.a, "{s}!{s} (from {s})", .{ lib, sym, im.name }) catch "?";
                         std.mem.writeInt(u64, im.img[at..][0..8], @intFromPtr(trap_table[n_traps]), .little);
                         n_traps += 1;
@@ -514,6 +941,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--dll-dir") and more) {
             i += 1;
             ld.dll_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--trap-unresolved")) {
+            trap_all = true;
         } else if (std.mem.eql(u8, arg, "--check")) {
             check_only = true;
         } else if (std.mem.eql(u8, arg, "--call") and more) {
@@ -534,6 +963,8 @@ pub fn main(init: std.process.Init) !void {
     if (!check_only and !std.mem.eql(u8, init.environ_map.get("WINS_WINRUN_BOX") orelse "", "1"))
         die(.usage, "execution requires the boxed launcher; use winload64_box.py", .{});
 
+    g_ld = &ld;
+    if (winrun.lookup("kernel32.dll", "SetLastError")) |f| @import("winload64_sync.zig").set_last_error = @ptrFromInt(f);
     const root_idx = ld.map(root.?);
     ld.bind(root_idx);
     if (ld.missing.items.len != 0) die(.unresolved, "unresolved imports, nothing executed:\n{s}", .{ld.missing.items});
@@ -576,6 +1007,7 @@ pub fn main(init: std.process.Init) !void {
     std.mem.writeInt(usize, peb[0x20..][0..8], @intFromPtr(params.ptr), .little); // ProcessParameters
     if (linux.errno(linux.syscall2(.arch_prctl, 0x1001, @intFromPtr(teb.ptr))) != .SUCCESS) die(.map_failed, "arch_prctl(ARCH_SET_GS) failed", .{});
 
+    installCrashReport(ld.images.items);
     ld.initialize(root_idx);
 
     var out: [256]u8 = undefined;

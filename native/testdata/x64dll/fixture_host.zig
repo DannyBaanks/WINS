@@ -22,6 +22,7 @@ const specs = [_]Spec{
     .{ .dll = "fixture_b.dll", .name = "fixb_tls_own", .ret = .u32 },
     .{ .dll = "fixture_b.dll", .name = "fixb_tls_own_bump", .ret = .u32 },
     .{ .dll = "fixture_a.dll", .name = "fix_tls_get", .ret = .u32 },
+    .{ .dll = "fixture_a.dll", .name = "fix_crt_format", .args = .{ -7, 42 }, .ret = .str },
 };
 
 pub fn main() void {

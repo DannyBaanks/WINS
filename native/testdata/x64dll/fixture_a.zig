@@ -53,3 +53,20 @@ export const fixture_tls_callback linksection(".CRT$XLB") = &tlsCallback;
 export fn fix_tls_callback_count() callconv(W) u32 {
     return tls_callback_count;
 }
+
+// msvcrt through the Win64 ABI (catches a shim built with the SysV convention).
+extern "msvcrt" fn malloc(n: usize) callconv(W) ?[*]u8;
+extern "msvcrt" fn free(p: ?[*]u8) callconv(W) void;
+extern "msvcrt" fn _snprintf(buf: [*]u8, n: usize, fmt: [*:0]const u8, ...) callconv(W) i32;
+
+var fmt_buf: [64]u8 = undefined;
+export fn fix_crt_format(a: i32, b: u32) callconv(W) [*:0]const u8 {
+    const p = malloc(32) orelse return "malloc returned NULL";
+    const vp: *volatile u8 = &p[0]; // volatile: the optimizer may not elide malloc/free
+    vp.* = 'x';
+    const c: u32 = vp.*;
+    free(p);
+    const n = _snprintf(&fmt_buf, fmt_buf.len, "%d|%u|%s|%x|%c", a, b, @as([*:0]const u8, "ok"), @as(u32, 0xBEEF), c);
+    if (n < 0 or n >= fmt_buf.len) return "snprintf failed";
+    return @ptrCast(&fmt_buf);
+}
