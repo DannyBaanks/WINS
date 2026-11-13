@@ -2679,33 +2679,244 @@ const WIN32_FIND_DATAA = extern struct {
     cAlternateFileName: [14]u8,
 };
 
-fn FindFirstFileA(lpFileName: ?[*:0]const u8, lpFindFileData: ?*anyopaque) callconv(W) usize {
-    _ = lpFileName;
-    if (lpFindFileData) |p| {
-        const fd: *WIN32_FIND_DATAA = @ptrCast(@alignCast(p));
-        @memset(@as([*]u8, @ptrCast(fd))[0..@sizeOf(WIN32_FIND_DATAA)], 0);
-        fd.dwFileAttributes = 0x80; // FILE_ATTRIBUTE_NORMAL
-        @memcpy(fd.cFileName[0..13], "FalloutNV.exe");
-        return 0x5001; // Valid find handle
+// Directory enumeration, as Win32 does it.
+//
+// These used to be stubs: FindFirstFileA ignored its pattern and always
+// answered one entry, "FalloutNV.exe", attributes 0x80, size 0, time 0.
+// FalloutNV lists its plugins with FindFirstFileA("DATA\\*.esm") and
+// "DATA\\*.esp" and calls it on every master and archive before opening it
+// (Proton relay log: 494 calls), so it never saw FalloutNV.esm and sat on the
+// loading screen. Semantics pinned against Proton by
+// native/testdata/find_probe.c: ASCII case-insensitive match of the last
+// component ('*', '?', and "x.*" also matching names without a dot), parent
+// resolved case-insensitively, "." and ".." listed, attributes 0x10/0x20,
+// real size and times, errors 2 (no match), 3 (no parent), 18 (end), 6 (bad
+// handle). Not modelled: 8.3 short names (cAlternateFileName stays empty),
+// read-only/hidden bits, FindFirstFileExA.
+const FIND_HANDLE_BASE: usize = 0x40000;
+const FIND_HANDLE_STEP: usize = 4;
+const MAX_FINDS = 64;
+
+const FindState = struct {
+    used: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    dir_fd: i32 = -1,
+    pat_len: usize = 0,
+    pat: [260]u8 = undefined,
+    buf: [4096]u8 align(8) = undefined,
+    buf_len: usize = 0,
+    buf_off: usize = 0,
+};
+var g_finds: [MAX_FINDS]FindState = [_]FindState{.{}} ** MAX_FINDS;
+
+fn findSlot(h: usize) ?*FindState {
+    if (h < FIND_HANDLE_BASE) return null;
+    const off = h - FIND_HANDLE_BASE;
+    if (off % FIND_HANDLE_STEP != 0) return null;
+    const i = off / FIND_HANDLE_STEP;
+    if (i >= MAX_FINDS) return null;
+    if (!g_finds[i].used.load(.acquire)) return null;
+    return &g_finds[i];
+}
+
+fn asciiLower(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+fn globMatchCi(pat: []const u8, name: []const u8) bool {
+    var p: usize = 0;
+    var n: usize = 0;
+    var star_p: ?usize = null;
+    var star_n: usize = 0;
+    while (n < name.len) {
+        if (p < pat.len and (pat[p] == '?' or (pat[p] != '*' and asciiLower(pat[p]) == asciiLower(name[n])))) {
+            p += 1;
+            n += 1;
+        } else if (p < pat.len and pat[p] == '*') {
+            star_p = p;
+            star_n = n;
+            p += 1;
+        } else if (star_p) |sp| {
+            p = sp + 1;
+            star_n += 1;
+            n = star_n;
+        } else return false;
     }
-    g_last_error = 2;
-    return 0xFFFFFFFF;
+    while (p < pat.len and pat[p] == '*') p += 1;
+    return p == pat.len;
+}
+
+/// Win32 mask match: glob, and a trailing ".*" also accepts a name with no
+/// dot at all (so "*.*" lists "Sub", "." and ".." as the oracle does).
+fn win32MaskMatch(pat: []const u8, name: []const u8) bool {
+    if (globMatchCi(pat, name)) return true;
+    if (pat.len >= 2 and std.mem.endsWith(u8, pat, ".*") and std.mem.indexOfScalar(u8, name, '.') == null)
+        return globMatchCi(pat[0 .. pat.len - 2], name);
+    return false;
+}
+
+fn unixToFiletime(sec: i64, nsec: u32) [2]u32 {
+    const t: u64 = @intCast(@max(0, (sec + 11644473600) * 10_000_000 + @divTrunc(@as(i64, nsec), 100)));
+    return .{ @truncate(t), @truncate(t >> 32) };
+}
+
+/// Next directory entry of `st` that matches its pattern, written into `out`.
+fn findAdvance(st: *FindState, out: *WIN32_FIND_DATAA) bool {
+    while (true) {
+        if (st.buf_off >= st.buf_len) {
+            const n = linux.getdents64(st.dir_fd, &st.buf, st.buf.len);
+            if (linux.errno(n) != .SUCCESS or n == 0) return false;
+            st.buf_len = n;
+            st.buf_off = 0;
+        }
+        const ent: *align(1) const linux.dirent64 = @ptrCast(&st.buf[st.buf_off]);
+        st.buf_off += ent.reclen;
+        const name_z: [*:0]const u8 = @ptrCast(&ent.name);
+        const name = std.mem.sliceTo(name_z, 0);
+        if (name.len >= out.cFileName.len) continue;
+        if (!win32MaskMatch(st.pat[0..st.pat_len], name)) continue;
+
+        var stx: linux.Statx = undefined;
+        const want: linux.STATX = .{ .TYPE = true, .SIZE = true, .MTIME = true, .ATIME = true, .BTIME = true };
+        if (linux.errno(linux.statx(st.dir_fd, name_z, 0, want, &stx)) != .SUCCESS) continue; // vanished
+        @memset(@as([*]u8, @ptrCast(out))[0..@sizeOf(WIN32_FIND_DATAA)], 0);
+        const is_dir = (stx.mode & linux.S.IFMT) == linux.S.IFDIR;
+        out.dwFileAttributes = if (is_dir) 0x10 else 0x20;
+        if (!is_dir) {
+            out.nFileSizeLow = @truncate(stx.size);
+            out.nFileSizeHigh = @truncate(stx.size >> 32);
+        }
+        out.ftLastWriteTime = unixToFiletime(stx.mtime.sec, stx.mtime.nsec);
+        out.ftLastAccessTime = unixToFiletime(stx.atime.sec, stx.atime.nsec);
+        out.ftCreationTime = if (stx.mask.BTIME)
+            unixToFiletime(stx.btime.sec, stx.btime.nsec)
+        else
+            out.ftLastWriteTime;
+        @memcpy(out.cFileName[0..name.len], name);
+        return true;
+    }
+}
+
+fn FindFirstFileA(lpFileName: ?[*:0]const u8, lpFindFileData: ?*anyopaque) callconv(W) usize {
+    const INVALID: usize = 0xFFFFFFFF;
+    const name_p = lpFileName orelse {
+        g_last_error = 2;
+        return INVALID;
+    };
+    const out: *WIN32_FIND_DATAA = @ptrCast(@alignCast(lpFindFileData orelse {
+        g_last_error = 87; // ERROR_INVALID_PARAMETER
+        return INVALID;
+    }));
+    const raw = std.mem.sliceTo(name_p, 0);
+    var norm: [512]u8 = undefined;
+    if (raw.len >= norm.len) {
+        g_last_error = 206; // ERROR_FILENAME_EXCED_RANGE
+        return INVALID;
+    }
+    for (raw, 0..) |c, i| norm[i] = if (c == '\\') '/' else c;
+    const path = norm[0..raw.len];
+
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    const pat = if (slash) |s| path[s + 1 ..] else path;
+    if (pat.len == 0 or pat.len >= 260) {
+        g_last_error = 2;
+        std.debug.print("[WINS:Kernel32] FindFirstFileA(\"{s}\") -> INVALID (err 2)\n", .{raw});
+        return INVALID;
+    }
+    var parent_buf: [512]u8 = undefined;
+    var parent: [*:0]const u8 = ".";
+    if (slash) |s| {
+        const dir = if (s == 0) "/" else path[0..s];
+        if (resolvePathCaseInsensitive(dir, &parent_buf)) |rp| parent = rp.ptr else {
+            g_last_error = 3; // ERROR_PATH_NOT_FOUND
+            std.debug.print("[WINS:Kernel32] FindFirstFileA(\"{s}\") -> INVALID (err 3)\n", .{raw});
+            return INVALID;
+        }
+    }
+
+    var idx: usize = 0;
+    while (idx < MAX_FINDS) : (idx += 1) {
+        if (g_finds[idx].used.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) break;
+    }
+    if (idx == MAX_FINDS) {
+        g_last_error = 4; // ERROR_TOO_MANY_OPEN_FILES
+        std.debug.print("[WINS:Kernel32] FindFirstFileA(\"{s}\") -> INVALID (no free find slot)\n", .{raw});
+        return INVALID;
+    }
+    const st = &g_finds[idx];
+    const rc = linux.open(parent, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) {
+        st.used.store(false, .release);
+        g_last_error = 3;
+        std.debug.print("[WINS:Kernel32] FindFirstFileA(\"{s}\") -> INVALID (err 3)\n", .{raw});
+        return INVALID;
+    }
+    st.dir_fd = @intCast(rc);
+    st.pat_len = pat.len;
+    @memcpy(st.pat[0..pat.len], pat);
+    st.buf_len = 0;
+    st.buf_off = 0;
+    if (!findAdvance(st, out)) {
+        _ = linux.close(st.dir_fd);
+        st.dir_fd = -1;
+        st.used.store(false, .release);
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        std.debug.print("[WINS:Kernel32] FindFirstFileA(\"{s}\") -> INVALID (err 2)\n", .{raw});
+        return INVALID;
+    }
+    const h = FIND_HANDLE_BASE + idx * FIND_HANDLE_STEP;
+    std.debug.print("[WINS:Kernel32] FindFirstFileA(\"{s}\") -> 0x{x} first=\"{s}\"\n", .{ raw, h, std.mem.sliceTo(&out.cFileName, 0) });
+    return h;
 }
 
 fn FindNextFileA(hFindFile: usize, lpFindFileData: ?*anyopaque) callconv(W) i32 {
-    _ = hFindFile; _ = lpFindFileData;
+    const st = findSlot(hFindFile) orelse {
+        g_last_error = 6; // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    const out: *WIN32_FIND_DATAA = @ptrCast(@alignCast(lpFindFileData orelse {
+        g_last_error = 87;
+        return 0;
+    }));
+    if (findAdvance(st, out)) return 1;
     g_last_error = 18; // ERROR_NO_MORE_FILES
     return 0;
 }
 
 fn FindClose(hFindFile: usize) callconv(W) i32 {
-    _ = hFindFile;
+    const st = findSlot(hFindFile) orelse {
+        g_last_error = 6; // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    _ = linux.close(st.dir_fd);
+    st.dir_fd = -1;
+    st.used.store(false, .release);
     return 1;
 }
 
+/// FILE_TYPE_DISK/CHAR/PIPE from what the descriptor really is; it used to
+/// answer FILE_TYPE_CHAR for every handle. Unknown handles: 0 + error 6.
 fn GetFileType(hFile: usize) callconv(W) u32 {
-    _ = hFile;
-    return 2; // FILE_TYPE_CHAR (console)
+    const fd: i32 = switch (hFile) {
+        0x1000 => 0,
+        0x1001 => 1,
+        0x1002 => 2,
+        0x10000...0x1FFFF => @intCast(hFile - 0x10000),
+        else => {
+            g_last_error = 6;
+            return 0; // FILE_TYPE_UNKNOWN
+        },
+    };
+    var stx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx)) != .SUCCESS) {
+        g_last_error = 6;
+        return 0;
+    }
+    return switch (stx.mode & linux.S.IFMT) {
+        linux.S.IFREG, linux.S.IFDIR, linux.S.IFBLK => 1, // FILE_TYPE_DISK
+        linux.S.IFCHR => 2, // FILE_TYPE_CHAR
+        linux.S.IFIFO, linux.S.IFSOCK => 3, // FILE_TYPE_PIPE
+        else => 0,
+    };
 }
 
 fn GetConsoleMode(hConsoleHandle: usize, lpMode: ?*u32) callconv(W) i32 {
@@ -6447,4 +6658,88 @@ test "case-insensitive paths: exact first, ASCII fold per component, 2 vs 3 on m
     _ = linux.unlinkat(linux.AT.FDCWD, nul(&z_buf, file), 0);
     _ = linux.rmdir(nul(&z_buf, data_dir));
     _ = linux.rmdir(nul(&z_buf, base));
+}
+
+test "FindFirstFileA: masks, case folding, real attributes and sizes, Win32 errors" {
+    // Mirrors native/testdata/find_probe.c (pinned against Proton): the
+    // plugin listing FalloutNV does with "DATA\\*.esm".
+    var base_buf: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, "/tmp/wins-find-{}", .{linux.getpid()});
+    var z: [300]u8 = undefined;
+    const nul = struct {
+        fn f(buf: []u8, comptime fmt: []const u8, args: anytype) [*:0]const u8 {
+            const s = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args) catch unreachable;
+            buf[s.len] = 0;
+            return @ptrCast(buf.ptr);
+        }
+    }.f;
+    const files = [_]struct { name: []const u8, size: usize }{
+        .{ .name = "FalloutNV.esm", .size = 5 }, .{ .name = "DeadMoney.esm", .size = 3 },
+        .{ .name = "Update.bsa", .size = 7 },    .{ .name = "readme.txt", .size = 0 },
+    };
+    try std.testing.expect(linux.errno(linux.mkdir(nul(&z, "{s}", .{base}), 0o755)) == .SUCCESS);
+    try std.testing.expect(linux.errno(linux.mkdir(nul(&z, "{s}/Data", .{base}), 0o755)) == .SUCCESS);
+    try std.testing.expect(linux.errno(linux.mkdir(nul(&z, "{s}/Data/Sub", .{base}), 0o755)) == .SUCCESS);
+    for (files) |f| {
+        const fd = linux.open(nul(&z, "{s}/Data/{s}", .{ base, f.name }), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        try std.testing.expect(linux.errno(fd) == .SUCCESS);
+        _ = linux.write(@intCast(fd), "XXXXXXXX", f.size);
+        _ = linux.close(@intCast(fd));
+    }
+    defer {
+        for (files) |f| _ = linux.unlinkat(linux.AT.FDCWD, nul(&z, "{s}/Data/{s}", .{ base, f.name }), 0);
+        _ = linux.rmdir(nul(&z, "{s}/Data/Sub", .{base}));
+        _ = linux.rmdir(nul(&z, "{s}/Data", .{base}));
+        _ = linux.rmdir(nul(&z, "{s}", .{base}));
+    }
+
+    var d: WIN32_FIND_DATAA = undefined;
+    // "*.esm" through an upper-case, backslashed parent: both masters, real sizes.
+    var h = FindFirstFileA(nul(&z, "{s}\\DATA\\*.ESM", .{base}), &d);
+    try std.testing.expect(h != 0xFFFFFFFF);
+    var seen: u32 = 0;
+    while (true) {
+        const name = std.mem.sliceTo(&d.cFileName, 0);
+        try std.testing.expectEqual(@as(u32, 0x20), d.dwFileAttributes);
+        try std.testing.expect(d.ftLastWriteTime[1] >= 0x01d00000);
+        if (std.mem.eql(u8, name, "FalloutNV.esm")) {
+            try std.testing.expectEqual(@as(u32, 5), d.nFileSizeLow);
+            seen |= 1;
+        } else if (std.mem.eql(u8, name, "DeadMoney.esm")) {
+            try std.testing.expectEqual(@as(u32, 3), d.nFileSizeLow);
+            seen |= 2;
+        } else return error.TestUnexpectedResult;
+        if (FindNextFileA(h, &d) == 0) break;
+    }
+    try std.testing.expectEqual(@as(u32, 3), seen);
+    try std.testing.expectEqual(@as(u32, 18), g_last_error);
+    try std.testing.expectEqual(@as(i32, 1), FindClose(h));
+    try std.testing.expectEqual(@as(i32, 0), FindClose(h)); // closed handles are invalid
+    try std.testing.expectEqual(@as(u32, 6), g_last_error);
+
+    // Literal, wrong case: the real on-disk spelling comes back.
+    h = FindFirstFileA(nul(&z, "{s}/data/update.BSA", .{base}), &d);
+    try std.testing.expect(h != 0xFFFFFFFF);
+    try std.testing.expectEqualStrings("Update.bsa", std.mem.sliceTo(&d.cFileName, 0));
+    _ = FindClose(h);
+
+    // "*.*" lists dot-less names too ("Sub", ".", ".."): 4 files + 3 dirs.
+    h = FindFirstFileA(nul(&z, "{s}/Data/*.*", .{base}), &d);
+    var count: u32 = 1;
+    while (FindNextFileA(h, &d) != 0) count += 1;
+    try std.testing.expectEqual(@as(u32, 7), count);
+    _ = FindClose(h);
+    h = FindFirstFileA(nul(&z, "{s}/Data/Sub", .{base}), &d);
+    try std.testing.expectEqual(@as(u32, 0x10), d.dwFileAttributes);
+    _ = FindClose(h);
+
+    // Errors: no match 2, missing parent 3.
+    try std.testing.expectEqual(@as(usize, 0xFFFFFFFF), FindFirstFileA(nul(&z, "{s}/Data/*.nope", .{base}), &d));
+    try std.testing.expectEqual(@as(u32, 2), g_last_error);
+    try std.testing.expectEqual(@as(usize, 0xFFFFFFFF), FindFirstFileA(nul(&z, "{s}/Nope/*.esm", .{base}), &d));
+    try std.testing.expectEqual(@as(u32, 3), g_last_error);
+
+    try std.testing.expect(win32MaskMatch("Fallout?V.esm", "FALLOUTNV.ESM"));
+    try std.testing.expect(!win32MaskMatch("*.esm", "FalloutNV.esp"));
+    try std.testing.expectEqual(@as(u32, 0), GetFileType(0x12345678));
 }
