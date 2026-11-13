@@ -2948,16 +2948,22 @@ fn MultiByteToWideChar(CodePage: u32, dwFlags: u32, lpMultiByteStr: ?[*]const u8
     _ = CodePage; _ = dwFlags;
     if (lpMultiByteStr == null) return 0;
     const src = lpMultiByteStr.?;
-    const in_len: usize = if (cbMultiByte < 0) std.mem.indexOfScalar(u8, std.mem.sliceTo(src, 0), 0) orelse 0 + 1 else @intCast(cbMultiByte);
+    // -1 = NUL-terminated, and the count includes the NUL. (This used to be
+    // `indexOfScalar(sliceTo(src, 0), 0) orelse 0 + 1`, which is always 1.)
+    const in_len: usize = if (cbMultiByte < 0) std.mem.len(@as([*:0]const u8, @ptrCast(src))) + 1 else @intCast(cbMultiByte);
     if (cchWideChar == 0) return @intCast(in_len);
     if (lpWideCharStr == null) return 0;
     const dst = lpWideCharStr.?;
     const out_max: usize = @intCast(cchWideChar);
-    const n = @min(in_len, out_max);
-    for (0..n) |i| {
+    if (out_max < in_len) {
+        g_last_error = 122; // ERROR_INSUFFICIENT_BUFFER: Win32 writes nothing useful and returns 0
+        return 0;
+    }
+    // Bytes map 1:1 to code points (Latin-1); the cp1252 0x80-0x9f block is not modelled.
+    for (0..in_len) |i| {
         dst[i] = src[i];
     }
-    return @intCast(n);
+    return @intCast(in_len);
 }
 
 fn WideCharToMultiByte(CodePage: u32, dwFlags: u32, lpWideCharStr: ?[*]const u16, cchWideChar: i32, lpMultiByteStr: ?[*]u8, cbMultiByte: i32, lpDefaultChar: ?[*]const u8, lpUsedDefaultChar: ?*i32) callconv(W) i32 {
@@ -3011,14 +3017,31 @@ fn GetStringTypeW(dwInfoType: u32, lpSrcStr: ?[*]const u16, cchSrc: i32, lpCharT
 }
 
 fn LCMapStringA(Locale: u32, dwMapFlags: u32, lpSrcStr: ?[*]const u8, cchSrc: i32, lpDestStr: ?[*]u8, cchDest: i32) callconv(W) i32 {
-    _ = Locale; _ = dwMapFlags;
+    _ = Locale;
     if (lpSrcStr == null) return 0;
-    const in_len: usize = if (cchSrc < 0) std.mem.indexOfScalar(u8, std.mem.sliceTo(lpSrcStr.?, 0), 0) orelse 0 + 1 else @intCast(cchSrc);
+    if (dwMapFlags == 0) {
+        g_last_error = 1004; // ERROR_INVALID_FLAGS (oracle: no mapping requested -> 0)
+        return 0;
+    }
+    const in_len: usize = if (cchSrc < 0) std.mem.len(@as([*:0]const u8, @ptrCast(lpSrcStr.?))) + 1 else @intCast(cchSrc);
     if (cchDest == 0) return @intCast(in_len);
     if (lpDestStr == null) return 0;
-    const n = @min(in_len, @as(usize, @intCast(cchDest)));
-    @memcpy(lpDestStr.?[0..n], lpSrcStr.?[0..n]);
-    return @intCast(n);
+    if (@as(usize, @intCast(cchDest)) < in_len) {
+        g_last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+        return 0;
+    }
+    // LCMAP_LOWERCASE (0x100) / LCMAP_UPPERCASE (0x200), ASCII only; other
+    // mappings (sort keys, width, kana) are not modelled and copy unchanged.
+    for (0..in_len) |i| {
+        const c = lpSrcStr.?[i];
+        lpDestStr.?[i] = if (dwMapFlags & 0x200 != 0 and c >= 'a' and c <= 'z')
+            c - 32
+        else if (dwMapFlags & 0x100 != 0 and c >= 'A' and c <= 'Z')
+            c + 32
+        else
+            c;
+    }
+    return @intCast(in_len);
 }
 
 fn LCMapStringW(Locale: u32, dwMapFlags: u32, lpSrcStr: ?[*]const u16, cchSrc: i32, lpDestStr: ?[*]u16, cchDest: i32) callconv(W) i32 {
@@ -3151,7 +3174,10 @@ fn lstrcpyA(lpString1: ?[*]u8, lpString2: ?[*:0]const u8) callconv(W) ?[*]u8 {
 
 fn lstrcatA(lpString1: ?[*]u8, lpString2: ?[*:0]const u8) callconv(W) ?[*]u8 {
     if (lpString1 == null or lpString2 == null) return lpString1;
-    const s1_len = std.mem.indexOfScalar(u8, std.mem.sliceTo(lpString1.?, 0), 0) orelse 0;
+    // Append after the existing NUL. (This used to be
+    // `indexOfScalar(sliceTo(s1, 0), 0) orelse 0`, which is always 0: lstrcatA
+    // overwrote its destination, so FalloutNV's "DATA\\" + "*.esm" became "*.esm".)
+    const s1_len = std.mem.len(@as([*:0]u8, @ptrCast(lpString1.?)));
     const s2 = std.mem.sliceTo(lpString2.?, 0);
     @memcpy(lpString1.?[s1_len .. s1_len + s2.len], s2);
     lpString1.?[s1_len + s2.len] = 0;
@@ -6742,4 +6768,24 @@ test "FindFirstFileA: masks, case folding, real attributes and sizes, Win32 erro
     try std.testing.expect(win32MaskMatch("Fallout?V.esm", "FALLOUTNV.ESM"));
     try std.testing.expect(!win32MaskMatch("*.esm", "FalloutNV.esp"));
     try std.testing.expectEqual(@as(u32, 0), GetFileType(0x12345678));
+}
+
+test "lstrcatA appends; -1 lengths count the whole string plus its NUL" {
+    var buf: [32]u8 = [_]u8{'Z'} ** 32;
+    _ = lstrcpyA(&buf, "DATA\\");
+    _ = lstrcatA(&buf, "*.esm");
+    try std.testing.expectEqualStrings("DATA\\*.esm", std.mem.sliceTo(@as([*:0]u8, @ptrCast(&buf)), 0));
+
+    var w: [16]u16 = undefined;
+    try std.testing.expectEqual(@as(i32, 11), MultiByteToWideChar(0, 0, "DATA\\a.esm", -1, null, 0));
+    try std.testing.expectEqual(@as(i32, 11), MultiByteToWideChar(0, 0, "DATA\\a.esm", -1, &w, 16));
+    try std.testing.expectEqual(@as(u16, 'm'), w[9]);
+    try std.testing.expectEqual(@as(u16, 0), w[10]);
+    try std.testing.expectEqual(@as(i32, 0), MultiByteToWideChar(0, 0, "abcdef", -1, &w, 3));
+    try std.testing.expectEqual(@as(u32, 122), g_last_error);
+
+    var d: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 16), LCMapStringA(0, 0x200, "Data\\Update.bsa", -1, &d, 32));
+    try std.testing.expectEqualStrings("DATA\\UPDATE.BSA", std.mem.sliceTo(@as([*:0]u8, @ptrCast(&d)), 0));
+    try std.testing.expectEqual(@as(i32, 0), LCMapStringA(0, 0, "x", -1, &d, 32));
 }
