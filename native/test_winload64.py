@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FIX = ROOT / 'native' / 'testdata' / 'x64dll'
 A = 'fixture_a.dll'
+ORACLE_PREFIX = Path(os.environ.get('WINS_WINE_ORACLE_PREFIX', Path.home() / '.cache' / 'wins' / 'wine-oracle-prefix'))
 SEQ = [  # (target, args, ret) - same order as fixture_host.zig
     (f'{A}!fix_version', [], 'str'), (f'{A}!fix_add', [-5, 3], 'i32'),
     (f'{A}!fix_attach_count', [], 'u32'), (f'{A}!fix_tls_callback_count', [], 'u32'),
@@ -76,17 +77,20 @@ class WinLoad64Tests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return [l.replace(f'call {A}!', 'call ') for l in r.stderr.splitlines() if l.startswith('call ')]
 
-    @unittest.skipUnless(shutil.which('wine'), 'Wine (the oracle) required')
+    @unittest.skipUnless(shutil.which('wine') and ORACLE_PREFIX.is_dir(),
+                         f'Wine and an initialised oracle prefix ({ORACLE_PREFIX}) required')
     def test_identical_to_wine_and_defect_detected(self):
+        # Creating a Wine prefix inside the cleanroom is unreliable on this host (first
+        # run can hang or leave it half-initialised), so the oracle uses a prefix that
+        # was initialised once and is reused: WINS_WINE_ORACLE_PREFIX or
+        # ~/.cache/wins/wine-oracle-prefix (see GUIA.md, "Cargar DLLs de 64 bits").
         box = ['bwrap', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv',
                '--ro-bind', '/usr', '/usr', '--ro-bind', '/etc', '/etc', '--symlink', 'usr/bin', '/bin',
                '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc',
                '--dev', '/dev', '--tmpfs', '/tmp', '--bind', str(self.dlls), '/work',
-               '--setenv', 'HOME', '/tmp', '--setenv', 'WINEPREFIX', '/work/prefix',
+               '--bind', str(ORACLE_PREFIX), '/prefix',
+               '--setenv', 'HOME', '/tmp', '--setenv', 'WINEPREFIX', '/prefix',
                '--setenv', 'WINEDEBUG', '-all', '--chdir', '/work', '--']
-        # A brand-new prefix finishes configuring on its first run and can swallow that
-        # program's output: initialise it first, then run the host.
-        subprocess.run(box + ['/usr/bin/wine', 'wineboot', '-u'], capture_output=True, timeout=600)
         w = subprocess.run(box + ['/usr/bin/wine', '/work/fixture_host.exe'], capture_output=True, text=True, timeout=600)
         oracle = [l for l in (w.stdout + w.stderr).splitlines() if l.startswith('call ')]
         self.assertEqual(len(oracle), len(SEQ), w.stderr[-2000:])
