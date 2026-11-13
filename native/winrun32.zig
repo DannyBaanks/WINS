@@ -1932,6 +1932,21 @@ fn CreateFileA(lpFileName: ?[*:0]const u8, dwDesiredAccess: u32, dwShareMode: u3
         }
         const open_errno = linux.errno(fd);
 
+        // Win32 paths are case-insensitive: "DATA/Fallout - Textures.bsa"
+        // names the same file as "Data/Fallout - Textures.bsa". Retry with
+        // the real on-disk spelling before giving up (filecase_probe.c).
+        if (open_errno == .NOENT) {
+            var resolved_buf: [512]u8 = undefined;
+            if (resolvePathCaseInsensitive(norm_slice, &resolved_buf)) |resolved| {
+                const fd_ci = linux.open(resolved.ptr, open_flags, 0o644);
+                if (linux.errno(fd_ci) == .SUCCESS) {
+                    std.debug.print("  -> SUCCESS [case-insensitive: {s}] fd={}\n", .{ resolved, fd_ci });
+                    g_last_error = 0;
+                    return @as(usize, @intCast(fd_ci)) + 0x10000;
+                }
+            }
+        }
+
         // A path with a drive letter or a directory prefix the loader's cwd
         // cannot resolve still names one of the game's own files: the game
         // runs with the loader's cwd set to the install directory, so the
@@ -1959,7 +1974,7 @@ fn CreateFileA(lpFileName: ?[*:0]const u8, dwDesiredAccess: u32, dwShareMode: u3
 
         // Every failure now names what actually went wrong.
         g_last_error = switch (open_errno) {
-            .NOENT => ERROR_FILE_NOT_FOUND,
+            .NOENT => fileNotFoundError(norm_slice),
             .ACCES => ERROR_ACCESS_DENIED,
             .PERM => ERROR_ACCESS_DENIED,
             .EXIST => ERROR_ALREADY_EXISTS,
@@ -2062,6 +2077,108 @@ fn FlushFileBuffers(hFile: usize) callconv(W) i32 {
     return 1;
 }
 
+// --- Win32 case-insensitive path resolution -------------------------------
+// Win32 treats every path component case-insensitively; Linux does not.
+// FalloutNV probes its archives as "DATA/Fallout - Textures.bsa" while the
+// directory on disk is "Data": without this, GetFileAttributesA answers
+// "not found", no BSA is ever opened, and the game dies on a NULL dereference
+// before the first frame. native/testdata/filecase_probe.c pins the semantics
+// against the Wine oracle (tools/diff_wine.sh).
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+fn ciAppend(buf: []u8, len: *usize, s: []const u8) bool {
+    if (len.* + s.len + 1 > buf.len) return false;
+    @memcpy(buf[len.* .. len.* + s.len], s);
+    len.* += s.len;
+    buf[len.*] = 0;
+    return true;
+}
+
+// Write the real on-disk spelling of `path` (forward slashes, relative or
+// absolute) into out_buf, NUL-terminated, and return it. Each component is
+// tried exactly first, then matched ASCII case-insensitively against its
+// parent directory. "." components are dropped, ".." is kept verbatim.
+// Returns null when a component has no match.
+fn resolvePathCaseInsensitive(path: []const u8, out_buf: []u8) ?[:0]const u8 {
+    if (path.len == 0 or out_buf.len < 2) return null;
+    var out_len: usize = 0;
+    if (path[0] == '/') {
+        out_buf[0] = '/';
+        out_buf[1] = 0;
+        out_len = 1;
+    }
+    var it = std.mem.splitScalar(u8, path, '/');
+    var comp_buf: [256]u8 = undefined;
+    var dent_buf: [4096]u8 align(8) = undefined;
+    while (it.next()) |comp| {
+        if (comp.len == 0 or std.mem.eql(u8, comp, ".")) continue;
+        if (comp.len >= comp_buf.len) return null;
+        if (out_len > 0 and out_buf[out_len - 1] != '/') {
+            if (!ciAppend(out_buf, &out_len, "/")) return null;
+        }
+        if (std.mem.eql(u8, comp, "..")) {
+            if (!ciAppend(out_buf, &out_len, "..")) return null;
+            continue;
+        }
+        @memcpy(comp_buf[0..comp.len], comp);
+        comp_buf[comp.len] = 0;
+        const parent: [*:0]const u8 = if (out_len == 0) "." else @ptrCast(out_buf.ptr);
+        const dir_rc = linux.open(parent, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        if (linux.errno(dir_rc) != .SUCCESS) return null;
+        const dir_fd: i32 = @intCast(dir_rc);
+        defer _ = linux.close(dir_fd);
+
+        if (linux.faccessat(dir_fd, comp_buf[0..comp.len :0].ptr, 0, 0) == 0) {
+            if (!ciAppend(out_buf, &out_len, comp)) return null;
+            continue;
+        }
+        var match_len: usize = 0;
+        var found = false;
+        while (!found) {
+            const n = linux.getdents64(dir_fd, &dent_buf, dent_buf.len);
+            if (linux.errno(n) != .SUCCESS or n == 0) break;
+            var off: usize = 0;
+            while (off < n) {
+                const ent: *align(1) const linux.dirent64 = @ptrCast(&dent_buf[off]);
+                const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
+                if (asciiEqlIgnoreCase(name, comp)) {
+                    if (name.len >= comp_buf.len) return null;
+                    @memcpy(comp_buf[0..name.len], name);
+                    match_len = name.len;
+                    found = true;
+                    break;
+                }
+                off += ent.reclen;
+            }
+        }
+        if (!found) return null;
+        if (!ciAppend(out_buf, &out_len, comp_buf[0..match_len])) return null;
+    }
+    if (out_len == 0) return null;
+    return out_buf[0..out_len :0];
+}
+
+// ERROR_FILE_NOT_FOUND when only the last component is missing,
+// ERROR_PATH_NOT_FOUND when a parent directory is missing (as Win32 does).
+fn fileNotFoundError(path: []const u8) u32 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| {
+        const parent = if (s == 0) "/" else path[0..s];
+        var buf: [512]u8 = undefined;
+        if (resolvePathCaseInsensitive(parent, &buf)) |rp| {
+            if (linux.faccessat(linux.AT.FDCWD, rp.ptr, 0, 0) == 0) return 2;
+        }
+        return 3;
+    }
+    return 2;
+}
+
 fn GetFileAttributesA(lpFileName: ?[*:0]const u8) callconv(W) u32 {
     if (lpFileName) |name| {
         const slice = std.mem.sliceTo(name, 0);
@@ -2073,11 +2190,34 @@ fn GetFileAttributesA(lpFileName: ?[*:0]const u8) callconv(W) u32 {
         norm_buf[norm_len] = 0;
         const norm_slice = norm_buf[0..norm_len:0];
 
-        const rc = linux.faccessat(linux.AT.FDCWD, norm_slice.ptr, 0, 0);
-        std.debug.print("[WINS:Kernel32] GetFileAttributesA(\"{s}\") -> rc={}\n", .{ norm_slice, rc });
-        if (rc == 0) return 0x80; // FILE_ATTRIBUTE_NORMAL
+        var target: [*:0]const u8 = norm_slice.ptr;
+        var resolved_buf: [512]u8 = undefined;
+        var rc = linux.faccessat(linux.AT.FDCWD, target, 0, 0);
+        if (rc != 0) {
+            if (resolvePathCaseInsensitive(norm_slice, &resolved_buf)) |resolved| {
+                target = resolved.ptr;
+                rc = linux.faccessat(linux.AT.FDCWD, target, 0, 0);
+            }
+        }
+        if (rc == 0) {
+            // The oracle reports FILE_ATTRIBUTE_ARCHIVE for plain files and
+            // FILE_ATTRIBUTE_DIRECTORY for directories; nothing else is
+            // modelled yet (read-only/hidden bits are not reported).
+            var attrs: u32 = 0x20;
+            var stx: linux.Statx = undefined;
+            if (linux.errno(linux.statx(linux.AT.FDCWD, target, 0, .{ .TYPE = true }, &stx)) == .SUCCESS and
+                (stx.mode & linux.S.IFMT) == linux.S.IFDIR)
+            {
+                attrs = 0x10;
+            }
+            std.debug.print("[WINS:Kernel32] GetFileAttributesA(\"{s}\") -> 0x{x}\n", .{ norm_slice, attrs });
+            return attrs;
+        }
+        g_last_error = fileNotFoundError(norm_slice);
+        std.debug.print("[WINS:Kernel32] GetFileAttributesA(\"{s}\") -> INVALID (err {})\n", .{ norm_slice, g_last_error });
+    } else {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
     }
-    g_last_error = 2; // ERROR_FILE_NOT_FOUND
     return 0xFFFFFFFF;
 }
 
@@ -6246,4 +6386,65 @@ test "thread control on handles this loader does not track keeps its legacy answ
     var code: u32 = 55;
     try std.testing.expectEqual(@as(i32, 1), GetExitCodeThread(0x4001, &code));
     try std.testing.expectEqual(@as(u32, 0), code);
+}
+
+test "case-insensitive paths: exact first, ASCII fold per component, 2 vs 3 on misses" {
+    // Fixture on disk: <base>/Data/Fallout - Textures.bsa (the exact shape of
+    // the FalloutNV archive probe). Exercises the real resolver and the real
+    // GetFileAttributesA, not a copy of their logic.
+    var base_buf: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, "/tmp/wins-ci-{}", .{linux.getpid()});
+    var file_buf: [220]u8 = undefined;
+    const file = try std.fmt.bufPrint(&file_buf, "{s}/Data/Fallout - Textures.bsa", .{base});
+    var dir_buf: [220]u8 = undefined;
+    var upper_buf: [220]u8 = undefined;
+    var folded_buf: [220]u8 = undefined;
+    var missfile_buf: [220]u8 = undefined;
+    var missdir_buf: [220]u8 = undefined;
+    var upperdir_buf: [220]u8 = undefined;
+    var z_buf: [240]u8 = undefined;
+    const nul = struct {
+        fn f(buf: []u8, s: []const u8) [*:0]const u8 {
+            @memcpy(buf[0..s.len], s);
+            buf[s.len] = 0;
+            return @ptrCast(buf.ptr);
+        }
+    }.f;
+
+    _ = linux.rmdir(nul(&z_buf, base)); // leftover from a crashed run, if any
+    try std.testing.expect(linux.errno(linux.mkdir(nul(&z_buf, base), 0o755)) == .SUCCESS);
+    const data_dir = try std.fmt.bufPrint(&dir_buf, "{s}/Data", .{base});
+    try std.testing.expect(linux.errno(linux.mkdir(nul(&z_buf, data_dir), 0o755)) == .SUCCESS);
+    const fd = linux.open(nul(&z_buf, file), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try std.testing.expect(linux.errno(fd) == .SUCCESS);
+    _ = linux.close(@intCast(fd));
+
+    var out: [512]u8 = undefined;
+    const upper = try std.fmt.bufPrint(&upper_buf, "{s}/DATA/Fallout - Textures.bsa", .{base});
+    const r1 = resolvePathCaseInsensitive(upper, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(file, r1);
+    const folded = try std.fmt.bufPrint(&folded_buf, "{s}/data/FALLOUT - TEXTURES.BSA", .{base});
+    const r2 = resolvePathCaseInsensitive(folded, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(file, r2);
+
+    const missfile = try std.fmt.bufPrint(&missfile_buf, "{s}/Data/nosuch.bsa", .{base});
+    try std.testing.expect(resolvePathCaseInsensitive(missfile, &out) == null);
+    try std.testing.expectEqual(@as(u32, 2), fileNotFoundError(missfile));
+    const missdir = try std.fmt.bufPrint(&missdir_buf, "{s}/Nope/x.bsa", .{base});
+    try std.testing.expect(resolvePathCaseInsensitive(missdir, &out) == null);
+    try std.testing.expectEqual(@as(u32, 3), fileNotFoundError(missdir));
+
+    // The real Win32 entry point: directory bit, archive bit, INVALID + error.
+    try std.testing.expectEqual(@as(u32, 0x10), GetFileAttributesA(nul(&z_buf, data_dir)));
+    const upper_dir = try std.fmt.bufPrint(&upperdir_buf, "{s}/DATA", .{base});
+    try std.testing.expectEqual(@as(u32, 0x10), GetFileAttributesA(nul(&z_buf, upper_dir)));
+    try std.testing.expectEqual(@as(u32, 0x20), GetFileAttributesA(nul(&z_buf, upper)));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), GetFileAttributesA(nul(&z_buf, missfile)));
+    try std.testing.expectEqual(@as(u32, 2), g_last_error);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), GetFileAttributesA(nul(&z_buf, missdir)));
+    try std.testing.expectEqual(@as(u32, 3), g_last_error);
+
+    _ = linux.unlinkat(linux.AT.FDCWD, nul(&z_buf, file), 0);
+    _ = linux.rmdir(nul(&z_buf, data_dir));
+    _ = linux.rmdir(nul(&z_buf, base));
 }
