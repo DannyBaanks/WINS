@@ -2178,87 +2178,142 @@ fn dev9_SetTexture(this: *anyopaque, Sampler: u32, pTexture: ?*anyopaque) callco
     return D3D_OK;
 }
 
-// Software Triangle Rasterizer with Depth-Buffer
-fn dev9_DrawPrimitive(this: *anyopaque, prim_type: u32, start_vertex: u32, count: u32) callconv(W) HRESULT {
-    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
-    self.draw_call_count += 1;
+const D3DPT_TRIANGLELIST: u32 = 4;
+const D3DPT_TRIANGLESTRIP: u32 = 5;
+const D3DPT_TRIANGLEFAN: u32 = 6;
 
-    // Rasterize TRIANGLELIST (4) if stream 0 is bound
-    if (prim_type == 4 and self.streams[0] != null and count > 0) {
-        const vb = self.streams[0].?;
-        const stride = if (self.stream_strides[0] >= 12) self.stream_strides[0] else 12;
-        const total_verts = count * 3;
-        var t: u32 = 0;
-        while (t < count) : (t += 1) {
-            const idx0 = (start_vertex + t * 3 + 0) * stride;
-            const idx1 = (start_vertex + t * 3 + 1) * stride;
-            const idx2 = (start_vertex + t * 3 + 2) * stride;
+/// The three stream offsets consumed by one triangle for a D3D primitive type.
+/// D3D9 counts primitives, not vertices, in DrawPrimitive and
+/// DrawIndexedPrimitive.
+fn triangleVertexOffsets(prim_type: u32, triangle: u32) ?[3]u64 {
+    const t: u64 = triangle;
+    return switch (prim_type) {
+        D3DPT_TRIANGLELIST => .{ t * 3, t * 3 + 1, t * 3 + 2 },
+        D3DPT_TRIANGLESTRIP => .{ t, t + 1, t + 2 },
+        D3DPT_TRIANGLEFAN => .{ 0, t + 1, t + 2 },
+        else => null,
+    };
+}
 
-            if (idx2 + 12 > vb.length) break;
+fn readIndex(ib: *const WinsIndexBuffer9, index: u64) ?u32 {
+    const width: u64 = switch (ib.format) {
+        D3DFMT_INDEX16 => 2,
+        D3DFMT_INDEX32 => 4,
+        else => return null,
+    };
+    const byte_offset = index * width;
+    if (byte_offset + width > @as(u64, @intCast(ib.data.len))) return null;
+    const offset: usize = @intCast(byte_offset);
+    if (ib.format == D3DFMT_INDEX16) {
+        return @as(u32, ib.data[offset]) | (@as(u32, ib.data[offset + 1]) << 8);
+    }
+    return @as(u32, ib.data[offset]) |
+        (@as(u32, ib.data[offset + 1]) << 8) |
+        (@as(u32, ib.data[offset + 2]) << 16) |
+        (@as(u32, ib.data[offset + 3]) << 24);
+}
 
-            const p0: [*]const f32 = @ptrCast(@alignCast(vb.data.ptr + idx0));
-            const p1: [*]const f32 = @ptrCast(@alignCast(vb.data.ptr + idx1));
-            const p2: [*]const f32 = @ptrCast(@alignCast(vb.data.ptr + idx2));
+fn readFloat32LE(bytes: []const u8, offset: usize) f32 {
+    const bits = @as(u32, bytes[offset]) |
+        (@as(u32, bytes[offset + 1]) << 8) |
+        (@as(u32, bytes[offset + 2]) << 16) |
+        (@as(u32, bytes[offset + 3]) << 24);
+    return @bitCast(bits);
+}
 
-            // Viewport projection: NDC [-1, 1] -> Screen [0, W]
-            const half_w = @as(f32, @floatFromInt(self.viewport.Width)) * 0.5;
-            const half_h = @as(f32, @floatFromInt(self.viewport.Height)) * 0.5;
+/// This first software path accepts a stream whose first three components are
+/// XYZ in NDC. Respect both the vertex-buffer binding offset and the stride; do
+/// not assume that the first vertex begins at byte zero.
+fn readVertexPosition(self: *const WinsD3DDevice9, vb: *const WinsVertexBuffer9, vertex: u32) ?[3]f32 {
+    const stride: u64 = if (self.stream_strides[0] >= 12) self.stream_strides[0] else 12;
+    const byte_offset = @as(u64, self.stream_offsets[0]) + @as(u64, vertex) * stride;
+    if (byte_offset + 12 > @as(u64, @intCast(vb.data.len))) return null;
+    const offset: usize = @intCast(byte_offset);
+    return .{
+        readFloat32LE(vb.data, offset),
+        readFloat32LE(vb.data, offset + 4),
+        readFloat32LE(vb.data, offset + 8),
+    };
+}
 
-            const sx0 = (p0[0] + 1.0) * half_w;
-            const sy0 = (1.0 - p0[1]) * half_h;
-            const sx1 = (p1[0] + 1.0) * half_w;
-            const sy1 = (1.0 - p1[1]) * half_h;
-            const sx2 = (p2[0] + 1.0) * half_w;
-            const sy2 = (1.0 - p2[1]) * half_h;
+fn rasterizeTriangle(self: *WinsD3DDevice9, vb: *const WinsVertexBuffer9, vertices: [3]u32) void {
+    if (self.viewport.Width == 0 or self.viewport.Height == 0) return;
+    const p0 = readVertexPosition(self, vb, vertices[0]) orelse return;
+    const p1 = readVertexPosition(self, vb, vertices[1]) orelse return;
+    const p2 = readVertexPosition(self, vb, vertices[2]) orelse return;
 
-            const min_x_f = @min(@min(sx0, sx1), sx2);
-            const max_x_f = @max(@max(sx0, sx1), sx2);
-            const min_y_f = @min(@min(sy0, sy1), sy2);
-            const max_y_f = @max(@max(sy0, sy1), sy2);
+    // Viewport projection: NDC [-1, 1] -> Screen [0, W].
+    const half_w = @as(f32, @floatFromInt(self.viewport.Width)) * 0.5;
+    const half_h = @as(f32, @floatFromInt(self.viewport.Height)) * 0.5;
+    const sx0 = (p0[0] + 1.0) * half_w;
+    const sy0 = (1.0 - p0[1]) * half_h;
+    const sx1 = (p1[0] + 1.0) * half_w;
+    const sy1 = (1.0 - p1[1]) * half_h;
+    const sx2 = (p2[0] + 1.0) * half_w;
+    const sy2 = (1.0 - p2[1]) * half_h;
 
-            const min_x = @max(0, @as(i32, @intFromFloat(min_x_f)));
-            const max_x = @min(@as(i32, @intCast(self.viewport.Width - 1)), @as(i32, @intFromFloat(max_x_f)));
-            const min_y = @max(0, @as(i32, @intFromFloat(min_y_f)));
-            const max_y = @min(@as(i32, @intCast(self.viewport.Height - 1)), @as(i32, @intFromFloat(max_y_f)));
+    const min_x_f = @min(@min(sx0, sx1), sx2);
+    const max_x_f = @max(@max(sx0, sx1), sx2);
+    const min_y_f = @min(@min(sy0, sy1), sy2);
+    const max_y_f = @max(@max(sy0, sy1), sy2);
+    const min_x = @max(0, @as(i32, @intFromFloat(min_x_f)));
+    const max_x = @min(@as(i32, @intCast(self.viewport.Width - 1)), @as(i32, @intFromFloat(max_x_f)));
+    const min_y = @max(0, @as(i32, @intFromFloat(min_y_f)));
+    const max_y = @min(@as(i32, @intCast(self.viewport.Height - 1)), @as(i32, @intFromFloat(max_y_f)));
 
-            const x0 = @as(i32, @intFromFloat(sx0));
-            const y0 = @as(i32, @intFromFloat(sy0));
-            const x1 = @as(i32, @intFromFloat(sx1));
-            const y1 = @as(i32, @intFromFloat(sy1));
-            const x2 = @as(i32, @intFromFloat(sx2));
-            const y2 = @as(i32, @intFromFloat(sy2));
+    const x0 = @as(i32, @intFromFloat(sx0));
+    const y0 = @as(i32, @intFromFloat(sy0));
+    const x1 = @as(i32, @intFromFloat(sx1));
+    const y1 = @as(i32, @intFromFloat(sy1));
+    const x2 = @as(i32, @intFromFloat(sx2));
+    const y2 = @as(i32, @intFromFloat(sy2));
+    const area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+    if (area == 0) return;
 
-            const area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
-            if (area == 0) continue;
-
-            const draw_color: u32 = 0xFF00FF00; // Solid green
-            var py = min_y;
-            while (py <= max_y) : (py += 1) {
-                var px = min_x;
-                while (px <= max_x) : (px += 1) {
-                    const w0 = (x1 - px) * (y2 - py) - (y1 - py) * (x2 - px);
-                    const w1 = (x2 - px) * (y0 - py) - (y2 - py) * (x0 - px);
-                    const w2 = (x0 - px) * (y1 - py) - (y0 - py) * (x1 - px);
-
-                    const inside = if (area > 0)
-                        (w0 >= 0 and w1 >= 0 and w2 >= 0)
-                    else
-                        (w0 <= 0 and w1 <= 0 and w2 <= 0);
-
-                    if (inside) {
-                        const pixel_idx = @as(usize, @intCast(py)) * self.viewport.Width + @as(usize, @intCast(px));
-                        const z_depth = (p0[2] + p1[2] + p2[2]) / 3.0;
-                        if (z_depth < self.depthbuffer[pixel_idx]) {
-                            self.depthbuffer[pixel_idx] = z_depth;
-                            self.backbuffer[pixel_idx] = draw_color;
-                        }
-                    }
+    const draw_color: u32 = 0xFF00FF00; // Deliberately simple placeholder shading.
+    var py = min_y;
+    while (py <= max_y) : (py += 1) {
+        var px = min_x;
+        while (px <= max_x) : (px += 1) {
+            const w0 = (x1 - px) * (y2 - py) - (y1 - py) * (x2 - px);
+            const w1 = (x2 - px) * (y0 - py) - (y2 - py) * (x0 - px);
+            const w2 = (x0 - px) * (y1 - py) - (y0 - py) * (x1 - px);
+            const inside = if (area > 0)
+                (w0 >= 0 and w1 >= 0 and w2 >= 0)
+            else
+                (w0 <= 0 and w1 <= 0 and w2 <= 0);
+            if (inside) {
+                const pixel_idx = @as(usize, @intCast(py)) * self.viewport.Width + @as(usize, @intCast(px));
+                if (pixel_idx >= self.backbuffer.len or pixel_idx >= self.depthbuffer.len) continue;
+                const z_depth = (p0[2] + p1[2] + p2[2]) / 3.0;
+                if (z_depth < self.depthbuffer[pixel_idx]) {
+                    self.depthbuffer[pixel_idx] = z_depth;
+                    self.backbuffer[pixel_idx] = draw_color;
                 }
             }
         }
-        _ = total_verts;
     }
+}
 
+// Software triangle rasterizer with depth-buffer. Vertex shaders, declaration
+// formats and textures remain outside this initial NDC path.
+fn dev9_DrawPrimitive(this: *anyopaque, prim_type: u32, start_vertex: u32, count: u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    self.draw_call_count += 1;
+    if (count == 0) return D3D_OK;
+    const vb = self.streams[0] orelse return D3D_OK;
+
+    var triangle: u32 = 0;
+    while (triangle < count) : (triangle += 1) {
+        const offsets = triangleVertexOffsets(prim_type, triangle) orelse return D3D_OK;
+        var vertices: [3]u32 = undefined;
+        for (offsets, 0..) |relative, i| {
+            const absolute = @as(u64, start_vertex) + relative;
+            if (absolute > std.math.maxInt(u32)) return D3DERR_INVALIDCALL;
+            vertices[i] = @intCast(absolute);
+        }
+        rasterizeTriangle(self, vb, vertices);
+    }
     return D3D_OK;
 }
 
@@ -2271,11 +2326,29 @@ fn dev9_DrawIndexedPrimitive(
     start_index: u32,
     prim_count: u32,
 ) callconv(W) HRESULT {
-    _ = base_vertex_idx;
-    _ = min_vertex_idx;
-    _ = num_vertices;
-    _ = start_index;
-    return dev9_DrawPrimitive(this, prim_type, 0, prim_count);
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    self.draw_call_count += 1;
+    if (prim_count == 0) return D3D_OK;
+    if (triangleVertexOffsets(prim_type, 0) == null) return D3D_OK;
+    const vb = self.streams[0] orelse return D3DERR_INVALIDCALL;
+    const ib = self.indices orelse return D3DERR_INVALIDCALL;
+    const range_end = @as(u64, min_vertex_idx) + num_vertices;
+
+    var triangle: u32 = 0;
+    while (triangle < prim_count) : (triangle += 1) {
+        const relative = triangleVertexOffsets(prim_type, triangle) orelse unreachable;
+        var vertices: [3]u32 = undefined;
+        for (relative, 0..) |position, i| {
+            const index_position = @as(u64, start_index) + position;
+            const raw_index = readIndex(ib, index_position) orelse return D3DERR_INVALIDCALL;
+            if (raw_index < min_vertex_idx or @as(u64, raw_index) >= range_end) return D3DERR_INVALIDCALL;
+            const absolute = @as(i64, base_vertex_idx) + @as(i64, raw_index);
+            if (absolute < 0 or absolute > std.math.maxInt(u32)) return D3DERR_INVALIDCALL;
+            vertices[i] = @intCast(absolute);
+        }
+        rasterizeTriangle(self, vb, vertices);
+    }
+    return D3D_OK;
 }
 
 /// The IDirect3DDevice9 methods this module does not implement yet.
@@ -4258,6 +4331,94 @@ fn testDevice(d3d: *WinsD3D9) !*WinsD3DDevice9 {
     var dev_raw: ?*anyopaque = null;
     try std.testing.expectEqual(D3D_OK, d3d.vtbl.CreateDevice(d3d, 0, 1, 0, 0, &params, &dev_raw));
     return @ptrCast(@alignCast(dev_raw.?));
+}
+
+fn writeTestU32LE(bytes: []u8, offset: usize, value: u32) void {
+    bytes[offset] = @truncate(value);
+    bytes[offset + 1] = @truncate(value >> 8);
+    bytes[offset + 2] = @truncate(value >> 16);
+    bytes[offset + 3] = @truncate(value >> 24);
+}
+
+fn writeTestPosition(bytes: []u8, vertex: usize, position: [3]f32) void {
+    for (position, 0..) |component, axis| {
+        writeTestU32LE(bytes, vertex * 12 + axis * 4, @bitCast(component));
+    }
+}
+
+fn setTestViewport(dev: *WinsD3DDevice9) void {
+    const viewport = D3DVIEWPORT9{ .X = 0, .Y = 0, .Width = 32, .Height = 32, .MinZ = 0, .MaxZ = 1 };
+    _ = dev.vtbl.SetViewport(dev, &viewport);
+}
+
+test "DrawIndexedPrimitive honors INDEX16 start index, base vertex and stream offset" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    setTestViewport(dev);
+
+    var vb_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateVertexBuffer(dev, 5 * 12, 0, 0, 1, &vb_raw, null));
+    const vb: *WinsVertexBuffer9 = @ptrCast(@alignCast(vb_raw.?));
+    const positions = [_][3]f32{
+        .{ 2, 2, 0.5 }, // unused vertices catch an ignored base/stream offset
+        .{ 2, 2, 0.5 },
+        .{ -0.75, -0.75, 0.5 },
+        .{ 0.75, -0.75, 0.5 },
+        .{ 0, 0.75, 0.5 },
+    };
+    for (positions, 0..) |position, i| writeTestPosition(vb.data, i, position);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetStreamSource(dev, 0, vb, 12, 12));
+
+    var ib_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateIndexBuffer(dev, 8, 0, D3DFMT_INDEX16, 1, &ib_raw, null));
+    const ib: *WinsIndexBuffer9 = @ptrCast(@alignCast(ib_raw.?));
+    const index_bytes = [_]u8{ 99, 0, 0, 0, 1, 0, 2, 0 };
+    @memcpy(ib.data, &index_bytes);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetIndices(dev, ib));
+
+    // Skip index 99, then add base vertex 1; stream offset adds another vertex.
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.DrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 1, 0, 3, 1, 1));
+    try std.testing.expectEqual(@as(u64, 1), dev.draw_call_count);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), dev.backbuffer[16 * 32 + 16]);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), dev.backbuffer[0]);
+
+    // Negative control: a negative effective vertex index is rejected before drawing.
+    @memset(dev.backbuffer, 0);
+    @memset(dev.depthbuffer, 1.0);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.DrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, -1, 0, 3, 1, 1));
+    try std.testing.expectEqual(@as(u32, 0), dev.backbuffer[16 * 32 + 16]);
+}
+
+test "DrawIndexedPrimitive assembles INDEX32 triangle strips and fans" {
+    const d3d: *WinsD3D9 = @ptrCast(@alignCast(Direct3DCreate9(32).?));
+    const dev = try testDevice(d3d);
+    setTestViewport(dev);
+
+    var vb_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateVertexBuffer(dev, 4 * 12, 0, 0, 1, &vb_raw, null));
+    const vb: *WinsVertexBuffer9 = @ptrCast(@alignCast(vb_raw.?));
+    const positions = [_][3]f32{
+        .{ -0.75, -0.75, 0.5 },
+        .{ -0.75, 0.75, 0.5 },
+        .{ 0.75, -0.75, 0.5 },
+        .{ 0.75, 0.75, 0.5 },
+    };
+    for (positions, 0..) |position, i| writeTestPosition(vb.data, i, position);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetStreamSource(dev, 0, vb, 0, 12));
+
+    var ib_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateIndexBuffer(dev, 4 * 4, 0, D3DFMT_INDEX32, 1, &ib_raw, null));
+    const ib: *WinsIndexBuffer9 = @ptrCast(@alignCast(ib_raw.?));
+    for ([_]u32{ 0, 1, 2, 3 }, 0..) |index, i| writeTestU32LE(ib.data, i * 4, index);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetIndices(dev, ib));
+
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.DrawIndexedPrimitive(dev, D3DPT_TRIANGLESTRIP, 0, 0, 4, 0, 2));
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), dev.backbuffer[16 * 32 + 16]);
+
+    @memset(dev.backbuffer, 0);
+    @memset(dev.depthbuffer, 1.0);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.DrawIndexedPrimitive(dev, D3DPT_TRIANGLEFAN, 0, 0, 4, 0, 2));
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), dev.backbuffer[16 * 32 + 16]);
 }
 
 test "device cooperative and transform state match D3D9" {
