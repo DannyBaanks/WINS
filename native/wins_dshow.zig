@@ -20,18 +20,25 @@
 //! stream and a monotonic clock. Semantics are pinned against Proton by
 //! native/testdata/dshow_probe.c.
 //!
-//! What is NOT implemented, deliberately and visibly: no PCM reaches an
-//! output device, so playback is silent (the MP3 is parsed, not decoded);
-//! one rendered stream per graph; no RenderFile/AddSourceFilter (no file
-//! source filter here); IReferenceClock::AdviseTime/AdvisePeriodic answer
-//! E_NOTIMPL; EC_COMPLETE is raised when a caller next asks the graph for
-//! position or events, so an event handle from GetEventHandle is only
-//! signaled by those calls; window notification (SetNotifyWindow) is stored
-//! but no message is ever posted; IDispatch is not implemented.
+//! Sound: on the first Run a native playback thread decodes the stream with
+//! the real libmpg123 and plays it through the host sound server
+//! (wins_audio.zig), following the graph clock (pause, seek, loop) and the
+//! IBasicAudio volume/balance. The thread also raises EC_COMPLETE on time.
+//! If the library or the server is missing it says so in the log and the
+//! graph keeps answering from the clock (silent, and labelled as such).
+//!
+//! What is NOT implemented, deliberately and visibly: one rendered stream
+//! per graph; no RenderFile/AddSourceFilter (no file source filter here);
+//! IReferenceClock::AdviseTime/AdvisePeriodic answer E_NOTIMPL; without the
+//! playback thread EC_COMPLETE is raised when a caller next asks for position
+//! or events, so a GetEventHandle handle is only signaled by those calls;
+//! window notification (SetNotifyWindow) is stored but no message is ever
+//! posted; IDispatch is not implemented.
 
 const std = @import("std");
 const linux = std.os.linux;
 const threads_mod = @import("winrun_threads.zig");
+const audio = @import("wins_audio.zig");
 
 pub const W: std.builtin.CallingConvention = .winapi;
 pub const HRESULT = i32;
@@ -696,7 +703,7 @@ fn rpReceiveConnection(p: Self, peer: ?*anyopaque, mt: ?*const AM_MEDIA_TYPE) ca
     if (r.data.len != 0) std.heap.page_allocator.free(r.data);
     r.data = buf;
     r.info = info;
-    std.debug.print("[WINS:DShow] connected: {} bytes, {} frames, {} Hz, {} ch, duration {} ms (playback is silent: no PCM output yet)\n", .{ got, info.frames, info.sample_rate, info.channels, @divTrunc(info.duration, 10_000) });
+    std.debug.print("[WINS:DShow] connected: {} bytes, {} frames, {} Hz, {} ch, duration {} ms\n", .{ got, info.frames, info.sample_rate, info.channels, @divTrunc(info.duration, 10_000) });
     return S_OK;
 }
 fn rpDisconnect(p: Self) callconv(W) HRESULT {
@@ -811,7 +818,70 @@ pub const Graph = struct {
     ev_len: usize = 0,
     ev_handle: usize = 0,
     notify_flags: i32 = 0,
+    player: ?std.Thread = null,
+    quit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
+
+/// Native playback thread: decode once, then keep the host stream at the
+/// graph clock's position. pa_simple_write blocks at real time, so this
+/// loop is paced by the sound server, not by sleeping.
+fn playerMain(g: *Graph) void {
+    const r = g.rend orelse return;
+    const pcm = audio.decodeMpeg(r.data) catch |e| {
+        std.debug.print("[WINS:DShow] decode failed ({s}); playback stays silent\n", .{@errorName(e)});
+        return;
+    };
+    defer pcm.deinit();
+    const out = audio.Output.open(pcm.rate, pcm.channels, "DirectShow audio") catch |e| {
+        std.debug.print("[WINS:DShow] no audio output ({s}); playback stays silent\n", .{@errorName(e)});
+        return;
+    };
+    defer out.close();
+    std.debug.print("[WINS:DShow] audio: {} frames, {} Hz, {} ch decoded; playing through the host sound server\n", .{ pcm.frames(), pcm.rate, pcm.channels });
+    const ch: usize = pcm.channels;
+    const total = pcm.frames();
+    var chunk: [2048]i16 = undefined;
+    const chunk_frames = @min(pcm.rate / 50, chunk.len / ch); // 20 ms
+    var cursor: usize = 0;
+    var playing = false;
+    while (!g.quit.load(.acquire)) {
+        g.lock.lock();
+        const st = g.state;
+        const pos = positionLocked(g);
+        const vol = g.volume;
+        const bal = g.balance;
+        g.lock.unlock();
+        if (st != 2) {
+            if (playing) out.flush();
+            playing = false;
+            sleepMs(10);
+            continue;
+        }
+        const target: usize = @intCast(@divTrunc(@max(pos, 0) * @as(i64, pcm.rate), 10_000_000));
+        // Resync on start, seek or loop; tolerate the server's buffer lead.
+        if (!playing or cursor + pcm.rate / 10 < target or cursor > target + pcm.rate / 2) {
+            if (playing) out.flush();
+            cursor = target;
+        }
+        playing = true;
+        if (cursor >= total) {
+            sleepMs(10);
+            continue;
+        }
+        const n = @min(total - cursor, chunk_frames);
+        const gn = audio.gains(vol, bal);
+        for (0..n) |i| for (0..ch) |c| {
+            const sv: f32 = @floatFromInt(pcm.samples[(cursor + i) * ch + c]);
+            const gain = if (ch == 2) gn[c] else (gn[0] + gn[1]) / 2;
+            chunk[i * ch + c] = @intFromFloat(std.math.clamp(@round(sv * gain), -32768, 32767));
+        };
+        if (!out.write(chunk[0 .. n * ch])) {
+            std.debug.print("[WINS:DShow] audio write failed; playback stops\n", .{});
+            return;
+        }
+        cursor += n;
+    }
+}
 
 fn graphFrom(comptime field: []const u8, p: *anyopaque) *Graph {
     const i: *Iface = @ptrCast(@alignCast(p));
@@ -968,6 +1038,12 @@ fn doRun(g: *Graph) HRESULT {
     g.run_start = t0;
     g.state = 2;
     g.lock.unlock();
+    if (g.player == null and g.rend != null and g.rend.?.info != null and audio.outputEnabled()) {
+        g.player = std.Thread.spawn(.{}, playerMain, .{g}) catch |e| blk: {
+            std.debug.print("[WINS:DShow] playback thread not started ({s}); silent\n", .{@errorName(e)});
+            break :blk null;
+        };
+    }
     std.debug.print("[WINS:DShow] Run at {} ms\n", .{@divTrunc(g.base, 10_000)});
     return S_OK;
 }
@@ -984,6 +1060,11 @@ fn doStop(g: *Graph) HRESULT {
 
 fn graphDestroy(g: *Graph) void {
     if (g.state != 0) _ = doStop(g);
+    if (g.player) |t| {
+        g.quit.store(true, .release);
+        t.join(); // it reads the renderer's stream: join before releasing it
+        g.player = null;
+    }
     if (g.rend) |r| {
         if (r.peer) |up| _ = vt(PinVtbl, up).Disconnect(up);
         rendDropConnection(r);
@@ -1657,4 +1738,24 @@ test "createFilterGraph: refuses aggregation and unknown interfaces, QI table is
     try std.testing.expectEqual(E_ABORT, evGetEvent(&g.ev, &code, &a, &b, 0));
     _ = UMc.release(mc.?);
     try std.testing.expectEqual(@as(u32, 0), UGb.release(out.?));
+}
+
+test "decode: the fixture decodes to a 440 Hz stereo sine through the real libmpg123" {
+    // Same bytes as testdata/dshow_fixture_mp3.h (sha256 e0484c89...). Oracle:
+    // ffmpeg decodes it to 25344 frames; mpg123 vs ffmpeg measured 96 dB SNR, lag 0.
+    const data = @embedFile("testdata/dshow_fixture.mp3");
+    const pcm = audio.decodeMpeg(data) catch |e| {
+        if (e == error.LibraryMissing) return error.SkipZigTest;
+        return e;
+    };
+    defer pcm.deinit();
+    try std.testing.expectEqual(@as(u32, 48000), pcm.rate);
+    try std.testing.expectEqual(@as(u32, 2), pcm.channels);
+    try std.testing.expectEqual(@as(usize, 22 * 1152), pcm.frames());
+    var z: u32 = 0;
+    var i: usize = 4801;
+    while (i < 19200) : (i += 1) {
+        if ((pcm.samples[(i - 1) * 2] < 0) != (pcm.samples[i * 2] < 0)) z += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 264), z); // 440 Hz over 0.3 s
 }
