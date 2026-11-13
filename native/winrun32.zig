@@ -2278,6 +2278,20 @@ fn iniTrim(line: []const u8) []const u8 {
     return line[start..end];
 }
 
+/// Win32 strips one matching pair of surrounding quotes (double or single)
+/// from a profile value after trimming whitespace; inner whitespace and inner
+/// quotes are kept, and a lone or mismatched quote is left alone. Measured
+/// against Wine with native/testdata/profile_probe.c (tools/diff_wine.sh).
+/// FalloutNV stores sD3DDevice="AMD Radeon 760M Graphics (RADV PHOENIX)" with
+/// the quotes and compares the returned string to the D3D9 adapter name, so
+/// returning the quotes sent the game to FalloutNVLauncher.exe every boot.
+fn iniUnquote(value: []const u8) []const u8 {
+    if (value.len >= 2 and (value[0] == '"' or value[0] == '\'') and value[value.len - 1] == value[0]) {
+        return value[1 .. value.len - 1];
+    }
+    return value;
+}
+
 fn iniNameEq(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
@@ -2348,7 +2362,7 @@ fn iniLookup(app: []const u8, key: []const u8, file: ?[*:0]const u8) ?[]const u8
         if (!in_section) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         if (!iniNameEq(iniTrim(line[0..eq]), key)) continue;
-        return iniTrim(line[eq + 1 ..]);
+        return iniUnquote(iniTrim(line[eq + 1 ..]));
     }
     return null;
 }
@@ -2436,10 +2450,23 @@ fn GetPrivateProfileStringA(lpAppName: ?[*:0]const u8, lpKeyName: ?[*:0]const u8
         const app_name = std.mem.sliceTo(app, 0);
         const key_name = if (lpKeyName) |k| std.mem.sliceTo(k, 0) else "";
         if (iniLookup(app_name, key_name, lpFileName)) |value| {
-            return iniCopyOut(lpReturnedString.?, nSize, value);
+            const n = iniCopyOut(lpReturnedString.?, nSize, value);
+            std.debug.print("[WINS:Kernel32] GetPrivateProfileStringA(\"{s}\", \"{s}\", file=\"{s}\") -> \"{s}\" (rc={d})\n", .{
+                app_name, key_name,
+                if (lpFileName) |f| std.mem.sliceTo(f, 0) else "(null)",
+                value, n,
+            });
+            return n;
         }
     }
-    return iniCopyOut(lpReturnedString.?, nSize, fallback);
+    const n = iniCopyOut(lpReturnedString.?, nSize, fallback);
+    std.debug.print("[WINS:Kernel32] GetPrivateProfileStringA(\"{s}\", \"{s}\", file=\"{s}\") -> default \"{s}\" (rc={d})\n", .{
+        if (lpAppName) |a| std.mem.sliceTo(a, 0) else "(null)",
+        if (lpKeyName) |k| std.mem.sliceTo(k, 0) else "(null)",
+        if (lpFileName) |f| std.mem.sliceTo(f, 0) else "(null)",
+        fallback, n,
+    });
+    return n;
 }
 
 fn GetPrivateProfileIntA(lpAppName: ?[*:0]const u8, lpKeyName: ?[*:0]const u8, nDefault: i32, lpFileName: ?[*:0]const u8) callconv(W) i32 {
@@ -2447,9 +2474,21 @@ fn GetPrivateProfileIntA(lpAppName: ?[*:0]const u8, lpKeyName: ?[*:0]const u8, n
         const app_name = std.mem.sliceTo(app, 0);
         const key_name = if (lpKeyName) |k| std.mem.sliceTo(k, 0) else "";
         if (iniLookup(app_name, key_name, lpFileName)) |value| {
-            return iniParseInt(value) orelse nDefault;
+            const v = iniParseInt(value) orelse nDefault;
+            std.debug.print("[WINS:Kernel32] GetPrivateProfileIntA(\"{s}\", \"{s}\", file=\"{s}\") -> {d}\n", .{
+                app_name, key_name,
+                if (lpFileName) |f| std.mem.sliceTo(f, 0) else "(null)",
+                v,
+            });
+            return v;
         }
     }
+    std.debug.print("[WINS:Kernel32] GetPrivateProfileIntA(\"{s}\", \"{s}\", file=\"{s}\") -> default {d}\n", .{
+        if (lpAppName) |a| std.mem.sliceTo(a, 0) else "(null)",
+        if (lpKeyName) |k| std.mem.sliceTo(k, 0) else "(null)",
+        if (lpFileName) |f| std.mem.sliceTo(f, 0) else "(null)",
+        nDefault,
+    });
     return nDefault;
 }
 
