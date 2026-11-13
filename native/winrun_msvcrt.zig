@@ -2068,7 +2068,8 @@ fn ldexp(x: f64, exp: i32) callconv(C) f64 {
 // 10. Formatting & Scanning
 // ---------------------------------------------------------------------------
 
-fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) i32 {
+/// pub: winload64's UCRT __stdio_common_* reuse this formatter.
+pub fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) i32 {
     const f = fmt orelse return -1;
     var arg_idx: usize = 0;
     var out_pos: usize = 0;

@@ -192,10 +192,88 @@ fn GetSystemTimePreciseAsFileTime(ft: *u64) callconv(W) void {
     ft.* = @as(u64, @intCast(ts.sec)) * 10_000_000 + @as(u64, @intCast(ts.nsec)) / 100 + 116_444_736_000_000_000;
 }
 
+// --------------------------------------------------------------- wait on address
+// WaitOnAddress compares `size` bytes; futexes wait on the aligned 32-bit word that
+// contains the address, so wake-ups are delivered to that word as well.
+fn wordOf(addr: usize) *u32 {
+    return @ptrFromInt(addr & ~@as(usize, 3));
+}
+fn WaitOnAddress(addr: *const anyopaque, cmp: *const anyopaque, size: usize, ms: u32) callconv(W) i32 {
+    const a = @intFromPtr(addr);
+    const same = switch (size) {
+        1 => @as(*const volatile u8, @ptrCast(addr)).* == @as(*const u8, @ptrCast(cmp)).*,
+        2 => @as(*const volatile u16, @ptrCast(@alignCast(addr))).* == @as(*const u16, @ptrCast(@alignCast(cmp))).*,
+        4 => @as(*const volatile u32, @ptrCast(@alignCast(addr))).* == @as(*const u32, @ptrCast(@alignCast(cmp))).*,
+        8 => @as(*const volatile u64, @ptrCast(@alignCast(addr))).* == @as(*const u64, @ptrCast(@alignCast(cmp))).*,
+        else => return 0,
+    };
+    if (!same) return 1;
+    const w = wordOf(a);
+    return if (futexWait(w, @atomicLoad(u32, w, .acquire), ms)) 1 else timedOut();
+}
+fn WakeByAddressSingle(addr: *const anyopaque) callconv(W) void {
+    futexWake(wordOf(@intFromPtr(addr)), 1);
+}
+fn WakeByAddressAll(addr: *const anyopaque) callconv(W) void {
+    futexWake(wordOf(@intFromPtr(addr)), std.math.maxInt(i32));
+}
+
+// ------------------------------------------------------------- small kernel32
+fn DisableThreadLibraryCalls(h: usize) callconv(W) i32 {
+    _ = h;
+    return 1; // winload64 never sends DLL_THREAD_* notifications anyway
+}
+fn SetThreadStackGuarantee(size: ?*u32) callconv(W) i32 {
+    if (size) |s| s.* = 0; // previous guarantee
+    return 1;
+}
+fn SetThreadErrorMode(mode: u32, old: ?*u32) callconv(W) i32 {
+    _ = mode;
+    if (old) |o| o.* = 0;
+    return 1;
+}
+fn GetThreadId(h: usize) callconv(W) u32 {
+    // Only the current-thread pseudo handle (-2) is known; other handles: 0 (failure).
+    return if (h == @as(usize, @bitCast(@as(isize, -2)))) @intCast(linux.gettid()) else 0;
+}
+fn GetThreadPriority(h: usize) callconv(W) i32 {
+    _ = h;
+    return 0; // THREAD_PRIORITY_NORMAL
+}
+fn putW(buf: ?[*]u16, cap: u32, s: []const u8) u32 {
+    if (buf == null or cap <= s.len) return @intCast(s.len + 1); // required size incl. NUL
+    for (s, 0..) |c, i| buf.?[i] = c;
+    buf.?[s.len] = 0;
+    return @intCast(s.len);
+}
+fn GetSystemDirectoryW(buf: ?[*]u16, cap: u32) callconv(W) u32 {
+    return putW(buf, cap, "C:\\Windows\\system32");
+}
+fn GetComputerNameExW(kind: u32, buf: ?[*]u16, size: *u32) callconv(W) i32 {
+    _ = kind;
+    const name = "WINS-CLEANROOM";
+    if (buf == null or size.* <= name.len) {
+        size.* = name.len + 1;
+        if (set_last_error) |f| f(234); // ERROR_MORE_DATA
+        return 0;
+    }
+    size.* = putW(buf, size.*, name);
+    return 1;
+}
+/// No unwinder yet: report zero captured frames (callers treat it as "no trace").
+fn RtlCaptureStackBackTrace(skip: u32, n: u32, frames: ?*anyopaque, hash: ?*u32) callconv(W) u16 {
+    _ = skip;
+    _ = n;
+    _ = frames;
+    if (hash) |h| h.* = 0;
+    return 0;
+}
+
 pub fn lookup(lib: []const u8, sym: []const u8) ?usize {
     const k32 = std.ascii.eqlIgnoreCase(lib, "kernel32.dll") or std.ascii.eqlIgnoreCase(lib, "kernelbase.dll");
     if (std.ascii.eqlIgnoreCase(lib, "ntdll.dll")) {
         if (std.mem.eql(u8, sym, "RtlGetVersion")) return @intFromPtr(&RtlGetVersion);
+        if (std.mem.eql(u8, sym, "RtlCaptureStackBackTrace")) return @intFromPtr(&RtlCaptureStackBackTrace);
         return null;
     }
     if (!k32) return null;
@@ -210,7 +288,12 @@ pub fn lookup(lib: []const u8, sym: []const u8) ?usize {
         .{ "InitializeConditionVariable", &InitializeConditionVariable },     .{ "WakeConditionVariable", &WakeConditionVariable },
         .{ "WakeAllConditionVariable", &WakeAllConditionVariable },           .{ "SleepConditionVariableSRW", &SleepConditionVariableSRW },
         .{ "SleepConditionVariableCS", &SleepConditionVariableCS },           .{ "InitOnceExecuteOnce", &InitOnceExecuteOnce },
-        .{ "GetSystemTimePreciseAsFileTime", &GetSystemTimePreciseAsFileTime },
+        .{ "GetSystemTimePreciseAsFileTime", &GetSystemTimePreciseAsFileTime }, .{ "WaitOnAddress", &WaitOnAddress },
+        .{ "WakeByAddressSingle", &WakeByAddressSingle },                     .{ "WakeByAddressAll", &WakeByAddressAll },
+        .{ "DisableThreadLibraryCalls", &DisableThreadLibraryCalls },         .{ "SetThreadStackGuarantee", &SetThreadStackGuarantee },
+        .{ "SetThreadErrorMode", &SetThreadErrorMode },                       .{ "GetThreadId", &GetThreadId },
+        .{ "GetThreadPriority", &GetThreadPriority },                         .{ "GetSystemDirectoryW", &GetSystemDirectoryW },
+        .{ "GetComputerNameExW", &GetComputerNameExW },                       .{ "RtlCaptureStackBackTrace", &RtlCaptureStackBackTrace },
     };
     inline for (table) |e| if (std.mem.eql(u8, sym, e[0])) return @intFromPtr(e[1]);
     return null;

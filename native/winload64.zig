@@ -203,6 +203,20 @@ fn GetModuleHandleExW(flags: u32, name: ?*const anyopaque, out: ?*usize) callcon
     if (out) |o| o.* = h;
     return @intFromBool(h != 0);
 }
+fn GetModuleHandleExA(flags: u32, name: ?*const anyopaque, out: ?*usize) callconv(W) i32 {
+    const FROM_ADDRESS: u32 = 0x4;
+    if (flags & FROM_ADDRESS != 0) return GetModuleHandleExW(flags, name, out);
+    const h = GetModuleHandleA(@ptrCast(name));
+    if (out) |o| o.* = h;
+    return @intFromBool(h != 0);
+}
+/// CreateEventExW(attrs, name, flags, access): flags 1 = manual reset, 2 = initial set.
+fn CreateEventExW(attrs: ?*anyopaque, name: ?[*:0]const u16, flags: u32, access: u32) callconv(W) usize {
+    _ = access;
+    const f = winrun.lookup("kernel32.dll", "CreateEventW") orelse return 0;
+    const CreateEventW = *const fn (?*anyopaque, i32, i32, ?[*:0]const u16) callconv(W) usize;
+    return (@as(CreateEventW, @ptrFromInt(f)))(attrs, @intFromBool(flags & 1 != 0), @intFromBool(flags & 2 != 0), name);
+}
 fn LoadLibraryW(name: ?[*:0]const u16) callconv(W) usize {
     var b: [272]u8 = undefined;
     return if (name) |n| moduleByName(utf16Key(&b, n), "LoadLibraryW") else 0;
@@ -473,10 +487,13 @@ fn VirtualUnlock(addr: ?*anyopaque, size: usize) callconv(W) i32 {
 fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
     var b: [272]u8 = undefined;
     if (@import("winload64_sync.zig").lookup(moduleKey(&b, lib), sym)) |a| return a;
+    if (std.mem.eql(u8, moduleKey(&b, lib), "ucrtbase.dll") or std.ascii.startsWithIgnoreCase(lib, "vcruntime140"))
+        if (@import("winload64_ucrt.zig").lookup(sym)) |a| return a;
     if (!std.mem.eql(u8, moduleKey(&b, lib), "kernel32.dll") and !std.ascii.eqlIgnoreCase(lib, "kernelbase.dll")) return null;
     const table = .{
         .{ "GetModuleHandleW", &GetModuleHandleW },   .{ "GetModuleHandleA", &GetModuleHandleA },
         .{ "GetModuleHandleExW", &GetModuleHandleExW }, .{ "LoadLibraryW", &LoadLibraryW },
+        .{ "GetModuleHandleExA", &GetModuleHandleExA }, .{ "CreateEventExW", &CreateEventExW },
         .{ "LoadLibraryA", &LoadLibraryA },           .{ "LoadLibraryExW", &LoadLibraryExW },
         .{ "LoadLibraryExA", &LoadLibraryExA },       .{ "FreeLibrary", &FreeLibrary },
         .{ "GetProcAddress", &GetProcAddress },       .{ "VirtualAlloc", &VirtualAlloc },
@@ -513,8 +530,15 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
     std.debug.print("  stack words pointing into executable sections (candidate return addresses):\n", .{});
     var n: usize = 0;
     var k: usize = 0;
+    var mapped_page: usize = 0;
     while (k < 1024 and n < 24) : (k += 1) {
-        const v = @as(*const u64, @ptrFromInt(rsp + k * 8)).*;
+        const at = rsp + k * 8;
+        const page = at & ~@as(usize, 4095);
+        if (page != mapped_page) { // stop at the end of the mapped stack
+            if (linux.errno(linux.madvise(@ptrFromInt(page), 4096, linux.MADV.NORMAL)) != .SUCCESS) break;
+            mapped_page = page;
+        }
+        const v = @as(*const u64, @ptrFromInt(at)).*;
         for (crash_images) |im| if (v >= im.base and v < im.base + im.img.len and inExec(im.secs, v - im.base)) {
             std.debug.print("    [rsp+0x{x}] {s}\n", .{ k * 8, where(&b1, v) });
             n += 1;
@@ -919,7 +943,9 @@ fn shimLibrary(lib: []const u8) []const u8 {
     return lib;
 }
 
-const Call = struct { name: []const u8, args: std.ArrayList(u64) = .empty, ret: enum { u32, i32, u64, str } = .u64 };
+/// outstr: the export takes `const char** out` first and returns the length;
+/// winload64 passes a cell, then prints `length` bytes from *out.
+const Call = struct { name: []const u8, args: std.ArrayList(u64) = .empty, ret: enum { u32, i32, u64, str, outstr } = .u64 };
 
 const usage = "usage: winload64 --pin ROOT.dll=HEX [--pin DEP.dll=HEX ...] [--dll-dir DIR] [--check] ROOT.dll [--call EXPORT [--arg N ...] [--ret u32|i32|u64|str]] ...";
 
@@ -1014,8 +1040,11 @@ pub fn main(init: std.process.Init) !void {
     for (calls.items) |c| {
         const addr = callTarget(&ld, root_idx, c.name).?;
         var av = [4]u64{ 0, 0, 0, 0 };
-        if (c.args.items.len > 4) die(.usage, "--call {s}: at most 4 integer args", .{c.name});
-        for (c.args.items, 0..) |v, k| av[k] = v;
+        var out_cell: u64 = 0;
+        const shift: usize = if (c.ret == .outstr) 1 else 0;
+        if (c.args.items.len + shift > 4) die(.usage, "--call {s}: at most 4 integer args", .{c.name});
+        if (shift == 1) av[0] = @intFromPtr(&out_cell);
+        for (c.args.items, 0..) |v, k| av[k + shift] = v;
         const F = *const fn (u64, u64, u64, u64) callconv(W) u64;
         const r = (@as(F, @ptrFromInt(addr)))(av[0], av[1], av[2], av[3]);
         const s = switch (c.ret) {
@@ -1023,6 +1052,7 @@ pub fn main(init: std.process.Init) !void {
             .i32 => try std.fmt.bufPrint(&out, "{d}", .{@as(i32, @bitCast(@as(u32, @truncate(r))))}),
             .u64 => try std.fmt.bufPrint(&out, "0x{x}", .{r}),
             .str => if (r == 0) "(null)" else std.mem.span(@as([*:0]const u8, @ptrFromInt(r))),
+            .outstr => if (out_cell == 0) "(null)" else @as([*]const u8, @ptrFromInt(out_cell))[0..@min(@as(usize, @truncate(r)), 4096)],
         };
         std.debug.print("call {s} = {s}\n", .{ c.name, s });
     }
