@@ -209,3 +209,62 @@ Present/rasterización real. Un frame visible TODAVÍA no está demostrado.
 - Límite: demostrado que el juego abre sus BSA y llega a CreateDevice sin
   crashear; un frame visible y la salida del cuelgue de carga NO están
   demostrados.
+
+## Continuación Claude Code (2026-11-13 tarde) — commits 52804fb, 414d685, 42822f8
+
+### Corrección al diagnóstico anterior
+El cuelgue en la pantalla de carga NO se debía a la ventana X11 / Present.
+Medido sobre el proceso colgado (754768, 7 h vivo): el hilo principal
+despertaba ~20 veces/s en un bucle de Sleep y los 15 workers estaban
+ociosos en futex. Es decir, esperaba datos, no una ventana. En el log no
+había ni una apertura de `FalloutNV.esm`.
+
+### Causa 1: FindFirstFileA era un stub (52804fb)
+Ignoraba el patrón y respondía siempre "FalloutNV.exe" (0x80, tamaño 0).
+El juego lista los plugins con `FindFirstFileA("DATA\\*.esm")` / `*.esp` y
+llama FindFirstFileA sobre cada master/BSA antes de abrirlo (log relay de
+Proton: 494 llamadas). Implementado de verdad: máscara `*`/`?` sin
+distinguir mayúsculas, padre resuelto con el resolver de 24683df, "." y
+"..", atributos 0x10/0x20, tamaño y FILETIME reales, errores 2/3/18/6.
+GetFileType ahora mira el descriptor (antes CHAR para todo).
+Probe: `native/testdata/find_probe.c`: rojo DIFFERENT → verde 46/46
+idénticas con Proton.
+
+### Causa 2: lstrcatA sobrescribía (414d685)
+Con Find arreglado, el juego pedía `"*.esm"` en vez de `"DATA\\*.esm"`.
+Call site leído de la imagen descifrada en memoria (el .text en disco está
+cifrado por SteamStub `.bind`; `/proc/<pid>/mem` del juego vivo se puede
+leer desde fuera del bwrap): `lstrcpyA(buf,"DATA\\")` + `lstrcatA(buf,"*.esm")`
+(0x4625c4..0x46262c, IAT 0xfdf078/0xfdf074). `lstrcatA` calculaba siempre
+una longitud de 0. El mismo patrón de bug, con `orelse 0 + 1`, estaba en
+MultiByteToWideChar y LCMapStringA con cuenta -1: convertían 1 carácter.
+Probe: `native/testdata/str_probe.c`: rojo reproduce "*.esm" → verde 11/11.
+Regresiones idénticas: find 46, thread 34, filecase 14, profile 29.
+zig test 26/26.
+
+### Estado tras los fixes (log 20261113T213800Z-1168996.log)
+Desde Steam: enumera y abre los 10 .esm (FalloutNV + DLC), procesa sus
+registros (sondea texturas de nvdlc03), y llega a la música del menú
+principal: abre `Data\Music\Special\MainTitle.mp3`, momento en que un
+worker se cae: SIGSEGV en EIP 0x83101e, lectura de NULL, EAX=0.
+
+### Causa 3 (NO resuelta): DirectShow
+`CoCreateInstance` devolvía S_OK con `*ppv = NULL`. Ahora (42822f8)
+devuelve REGDB_E_CLASSNOTREG y registra en el log la clase pedida:
+`CLSID_FilterGraph {e436ebb3-524f-11ce-9f53-0020af0ba770}`,
+`IID_IGraphBuilder {56a8689f-0ad4-11ce-b03a-0020af0ba770}`. En Wine,
+quartz.dll se carga en el mismo punto. **El juego no comprueba el HRESULT**
+y se cae igual en el mismo EIP (log 20261113T214131Z-1173584.log). Que la
+causa sea ese puntero NULL es una inferencia (mismo EIP, EAX=0 justo
+después de la llamada); el código en 0x83101e no se ha desensamblado.
+
+Siguiente paso: un FilterGraph DirectShow nativo para reproducir MP3
+(IGraphBuilder::RenderFile + IMediaControl / IMediaEventEx / IBasicAudio /
+IMediaSeeking, lo que el juego use de verdad). Antes de diseñarlo, medir
+la secuencia real de métodos con el oráculo (`WINEDEBUG=+quartz` en
+`~/.cache/wins-oracle/run_oracle.sh`). wins_dsound.zig ya documenta que hoy
+no sale PCM a ningún dispositivo. Un frame visible sigue NOT_DEMONSTRATED.
+
+Loader instalado en el tool de Steam: sha256 8ad6b1fd…248f
+(build `/tmp/wins-find.uCMKz1oy/build-com`). Backup del de Codex:
+`dist/winrun32.prev-24683df` (04878ba1…6ac2).
