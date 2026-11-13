@@ -184,7 +184,8 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             };
         }
 
-        fn lookup(lib: []const u8, name: []const u8) ?usize {
+        /// pub: winload64 (the multi-image x64 DLL loader) reuses this shim table.
+        pub fn lookup(lib: []const u8, name: []const u8) ?usize {
             if (std.ascii.eqlIgnoreCase(lib, "kernel32.dll")) {
                 for (exports()) |e| if (std.mem.eql(u8, name, e.name)) return e.addr;
                 return @import("winrun_kernel32.zig").lookup(name);

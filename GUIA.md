@@ -198,3 +198,34 @@ El corredor carga ambos ELF **dentro de la caja**; la comparación solo cubre la
 | Error de `bwrap`, timeout o directorio existente | La operación no se completó. | Conserva la salida parcial y reintenta con un directorio nuevo. |
 
 La caja usa espacios de nombres y tiempos límite, pero no establece cuotas de memoria o disco: usa una VM o límites adicionales si necesitas procesar material hostil. Extraer archivos no recompila ni traduce automáticamente un PE cerrado. El flujo Zig actual es experimental y no reemplaza aún todos los comandos y recetas Python. El `compile-fuzz` Python heredado está desactivado; el fuzzer Zig anterior contiene comparaciones de modelos que no demuestran equivalencia con el PE.
+
+## Cargar DLLs de 64 bits (winload64)
+
+`winload64` carga una DLL x86-64 **y las DLL que importa** (las que estén en
+`--dll-dir`), resuelve los imports entre ellas y contra los shims de WINS (los mismos
+de `winrun`, más el CRT moderno `api-ms-win-crt-*`/`vcruntime140`), le da a cada DLL
+su propio slot de TLS, prepara TEB/PEB en GS, corre los callbacks de TLS y `DllMain`
+(dependencias primero) y llama los exports que pidas. Ejecuta código de la DLL, así
+que solo corre dentro de la caja y **cada DLL va fijada por SHA-256**:
+
+```bash
+zig build-exe native/winload64.zig -O ReleaseSafe -femit-bin=build/winload64
+python3 native/winload64_box.py --loader build/winload64 --dll-dir DIR raiz.dll \
+  --pin raiz.dll=SHA256 --pin dep.dll=SHA256 \
+  --call Export --arg 40 --arg 1 --ret i32 \
+  --call dep.dll!OtroExport --ret str
+```
+
+- `--check` mapea, relocaliza y enlaza **sin ejecutar nada** (fuera de la caja también).
+- Salidas: 2 uso, 3 rechazado (hash, DLL sin fijar, alcance), 4 imports sin resolver
+  (lista lo que falta; no ejecuta nada), 5 imagen mal formada, 6 mapeo, 7 `DllMain`/TLS falló.
+- Un import diferido (`delay import`) sin implementación se enlaza a una trampa que
+  avisa y termina **solo si se llama**.
+- NO implementado todavía: despacho de excepciones SEH (`.pdata` se valida y se cuenta;
+  una excepción termina el proceso), hilos nuevos, `DLL_THREAD_ATTACH`, descarga de DLLs.
+
+Prueba (`python3 -m unittest native/test_winload64.py`): compila desde cero las DLL
+sintéticas de `native/testdata/x64dll/` y exige que los resultados sean **idénticos a
+Wine** (un `.exe` anfitrión que hace las mismas llamadas con el loader real de Windows,
+en bwrap); el loader con defecto deliberado `winload64_bad_tls_index` tiene que **diferir**;
+más los controles de hash, DLL sin fijar, import sin implementar, `DllMain` FALSE y caja.
