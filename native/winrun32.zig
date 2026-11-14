@@ -19,6 +19,7 @@ const extra_dlls_mod = @import("winrun_extra_dlls.zig");
 const dsound_mod = @import("wins_dsound.zig");
 const dshow_mod = @import("wins_dshow.zig");
 const user32_mod = @import("wins_user32.zig");
+const dinput_mod = @import("wins_dinput.zig");
 // winrun_gui_support and x11_window are NOT imported: they need static libX11,
 // which is unavailable for the i386 target this loader builds for.
 const ordinals_mod = @import("winrun_ordinals.zig");
@@ -4549,12 +4550,13 @@ fn SteamUserStats() callconv(W) usize {
 // Bink Video Shims (binkw32.dll)
 // ============================================================================
 
+/// There is no Bink decoder yet, so every open fails the way binkw32 fails
+/// for a file it cannot open: a NULL handle. The old constant handle
+/// (0xB14C0001) was dereferenced by FalloutNV as a BINK structure (Width at
+/// +0, Height at +4): New Game crashed reading 0xB14C0005.
 fn BinkOpen(name: ?[*:0]const u8, flags: u32) callconv(W) usize {
-    _ = flags;
-    if (name) |n| {
-        std.debug.print("[WINS:BinkVideo] _BinkOpen(\"{s}\") -> Video bypassed to menu.\n", .{std.mem.sliceTo(n, 0)});
-    }
-    return 0xB14C0001; // Valid dummy Bink handle
+    std.debug.print("[WINS:BinkVideo] _BinkOpen(\"{s}\", flags 0x{x}) -> NULL (no Bink decoder yet; the video is skipped)\n", .{ if (name) |n| std.mem.sliceTo(n, 0) else "(null)", flags });
+    return 0;
 }
 
 fn BinkClose(bink: usize) callconv(W) void {
@@ -4580,7 +4582,9 @@ fn BinkPause(bink: usize, pause: i32) callconv(W) i32 {
     return 0;
 }
 
-fn BinkCopyToBufferRect() callconv(W) i32 {
+/// _BinkCopyToBufferRect@44: eleven stack words, which the callee pops.
+fn BinkCopyToBufferRect(bink: usize, dest: usize, pitch: u32, height: u32, x: u32, y: u32, sx: u32, sy: u32, sw: u32, sh: u32, flags: u32) callconv(W) i32 {
+    _ = .{ bink, dest, pitch, height, x, y, sx, sy, sw, sh, flags };
     return 0;
 }
 
@@ -5072,6 +5076,8 @@ const WinsDirectInput8Vtbl = struct {
 const WinsDirectInput8 = struct {
     vtbl: *const WinsDirectInput8Vtbl,
     ref_count: u32,
+    /// Created for IID_IDirectInput8W: device info strings are UTF-16.
+    wide: bool = false,
 };
 
 fn di8_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) i32 {
@@ -5092,10 +5098,13 @@ fn di8_Release(this: *anyopaque) callconv(W) u32 {
     self.ref_count -= 1;
     return self.ref_count;
 }
+/// The system keyboard and mouse are real devices fed by the game window
+/// (wins_dinput.zig); anything else does not exist on this adapter.
 fn di8_CreateDevice(this: *anyopaque, guid: ?*const anyopaque, ppv: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) i32 {
-    _ = this; _ = guid; _ = outer;
-    if (ppv) |p| p.* = null;
-    return DIERR_GENERIC; // no input devices on this machine
+    _ = outer;
+    const self: *WinsDirectInput8 = @ptrCast(@alignCast(this));
+    const out = ppv orelse return @bitCast(@as(u32, 0x80004003)); // E_POINTER
+    return dinput_mod.createDevice(@ptrCast(guid), self.wide, out);
 }
 fn di8_EnumDevices(this: *anyopaque, dev_type: u32, cb: ?*anyopaque, ref: ?*anyopaque, flags: u32) callconv(W) i32 {
     _ = this; _ = dev_type; _ = cb; _ = ref; _ = flags;
@@ -5136,10 +5145,13 @@ const g_di8_vtbl = WinsDirectInput8Vtbl{
 };
 
 fn DirectInput8Create(hinst: usize, dwVersion: u32, riidltf: ?*anyopaque, ppvOut: ?*?*anyopaque, punkOuter: ?*anyopaque) callconv(W) i32 {
-    _ = hinst; _ = dwVersion; _ = riidltf; _ = punkOuter;
+    _ = hinst; _ = punkOuter;
     const out = ppvOut orelse return @bitCast(@as(u32, 0x80070057)); // E_INVALIDARG
     const obj = std.heap.page_allocator.create(WinsDirectInput8) catch return @bitCast(@as(u32, 0x8007000E)); // E_OUTOFMEMORY
-    obj.* = .{ .vtbl = &g_di8_vtbl, .ref_count = 1 };
+    // IID_IDirectInput8W is {BF798031-483A-4DA2-AA99-5D64ED369700}; A ends its Data1 in 30.
+    const wide = if (riidltf) |r| (@as(*align(1) const u32, @ptrCast(r)).* == 0xBF798031) else false;
+    obj.* = .{ .vtbl = &g_di8_vtbl, .ref_count = 1, .wide = wide };
+    std.debug.print("[WINS:DInput] DirectInput8Create(version 0x{x}, {s})\n", .{ dwVersion, if (wide) "W" else "A" });
     out.* = @ptrCast(obj);
     return DI_OK;
 }

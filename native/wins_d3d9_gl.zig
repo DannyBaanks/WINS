@@ -29,6 +29,8 @@ pub var active: bool = false;
 /// WINS_D3D9_CAPTURE=<frame>:<path>: write that presented frame as a PPM.
 pub var capture_frame: u64 = std.math.maxInt(u64);
 pub var capture_path: [256:0]u8 = [_:0]u8{0} ** 256;
+/// Non-zero: capture again every `capture_period` frames, as <path>-<frame>.ppm.
+pub var capture_period: u64 = 0;
 
 const alloc = std.heap.page_allocator;
 
@@ -667,7 +669,10 @@ fn writeCapture(frame: u64) void {
     defer alloc.free(bytes);
     gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
     gl.glReadPixels(0, 0, @intCast(g_w), @intCast(g_h), 0x1907, GL_UNSIGNED_BYTE, bytes.ptr); // RGB, row 0 = top
-    const path = std.mem.sliceTo(&capture_path, 0);
+    var name_buf: [300]u8 = undefined;
+    const base = std.mem.sliceTo(&capture_path, 0);
+    const path_s = if (capture_period != 0) (std.fmt.bufPrintZ(&name_buf, "{s}-{d}.ppm", .{ base, frame }) catch return) else (std.fmt.bufPrintZ(&name_buf, "{s}", .{base}) catch return);
+    const path: []const u8 = path_s;
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch {
         std.debug.print("[WINS:D3D9:GL] capture: cannot create {s}\n", .{path});
         return;
@@ -688,7 +693,10 @@ fn writeCapture(frame: u64) void {
 fn presentJob(raw: ?*anyopaque) void {
     const job: *PresentJob = @ptrCast(@alignCast(raw.?));
     const gl = &host.gl;
-    if (job.frame == capture_frame) writeCapture(job.frame);
+    if (job.frame == capture_frame) {
+        writeCapture(job.frame);
+        if (capture_period != 0) capture_frame += capture_period;
+    }
     gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
     gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     gl.glDisable(GL_SCISSOR_TEST);

@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const input = @import("wins_dinput.zig");
 
 extern fn dlopen(path: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
@@ -31,7 +32,36 @@ const Xlib = struct {
     XStoreName: *const fn (?*anyopaque, c_ulong, [*:0]const u8) callconv(.c) c_int,
     XFlush: *const fn (?*anyopaque) callconv(.c) c_int,
     XSync: *const fn (?*anyopaque, c_int) callconv(.c) c_int,
+    XSelectInput: *const fn (?*anyopaque, c_ulong, c_long) callconv(.c) c_int,
+    XPending: *const fn (?*anyopaque) callconv(.c) c_int,
+    XNextEvent: *const fn (?*anyopaque, *XEvent) callconv(.c) c_int,
+    XWarpPointer: *const fn (?*anyopaque, c_ulong, c_ulong, c_int, c_int, c_uint, c_uint, c_int, c_int) callconv(.c) c_int,
+    XCreateBitmapFromData: *const fn (?*anyopaque, c_ulong, [*]const u8, c_uint, c_uint) callconv(.c) c_ulong,
+    XCreatePixmapCursor: *const fn (?*anyopaque, c_ulong, c_ulong, *XColor, *XColor, c_uint, c_uint) callconv(.c) c_ulong,
+    XDefineCursor: *const fn (?*anyopaque, c_ulong, c_ulong) callconv(.c) c_int,
+    XkbSetDetectableAutoRepeat: *const fn (?*anyopaque, c_int, ?*c_int) callconv(.c) c_int,
 };
+
+/// XEvent is a union of 24 longs; only the common key/button/motion prefix is read.
+const XEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: ?*anyopaque,
+    window: c_ulong,
+    root: c_ulong,
+    subwindow: c_ulong,
+    time: c_ulong,
+    x: c_int,
+    y: c_int,
+    x_root: c_int,
+    y_root: c_int,
+    state: c_uint,
+    detail: c_uint, // keycode or button
+    pad: [24 - 14]c_long,
+};
+
+const XColor = extern struct { pixel: c_ulong = 0, red: u16 = 0, green: u16 = 0, blue: u16 = 0, flags: u8 = 0, pad: u8 = 0 };
 
 const Glx = struct {
     glXChooseVisual: *const fn (?*anyopaque, c_int, [*]const c_int) callconv(.c) ?*XVisualInfo,
@@ -251,11 +281,19 @@ fn openSurface() bool {
     const root = xlib.XRootWindow(dpy, vi.screen);
     var swa: XSetWindowAttributes = .{};
     swa.colormap = xlib.XCreateColormap(dpy, root, vi.visual, 0); // AllocNone
-    swa.event_mask = 0;
+    // KeyPress|KeyRelease|ButtonPress|ButtonRelease|PointerMotion|FocusChange
+    swa.event_mask = 0x1 | 0x2 | 0x4 | 0x8 | 0x40 | 0x200000;
     // CWBorderPixel | CWColormap | CWEventMask
     const win = xlib.XCreateWindow(dpy, root, 0, 0, g_args.w, g_args.h, 0, vi.depth, 1, vi.visual, (1 << 3) | (1 << 13) | (1 << 11), &swa);
     if (win == 0) return false;
     _ = xlib.XStoreName(dpy, win, &g_args.title);
+    // DirectInput has no autorepeat: hold keys as one press, one release.
+    _ = xlib.XkbSetDetectableAutoRepeat(dpy, 1, null);
+    // The game draws its own cursor; hide the host one over the window.
+    const blank = [_]u8{0} ** 8;
+    const pix = xlib.XCreateBitmapFromData(dpy, win, &blank, 8, 8);
+    var black: XColor = .{};
+    _ = xlib.XDefineCursor(dpy, win, xlib.XCreatePixmapCursor(dpy, pix, pix, &black, &black, 0, 0));
     _ = xlib.XMapWindow(dpy, win);
     const ctx = glx.glXCreateContext(dpy, vi, null, 1) orelse {
         std.debug.print("[WINS:GL] glXCreateContext failed\n", .{});
@@ -317,7 +355,66 @@ pub fn start(w: u32, h: u32, title: []const u8) bool {
     return g_state.load(.acquire) == 1;
 }
 
-/// Render thread only: show the back buffer.
+/// Render thread only: show the back buffer, then deliver the window's input.
 pub fn swap() void {
     glx.glXSwapBuffers(g_display, g_window);
+    pumpInput();
+}
+
+var g_last_x: c_int = 0;
+var g_last_y: c_int = 0;
+var g_have_last = false;
+var g_seen_types: u16 = 0;
+
+/// Render thread: X11 events of the game window -> DirectInput state. While
+/// the window has the focus the pointer is kept inside it (warped back to the
+/// centre), so mouse look keeps producing motion as on Windows.
+fn pumpInput() void {
+    const dpy = g_display;
+    var ev: XEvent = undefined;
+    while (xlib.XPending(dpy) > 0) {
+        _ = xlib.XNextEvent(dpy, &ev);
+        if (ev.type >= 2 and ev.type <= 10 and g_seen_types & (@as(u16, 1) << @intCast(ev.type)) == 0) {
+            g_seen_types |= @as(u16, 1) << @intCast(ev.type);
+            std.debug.print("[WINS:GL] first X11 input event of type {d} (detail {d}, at {d},{d})\n", .{ ev.type, ev.detail, ev.x, ev.y });
+        }
+        switch (ev.type) {
+            2, 3 => input.keyEvent(input.dikFromX11(ev.detail), ev.type == 2),
+            4, 5 => {
+                const down = ev.type == 4;
+                switch (ev.detail) {
+                    1 => input.mouseButton(0, down),
+                    2 => input.mouseButton(2, down),
+                    3 => input.mouseButton(1, down),
+                    4 => if (down) input.mouseWheel(120),
+                    5 => if (down) input.mouseWheel(-120),
+                    8 => input.mouseButton(3, down),
+                    9 => input.mouseButton(4, down),
+                    else => {},
+                }
+            },
+            6 => {
+                if (g_have_last) input.mouseMove(ev.x - g_last_x, ev.y - g_last_y);
+                g_last_x = ev.x;
+                g_last_y = ev.y;
+                g_have_last = true;
+            },
+            9 => input.focus(true),
+            10 => {
+                input.focus(false);
+                g_have_last = false;
+            },
+            else => {},
+        }
+    }
+    if (input.focused() and g_have_last) {
+        const cx: c_int = @intCast(width / 2);
+        const cy: c_int = @intCast(height / 2);
+        if (@abs(g_last_x - cx) > @as(c_int, @intCast(width / 4)) or @abs(g_last_y - cy) > @as(c_int, @intCast(height / 4))) {
+            _ = xlib.XWarpPointer(dpy, 0, g_window, 0, 0, 0, 0, cx, cy);
+            g_last_x = cx;
+            g_last_y = cy;
+            _ = xlib.XFlush(dpy);
+        }
+    }
 }

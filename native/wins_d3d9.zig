@@ -4963,8 +4963,16 @@ test "scissor rectangle: starts as the back buffer, round trips, null is INVALID
 }
 
 /// WINS_D3D9_CAPTURE=<frame>:<path> (set by the loader).
-pub fn hostgl_capture(frame: u64, path: []const u8) void {
+pub fn hostgl_capture(frame: u64, path_spec: []const u8) void {
     hostgl.capture_frame = frame;
+    // <path>[:<period>]
+    var path = path_spec;
+    if (std.mem.lastIndexOfScalar(u8, path_spec, ':')) |c| {
+        if (std.fmt.parseInt(u64, path_spec[c + 1 ..], 10)) |period| {
+            hostgl.capture_period = period;
+            path = path_spec[0..c];
+        } else |_| {}
+    }
     const n = @min(path.len, hostgl.capture_path.len - 1);
     @memcpy(hostgl.capture_path[0..n], path[0..n]);
     hostgl.capture_path[n] = 0;
