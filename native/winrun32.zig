@@ -684,33 +684,61 @@ fn VirtualFree(lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32) callconv(
     if (lpAddress) |addr| {
         const base = @intFromPtr(addr);
         std.debug.print("[WINS:Kernel32] VirtualFree(0x{x}, size={d}, type=0x{x})\n", .{ base, dwSize, dwFreeType });
-        // MEM_RELEASE (0x8000) with dwSize 0 releases the whole reservation;
-        // MEM_DECOMMIT (0x4000) only withdraws the pages, which here means
-        // making them inaccessible rather than unmapping the neighbours. A
-        // sub-range release is not something a reservation supports, so it
-        // releases the reservation the address belongs to.
+        // MEM_RELEASE (0x8000) takes the reservation's base and size 0 and
+        // unmaps the whole reservation; MEM_DECOMMIT (0x4000) withdraws only
+        // the pages holding a byte of [addr, addr+size) (size 0: up to the end
+        // of the reservation), which here means zeroing them and making them
+        // inaccessible, never unmapping neighbours (pinned by
+        // native/testdata/decommit_probe.c against Wine).
         const is_release = (dwFreeType & 0x8000) != 0;
         const is_decommit = (dwFreeType & 0x4000) != 0;
-        var size: usize = 0;
+        if (is_release == is_decommit) {
+            g_last_error = 87; // ERROR_INVALID_PARAMETER: exactly one of the two
+            return 0;
+        }
+        var owner: ?Reservation = null;
         for (g_reservations) |r| {
             if (r.size != 0 and base >= r.base and base < r.base + r.size) {
-                size = r.size;
+                owner = r;
                 break;
             }
         }
-        if (size == 0) {
+        const res = owner orelse {
             // Not one of our reservations. Unmapping it would destroy memory
             // that belongs to someone else -- the real client, libc, or the
             // kernel. A release that cannot prove ownership must not unmap.
             std.debug.print("[WINS:Kernel32] VirtualFree: 0x{x} is not one of our reservations; refusing to release it\n", .{base});
+            g_last_error = 487; // ERROR_INVALID_ADDRESS
             return 0;
-        }
-        if (is_decommit and !is_release) {
-            _ = linux.mprotect(@as([*]u8, @ptrFromInt(base)), size, linux.PROT{});
+        };
+        const res_end = res.base + std.mem.alignForward(usize, res.size, 4096);
+        if (is_decommit) {
+            // Decommitting for the size of the WHOLE reservation from an
+            // interior address (what this did before) withdrew the game's live
+            // heap after one guard page: FalloutNV decommits single pages at
+            // 0x51d1000 / 0x71e1000 inside 8 MB reservations and then faulted
+            // one page later, in its main loop.
+            const lo = base & ~@as(usize, 4095);
+            const hi = if (dwSize == 0) res_end else std.mem.alignForward(usize, base + dwSize, 4096);
+            if (hi > res_end) {
+                g_last_error = 487; // ERROR_INVALID_ADDRESS: beyond the reservation
+                return 0;
+            }
+            // Decommitted pages lose their contents: a later commit reads zeros.
+            _ = linux.madvise(@ptrFromInt(lo), hi - lo, linux.MADV.DONTNEED);
+            _ = linux.mprotect(@as([*]u8, @ptrFromInt(lo)), hi - lo, linux.PROT{});
             return 1;
         }
-        _ = linux.munmap(@as([*]u8, @ptrFromInt(base)), size);
-        untrackReservation(base);
+        if (base != res.base) {
+            g_last_error = 487; // ERROR_INVALID_ADDRESS: not the reservation's base
+            return 0;
+        }
+        if (dwSize != 0) {
+            g_last_error = 87; // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        _ = linux.munmap(@as([*]u8, @ptrFromInt(res.base)), res.size);
+        untrackReservation(res.base);
         return 1;
     }
     return 0;
