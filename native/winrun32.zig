@@ -6164,6 +6164,25 @@ pub fn main(init: std.process.Init) !void {
     // its oracle by one log line and nothing else, which is how the mistake
     // was caught.
     if (getenv("SteamAppId") != null) loadRealSteamClient();
+    // Host GPU rendering for Direct3D 9 devices (WINS_D3D9_HOST=0: headless).
+    d3d9.host_enabled = if (getenv("WINS_D3D9_HOST")) |v| v[0] != '0' else true;
+    if (getenv("WINS_D3D9_CAPTURE")) |v| {
+        const spec = std.mem.sliceTo(v, 0);
+        if (std.mem.indexOfScalar(u8, spec, ':')) |colon| {
+            d3d9.hostgl_capture(std.fmt.parseInt(u64, spec[0..colon], 10) catch 0, spec[colon + 1 ..]);
+        }
+    }
+    // Instrument: WINS_D3D9_TRACE=<frames> prints the device's draw stream.
+    if (getenv("WINS_D3D9_TRACE")) |v| {
+        const spec = std.mem.sliceTo(v, 0);
+        if (std.mem.indexOfScalar(u8, spec, ':')) |_| {
+            var parts = std.mem.splitScalar(u8, spec, ':');
+            d3d9.trace_after = std.fmt.parseInt(u64, parts.next() orelse "", 10) catch 0;
+            d3d9.trace_budget = std.fmt.parseInt(u32, parts.next() orelse "", 10) catch 0;
+            d3d9.trace_period = std.fmt.parseInt(u64, parts.next() orelse "", 10) catch 0;
+        } else d3d9.trace_frames = std.fmt.parseInt(u32, spec, 10) catch 0;
+        d3d9.trace_resources = d3d9.trace_frames != 0 or d3d9.trace_budget != 0;
+    }
     // Before any guest code runs, because the guest's address reservations
     // (MAP_FIXED) happen before it ever asks for the Steam interface.
     protectForeignMemory();

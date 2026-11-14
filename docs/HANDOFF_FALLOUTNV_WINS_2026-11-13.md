@@ -343,3 +343,31 @@ alta el oráculo de Proton/Wine se cuelga en el arranque; `wine` de Proton direc
 `~/.cache/wins-oracle/compat/pfx` sin DISPLAY funcionó para probes de consola.
 Loaders instalados: actual 93603f2 (096fba5a…), respaldos `winrun32.prev-1d1a346`,
 `winrun32.prev-bea1e24`.
+
+## Continuación Claude Code (2026-11-14 tarde) — primer frame real por GPU
+
+### Hecho
+- `SetScissorRect/GetScissorRect` reales (estado guardado; recorta con D3DRS_SCISSORTESTENABLE).
+- Trazador de draws (instrumento): `WINS_D3D9_TRACE=<frames>` o `<inicio>:<frames>[:<periodo>]`
+  imprime clears, draws (shaders, decl, streams, texturas, constantes, estados) y Present.
+  Medido en el menú: 4 `DrawIndexedPrimitive` por frame, vs_1_1 + ps_2_a, quads DXT1/DXT5.
+- `native/wins_d3d9_shader.zig`: traductor de bytecode D3D9 (vs_1_1..3_0, ps_2_0..3_0) a GLSL 1.20.
+  Lo no implementado (ps_1_x, subrutinas, predicados) se rechaza y el draw se salta, no se adivina.
+- `native/wins_gl.zig`: ventana X11 + contexto GLX (dlopen de libX11/libGL i386) en un hilo de
+  render nativo; los hilos del guest le pasan trabajos con futex.
+- `native/wins_d3d9_gl.zig`: backend del device: back buffer como FBO (fila 0 arriba,
+  `glClipControl(UPPER_LEFT, ZERO_TO_ONE)` = espacio de clip D3D), estados de blend/z/stencil/
+  cull/scissor, subida de texturas (DXT1/3/5 y formatos sin comprimir), programas por par vs/ps.
+  `WINS_D3D9_HOST=0` vuelve al camino sin ventana; `WINS_D3D9_CAPTURE=<frame>:<ruta>` escribe un PPM.
+
+### Evidencia
+Lanzado desde la herramienta WINS (Steam real, AppID 22380): renderer "AMD Radeon 760M (radeonsi)",
+OpenGL 4.6 Mesa 25.2.8. Frame 3000 capturado: pantalla de Obsidian Entertainment completa y correcta
+(PNG sha256 54aa16b7…f901; 9389/9501 muestras no negras). Ningún aviso `[WINS:D3D9:GL]` en la corrida.
+Tests: `zig test native/wins_d3d9.zig` 30/30 (incluye 3 del traductor y el de scissor).
+
+### Pendiente / límites
+- Solo se verificaron los quads 2D del intro/menú. Escenas 3D (render targets fuera del back buffer,
+  pipeline fijo, FVF, cube/volume, UDEC3/DEC3N) se reportan una vez y se saltan.
+- Sin entrada (teclado/ratón X11 → mensajes de la ventana) todavía: siguiente paso natural.
+- DirectSound sigue en silencio.

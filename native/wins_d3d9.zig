@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const hostgl = @import("wins_d3d9_gl.zig");
 
 pub const W: std.builtin.CallingConvention = .winapi;
 
@@ -1133,6 +1134,9 @@ pub const WinsTexture9 = struct {
     /// One surface per mip level, each with its own size, pitch and storage.
     surfaces: []*WinsSurface9,
     allocator: std.mem.Allocator,
+    /// Host GPU copy (wins_d3d9_gl.zig): 0 until first sampled; dirty after an unlock.
+    gl_name: u32 = 0,
+    gl_dirty: bool = true,
 
     /// Number of levels in a full mip chain down to 1x1: 1 + floor(log2(max(w, h))).
     pub fn fullChain(width: u32, height: u32) u32 {
@@ -1184,6 +1188,7 @@ pub const WinsTexture9 = struct {
             if (s.ref_count > 1) return;
         }
         const a = self.allocator;
+        hostgl.textureGone(self.gl_name);
         for (self.surfaces) |s| s.destroy();
         a.free(self.surfaces);
         a.destroy(self);
@@ -1254,6 +1259,7 @@ fn tex_LockRect(this: *anyopaque, level: u32, pLocked: ?*D3DLOCKED_RECT, pRect: 
 fn tex_UnlockRect(this: *anyopaque, level: u32) callconv(W) HRESULT {
     const self: *WinsTexture9 = @ptrCast(@alignCast(this));
     if (level >= self.surfaces.len) return D3DERR_INVALIDCALL;
+    self.gl_dirty = true;
     const s = self.surfaces[level];
     return s.vtbl.UnlockRect(s);
 }
@@ -1487,6 +1493,83 @@ comptime {
     }
 }
 
+/// Draw tracer: an instrument, off unless the loader sets it from
+/// WINS_D3D9_TRACE=<frames>. While frames remain, every draw, clear, target
+/// change and present prints one line with the state a backend would need, so
+/// the next piece of the device is built from what the guest really asks for.
+pub var trace_frames: u32 = 0;
+/// Set by the loader (WINS_D3D9_HOST=0 turns it off): devices get an X11
+/// window and render on the host GPU.
+pub var host_enabled: bool = false;
+/// WINS_D3D9_TRACE=<start>:<frames> arms the tracer once `start` frames were
+/// presented (the frames of interest come long after the loading screens).
+pub var trace_after: u64 = 0;
+pub var trace_budget: u32 = 0;
+/// Non-zero: re-arm every `trace_period` frames (WINS_D3D9_TRACE=<start>:<frames>:<period>).
+pub var trace_period: u64 = 0;
+/// Stays true once tracing was requested: resource creation is logged for the
+/// whole run (it happens long before the frames of interest).
+pub var trace_resources: bool = false;
+
+fn shaderVersion(sh: ?*const WinsShader9) u32 {
+    const s = sh orelse return 0;
+    return if (s.tokens.len > 0) s.tokens[0] else 0;
+}
+
+fn traceDraw(self: *const WinsD3DDevice9, kind: []const u8, prim: u32, a: i64, b: u32, c: u32) void {
+    if (trace_frames == 0) return;
+    std.debug.print("[WINS:D3D9:trace] f{d} {s} prim={d} base/start={d} first={d} count={d} vs={x}@{x} ps={x}@{x} zenable={d} zwrite={d} alphablend={d} src={d} dst={d} alphatest={d} cull={d} scissor={d} colorwrite={x}\n", .{
+        self.frame_count,                 kind,                                 prim,                                a,                                   b,                                   c,
+        shaderVersion(self.active_vs),    @intFromPtr(self.active_vs),          shaderVersion(self.active_ps),       @intFromPtr(self.active_ps),         self.render_states[7],               self.render_states[14],
+        self.render_states[27],           self.render_states[19],               self.render_states[20],              self.render_states[15],              self.render_states[22],              self.render_states[174],
+        self.render_states[168],
+    });
+    inline for (.{ self.active_vs, self.active_ps }, .{ "vs", "ps" }) |maybe_sh, tag| {
+        if (maybe_sh) |sh| {
+            std.debug.print("[WINS:D3D9:trace]   {s} tokens:", .{tag});
+            for (sh.tokens) |t| std.debug.print(" {x:0>8}", .{t});
+            std.debug.print("\n", .{});
+        }
+    }
+    std.debug.print("[WINS:D3D9:trace]   vsc:", .{});
+    for (self.vs_consts[0..12]) |k| std.debug.print(" [{d:.4} {d:.4} {d:.4} {d:.4}]", .{ k[0], k[1], k[2], k[3] });
+    std.debug.print("\n[WINS:D3D9:trace]   psc:", .{});
+    for (self.ps_consts[0..6]) |k| std.debug.print(" [{d:.4} {d:.4} {d:.4} {d:.4}]", .{ k[0], k[1], k[2], k[3] });
+    std.debug.print("\n", .{});
+    if (self.streams[0]) |vb| {
+        std.debug.print("[WINS:D3D9:trace]   vb0 floats:", .{});
+        var o: usize = self.stream_offsets[0];
+        while (o + 4 <= vb.data.len and o < self.stream_offsets[0] + 80) : (o += 4) std.debug.print(" {d:.3}", .{readFloat32LE(vb.data, o)});
+        std.debug.print("\n", .{});
+    }
+    if (self.indices) |ib| {
+        std.debug.print("[WINS:D3D9:trace]   ib bytes:", .{});
+        for (ib.data[0..@min(ib.data.len, 24)]) |x| std.debug.print(" {x:0>2}", .{x});
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("[WINS:D3D9:trace]   viewport {d},{d} {d}x{d} z {d}..{d}\n", .{ self.viewport.X, self.viewport.Y, self.viewport.Width, self.viewport.Height, self.viewport.MinZ, self.viewport.MaxZ });
+    if (self.vertex_decl) |d| {
+        std.debug.print("[WINS:D3D9:trace]   decl@{x}:", .{@intFromPtr(d)});
+        for (d.elements) |e| {
+            if (isDeclEnd(e)) break;
+            std.debug.print(" s{d}+{d}:t{d}:u{d}.{d}", .{ e.Stream, e.Offset, e.Type, e.Usage, e.UsageIndex });
+        }
+        std.debug.print("\n", .{});
+    } else std.debug.print("[WINS:D3D9:trace]   decl=null\n", .{});
+    for (self.streams, 0..) |maybe, i| {
+        const vb = maybe orelse continue;
+        std.debug.print("[WINS:D3D9:trace]   stream{d} vb@{x} len={d} stride={d} off={d} usage={x}\n", .{ i, @intFromPtr(vb), vb.length, self.stream_strides[i], self.stream_offsets[i], vb.usage });
+    }
+    if (self.indices) |ib| std.debug.print("[WINS:D3D9:trace]   ib@{x} len={d} fmt={d}\n", .{ @intFromPtr(ib), ib.data.len, ib.format });
+    for (self.bound_textures, 0..) |maybe, i| {
+        const t = maybe orelse continue;
+        std.debug.print("[WINS:D3D9:trace]   tex{d} @{x} {d}x{d} fmt={x} levels={d} usage={x} min={d} mag={d} mip={d} addr={d}/{d}\n", .{
+            i,                           @intFromPtr(t),              t.width,                     t.height, t.format, t.levels, t.usage,
+            self.sampler_states[i][6],   self.sampler_states[i][5],   self.sampler_states[i][7],   self.sampler_states[i][1], self.sampler_states[i][2],
+        });
+    }
+}
+
 pub const WinsD3DDevice9 = struct {
     // Largest alignment in the struct, so the compiler keeps it first (see the
     // comptime check above); the guest dereferences offset 0 as the vtable.
@@ -1496,6 +1579,9 @@ pub const WinsD3DDevice9 = struct {
     device_type: u32,
     params: D3DPRESENT_PARAMETERS,
     viewport: D3DVIEWPORT9,
+    /// D3DRS_SCISSORTESTENABLE clips to this; a new device starts with the
+    /// whole back buffer.
+    scissor: D3DRECT,
     material: D3DMATERIAL9,
     transform_states: [kTransformStateCount]D3DMATRIX,
     lights: std.AutoHashMapUnmanaged(u32, D3DLightState9),
@@ -1522,6 +1608,10 @@ pub const WinsD3DDevice9 = struct {
     active_vs: ?*WinsShader9,
     active_ps: ?*WinsShader9,
     allocator: std.mem.Allocator,
+    /// The host backend draws only into the implicit back buffer.
+    render_target_is_backbuffer: bool = true,
+    /// True when this device renders through wins_d3d9_gl.zig.
+    host: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, adapter: u32, device_type: u32, params: D3DPRESENT_PARAMETERS) !*WinsD3DDevice9 {
         const dev = try allocator.create(WinsD3DDevice9);
@@ -1548,6 +1638,7 @@ pub const WinsD3DDevice9 = struct {
                 .MinZ = 0.0,
                 .MaxZ = 1.0,
             },
+            .scissor = .{ .x1 = 0, .y1 = 0, .x2 = @intCast(w), .y2 = @intCast(h) },
             .material = defaultMaterial9(),
             .transform_states = [_]D3DMATRIX{d3dIdentityMatrix()} ** kTransformStateCount,
             .lights = .empty,
@@ -1759,6 +1850,7 @@ fn d3d9_CreateDevice(
     });
     const gpa = std.heap.page_allocator;
     const dev = WinsD3DDevice9.init(gpa, adapter, dev_type, params) catch return E_OUTOFMEMORY;
+    if (host_enabled) dev.host = hostgl.attach(dev.viewport.Width, dev.viewport.Height, "WINS");
     ppDevice.?.* = @ptrCast(dev);
     return D3D_OK;
 }
@@ -2016,10 +2108,12 @@ fn dev9_Clear(
     z: f32,
     stencil: u32,
 ) callconv(W) HRESULT {
-    _ = count;
-    _ = pRects;
-    _ = stencil;
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (trace_frames != 0) std.debug.print("[WINS:D3D9:trace] f{d} Clear(rects={d}, flags={x}, color={x}, z={d}, stencil={d})\n", .{ self.frame_count, count, flags, color, z, stencil });
+    if (self.host) {
+        hostgl.clear(self, count, pRects, flags, color, z, stencil);
+        return D3D_OK;
+    }
     if ((flags & D3DCLEAR_TARGET) != 0) {
         @memset(self.backbuffer, color);
     }
@@ -2040,7 +2134,16 @@ fn dev9_Present(
     _ = hWindow;
     _ = pDirty;
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (trace_frames != 0) {
+        std.debug.print("[WINS:D3D9:trace] f{d} Present (draw calls so far {d})\n", .{ self.frame_count, self.draw_call_count });
+        trace_frames -= 1;
+    }
+    if (self.host) hostgl.present(self.frame_count);
     self.frame_count += 1;
+    if (trace_budget != 0 and self.frame_count >= trace_after) {
+        trace_frames = trace_budget;
+        if (trace_period != 0) trace_after = self.frame_count + trace_period else trace_budget = 0;
+    }
     return D3D_OK;
 }
 fn dev9_SetViewport(this: *anyopaque, pViewport: ?*const D3DVIEWPORT9) callconv(W) HRESULT {
@@ -2107,7 +2210,11 @@ fn dev9_CreateTexture(
     _ = pSharedHandle;
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (ppTexture == null) return E_FAIL;
-    const tex = WinsTexture9.create(self.allocator, Width, Height, Levels, Usage, Format, Pool) catch |e| return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
+    const tex = WinsTexture9.create(self.allocator, Width, Height, Levels, Usage, Format, Pool) catch |e| {
+        if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateTexture({d}x{d}, levels={d}, usage={x}, fmt={x}, pool={d}) REFUSED\n", .{ Width, Height, Levels, Usage, Format, Pool });
+        return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
+    };
+    if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateTexture({d}x{d}, levels={d}, usage={x}, fmt={x}, pool={d}) -> @{x}\n", .{ Width, Height, Levels, Usage, Format, Pool, @intFromPtr(tex) });
     ppTexture.?.* = @ptrCast(tex);
     return D3D_OK;
 }
@@ -2116,6 +2223,7 @@ fn dev9_CreateVertexShader(this: *anyopaque, pFunction: ?*const u32, ppShader: ?
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (ppShader == null) return E_FAIL;
     const sh = WinsShader9.create(self.allocator, false, pFunction) catch return E_OUTOFMEMORY;
+    if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateVertexShader -> @{x} version={x} tokens={d}\n", .{ @intFromPtr(sh), shaderVersion(sh), sh.tokens.len });
     ppShader.?.* = @ptrCast(sh);
     return D3D_OK;
 }
@@ -2124,6 +2232,7 @@ fn dev9_CreatePixelShader(this: *anyopaque, pFunction: ?*const u32, ppShader: ?*
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (ppShader == null) return E_FAIL;
     const sh = WinsShader9.create(self.allocator, true, pFunction) catch return E_OUTOFMEMORY;
+    if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreatePixelShader -> @{x} version={x} tokens={d}\n", .{ @intFromPtr(sh), shaderVersion(sh), sh.tokens.len });
     ppShader.?.* = @ptrCast(sh);
     return D3D_OK;
 }
@@ -2326,7 +2435,13 @@ fn rasterizeTriangle(self: *WinsD3DDevice9, vb: *const WinsVertexBuffer9, vertic
 fn dev9_DrawPrimitive(this: *anyopaque, prim_type: u32, start_vertex: u32, count: u32) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     self.draw_call_count += 1;
+    traceDraw(self, "DrawPrimitive", prim_type, 0, start_vertex, count);
     if (count == 0) return D3D_OK;
+    if (self.host) {
+        var job: hostgl.DrawJob = .{ .dev = self, .prim = prim_type, .indexed = false, .base_vertex = start_vertex, .prim_count = count };
+        hostgl.draw(&job);
+        return D3D_OK;
+    }
     const vb = self.streams[0] orelse return D3D_OK;
 
     var triangle: u32 = 0;
@@ -2354,7 +2469,14 @@ fn dev9_DrawIndexedPrimitive(
 ) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     self.draw_call_count += 1;
+    traceDraw(self, "DrawIndexedPrimitive", prim_type, base_vertex_idx, start_index, prim_count);
     if (prim_count == 0) return D3D_OK;
+    if (self.host) {
+        if (self.indices == null) return D3DERR_INVALIDCALL;
+        var job: hostgl.DrawJob = .{ .dev = self, .prim = prim_type, .indexed = true, .base_vertex = base_vertex_idx, .min_index = min_vertex_idx, .num_vertices = num_vertices, .start_index = start_index, .prim_count = prim_count };
+        hostgl.draw(&job);
+        return D3D_OK;
+    }
     if (triangleVertexOffsets(prim_type, 0) == null) return D3D_OK;
     const vb = self.streams[0] orelse return D3DERR_INVALIDCALL;
     const ib = self.indices orelse return D3DERR_INVALIDCALL;
@@ -3057,18 +3179,22 @@ fn dev9_GetCurrentTexturePalette(this: *anyopaque, p0: ?*u32) callconv(W) HRESUL
     return E_NOTIMPL;
 }
 
+/// The rectangle is stored as given (D3D9 does not clamp or validate it); a
+/// null pointer is D3DERR_INVALIDCALL. It only clips while
+/// D3DRS_SCISSORTESTENABLE (174) is set.
 fn dev9_SetScissorRect(this: *anyopaque, p0: ?*const D3DRECT) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!SetScissorRect is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const r = p0 orelse return D3DERR_INVALIDCALL;
+    self.scissor = r.*;
+    if (trace_frames != 0) std.debug.print("[WINS:D3D9:trace] f{d} SetScissorRect({d},{d},{d},{d})\n", .{ self.frame_count, r.x1, r.y1, r.x2, r.y2 });
+    return D3D_OK;
 }
 
 fn dev9_GetScissorRect(this: *anyopaque, p0: ?*D3DRECT) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!GetScissorRect is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = p0 orelse return D3DERR_INVALIDCALL;
+    out.* = self.scissor;
+    return D3D_OK;
 }
 
 fn dev9_SetSoftwareVertexProcessing(this: *anyopaque, p0: i32) callconv(W) HRESULT {
@@ -4817,4 +4943,29 @@ test "material and light state round-trip with D3D9 validation" {
     try std.testing.expectEqual(D3DLIGHT_DIRECTIONAL, light_read.Type);
     try std.testing.expectEqual(@as(f32, 1), light_read.Diffuse.r);
     try std.testing.expectEqual(@as(u32, 0), dev.vtbl.Release(dev));
+}
+
+test "scissor rectangle: starts as the back buffer, round trips, null is INVALIDCALL" {
+    var d3d = WinsD3D9.init();
+    const dev = try testDevice(&d3d);
+    var r: D3DRECT = undefined;
+    try std.testing.expectEqual(D3D_OK, dev9_GetScissorRect(dev, &r));
+    try std.testing.expectEqual(@as(i32, 0), r.x1);
+    try std.testing.expectEqual(@as(i32, @intCast(dev.viewport.Width)), r.x2);
+    try std.testing.expectEqual(@as(i32, @intCast(dev.viewport.Height)), r.y2);
+    const want: D3DRECT = .{ .x1 = 3, .y1 = 5, .x2 = 70, .y2 = 90 };
+    try std.testing.expectEqual(D3D_OK, dev9_SetScissorRect(dev, &want));
+    try std.testing.expectEqual(D3D_OK, dev9_GetScissorRect(dev, &r));
+    try std.testing.expectEqual(want, r);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev9_SetScissorRect(dev, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev9_GetScissorRect(dev, null));
+    try std.testing.expectEqual(want, r);
+}
+
+/// WINS_D3D9_CAPTURE=<frame>:<path> (set by the loader).
+pub fn hostgl_capture(frame: u64, path: []const u8) void {
+    hostgl.capture_frame = frame;
+    const n = @min(path.len, hostgl.capture_path.len - 1);
+    @memcpy(hostgl.capture_path[0..n], path[0..n]);
+    hostgl.capture_path[n] = 0;
 }
