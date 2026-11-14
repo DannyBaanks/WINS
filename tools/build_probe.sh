@@ -27,7 +27,7 @@ mkdir -p "$PROBE"
 # never silently diverge from what gets measured.
 for src in winrun32.zig winrun_kernel32.zig winrun_msvcrt.zig winrun_extra_dlls.zig \
            winrun_ordinals.zig wins_d3d9.zig wins_graph.zig winrun_vorbis.zig wins_dsound.zig \
-           wins_dshow.zig; do
+           wins_dshow.zig wins_audio.zig wins_user32.zig winrun_threads.zig; do
     cp "$REPO/native/$src" "$PROBE/$src"
 done
 

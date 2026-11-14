@@ -18,6 +18,7 @@ const vorbis_mod = @import("winrun_vorbis.zig");
 const extra_dlls_mod = @import("winrun_extra_dlls.zig");
 const dsound_mod = @import("wins_dsound.zig");
 const dshow_mod = @import("wins_dshow.zig");
+const user32_mod = @import("wins_user32.zig");
 // winrun_gui_support and x11_window are NOT imported: they need static libX11,
 // which is unavailable for the i386 target this loader builds for.
 const ordinals_mod = @import("winrun_ordinals.zig");
@@ -1066,6 +1067,10 @@ fn GetLastError() callconv(W) u32 {
 }
 
 fn SetLastError(err: u32) callconv(W) void {
+    g_last_error = err;
+}
+
+fn setLastErrorHook(err: u32) void {
     g_last_error = err;
 }
 
@@ -4564,132 +4569,13 @@ fn BinkSetSoundSystem(open_fn: ?*anyopaque, param: usize) callconv(W) i32 {
 // ============================================================================
 // User32 GUI Shims
 // ============================================================================
+// Windows, classes, the message queue, activation and focus live in
+// wins_user32.zig; what is left here is input, cursor and system queries.
 
 fn GetSystemMetrics(nIndex: i32) callconv(W) i32 {
     if (nIndex == 0) return 1920; // SM_CXSCREEN
     if (nIndex == 1) return 1080; // SM_CYSCREEN
     return 0;
-}
-
-fn GetDesktopWindow() callconv(W) usize {
-    return 0x10001;
-}
-
-fn GetActiveWindow() callconv(W) usize {
-    return 0x10002;
-}
-
-fn GetForegroundWindow() callconv(W) usize {
-    return 0x10002;
-}
-
-fn FindWindowA(lpClass: ?[*:0]const u8, lpWindow: ?[*:0]const u8) callconv(W) usize {
-    _ = lpClass; _ = lpWindow;
-    return 0;
-}
-
-fn CreateWindowExA(
-    dwExStyle: u32,
-    lpClassName: ?[*:0]const u8,
-    lpWindowName: ?[*:0]const u8,
-    dwStyle: u32,
-    x: i32,
-    y: i32,
-    nWidth: i32,
-    nHeight: i32,
-    hWndParent: usize,
-    hMenu: usize,
-    hInstance: usize,
-    lpParam: ?*anyopaque,
-) callconv(W) usize {
-    _ = dwExStyle; _ = dwStyle; _ = x; _ = y; _ = hWndParent; _ = hMenu; _ = hInstance; _ = lpParam;
-    const win_title = if (lpWindowName) |w| std.mem.sliceTo(w, 0) else "Game";
-    std.debug.print("[WINS:User32] CreateWindowExA(\"{s}\", size: {}x{}) -> HWND 0x20001 created!\n", .{
-        win_title, nWidth, nHeight,
-    });
-    _ = lpClassName;
-    return 0x20001; // Valid HWND handle
-}
-
-fn DefWindowProcA(hWnd: usize, Msg: u32, wParam: usize, lParam: usize) callconv(W) usize {
-    _ = hWnd; _ = Msg; _ = wParam; _ = lParam;
-    return 0;
-}
-
-fn RegisterClassA(lpWndClass: ?*anyopaque) callconv(W) u16 {
-    _ = lpWndClass;
-    return 0xC001;
-}
-
-fn ShowWindow(hWnd: usize, nCmdShow: i32) callconv(W) i32 {
-    _ = hWnd; _ = nCmdShow;
-    return 1;
-}
-
-fn UpdateWindow(hWnd: usize) callconv(W) i32 {
-    _ = hWnd;
-    return 1;
-}
-
-fn SetFocus(hWnd: usize) callconv(W) usize {
-    return hWnd;
-}
-
-fn SetForegroundWindow(hWnd: usize) callconv(W) i32 {
-    _ = hWnd;
-    return 1;
-}
-
-fn GetClientRect(hWnd: usize, lpRect: ?*d3d9.D3DRECT) callconv(W) i32 {
-    _ = hWnd;
-    if (lpRect) |r| {
-        r.x1 = 0; r.y1 = 0; r.x2 = 1280; r.y2 = 720;
-    }
-    return 1;
-}
-
-fn GetWindowRect(hWnd: usize, lpRect: ?*d3d9.D3DRECT) callconv(W) i32 {
-    return GetClientRect(hWnd, lpRect);
-}
-
-fn AdjustWindowRect(lpRect: ?*anyopaque, dwStyle: u32, bMenu: i32) callconv(W) i32 {
-    _ = lpRect; _ = dwStyle; _ = bMenu;
-    return 1;
-}
-
-fn AdjustWindowRectEx(lpRect: ?*anyopaque, dwStyle: u32, bMenu: i32, dwEx: u32) callconv(W) i32 {
-    _ = lpRect; _ = dwStyle; _ = bMenu; _ = dwEx;
-    return 1;
-}
-
-fn PeekMessageA(lpMsg: ?*anyopaque, hWnd: usize, wMin: u32, wMax: u32, wRemove: u32) callconv(W) i32 {
-    _ = lpMsg; _ = hWnd; _ = wMin; _ = wMax; _ = wRemove;
-    return 0; // No messages waiting
-}
-
-fn GetMessageA(lpMsg: ?*anyopaque, hWnd: usize, wMin: u32, wMax: u32) callconv(W) i32 {
-    _ = lpMsg; _ = hWnd; _ = wMin; _ = wMax;
-    return 0;
-}
-
-fn TranslateMessage(lpMsg: ?*anyopaque) callconv(W) i32 {
-    _ = lpMsg;
-    return 0;
-}
-
-fn DispatchMessageA(lpMsg: ?*anyopaque) callconv(W) usize {
-    _ = lpMsg;
-    return 0;
-}
-
-fn SendMessageA(hWnd: usize, Msg: u32, wParam: usize, lParam: usize) callconv(W) usize {
-    _ = hWnd; _ = Msg; _ = wParam; _ = lParam;
-    return 0;
-}
-
-fn DestroyWindow(hWnd: usize) callconv(W) i32 {
-    _ = hWnd;
-    return 1;
 }
 
 fn LoadIconA(hInstance: usize, lpIconName: ?[*:0]const u8) callconv(W) usize {
@@ -4704,16 +4590,6 @@ fn LoadCursorA(hInstance: usize, lpCursorName: ?[*:0]const u8) callconv(W) usize
 
 fn ShowCursor(bShow: i32) callconv(W) i32 {
     return bShow;
-}
-
-fn SetWindowPos(hWnd: usize, hWndInsertAfter: usize, X: i32, Y: i32, cx: i32, cy: i32, uFlags: u32) callconv(W) i32 {
-    _ = hWnd; _ = hWndInsertAfter; _ = X; _ = Y; _ = cx; _ = cy; _ = uFlags;
-    return 1;
-}
-
-fn GetWindow(hWnd: usize, uCmd: u32) callconv(W) usize {
-    _ = hWnd; _ = uCmd;
-    return 0;
 }
 
 fn GetDoubleClickTime() callconv(W) u32 {
@@ -4740,49 +4616,9 @@ fn CallNextHookEx(hhk: usize, nCode: i32, wParam: usize, lParam: usize) callconv
     return 0;
 }
 
-fn GetWindowTextA(hWnd: usize, lpString: ?[*]u8, nMaxCount: i32) callconv(W) i32 {
-    _ = hWnd;
-    if (lpString == null or nMaxCount <= 0) return 0;
-    const txt = "Fallout: New Vegas";
-    const len: usize = @min(@as(usize, @intCast(nMaxCount - 1)), txt.len);
-    @memcpy(lpString.?[0..len], txt[0..len]);
-    lpString.?[len] = 0;
-    return @intCast(len);
-}
-
-fn SetWindowTextA(hWnd: usize, lpString: ?[*:0]const u8) callconv(W) i32 {
-    _ = hWnd; _ = lpString;
-    return 1;
-}
-
-fn GetClassNameA(hWnd: usize, lpClassName: ?[*]u8, nMaxCount: i32) callconv(W) i32 {
-    _ = hWnd;
-    if (lpClassName == null or nMaxCount <= 0) return 0;
-    const cls = "BethesdaWindowClass";
-    const len: usize = @min(@as(usize, @intCast(nMaxCount - 1)), cls.len);
-    @memcpy(lpClassName.?[0..len], cls[0..len]);
-    lpClassName.?[len] = 0;
-    return @intCast(len);
-}
-
 fn SendInput(cInputs: u32, pInputs: ?*anyopaque, cbSize: i32) callconv(W) u32 {
     _ = pInputs; _ = cbSize;
     return cInputs;
-}
-
-fn EnumChildWindows(hWndParent: usize, lpEnumFunc: ?*anyopaque, lParam: usize) callconv(W) i32 {
-    _ = hWndParent; _ = lpEnumFunc; _ = lParam;
-    return 1;
-}
-
-fn GetWindowLongA(hWnd: usize, nIndex: i32) callconv(W) usize {
-    _ = hWnd; _ = nIndex;
-    return 0;
-}
-
-fn GetClassLongA(hWnd: usize, nIndex: i32) callconv(W) usize {
-    _ = hWnd; _ = nIndex;
-    return 0;
 }
 
 fn EnumDisplayDevicesA(lpDevice: ?*anyopaque, iDevNum: u32, lpDisplayDevice: ?*anyopaque, dwFlags: u32) callconv(W) i32 {
@@ -5503,45 +5339,17 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (std.mem.eql(u8, name, "OpenThread")) return @ptrCast(&OpenThread);
         if (std.mem.eql(u8, name, "AddVectoredExceptionHandler")) return @ptrCast(&AddVectoredExceptionHandler);
     } else if (std.ascii.eqlIgnoreCase(dll, "user32.dll") or std.ascii.eqlIgnoreCase(dll, "user32")) {
+        if (user32_mod.lookup(name)) |addr| return @ptrFromInt(addr);
         if (std.mem.eql(u8, name, "GetSystemMetrics")) return @ptrCast(&GetSystemMetrics);
-        if (std.mem.eql(u8, name, "GetDesktopWindow")) return @ptrCast(&GetDesktopWindow);
-        if (std.mem.eql(u8, name, "GetActiveWindow")) return @ptrCast(&GetActiveWindow);
-        if (std.mem.eql(u8, name, "GetForegroundWindow")) return @ptrCast(&GetForegroundWindow);
-        if (std.mem.eql(u8, name, "FindWindowA")) return @ptrCast(&FindWindowA);
-        if (std.mem.eql(u8, name, "CreateWindowExA")) return @ptrCast(&CreateWindowExA);
-        if (std.mem.eql(u8, name, "DefWindowProcA")) return @ptrCast(&DefWindowProcA);
-        if (std.mem.eql(u8, name, "RegisterClassA")) return @ptrCast(&RegisterClassA);
-        if (std.mem.eql(u8, name, "ShowWindow")) return @ptrCast(&ShowWindow);
-        if (std.mem.eql(u8, name, "UpdateWindow")) return @ptrCast(&UpdateWindow);
-        if (std.mem.eql(u8, name, "SetFocus")) return @ptrCast(&SetFocus);
-        if (std.mem.eql(u8, name, "SetForegroundWindow")) return @ptrCast(&SetForegroundWindow);
-        if (std.mem.eql(u8, name, "GetClientRect")) return @ptrCast(&GetClientRect);
-        if (std.mem.eql(u8, name, "GetWindowRect")) return @ptrCast(&GetWindowRect);
-        if (std.mem.eql(u8, name, "AdjustWindowRect")) return @ptrCast(&AdjustWindowRect);
-        if (std.mem.eql(u8, name, "AdjustWindowRectEx")) return @ptrCast(&AdjustWindowRectEx);
-        if (std.mem.eql(u8, name, "PeekMessageA")) return @ptrCast(&PeekMessageA);
-        if (std.mem.eql(u8, name, "GetMessageA")) return @ptrCast(&GetMessageA);
-        if (std.mem.eql(u8, name, "TranslateMessage")) return @ptrCast(&TranslateMessage);
-        if (std.mem.eql(u8, name, "DispatchMessageA")) return @ptrCast(&DispatchMessageA);
-        if (std.mem.eql(u8, name, "SendMessageA")) return @ptrCast(&SendMessageA);
-        if (std.mem.eql(u8, name, "DestroyWindow")) return @ptrCast(&DestroyWindow);
         if (std.mem.eql(u8, name, "LoadIconA")) return @ptrCast(&LoadIconA);
         if (std.mem.eql(u8, name, "LoadCursorA")) return @ptrCast(&LoadCursorA);
         if (std.mem.eql(u8, name, "ShowCursor")) return @ptrCast(&ShowCursor);
-        if (std.mem.eql(u8, name, "SetWindowPos")) return @ptrCast(&SetWindowPos);
-        if (std.mem.eql(u8, name, "GetWindow")) return @ptrCast(&GetWindow);
         if (std.mem.eql(u8, name, "GetDoubleClickTime")) return @ptrCast(&GetDoubleClickTime);
         if (std.mem.eql(u8, name, "SwapMouseButton")) return @ptrCast(&SwapMouseButton);
         if (std.mem.eql(u8, name, "UnhookWindowsHookEx")) return @ptrCast(&UnhookWindowsHookEx);
         if (std.mem.eql(u8, name, "SetWindowsHookExA")) return @ptrCast(&SetWindowsHookExA);
         if (std.mem.eql(u8, name, "CallNextHookEx")) return @ptrCast(&CallNextHookEx);
-        if (std.mem.eql(u8, name, "GetWindowTextA")) return @ptrCast(&GetWindowTextA);
-        if (std.mem.eql(u8, name, "SetWindowTextA")) return @ptrCast(&SetWindowTextA);
-        if (std.mem.eql(u8, name, "GetClassNameA")) return @ptrCast(&GetClassNameA);
         if (std.mem.eql(u8, name, "SendInput")) return @ptrCast(&SendInput);
-        if (std.mem.eql(u8, name, "EnumChildWindows")) return @ptrCast(&EnumChildWindows);
-        if (std.mem.eql(u8, name, "GetWindowLongA")) return @ptrCast(&GetWindowLongA);
-        if (std.mem.eql(u8, name, "GetClassLongA")) return @ptrCast(&GetClassLongA);
         if (std.mem.eql(u8, name, "EnumDisplayDevicesA")) return @ptrCast(&EnumDisplayDevicesA);
         if (std.mem.eql(u8, name, "MessageBoxA")) return @ptrCast(&MessageBoxA);
         if (std.mem.eql(u8, name, "GetAsyncKeyState")) return @ptrCast(&GetAsyncKeyState);
@@ -5945,6 +5753,7 @@ fn setupTib() !void {
     if (rc != 0) return error.SetThreadAreaFailed;
 
     msvcrt_mod.guest_tib_base = @intFromPtr(&g_tib_buffer);
+    user32_mod.g_set_last_error = &setLastErrorHook;
     threads_mod.g_thread_init = &guestThreadInit;
 
     const selector: u16 = @intCast((desc.entry_number << 3) | 3);
