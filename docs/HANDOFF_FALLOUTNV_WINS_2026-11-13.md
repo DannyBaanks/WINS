@@ -306,3 +306,40 @@ después superficie X11 + Present.
 `wins_dsound.zig` sigue en silencio (su nota y separation_gate lo exigen). El
 juego aún no crea buffers en esta corrida (no hay interacción sin ventana), así que
 el mezclador se hará y medirá cuando la ventana esté activa.
+
+## Continuación Claude Code (2026-11-13/14 noche) — ventanas reales + VirtualFree: bea1e24, 93603f2
+
+### USER32 real (bea1e24)
+`native/wins_user32.zig`: clases, tabla de ventanas con HWND reales, creación por el
+wndproc (GETMINMAXINFO/NCCREATE/NCCALCSIZE/CREATE/SIZE/MOVE), cola por hilo (posted,
+WM_QUIT, WM_PAINT sintetizado, SendMessage entre hilos), activación/foco/foreground con
+el orden Win32, SetWindowPos/ShowWindow/DestroyWindow, DefWindowProcA. winrun32.zig
+quitó 29 funciones falsas. Probe `native/testdata/window_probe.c` contra Proton sobre
+Xvfb sin WM (3 corridas idénticas): HEAD rechaza el probe (4 imports) y forzado difiere
+desde la línea 2; nuevo: **96/96 idénticas**.
+Forma medida en el juego: clase "Fallout: New Vegas" (wndproc 0x86a0a0), ventana
+top-level WS_VISIBLE 320x240 + hija WS_CHILD|WS_VISIBLE 1280x720; CreateDevice usa la
+hija. Con la ventana activa el bucle principal YA corre (~150 iteraciones/s).
+
+### VirtualFree(MEM_DECOMMIT) (93603f2)
+Siguiente crash: EIP 0xaa6f04 leyendo 0x71e2000. El heap del juego pone páginas guarda
+con `VirtualFree(0x71e1000, 4096, MEM_DECOMMIT)` dentro de reservas de 8 MB; WINS
+retiraba desde ahí el tamaño de TODA la reserva. Ahora: exactamente las páginas de
+[addr, addr+size) (size 0 = hasta el fin), en ceros al re-comprometer; MEM_RELEASE exige
+base (487) y size 0 (87). Probe `decommit_probe.c`: rojo SIGSEGV tras la línea 1, verde
+**15/15** con Wine.
+
+### Estado al cierre
+Corrida con 93603f2: sin crash; menú principal (main_background, MainTitle.mp3 sonando),
+bucle de render estable ≈34k frames hasta que lo detuve. Lo siguiente es D3D9: el único
+método no implementado que pide por frame es `device!SetScissorRect` (caller 0xb97d66,
+miles/s: además inunda el log/journal — conviene loguearlo una sola vez). Aún **no hay
+píxeles**: no existe superficie nativa detrás de la ventana (Present no muestra nada);
+eso es el paso grande (ventana X11 + backend del device).
+Gotchas: el `comm` del proceso del juego es `exe` (pgrep -x winrun32 no lo ve; usar
+`pgrep -f '^/tmp/wins-tool/dist/winrun32'`); el log de `~/.local/state/wins/.../logs`
+sale truncado por tee — el journal (`journalctl --user`) tiene todo. Con presión de IO
+alta el oráculo de Proton/Wine se cuelga en el arranque; `wine` de Proton directo sobre
+`~/.cache/wins-oracle/compat/pfx` sin DISPLAY funcionó para probes de consola.
+Loaders instalados: actual 93603f2 (096fba5a…), respaldos `winrun32.prev-1d1a346`,
+`winrun32.prev-bea1e24`.
