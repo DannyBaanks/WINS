@@ -385,7 +385,11 @@ fn renderMain() void {
     while (true) {
         const posted = g_posted.load(.acquire);
         if (posted == served) {
-            futexWait(&g_posted, posted);
+            // Wake at least every 10 ms to serve the window's input even while
+            // the game presents nothing (loading screens, long waits).
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+            _ = linux.syscall4(.futex, @intFromPtr(&g_posted), 0, posted, @intFromPtr(&ts));
+            if (g_posted.load(.acquire) == served) pumpInput();
             continue;
         }
         if (g_job_fn) |f| f(g_job_ctx);
@@ -425,6 +429,7 @@ var g_last_x: c_int = 0;
 var g_last_y: c_int = 0;
 var g_have_last = false;
 var g_seen_types: u16 = 0;
+var g_keys_logged: u32 = 0;
 
 /// Render thread: X11 events of the game window -> DirectInput state. While
 /// the window has the focus the pointer is kept inside it (warped back to the
@@ -434,7 +439,11 @@ fn pumpInput() void {
     var ev: XEvent = undefined;
     while (xlib.XPending(dpy) > 0) {
         _ = xlib.XNextEvent(dpy, &ev);
-        if (ev.type >= 2 and ev.type <= 10 and g_seen_types & (@as(u16, 1) << @intCast(ev.type)) == 0) {
+        if (ev.type == 2 and g_keys_logged < 40) {
+            g_keys_logged += 1;
+            std.debug.print("[WINS:GL] KeyPress keycode {d} -> DIK 0x{x}\n", .{ ev.detail, input.dikFromX11(ev.detail) });
+        }
+        if (ev.type >= 2 and ev.type <= 8 and g_seen_types & (@as(u16, 1) << @intCast(ev.type)) == 0) {
             g_seen_types |= @as(u16, 1) << @intCast(ev.type);
             std.debug.print("[WINS:GL] first X11 input event of type {d} (detail {d}, at {d},{d})\n", .{ ev.type, ev.detail, ev.x, ev.y });
         }
@@ -471,8 +480,13 @@ fn pumpInput() void {
                 g_last_y = ev.y;
                 g_have_last = true;
             },
-            9 => input.focus(true),
+            9 => {
+                // XFocusChangeEvent: mode and detail sit where key events keep root/subwindow.
+                std.debug.print("[WINS:GL] FocusIn (mode {d}, detail {d})\n", .{ ev.root, ev.subwindow });
+                input.focus(true);
+            },
             10 => {
+                std.debug.print("[WINS:GL] FocusOut (mode {d}, detail {d})\n", .{ ev.root, ev.subwindow });
                 input.focus(false);
                 g_have_last = false;
             },

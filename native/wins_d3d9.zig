@@ -1793,7 +1793,12 @@ fn d3d9_GetAdapterIdentifier(this: *anyopaque, adapter: u32, flags: u32, pIdenti
     const out: ?*align(1) D3DADAPTER_IDENTIFIER9 = if (pIdentifier) |p| @ptrCast(p) else null;
     const id = out orelse return E_POINTER;
     var value: D3DADAPTER_IDENTIFIER9 = std.mem.zeroes(D3DADAPTER_IDENTIFIER9);
-    fillAscii(value.Driver[0..], "WINS Direct3D 9 Software Adapter");
+    // FalloutNV picks its renderer tier from the driver file name's prefix
+    // ("ati", "nv", "ig"); with an unknown one it never creates the shader
+    // object its 3D scenes ask for and crashes at 0xb57aa9 (New Game after
+    // the intro). The name is what wined3d reports for this AMD adapter,
+    // measured with the Proton oracle (tools/adapter_id.exe): atiumdag.dll.
+    fillAscii(value.Driver[0..], "atiumdag.dll");
     // Fallout NV stores D3DADAPTER_IDENTIFIER9.Description as sD3DDevice in
     // FalloutPrefs.ini and launches its separate launcher when the current
     // description differs. Keep the host adapter identity here even though
