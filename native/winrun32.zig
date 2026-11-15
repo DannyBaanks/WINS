@@ -25,6 +25,7 @@ const bink_mod = @import("wins_bink.zig");
 // which is unavailable for the i386 target this loader builds for.
 const ordinals_mod = @import("winrun_ordinals.zig");
 const threads_mod = @import("winrun_threads.zig");
+const libs_mod = @import("wins_libs.zig");
 
 const W: std.builtin.CallingConvention = .winapi;
 
@@ -5268,6 +5269,31 @@ fn unhandledApiStub() callconv(W) usize {
 // Symbol Dispatchers (resolveImport & GetProcAddress)
 // ============================================================================
 
+/// `name` copied into `buf` with anything that would break a JSON string replaced.
+fn scrubJson(buf: []u8, name: []const u8) []const u8 {
+    const n = @min(name.len, buf.len);
+    for (name[0..n], 0..) |c, i| buf[i] = if (c == '"' or c == '\\' or c < 0x20 or c > 0x7e) '?' else c;
+    return buf[0..n];
+}
+
+/// One log line with the versions of the WINS libraries this image imports from,
+/// and one for the DLLs it imports that no WINS library answers for. A bug report
+/// that carries the log carries the versions.
+fn reportLibraries(used: *const [libs_mod.libraries.len]u32, lacking: anytype) void {
+    var line: [1024]u8 = undefined;
+    var w: usize = 0;
+    for (used, 0..) |slots, i| {
+        if (slots == 0) continue;
+        const lib = &libs_mod.libraries[i];
+        const piece = std.fmt.bufPrint(line[w..], "{s}{s} {s}", .{ if (w == 0) "" else ", ", lib.name, lib.version }) catch break;
+        w += piece.len;
+    }
+    std.debug.print("[WINS:libs] used: {s}\n", .{line[0..w]});
+    for (lacking) |l| {
+        std.debug.print("[WINS:libs] NO WINS LIBRARY for {s}: {d} import slot(s), {d} unresolved\n", .{ l.dll[0..l.len], l.slots, l.unresolved });
+    }
+}
+
 fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
     if (std.ascii.eqlIgnoreCase(dll, "kernel32.dll") or std.ascii.eqlIgnoreCase(dll, "kernel32")) {
         if (std.mem.eql(u8, name, "GetLastError")) return @ptrCast(&GetLastError);
@@ -5964,17 +5990,35 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
 
     if (args.len < 2) {
-        std.debug.print("Usage: winrun32 [--check] [--run] <path-to-pe32.exe>\n", .{});
+        std.debug.print("Usage: winrun32 [--check] [--run] [--imports] <path-to-pe32.exe>\n       winrun32 --libs\n", .{});
         return;
     }
 
     var check_only = false;
     var run_target = false;
     var run_anyway = false;
+    var list_imports = false;
     var target_path: []const u8 = "";
 
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--check")) {
+        if (std.mem.eql(u8, arg, "--libs")) {
+            // The library registry as JSON on stdout; nothing is loaded.
+            const json = libs_mod.jsonAlloc(allocator) catch {
+                std.debug.print("out of memory\n", .{});
+                linux.exit_group(1);
+            };
+            var done: usize = 0;
+            while (done < json.len) {
+                const n = linux.write(1, json.ptr + done, json.len - done);
+                if (linux.errno(n) != .SUCCESS) linux.exit_group(1);
+                done += n;
+            }
+            linux.exit_group(0);
+        } else if (std.mem.eql(u8, arg, "--imports")) {
+            // Report every import slot of the image: resolved or not, and which
+            // WINS library answers for its DLL. Does not run the program.
+            list_imports = true;
+        } else if (std.mem.eql(u8, arg, "--check")) {
             check_only = true;
         } else if (std.mem.eql(u8, arg, "--run")) {
             run_target = true;
@@ -6306,6 +6350,10 @@ pub fn main(init: std.process.Init) !void {
     // Step 3: Patch Import Address Table (IAT) in Memory!
     var patched_count: usize = 0;
     var unresolved_slots: usize = 0;
+    // Which libraries this image's imports touch, and the DLLs WINS has none for.
+    var used_libs = [_]u32{0} ** libs_mod.libraries.len;
+    var lacking: [48]struct { dll: [64]u8, len: u8, slots: u32, unresolved: u32 } = undefined;
+    var lacking_n: usize = 0;
     if (import_rva != 0 and import_size != 0) {
         var desc_va = import_rva;
         while (desc_va + 20 <= size_of_image) : (desc_va += 20) {
@@ -6317,6 +6365,22 @@ pub fn main(init: std.process.Init) !void {
 
             const dll_name = std.mem.sliceTo(dest_slice + name_rva, 0);
             const thunk_rva = if (orig_thunk != 0) orig_thunk else first_thunk;
+            const dll_lib = libs_mod.libraryFor(dll_name);
+            var lack_idx: ?usize = null;
+            if (dll_lib == null) {
+                for (lacking[0..lacking_n], 0..) |l, k| {
+                    if (std.ascii.eqlIgnoreCase(l.dll[0..l.len], dll_name)) lack_idx = k;
+                }
+                if (lack_idx == null and lacking_n < lacking.len) {
+                    const n: u8 = @intCast(@min(dll_name.len, 64));
+                    @memcpy(lacking[lacking_n].dll[0..n], dll_name[0..n]);
+                    lacking[lacking_n].len = n;
+                    lacking[lacking_n].slots = 0;
+                    lacking[lacking_n].unresolved = 0;
+                    lack_idx = lacking_n;
+                    lacking_n += 1;
+                }
+            }
 
             var cur_lookup = thunk_rva;
             var cur_iat = first_thunk;
@@ -6337,6 +6401,32 @@ pub fn main(init: std.process.Init) !void {
                     resolved_fn = resolveImport(dll_name, ord_name);
                 }
 
+                const was_resolved = resolved_fn != null;
+                if (dll_lib) |lib| used_libs[libs_mod.indexOf(lib)] += 1;
+                if (lack_idx) |k| {
+                    lacking[k].slots += 1;
+                    if (!was_resolved) lacking[k].unresolved += 1;
+                }
+                if (list_imports) {
+                    // One JSON object per slot; the DLL and symbol names of a PE import
+                    // table are plain ASCII without quotes or backslashes in practice,
+                    // and a name that has either is reported with them replaced.
+                    var sym_buf: [160]u8 = undefined;
+                    var dll_buf: [96]u8 = undefined;
+                    const sym: []const u8 = if (by_ordinal)
+                        (std.fmt.bufPrint(&sym_buf, "#{d}", .{val & 0xFFFF}) catch "#?")
+                    else
+                        scrubJson(&sym_buf, std.mem.sliceTo(dest_slice + val + 2, 0));
+                    std.debug.print("WINS_IMPORT {{\"dll\":\"{s}\",\"symbol\":\"{s}\",\"ordinal\":{s},\"resolved\":{s},\"library\":{s}{s}{s}}}\n", .{
+                        scrubJson(&dll_buf, dll_name),
+                        sym,
+                        if (by_ordinal) "true" else "false",
+                        if (was_resolved) "true" else "false",
+                        if (dll_lib != null) "\"" else "",
+                        if (dll_lib) |lib| lib.name else "null",
+                        if (dll_lib != null) "\"" else "",
+                    });
+                }
                 if (resolved_fn == null) {
                     resolved_fn = @ptrCast(&unhandledApiStub);
                     unresolved_slots += 1;
@@ -6360,6 +6450,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  [IAT Patcher] WARNING: {d} slot(s) fell back to the null stub (listed above).\n", .{unresolved_slots});
     }
     std.debug.print("[WINS:winrun32] Memory staging & IAT patching complete!\n", .{});
+    reportLibraries(&used_libs, lacking[0..lacking_n]);
+    if (list_imports) linux.exit_group(0);
 
     // Fail closed. winrun (x86-64) refuses to run an image with unimplemented
     // imports; this loader used to bind a stub returning 0 and jump straight in,

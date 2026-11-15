@@ -42,6 +42,8 @@ build() { # name source [extra zig args...]
 
 # x86-64 PE loader and the PE/installer inspection tools.
 build winrun      native/winrun.zig  -O ReleaseSafe
+# The x86-64 loader for programs with a window; needs libX11 for the host window.
+build winrun_gui  native/winrun_gui.zig -O ReleaseSafe -lc -lX11
 build wins-native native/main.zig    -O ReleaseSafe
 build wins-compare native/compare.zig -O ReleaseSafe -lc
 # i386 PE loader: flags must match tools/separation_gate.sh (the shipped build);

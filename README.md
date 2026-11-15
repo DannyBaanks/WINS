@@ -116,6 +116,8 @@ WINS was pointed at the full installer (5.76 GB). It deposits every file without
   - **recipes**: [./core/recipes/README.md](./core/recipes/README.md) - Modular extraction and re-hosting transmuters for Electron, .NET Core / Avalonia, PyInstaller, and Native PE.
   - **transpiler**: [./core/transpiler/README.md](./core/transpiler/README.md) - Static PE parser, IAT/RTTI lineage extractor, and zero-Win32 POSIX C/Zig shimming layer.
   - **fuzzer**: [./core/fuzzer/README.md](./core/fuzzer/README.md) - Ultra-high-throughput Zig differential fuzzing engine (>7,000,000 ops/sec) for proving API equivalence.
+- **libs**: [./libs/README.md](./libs/README.md) - The Windows DLLs WINS stands in for, as versioned libraries (`wins-d3d9`, `wins-dsound`, ...), what has been run through each, and the generated gap report of the DLLs and imports WINS still lacks compared with Windows.
+- **launch**: [./launch/falloutnv/README.txt](./launch/falloutnv/README.txt) - The Steam compatibility tool for Fallout: New Vegas (launcher, installer): the Play button runs the game under the WINS i386 loader.
 
 ---
 
