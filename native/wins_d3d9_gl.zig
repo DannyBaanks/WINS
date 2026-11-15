@@ -187,9 +187,193 @@ fn setEnabled(cap: host.GLenum, on: bool) void {
     if (on) host.gl.glEnable(cap) else host.gl.glDisable(cap);
 }
 
-fn applyTargetState(dev: *const Device) void {
+// ---- render targets ------------------------------------------------------------
+
+const RtFormat = struct { internal: host.GLint, format: host.GLenum, ty: host.GLenum, channels: u8 };
+
+/// Colour formats a render target can have, as OpenGL storage. `channels`
+/// below 4 makes the missing components read as 1, as D3D9 samples them.
+fn rtFormat(format: u32) RtFormat {
+    return switch (format) {
+        113 => .{ .internal = 0x881A, .format = GL_RGBA, .ty = 0x140B, .channels = 4 }, // A16B16G16R16F
+        116 => .{ .internal = 0x8814, .format = GL_RGBA, .ty = 0x1406, .channels = 4 }, // A32B32G32R32F
+        114 => .{ .internal = 0x822E, .format = 0x1903, .ty = 0x1406, .channels = 1 }, // R32F
+        111 => .{ .internal = 0x822D, .format = 0x1903, .ty = 0x140B, .channels = 1 }, // R16F
+        112 => .{ .internal = 0x822F, .format = 0x8227, .ty = 0x140B, .channels = 2 }, // G16R16F
+        115 => .{ .internal = 0x8230, .format = 0x8227, .ty = 0x1406, .channels = 2 }, // G32R32F
+        31, 35 => .{ .internal = 0x8059, .format = GL_RGBA, .ty = GL_UNSIGNED_BYTE, .channels = 4 }, // 10:10:10:2
+        34 => .{ .internal = 0x805B, .format = GL_RGBA, .ty = 0x1403, .channels = 4 }, // A16B16G16R16
+        else => .{ .internal = 0x8058, .format = GL_BGRA, .ty = GL_UNSIGNED_BYTE, .channels = 4 }, // 8-bit RGBA
+    };
+}
+
+fn allocRtTexture(name: *host.GLuint, format: u32, w: u32, h: u32, levels: usize) void {
     const gl = &host.gl;
-    gl.glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    const f = rtFormat(format);
+    gl.glGenTextures(1, name);
+    gl.glBindTexture(GL_TEXTURE_2D, name.*);
+    var l: usize = 0;
+    while (l < levels) : (l += 1) {
+        gl.glTexImage2D(GL_TEXTURE_2D, @intCast(l), f.internal, @intCast(@max(1, w >> @intCast(l))), @intCast(@max(1, h >> @intCast(l))), 0, f.format, f.ty, null);
+    }
+    gl.glTexParameteri(GL_TEXTURE_2D, 0x813D, @intCast(levels - 1)); // MAX_LEVEL
+    if (f.channels < 2) gl.glTexParameteri(GL_TEXTURE_2D, 0x8E43, 1); // SWIZZLE_G = ONE
+    if (f.channels < 3) gl.glTexParameteri(GL_TEXTURE_2D, 0x8E44, 1); // SWIZZLE_B = ONE
+    if (f.channels < 4) gl.glTexParameteri(GL_TEXTURE_2D, 0x8E45, 1); // SWIZZLE_A = ONE
+    gl.glTexParameteri(GL_TEXTURE_2D, 0x2801, 0x2601);
+    gl.glTexParameteri(GL_TEXTURE_2D, 0x2800, 0x2601);
+}
+
+const ColorRef = struct { tex: host.GLuint, level: host.GLint };
+
+/// The GPU texture (and level) behind a colour surface the device renders
+/// into or copies from. The back buffer is the presentation texture.
+fn colorOf(dev: *Device, s: *d3d.WinsSurface9) ColorRef {
+    if (d3d.deviceRenderTarget(dev)) |bb| {
+        if (s == bb) return .{ .tex = g_color, .level = 0 };
+    }
+    if (s.parent) |t| {
+        if (t.gl_name == 0) allocRtTexture(&t.gl_name, t.format, t.width, t.height, t.surfaces.len);
+        return .{ .tex = t.gl_name, .level = @intCast(s.level) };
+    }
+    if (s.gl_name == 0) {
+        allocRtTexture(&s.gl_name, s.format, s.width, s.height, 1);
+        // A surface with CPU pixels (off-screen plain) starts with them.
+        if (s.usage & d3d.D3DUSAGE_RENDERTARGET == 0) {
+            if (texFormat(s.format)) |tf| {
+                if (!tf.compressed) host.gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(tf.internal), @intCast(s.width), @intCast(s.height), 0, tf.format, tf.ty, s.data.ptr);
+            }
+        }
+    }
+    return .{ .tex = s.gl_name, .level = 0 };
+}
+
+/// The renderbuffer behind a depth/stencil surface; the device's automatic
+/// one shares the back buffer's.
+fn depthOf(dev: *Device, s: *d3d.WinsSurface9) host.GLuint {
+    if (d3d.deviceDepthStencil(dev)) |auto| {
+        if (s == auto and s.width == g_w and s.height == g_h) return g_depth;
+    }
+    if (s.gl_name == 0) {
+        const gl = &host.gl;
+        gl.glGenRenderbuffers(1, &s.gl_name);
+        gl.glBindRenderbuffer(GL_RENDERBUFFER, s.gl_name);
+        gl.glRenderbufferStorage(GL_RENDERBUFFER, 0x88F0, @intCast(s.width), @intCast(s.height)); // DEPTH24_STENCIL8
+    }
+    return s.gl_name;
+}
+
+var g_rt_fbo: host.GLuint = 0;
+var g_rt_bound: [4]ColorRef = [_]ColorRef{.{ .tex = 0, .level = 0 }} ** 4;
+var g_rt_depth: host.GLuint = 0;
+var g_copy_fbo: [2]host.GLuint = .{ 0, 0 };
+
+fn bindTargets(dev: *Device) void {
+    const gl = &host.gl;
+    if (g_rt_fbo == 0) gl.glGenFramebuffers(1, &g_rt_fbo);
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, g_rt_fbo);
+    var want: [4]ColorRef = [_]ColorRef{.{ .tex = 0, .level = 0 }} ** 4;
+    for (0..4) |i| {
+        if (dev.render_targets[i]) |s| {
+            want[i] = colorOf(dev, s);
+        } else if (i == 0) want[i] = .{ .tex = g_color, .level = 0 };
+    }
+    const ds: host.GLuint = if (d3d.deviceBoundDepthStencil(dev)) |s| depthOf(dev, s) else 0;
+    var changed = false;
+    for (0..4) |i| {
+        if (want[i].tex != g_rt_bound[i].tex or want[i].level != g_rt_bound[i].level) {
+            gl.glFramebufferTexture2D(GL_FRAMEBUFFER, 0x8CE0 + @as(host.GLenum, @intCast(i)), GL_TEXTURE_2D, want[i].tex, want[i].level);
+            g_rt_bound[i] = want[i];
+            changed = true;
+        }
+    }
+    if (ds != g_rt_depth) {
+        gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, 0x821A, GL_RENDERBUFFER, ds);
+        g_rt_depth = ds;
+        changed = true;
+    }
+    if (changed) {
+        var bufs: [4]host.GLenum = undefined;
+        var n: usize = 0;
+        for (0..4) |i| {
+            bufs[i] = if (want[i].tex != 0) 0x8CE0 + @as(host.GLenum, @intCast(i)) else 0; // NONE
+            if (want[i].tex != 0) n = i + 1;
+        }
+        gl.glDrawBuffers(@intCast(@max(n, 1)), &bufs);
+        const st = gl.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (st != 0x8CD5) std.debug.print("[WINS:D3D9:GL] render-target set is incomplete (0x{x}); its draws are lost\n", .{st});
+    }
+}
+
+/// Bind `s` alone to one of the two copy framebuffers (0 read, 1 draw).
+fn bindCopy(dev: *Device, which: usize, s: *d3d.WinsSurface9) bool {
+    const gl = &host.gl;
+    if (g_copy_fbo[which] == 0) gl.glGenFramebuffers(1, &g_copy_fbo[which]);
+    const target: host.GLenum = if (which == 0) GL_READ_FRAMEBUFFER else GL_DRAW_FRAMEBUFFER;
+    gl.glBindFramebuffer(target, g_copy_fbo[which]);
+    if (s.usage & d3d.D3DUSAGE_DEPTHSTENCIL != 0) {
+        gl.glFramebufferTexture2D(target, 0x8CE0, GL_TEXTURE_2D, 0, 0);
+        gl.glFramebufferRenderbuffer(target, 0x821A, GL_RENDERBUFFER, depthOf(dev, s));
+    } else {
+        const c = colorOf(dev, s);
+        gl.glFramebufferRenderbuffer(target, 0x821A, GL_RENDERBUFFER, 0);
+        gl.glFramebufferTexture2D(target, 0x8CE0, GL_TEXTURE_2D, c.tex, c.level);
+    }
+    return gl.glCheckFramebufferStatus(target) == 0x8CD5;
+}
+
+const StretchJob = struct { dev: *Device, src: *d3d.WinsSurface9, sr: d3d.D3DRECT, dst: *d3d.WinsSurface9, dr: d3d.D3DRECT, filter: u32 };
+fn stretchJob(raw: ?*anyopaque) void {
+    const j: *StretchJob = @ptrCast(@alignCast(raw.?));
+    const gl = &host.gl;
+    if (!bindCopy(j.dev, 0, j.src) or !bindCopy(j.dev, 1, j.dst)) return warnOnce(12, "a StretchRect between these surfaces has no OpenGL path; skipped");
+    gl.glDisable(GL_SCISSOR_TEST);
+    gl.glColorMask(1, 1, 1, 1);
+    const depth = j.src.usage & d3d.D3DUSAGE_DEPTHSTENCIL != 0;
+    const mask: c_uint = if (depth) 0x0100 | 0x0400 else 0x4000;
+    const filter: host.GLenum = if (!depth and j.filter == 2) 0x2601 else 0x2600; // D3DTEXF_LINEAR
+    gl.glBlitFramebuffer(j.sr.x1, j.sr.y1, j.sr.x2, j.sr.y2, j.dr.x1, j.dr.y1, j.dr.x2, j.dr.y2, mask, filter);
+    if (j.dst.parent) |t| t.gl_dirty = false;
+}
+pub fn stretchRect(dev: *Device, src: *d3d.WinsSurface9, sr: d3d.D3DRECT, dst: *d3d.WinsSurface9, dr: d3d.D3DRECT, filter: u32) void {
+    var j: StretchJob = .{ .dev = dev, .src = src, .sr = sr, .dst = dst, .dr = dr, .filter = filter };
+    host.run(&stretchJob, &j);
+}
+
+const FillJob = struct { dev: *Device, s: *d3d.WinsSurface9, r: d3d.D3DRECT, color: u32 };
+fn fillJob(raw: ?*anyopaque) void {
+    const j: *FillJob = @ptrCast(@alignCast(raw.?));
+    const gl = &host.gl;
+    if (!bindCopy(j.dev, 1, j.s)) return;
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, g_copy_fbo[1]);
+    gl.glEnable(GL_SCISSOR_TEST);
+    gl.glScissor(j.r.x1, j.r.y1, @max(0, j.r.x2 - j.r.x1), @max(0, j.r.y2 - j.r.y1));
+    gl.glColorMask(1, 1, 1, 1);
+    const c = j.color;
+    gl.glClearColor(@as(f32, @floatFromInt((c >> 16) & 0xFF)) / 255.0, @as(f32, @floatFromInt((c >> 8) & 0xFF)) / 255.0, @as(f32, @floatFromInt(c & 0xFF)) / 255.0, @as(f32, @floatFromInt(c >> 24)) / 255.0);
+    gl.glClear(0x4000);
+}
+pub fn colorFill(dev: *Device, s: *d3d.WinsSurface9, r: d3d.D3DRECT, color: u32) void {
+    var j: FillJob = .{ .dev = dev, .s = s, .r = r, .color = color };
+    host.run(&fillJob, &j);
+}
+
+const ReadJob = struct { dev: *Device, src: *d3d.WinsSurface9, dst: *d3d.WinsSurface9 };
+fn readJob(raw: ?*anyopaque) void {
+    const j: *ReadJob = @ptrCast(@alignCast(raw.?));
+    const gl = &host.gl;
+    if (!bindCopy(j.dev, 0, j.src)) return;
+    const f = rtFormat(j.dst.format);
+    gl.glReadPixels(0, 0, @intCast(j.dst.width), @intCast(j.dst.height), f.format, f.ty, j.dst.data.ptr);
+}
+pub fn readSurface(dev: *Device, src: *d3d.WinsSurface9, dst: *d3d.WinsSurface9) void {
+    var j: ReadJob = .{ .dev = dev, .src = src, .dst = dst };
+    host.run(&readJob, &j);
+}
+
+fn applyTargetState(dev: *Device) void {
+    const gl = &host.gl;
+    bindTargets(dev);
     const vp = dev.viewport;
     gl.glViewport(@intCast(vp.X), @intCast(vp.Y), @intCast(vp.Width), @intCast(vp.Height));
     gl.glDepthRange(vp.MinZ, vp.MaxZ);
@@ -255,7 +439,7 @@ fn applyRenderStates(dev: *const Device) void {
 // ---- clear ------------------------------------------------------------------
 
 const ClearJob = struct {
-    dev: *const Device,
+    dev: *Device,
     count: u32,
     rects: ?[*]const d3d.D3DRECT,
     flags: u32,
@@ -315,7 +499,7 @@ fn clearJob(raw: ?*anyopaque) void {
     }
 }
 
-pub fn clear(dev: *const Device, count: u32, rects: ?*const d3d.D3DRECT, flags: u32, color: u32, z: f32, stencil: u32) void {
+pub fn clear(dev: *Device, count: u32, rects: ?*const d3d.D3DRECT, flags: u32, color: u32, z: f32, stencil: u32) void {
     var job: ClearJob = .{ .dev = dev, .count = count, .rects = if (rects) |r| @ptrCast(r) else null, .flags = flags, .color = color, .z = z, .stencil = stencil };
     host.run(&clearJob, &job);
 }
@@ -442,14 +626,16 @@ fn texFormat(format: u32) ?TexFormat {
 /// Bind `tex` to the active unit, uploading its levels when they changed.
 fn bindTexture(tex: *d3d.WinsTexture9) bool {
     const gl = &host.gl;
+    if (tex.usage & d3d.D3DUSAGE_RENDERTARGET != 0) {
+        // Rendered on the GPU: storage only, never uploaded from the CPU copy.
+        if (tex.gl_name == 0) allocRtTexture(&tex.gl_name, tex.format, tex.width, tex.height, tex.surfaces.len);
+        gl.glBindTexture(GL_TEXTURE_2D, tex.gl_name);
+        return true;
+    }
     const tf = texFormat(tex.format) orelse {
         warnOnce(3, "a texture format has no OpenGL upload path yet; it samples as empty");
         return false;
     };
-    if (tex.usage & d3d.D3DUSAGE_RENDERTARGET != 0) {
-        warnOnce(4, "render-target textures are not implemented; they sample as empty");
-        return false;
-    }
     if (tex.gl_name == 0) {
         gl.glGenTextures(1, &tex.gl_name);
         tex.gl_dirty = true;
@@ -583,7 +769,6 @@ fn drawJob(raw: ?*anyopaque) void {
     const job: *DrawJob = @ptrCast(@alignCast(raw.?));
     const gl = &host.gl;
     const dev = job.dev;
-    if (dev.render_target_is_backbuffer == false) return warnOnce(5, "draws into a render target other than the back buffer are not implemented; skipped");
     const elements: []const d3d.D3DVERTEXELEMENT9 = if (dev.use_fvf) dev.fvf_elements[0..] else if (dev.vertex_decl) |dcl| dcl.elements else return warnOnce(2, "a draw with neither a vertex declaration nor an FVF; skipped");
     const shape = vertexCount(job.prim, job.prim_count) orelse return;
     if (shape.count == 0 or shape.count > std.math.maxInt(i32)) return;

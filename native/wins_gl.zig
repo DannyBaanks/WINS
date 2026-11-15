@@ -235,6 +235,7 @@ pub const Gl = struct {
     glRenderbufferStorage: *const fn (GLenum, GLenum, GLsizei, GLsizei) callconv(.c) void,
     glFramebufferRenderbuffer: *const fn (GLenum, GLenum, GLenum, GLuint) callconv(.c) void,
     glCheckFramebufferStatus: *const fn (GLenum) callconv(.c) GLenum,
+    glDrawBuffers: *const fn (GLsizei, [*]const GLenum) callconv(.c) void,
     glBlitFramebuffer: *const fn (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, c_uint, GLenum) callconv(.c) void,
 };
 

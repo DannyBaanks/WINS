@@ -998,6 +998,12 @@ pub const WinsSurface9 = struct {
     multi_sample_type: u32 = 0,
     /// Depth/stencil surfaces are not lockable in D3D9 (LockRect -> D3DERR_INVALIDCALL).
     lockable: bool = true,
+    /// Host GPU object (wins_d3d9_gl.zig): a texture for colour render
+    /// targets, a renderbuffer for depth/stencil; 0 until first used.
+    gl_name: u32 = 0,
+    /// Set for a level of a texture: the texture owns the GPU storage.
+    parent: ?*WinsTexture9 = null,
+    level: u32 = 0,
 
     /// A surface over memory owned elsewhere, e.g. the device's back buffer: the
     /// guest and the rasterizer then see the very same pixels, with no copy.
@@ -1163,6 +1169,10 @@ pub const WinsTexture9 = struct {
             s.usage = usage;
             s.pool = pool;
             surfs[made] = s;
+        }
+        for (surfs, 0..) |sf, li| {
+            sf.parent = tex;
+            sf.level = @intCast(li);
         }
         tex.* = .{
             .vtbl = &g_tex9_vtbl,
@@ -1666,8 +1676,8 @@ pub const WinsD3DDevice9 = struct {
     fvf: u32 = 0,
     use_fvf: bool = false,
     fvf_elements: [24]D3DVERTEXELEMENT9 = undefined,
-    /// The host backend draws only into the implicit back buffer.
-    render_target_is_backbuffer: bool = true,
+    /// SetRenderTarget slots; null in slot 0 means the implicit back buffer.
+    render_targets: [4]?*WinsSurface9 = .{ null, null, null, null },
     /// True when this device renders through wins_d3d9_gl.zig.
     host: bool = false,
 
@@ -2679,7 +2689,7 @@ fn dev9_Reset(this: *anyopaque, p0: ?*D3DPRESENT_PARAMETERS) callconv(W) HRESULT
 
 /// The device's persistent render-target surface: wraps the back buffer the
 /// rasterizer draws into. Created on first use; callers receive a counted reference.
-fn deviceRenderTarget(self: *WinsD3DDevice9) ?*WinsSurface9 {
+pub fn deviceRenderTarget(self: *WinsD3DDevice9) ?*WinsSurface9 {
     if (self.rt_surface == null) {
         const fmt: u32 = if (self.params.BackBufferFormat != 0) self.params.BackBufferFormat else D3DFMT_X8R8G8B8;
         self.rt_surface = WinsSurface9.wrap(self.allocator, self.viewport.Width, self.viewport.Height, fmt, std.mem.sliceAsBytes(self.backbuffer), D3DUSAGE_RENDERTARGET, 0, true) catch return null;
@@ -2688,7 +2698,7 @@ fn deviceRenderTarget(self: *WinsD3DDevice9) ?*WinsSurface9 {
     return self.rt_surface;
 }
 
-fn deviceDepthStencil(self: *WinsD3DDevice9) ?*WinsSurface9 {
+pub fn deviceDepthStencil(self: *WinsD3DDevice9) ?*WinsSurface9 {
     if (self.params.EnableAutoDepthStencil == 0) return null;
     if (self.ds_surface == null) {
         self.ds_surface = WinsSurface9.wrap(self.allocator, self.viewport.Width, self.viewport.Height, self.params.AutoDepthStencilFormat, std.mem.sliceAsBytes(self.depthbuffer), D3DUSAGE_DEPTHSTENCIL, 0, false) catch return null;
@@ -2697,7 +2707,7 @@ fn deviceDepthStencil(self: *WinsD3DDevice9) ?*WinsSurface9 {
     return self.ds_surface;
 }
 
-fn deviceBoundDepthStencil(self: *WinsD3DDevice9) ?*WinsSurface9 {
+pub fn deviceBoundDepthStencil(self: *WinsD3DDevice9) ?*WinsSurface9 {
     if (self.depth_stencil_explicit) return self.bound_ds_surface;
     return deviceDepthStencil(self);
 }
@@ -2772,18 +2782,25 @@ fn dev9_CreateCubeTexture(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, 
     return E_NOTIMPL;
 }
 
-fn dev9_CreateRenderTarget(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: i32, p6: ?*?*anyopaque, p7: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    _ = p4;
-    _ = p5;
-    _ = p6;
-    _ = p7;
-    std.debug.print("[WINS:D3D9] device!CreateRenderTarget is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// A colour surface the device can render into (default pool). Its pixels
+/// live on the host GPU; LockRect on it is not supported (lockable = false
+/// is answered whatever the caller asked). Multisampling is refused.
+fn dev9_CreateRenderTarget(this: *anyopaque, width: u32, height: u32, format: u32, multi_sample: u32, multi_sample_quality: u32, lockable: i32, ppSurface: ?*?*anyopaque, pShared: ?*anyopaque) callconv(W) HRESULT {
+    _ = multi_sample_quality;
+    _ = lockable;
+    _ = pShared;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppSurface orelse return D3DERR_INVALIDCALL;
+    if (width == 0 or height == 0) return D3DERR_INVALIDCALL;
+    if (multi_sample != D3DMULTISAMPLE_NONE) return D3DERR_NOTAVAILABLE;
+    const s = WinsSurface9.create(self.allocator, width, height, format) catch return E_OUTOFMEMORY;
+    s.usage = D3DUSAGE_RENDERTARGET;
+    s.pool = 0;
+    s.lockable = false;
+    s.owner_device = this;
+    if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateRenderTarget({d}x{d}, fmt={x}) -> @{x}\n", .{ width, height, format, @intFromPtr(s) });
+    out.* = s;
+    return D3D_OK;
 }
 
 /// A depth/stencil surface of its own (not the device's auto depth buffer): 4 bytes per
@@ -2825,12 +2842,14 @@ fn dev9_UpdateTexture(this: *anyopaque, p0: ?*anyopaque, p1: ?*anyopaque) callco
     return E_NOTIMPL;
 }
 
-fn dev9_GetRenderTargetData(this: *anyopaque, p0: ?*anyopaque, p1: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!GetRenderTargetData is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// Render target -> system-memory surface of the same size and format.
+fn dev9_GetRenderTargetData(this: *anyopaque, src_raw: ?*anyopaque, dst_raw: ?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const src: *WinsSurface9 = @ptrCast(@alignCast(src_raw orelse return D3DERR_INVALIDCALL));
+    const dst: *WinsSurface9 = @ptrCast(@alignCast(dst_raw orelse return D3DERR_INVALIDCALL));
+    if (src.width != dst.width or src.height != dst.height or src.format != dst.format) return D3DERR_INVALIDCALL;
+    if (self.host) hostgl.readSurface(self, src, dst) else if (src.data.len == dst.data.len) @memcpy(dst.data, src.data);
+    return D3D_OK;
 }
 
 fn dev9_GetFrontBufferData(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
@@ -2841,24 +2860,25 @@ fn dev9_GetFrontBufferData(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(
     return E_NOTIMPL;
 }
 
-fn dev9_StretchRect(this: *anyopaque, p0: ?*anyopaque, p1: ?*const D3DRECT, p2: ?*anyopaque, p3: ?*const D3DRECT, p4: u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    _ = p4;
-    std.debug.print("[WINS:D3D9] device!StretchRect is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// Surface-to-surface copy with scaling, on the host GPU.
+fn dev9_StretchRect(this: *anyopaque, src_raw: ?*anyopaque, src_rect: ?*const D3DRECT, dst_raw: ?*anyopaque, dst_rect: ?*const D3DRECT, filter: u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const src: *WinsSurface9 = @ptrCast(@alignCast(src_raw orelse return D3DERR_INVALIDCALL));
+    const dst: *WinsSurface9 = @ptrCast(@alignCast(dst_raw orelse return D3DERR_INVALIDCALL));
+    const sr: D3DRECT = if (src_rect) |r| r.* else .{ .x1 = 0, .y1 = 0, .x2 = @intCast(src.width), .y2 = @intCast(src.height) };
+    const dr: D3DRECT = if (dst_rect) |r| r.* else .{ .x1 = 0, .y1 = 0, .x2 = @intCast(dst.width), .y2 = @intCast(dst.height) };
+    if (trace_frames != 0) std.debug.print("[WINS:D3D9:trace] f{d} StretchRect(@{x} -> @{x}, filter {d})\n", .{ self.frame_count, @intFromPtr(src), @intFromPtr(dst), filter });
+    if (self.host) hostgl.stretchRect(self, src, sr, dst, dr, filter);
+    return D3D_OK;
 }
 
-fn dev9_ColorFill(this: *anyopaque, p0: ?*anyopaque, p1: ?*const D3DRECT, p2: u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    std.debug.print("[WINS:D3D9] device!ColorFill is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// Fill a rectangle of a render target (or off-screen surface) with a colour.
+fn dev9_ColorFill(this: *anyopaque, surf_raw: ?*anyopaque, rect: ?*const D3DRECT, color: u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const s: *WinsSurface9 = @ptrCast(@alignCast(surf_raw orelse return D3DERR_INVALIDCALL));
+    const r: D3DRECT = if (rect) |x| x.* else .{ .x1 = 0, .y1 = 0, .x2 = @intCast(s.width), .y2 = @intCast(s.height) };
+    if (self.host) hostgl.colorFill(self, s, r, color);
+    return D3D_OK;
 }
 
 fn dev9_CreateOffscreenPlainSurface(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: ?*?*anyopaque, p5: ?*anyopaque) callconv(W) HRESULT {
@@ -2873,23 +2893,44 @@ fn dev9_CreateOffscreenPlainSurface(this: *anyopaque, p0: u32, p1: u32, p2: u32,
     return E_NOTIMPL;
 }
 
-fn dev9_SetRenderTarget(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT {
+/// Slot 0 must stay bound; slots 1..3 (multiple render targets) may be
+/// unbound with null. Setting slot 0 resets the viewport and the scissor
+/// rectangle to the new target, as D3D9 does.
+fn dev9_SetRenderTarget(this: *anyopaque, index: u32, raw: ?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
-    if (p0 != 0 or p1 == null) return D3DERR_INVALIDCALL;
+    if (index >= 4) return D3DERR_INVALIDCALL;
+    if (index == 0 and raw == null) return D3DERR_INVALIDCALL;
     const backbuffer = deviceRenderTarget(self) orelse return E_OUTOFMEMORY;
-    // The software rasterizer currently renders only into its implicit back
-    // buffer. Accept rebinding that actual surface; do not pretend arbitrary
-    // render targets work until drawing and ownership are implemented for them.
-    if (p1.? != @as(*anyopaque, @ptrCast(backbuffer))) return E_NOTIMPL;
-    self.viewport = .{ .X = 0, .Y = 0, .Width = backbuffer.width, .Height = backbuffer.height, .MinZ = 0, .MaxZ = 1 };
+    var surface: ?*WinsSurface9 = null;
+    if (raw) |r| {
+        const s: *WinsSurface9 = @ptrCast(@alignCast(r));
+        if (s.vtbl != &g_surf9_vtbl) return D3DERR_INVALIDCALL;
+        if (s != backbuffer and (s.usage & D3DUSAGE_RENDERTARGET) == 0) return D3DERR_INVALIDCALL;
+        surface = if (s == backbuffer) null else s;
+    }
+    if (self.render_targets[index]) |old| {
+        if (old.ref_count > 0) old.ref_count -= 1;
+    }
+    if (surface) |s| s.ref_count += 1;
+    self.render_targets[index] = surface;
+    if (trace_frames != 0) std.debug.print("[WINS:D3D9:trace] f{d} SetRenderTarget({d}, @{x})\n", .{ self.frame_count, index, @intFromPtr(raw) });
+    if (index == 0) {
+        const t = surface orelse backbuffer;
+        self.viewport = .{ .X = 0, .Y = 0, .Width = t.width, .Height = t.height, .MinZ = 0, .MaxZ = 1 };
+        self.scissor = .{ .x1 = 0, .y1 = 0, .x2 = @intCast(t.width), .y2 = @intCast(t.height) };
+    }
     return D3D_OK;
 }
 
 fn dev9_GetRenderTarget(this: *anyopaque, index: u32, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     const out = ppSurface orelse return D3DERR_INVALIDCALL;
-    if (index != 0) return D3DERR_NOTFOUND; // one render target; MRT is not implemented
-    const s = deviceRenderTarget(self) orelse return E_OUTOFMEMORY;
+    out.* = null;
+    if (index >= 4) return D3DERR_INVALIDCALL;
+    const s = self.render_targets[index] orelse blk: {
+        if (index != 0) return D3DERR_NOTFOUND;
+        break :blk deviceRenderTarget(self) orelse return E_OUTOFMEMORY;
+    };
     s.ref_count += 1;
     out.* = s;
     return D3D_OK;
@@ -2903,8 +2944,9 @@ fn dev9_SetDepthStencilSurface(this: *anyopaque, p0: ?*anyopaque) callconv(W) HR
         if (surface.vtbl != &g_surf9_vtbl or surface.owner_device != this) return D3DERR_INVALIDCALL;
         if ((surface.usage & D3DUSAGE_DEPTHSTENCIL) == 0 or surface.pool != 0 or !isDepthStencilFormat(surface.format)) return D3DERR_INVALIDCALL;
         if (surface.multi_sample_type != 0) return D3DERR_INVALIDCALL;
-        const render_target = deviceRenderTarget(self) orelse return E_OUTOFMEMORY;
-        if (surface.width != render_target.width or surface.height != render_target.height or surface.multi_sample_type != render_target.multi_sample_type) return D3DERR_INVALIDCALL;
+        // D3D9: the depth buffer must be at least as large as render target 0.
+        const rt0 = self.render_targets[0] orelse (deviceRenderTarget(self) orelse return E_OUTOFMEMORY);
+        if (surface.width < rt0.width or surface.height < rt0.height) return D3DERR_INVALIDCALL;
 
         if (active) |current| {
             if (current == surface) {
@@ -4466,7 +4508,7 @@ test "render target / back buffer / depth surfaces wrap the device's own memory"
     try std.testing.expectEqual(@as(u32, 32), dev.viewport.Height);
     try std.testing.expectEqual(@as(u32, 3), s.ref_count);
     try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetRenderTarget(dev, 0, null));
-    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetRenderTarget(dev, 1, bb));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetRenderTarget(dev, 4, bb)); // NumSimultaneousRTs = 4
 
     // Description: a render-target surface, in the default pool, device-sized.
     var desc: D3DSURFACE_DESC = undefined;
@@ -4535,7 +4577,7 @@ test "SetDepthStencilSurface binds caller-created surfaces, retains them, and un
     try std.testing.expectEqual(D3DERR_NOTFOUND, dev.vtbl.GetDepthStencilSurface(dev, &current));
     try std.testing.expect(current == null);
 
-    // A same-device depth surface still has to match the active render target.
+    // A same-device depth surface must be at least as large as the active render target.
     var wrong_size: ?*anyopaque = null;
     try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateDepthStencilSurface(dev, 16, 32, D3DFMT_D24S8, 0, 0, 0, &wrong_size, null));
     try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetDepthStencilSurface(dev, wrong_size));
