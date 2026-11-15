@@ -3199,6 +3199,20 @@ const MmioFile = struct {
 var g_mmio_table: [32]MmioFile = [_]MmioFile{.{}} ** 32;
 const MMIO_HANDLE_BASE: usize = 0x00310000;
 
+var mmio_trace_left: i32 = -1;
+/// WINS_MMIO_TRACE=<n>: report the first n mmio opens and chunk lookups.
+fn mmioTrace(comptime fmt: []const u8, args: anytype) void {
+    if (mmio_trace_left < 0) {
+        mmio_trace_left = 0;
+        // The host's environment (libc), not the guest's CRT one above.
+        const host_getenv = @extern(*const fn ([*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv" });
+        if (host_getenv("WINS_MMIO_TRACE")) |v| mmio_trace_left = std.fmt.parseInt(i32, std.mem.sliceTo(v, 0), 10) catch 0;
+    }
+    if (mmio_trace_left == 0) return;
+    mmio_trace_left -= 1;
+    std.debug.print("[WINS:winmm] " ++ fmt ++ "\n", args);
+}
+
 fn mmioFile(hmmio: usize) ?*MmioFile {
     if (hmmio <= MMIO_HANDLE_BASE or hmmio - MMIO_HANDLE_BASE > g_mmio_table.len) return null;
     const f = &g_mmio_table[hmmio - MMIO_HANDLE_BASE - 1];
@@ -3225,6 +3239,7 @@ fn mmioOpenA(szFilename: ?[*:0]const u8, pmioopen: ?*MMIOINFO, dwOpenFlags: u32)
         const rc = proc(&f.info, MMIOM_OPEN, @intFromPtr(szFilename), 0);
         if (rc != 0) {
             if (pmioopen) |src| src.wErrorRet = @truncate(@as(usize, @bitCast(rc)));
+            mmioTrace("mmioOpenA(\"{s}\"): the I/O procedure refused it ({d})", .{ if (szFilename) |n| std.mem.sliceTo(n, 0) else "", rc });
             return 0;
         }
     } else {
@@ -3237,6 +3252,7 @@ fn mmioOpenA(szFilename: ?[*:0]const u8, pmioopen: ?*MMIOINFO, dwOpenFlags: u32)
     }
     f.used = true;
     if (pmioopen) |src| src.wErrorRet = 0;
+    mmioTrace("mmioOpenA(\"{s}\") -> 0x{x}", .{ if (szFilename) |n| std.mem.sliceTo(n, 0) else "", f.info.hmmio });
     return f.info.hmmio;
 }
 
@@ -3272,7 +3288,12 @@ fn mmioRead(hmmio: usize, pch: ?[*]u8, cch: i32) callconv(W) i32 {
 fn mmioSeek(hmmio: usize, lOffset: i32, iOrigin: i32) callconv(W) i32 {
     const f = mmioFile(hmmio) orelse return -1;
     if (f.info.pIOProc) |proc| {
-        return @intCast(proc(&f.info, MMIOM_SEEK, @as(usize, @bitCast(@as(isize, lOffset))), @as(usize, @bitCast(@as(isize, iOrigin)))));
+        const rc = proc(&f.info, MMIOM_SEEK, @as(usize, @bitCast(@as(isize, lOffset))), @as(usize, @bitCast(@as(isize, iOrigin))));
+        if (rc == -1) return -1;
+        // The procedure keeps lDiskOffset current; that is the position winmm
+        // itself goes by. Its return value is not reliable: FalloutNV's
+        // (0xaf0583) seeks, stores the position there and returns 0.
+        return f.info.lDiskOffset;
     }
     if (iOrigin < 0 or iOrigin > 2) return -1;
     const r = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, f.fd))), @as(usize, @bitCast(@as(isize, lOffset))), @as(usize, @intCast(iOrigin)));
@@ -3315,6 +3336,7 @@ fn mmioDescend(hmmio: usize, lpck: ?*MMCKINFO, parent: ?*const MMCKINFO, wFlags:
         const got: i32 = if (pos < max_pos) mmioRead(hmmio, @ptrCast(&head), 12) else 0;
         if (got < 8) {
             _ = mmioSeek(hmmio, @bitCast(start), 0);
+            mmioTrace("mmioDescend(0x{x}, id 0x{x} type 0x{x}): not found from {d} (read {d} at {d})", .{ hmmio, want_id, want_type, start, got, pos });
             return MMIOERR_CHUNKNOTFOUND;
         }
         const is_form = head[0] == FOURCC_RIFF or head[0] == FOURCC_LIST;
@@ -3331,6 +3353,7 @@ fn mmioDescend(hmmio: usize, lpck: ?*MMCKINFO, parent: ?*const MMCKINFO, wFlags:
                 ck.fccType = 0;
                 _ = mmioSeek(hmmio, @bitCast(ck.dwDataOffset), 0);
             }
+            mmioTrace("mmioDescend(0x{x}): chunk 0x{x} size {d} data at {d}", .{ hmmio, ck.ckid, ck.cksize, ck.dwDataOffset });
             return 0;
         }
         pos = pos + 8 + ((head[1] +% 1) & ~@as(u32, 1));

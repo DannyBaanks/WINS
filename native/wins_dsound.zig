@@ -1314,6 +1314,41 @@ fn spatial(b: *const Buffer, listener: ?*const Buffer) [2]f32 {
     return .{ gain * @min(1, 1 - pan), gain * @min(1, 1 + pan) };
 }
 
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+var trace_left: i32 = -1;
+
+/// WINS_DSOUND_TRACE=<n>: describe the first n sounds as the mixer starts
+/// them -- whether the buffer holds any signal, and what the volume and the
+/// 3D placement do to it.
+fn traceStart(b: *const Buffer, listener: ?*const Buffer, sp: [2]f32, gl: f32, gr: f32, master: f32) void {
+    if (trace_left < 0) {
+        trace_left = 0;
+        if (getenv("WINS_DSOUND_TRACE")) |v| trace_left = std.fmt.parseInt(i32, std.mem.sliceTo(v, 0), 10) catch 0;
+    }
+    if (trace_left == 0) return;
+    trace_left -= 1;
+    var peak: f32 = 0;
+    const chans: usize = @max(1, b.wfx.nChannels);
+    const align_: usize = if (b.wfx.nBlockAlign != 0) b.wfx.nBlockAlign else chans * (b.wfx.wBitsPerSample / 8);
+    const frames = b.buf_len / align_;
+    var f: usize = 0;
+    while (f < frames) : (f += 1) peak = @max(peak, @abs(sampleAt(b, f, 0)));
+    const w = &b.i3d.words;
+    const p = vec(w[0..3]);
+    var lp: [3]f32 = .{ 0, 0, 0 };
+    if (listener) |l| lp = vec(l.i3d.words[0..3]);
+    std.debug.print("[WINS:DSound:trace] start flags 0x{x} {d} bytes {d} Hz {d} ch from byte {d}{s}: peak {d:.3}, volume {d}, pan {d}, master {d:.3}; 3D {s} mode {d} pos ({d:.1},{d:.1},{d:.1}) min {d:.1} max {d:.1} listener ({d:.1},{d:.1},{d:.1}) -> spatial {d:.4}/{d:.4}; gain L {d:.4} R {d:.4}\n", .{
+        b.flags,                                       b.buf_len,                    if (b.frequency != 0) b.frequency else b.wfx.nSamplesPerSec,
+        b.wfx.nChannels,                               b.start_cursor,               if (b.looping) " looping" else "",
+        peak,                                          b.volume,                     b.pan,
+        master,                                        if (b.i3d.vtbl != null) "on" else "off", w[14],
+        p[0],                                          p[1],                         p[2],
+        @as(f32, @bitCast(w[12])),                     @as(f32, @bitCast(w[13])),    lp[0],
+        lp[1],                                         lp[2],                        sp[0],
+        sp[1],                                         gl,                           gr,
+    });
+}
+
 fn mixerMain() void {
     const out = audio.Output.open(MIX_RATE, 2, "DirectSound") catch {
         std.debug.print("[WINS:DSound] no host sound server; effects and voices stay silent\n", .{});
@@ -1342,6 +1377,7 @@ fn mixerMain() void {
             if (align_ == 0) continue;
             const frames: f64 = @floatFromInt(b.buf_len / align_);
             if (frames < 1) continue;
+            const restarted = b.mix_restart;
             if (b.mix_restart) {
                 b.mix_restart = false;
                 b.mix_frame = @as(f64, @floatFromInt(b.start_cursor / align_));
@@ -1352,6 +1388,7 @@ fn mixerMain() void {
             const sp = spatial(b, listener);
             const gl = g[0] * sp[0] * master;
             const gr = g[1] * sp[1] * master;
+            if (restarted) traceStart(b, listener, sp, gl, gr, master);
             var f: usize = 0;
             while (f < MIX_FRAMES) : (f += 1) {
                 if (b.mix_frame >= frames) {
