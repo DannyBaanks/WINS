@@ -62,7 +62,7 @@ class TestBinaryTriage(unittest.TestCase):
         triage = BinaryTriage(sample_path).probe()
         self.assertEqual(triage["envelope"]["type"], "nsis")
         self.assertEqual(triage["runtime"], "native_pe")
-        self.assertEqual(triage["recommended_recipe"], "recipe_micro_wine")
+        self.assertEqual(triage["recommended_recipe"], "recipe_transpiler")
 
     def test_winmerge_installer_probe(self):
         sample_path = os.path.expanduser("~/Descargas/wins-samples/WinMerge-2.16.60-x64-Setup.exe")
@@ -72,7 +72,7 @@ class TestBinaryTriage(unittest.TestCase):
         triage = BinaryTriage(sample_path).probe()
         self.assertEqual(triage["envelope"]["type"], "inno")
         self.assertEqual(triage["runtime"], "native_pe")
-        self.assertEqual(triage["recommended_recipe"], "recipe_micro_wine")
+        self.assertEqual(triage["recommended_recipe"], "recipe_transpiler")
 
 if __name__ == "__main__":
     unittest.main()

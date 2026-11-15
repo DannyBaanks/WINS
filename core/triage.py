@@ -154,8 +154,8 @@ class BinaryTriage:
                                 "envelope": "Inno Setup",
                                 "imports": "Kernel32 / User32 direct dependencies",
                             },
-                            "feasibility": "REQUIRES_ISOLATED_EMULATION (Pure Win32 C/C++ binary)",
-                            "recipe": "recipe_micro_wine",
+                            "feasibility": "CANDIDATE_HARVEST_AND_TRANSPILATION (Deconstruct components & map to Linux engines)",
+                            "recipe": "recipe_transpiler",
                         }
                 except Exception:
                     pass
@@ -279,8 +279,8 @@ class BinaryTriage:
                 "framework": "Native Compiled Win32/x86_64 Machine Code",
                 "imports": "Kernel32 / User32 direct dependencies",
             },
-            "feasibility": "REQUIRES_ISOLATED_EMULATION (Pure Win32 C/C++ binary)",
-            "recipe": "recipe_micro_wine",
+            "feasibility": "CANDIDATE_HARVEST_AND_TRANSPILATION (Deconstruct components & map to Linux engines)",
+            "recipe": "recipe_transpiler",
         }
 
 if __name__ == "__main__":
