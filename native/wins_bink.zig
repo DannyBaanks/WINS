@@ -350,7 +350,10 @@ fn soundMain(st: *State) void {
     const dct = st.hdr.audio_flags & 0x1000 != 0;
     const stereo = st.hdr.audio_flags & 0x2000 != 0;
     const channels: u32 = if (stereo) 2 else 1;
-    const ctx = openDecoder(if (dct) "binkaudio_dct" else "binkaudio_rdft", 1, 0, std.mem.asBytes(&st.hdr.tag), 0, 0) orelse return;
+    const ctx = openDecoder(if (dct) "binkaudio_dct" else "binkaudio_rdft", 1, 0, std.mem.asBytes(&st.hdr.tag), 0, 0) orelse {
+        std.debug.print("[WINS:Bink] the host has no usable Bink audio decoder; the video plays silent\n", .{});
+        return;
+    };
     var c: ?*anyopaque = ctx;
     defer av.avcodec_free_context(&c);
     _ = av.av_opt_set(ctx, "ch_layout", if (stereo) "stereo" else "mono", 0);
@@ -360,8 +363,12 @@ fn soundMain(st: *State) void {
         return;
     }
     if (!audio.outputEnabled()) return;
-    const out = audio.Output.open(st.hdr.audio_rate, channels, "Bink video") catch return;
+    const out = audio.Output.open(st.hdr.audio_rate, channels, "Bink video") catch {
+        std.debug.print("[WINS:Bink] no host sound server; the video plays silent\n", .{});
+        return;
+    };
     defer out.close();
+    std.debug.print("[WINS:Bink] audio: {d} Hz, {d} channel(s), {s}, playing through the host sound server\n", .{ st.hdr.audio_rate, channels, if (dct) "DCT" else "RDFT" });
     var pkt = av.av_packet_alloc();
     var frm = av.av_frame_alloc();
     defer {
