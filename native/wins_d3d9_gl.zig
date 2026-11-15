@@ -1213,3 +1213,65 @@ pub fn present(frame: u64) void {
     var job: PresentJob = .{ .frame = frame };
     host.run(&presentJob, &job);
 }
+
+// ---- occlusion queries --------------------------------------------------------
+
+const GL_SAMPLES_PASSED = 0x8914;
+const GL_QUERY_RESULT = 0x8866;
+
+/// The GL query currently counting samples (GL allows one per target).
+var g_active_query: u32 = 0;
+
+const QueryJob = struct { op: enum { begin, end, result, delete }, q: *d3d.WinsQuery9 };
+fn queryJob(raw: ?*anyopaque) void {
+    const j: *QueryJob = @ptrCast(@alignCast(raw.?));
+    const gl = &host.gl;
+    const q = j.q;
+    switch (j.op) {
+        .begin => {
+            if (q.gl_name == 0) gl.glGenQueries(1, &q.gl_name);
+            // D3D9 lets occlusion queries overlap, GL does not: the one that
+            // was counting stops here and keeps what it counted so far.
+            if (g_active_query != 0) gl.glEndQuery(GL_SAMPLES_PASSED);
+            gl.glBeginQuery(GL_SAMPLES_PASSED, q.gl_name);
+            g_active_query = q.gl_name;
+        },
+        .end => {
+            if (g_active_query == q.gl_name and q.gl_name != 0) {
+                gl.glEndQuery(GL_SAMPLES_PASSED);
+                g_active_query = 0;
+            }
+        },
+        .result => {
+            var n: u32 = 0;
+            if (q.gl_name != 0 and g_active_query != q.gl_name) gl.glGetQueryObjectuiv(q.gl_name, GL_QUERY_RESULT, &n);
+            q.result = n;
+        },
+        .delete => {
+            if (q.gl_name == 0) return;
+            if (g_active_query == q.gl_name) {
+                gl.glEndQuery(GL_SAMPLES_PASSED);
+                g_active_query = 0;
+            }
+            gl.glDeleteQueries(1, &q.gl_name);
+            q.gl_name = 0;
+        },
+    }
+}
+pub fn queryBegin(q: *d3d.WinsQuery9) void {
+    var j: QueryJob = .{ .op = .begin, .q = q };
+    host.run(&queryJob, &j);
+}
+pub fn queryEnd(q: *d3d.WinsQuery9) void {
+    var j: QueryJob = .{ .op = .end, .q = q };
+    host.run(&queryJob, &j);
+}
+/// Waits for the GPU's count (GL_QUERY_RESULT blocks until it is ready).
+pub fn queryResult(q: *d3d.WinsQuery9) void {
+    var j: QueryJob = .{ .op = .result, .q = q };
+    host.run(&queryJob, &j);
+}
+pub fn queryGone(q: *d3d.WinsQuery9) void {
+    var j: QueryJob = .{ .op = .delete, .q = q };
+    host.run(&queryJob, &j);
+}

@@ -3645,12 +3645,130 @@ fn dev9_DeletePatch(this: *anyopaque, p0: u32) callconv(W) HRESULT {
     return E_NOTIMPL;
 }
 
-fn dev9_CreateQuery(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
+// ---- IDirect3DQuery9 ---------------------------------------------------------
+
+const D3DQUERYTYPE_EVENT: u32 = 8;
+const D3DQUERYTYPE_OCCLUSION: u32 = 9;
+const D3DISSUE_END: u32 = 1;
+const D3DISSUE_BEGIN: u32 = 2;
+
+const IDirect3DQuery9Vtbl = extern struct {
+    QueryInterface: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(W) u32,
+    Release: *const fn (*anyopaque) callconv(W) u32,
+    GetDevice: *const fn (*anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    GetType: *const fn (*anyopaque) callconv(W) u32,
+    GetDataSize: *const fn (*anyopaque) callconv(W) u32,
+    Issue: *const fn (*anyopaque, u32) callconv(W) HRESULT,
+    GetData: *const fn (*anyopaque, ?*anyopaque, u32, u32) callconv(W) HRESULT,
+};
+
+/// An occlusion query counts, on the host GPU, the samples that pass the depth
+/// test between Issue(BEGIN) and Issue(END). An event query only says "the GPU
+/// caught up", which is true by the time GetData's job has run.
+pub const WinsQuery9 = extern struct {
+    vtbl: *const IDirect3DQuery9Vtbl,
+    ref_count: u32,
+    device: *WinsD3DDevice9,
+    kind: u32,
+    gl_name: u32 = 0,
+    result: u32 = 0,
+    /// Issue(END) happened at least once, so there is a count to hand out.
+    ended: bool = false,
+};
+
+fn query_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
+    _ = riid;
+    const self: *WinsQuery9 = @ptrCast(@alignCast(this));
+    self.ref_count += 1;
+    if (ppv) |p| p.* = this;
+    return S_OK;
+}
+fn query_AddRef(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsQuery9 = @ptrCast(@alignCast(this));
+    self.ref_count += 1;
+    return self.ref_count;
+}
+fn query_Release(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsQuery9 = @ptrCast(@alignCast(this));
+    if (self.ref_count > 0) self.ref_count -= 1;
+    if (self.ref_count == 0 and self.gl_name != 0) hostgl.queryGone(self);
+    return self.ref_count;
+}
+fn query_GetDevice(this: *anyopaque, out: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsQuery9 = @ptrCast(@alignCast(this));
+    const o = out orelse return D3DERR_INVALIDCALL;
+    self.device.ref_count += 1;
+    o.* = @ptrCast(self.device);
+    return D3D_OK;
+}
+fn query_GetType(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsQuery9 = @ptrCast(@alignCast(this));
+    return self.kind;
+}
+fn query_GetDataSize(this: *anyopaque) callconv(W) u32 {
     _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!CreateQuery is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    return 4; // DWORD sample count, or BOOL for the event query
+}
+fn query_Issue(this: *anyopaque, flags: u32) callconv(W) HRESULT {
+    const self: *WinsQuery9 = @ptrCast(@alignCast(this));
+    if (self.kind == D3DQUERYTYPE_OCCLUSION) {
+        if (flags & D3DISSUE_BEGIN != 0) {
+            self.ended = false;
+            hostgl.queryBegin(self);
+        }
+        if (flags & D3DISSUE_END != 0) {
+            hostgl.queryEnd(self);
+            self.ended = true;
+        }
+    } else if (flags & D3DISSUE_END != 0) {
+        self.ended = true;
+    }
+    return D3D_OK;
+}
+fn query_GetData(this: *anyopaque, data: ?*anyopaque, size: u32, flags: u32) callconv(W) HRESULT {
+    _ = flags;
+    const self: *WinsQuery9 = @ptrCast(@alignCast(this));
+    var value: u32 = 1; // event: the GPU has caught up
+    if (self.kind == D3DQUERYTYPE_OCCLUSION) {
+        if (self.ended) hostgl.queryResult(self);
+        value = self.result;
+    }
+    if (data) |d| {
+        if (size < 4) return D3DERR_INVALIDCALL;
+        @as(*align(1) u32, @ptrCast(d)).* = value;
+    }
+    return S_OK;
+}
+
+const g_query9_vtbl: IDirect3DQuery9Vtbl = .{
+    .QueryInterface = &query_QueryInterface,
+    .AddRef = &query_AddRef,
+    .Release = &query_Release,
+    .GetDevice = &query_GetDevice,
+    .GetType = &query_GetType,
+    .GetDataSize = &query_GetDataSize,
+    .Issue = &query_Issue,
+    .GetData = &query_GetData,
+};
+
+/// FalloutNV asks for an occlusion query when it loads the Mojave (0xc4ed32)
+/// and calls Issue on the result without looking at the HRESULT.
+fn dev9_CreateQuery(this: *anyopaque, kind: u32, out: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    // Counting samples needs the GPU; without a host surface there is nothing
+    // honest to answer.
+    const supported = kind == D3DQUERYTYPE_EVENT or (kind == D3DQUERYTYPE_OCCLUSION and self.host);
+    if (!supported) {
+        std.debug.print("[WINS:D3D9] CreateQuery(type {d}) is not available (caller 0x{x})\n", .{ kind, @returnAddress() });
+        if (out) |o| o.* = null;
+        return D3DERR_NOTAVAILABLE;
+    }
+    const o = out orelse return D3D_OK; // NULL asks only "is it supported?"
+    const q = self.allocator.create(WinsQuery9) catch return E_OUTOFMEMORY;
+    q.* = .{ .vtbl = &g_query9_vtbl, .ref_count = 1, .device = self, .kind = kind };
+    o.* = @ptrCast(q);
+    return D3D_OK;
 }
 const g_device9_vtbl: IDirect3DDevice9Vtbl = .{
     .QueryInterface = &dev9_QueryInterface,

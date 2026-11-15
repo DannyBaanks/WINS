@@ -237,6 +237,12 @@ pub const Gl = struct {
     glCheckFramebufferStatus: *const fn (GLenum) callconv(.c) GLenum,
     glDrawBuffers: *const fn (GLsizei, [*]const GLenum) callconv(.c) void,
     glBlitFramebuffer: *const fn (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, c_uint, GLenum) callconv(.c) void,
+
+    glGenQueries: *const fn (GLsizei, *GLuint) callconv(.c) void,
+    glDeleteQueries: *const fn (GLsizei, *const GLuint) callconv(.c) void,
+    glBeginQuery: *const fn (GLenum, GLuint) callconv(.c) void,
+    glEndQuery: *const fn (GLenum) callconv(.c) void,
+    glGetQueryObjectuiv: *const fn (GLuint, GLenum, *GLuint) callconv(.c) void,
 };
 
 /// Valid on the render thread once `start` returned true.
