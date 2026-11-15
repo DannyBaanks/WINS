@@ -333,7 +333,15 @@ fn stretchJob(raw: ?*anyopaque) void {
     const mask: c_uint = if (depth) 0x0100 | 0x0400 else 0x4000;
     const filter: host.GLenum = if (!depth and j.filter == 2) 0x2601 else 0x2600; // D3DTEXF_LINEAR
     gl.glBlitFramebuffer(j.sr.x1, j.sr.y1, j.sr.x2, j.sr.y2, j.dr.x1, j.dr.y1, j.dr.x2, j.dr.y2, mask, filter);
-    if (j.dst.parent) |t| t.gl_dirty = false;
+    // A destination with CPU pixels (off-screen plain, or a non-target texture
+    // level): bring the result back to the memory the guest reads.
+    const is_bb = if (d3d.deviceRenderTarget(j.dev)) |bb| bb == j.dst else false;
+    if (!depth and !is_bb and j.dst.usage & d3d.D3DUSAGE_RENDERTARGET == 0) {
+        gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, g_copy_fbo[1]);
+        if (texFormat(j.dst.format)) |tf| {
+            if (!tf.compressed) gl.glReadPixels(0, 0, @intCast(j.dst.width), @intCast(j.dst.height), tf.format, tf.ty, j.dst.data.ptr);
+        }
+    }
 }
 pub fn stretchRect(dev: *Device, src: *d3d.WinsSurface9, sr: d3d.D3DRECT, dst: *d3d.WinsSurface9, dr: d3d.D3DRECT, filter: u32) void {
     var j: StretchJob = .{ .dev = dev, .src = src, .sr = sr, .dst = dst, .dr = dr, .filter = filter };

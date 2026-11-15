@@ -164,7 +164,242 @@ pub const Buffer = extern struct {
     start_ms: i64,
     start_cursor: u32,
     primary: bool,
+    /// IDirectSound3DListener (primary buffers) / IDirectSound3DBuffer
+    /// (secondary buffers created with DSBCAPS_CTRL3D): a second interface
+    /// of the same object, sharing its reference count.
+    i3d: Sub3D,
 };
+
+/// The 3D interface of a buffer. Parameters are stored and answered as set;
+/// positional mixing is not done (there is no mixer output yet).
+pub const Sub3D = extern struct {
+    vtbl: ?*const anyopaque,
+    owner: ?*Buffer,
+    // DS3DLISTENER / DS3DBUFFER without dwSize, as 32-bit words.
+    words: [15]u32,
+};
+
+const IID_IDirectSound3DListener = Guid{ .data1 = 0x279AFA84, .data2 = 0x4981, .data3 = 0x11CE, .data4 = .{ 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 } };
+const IID_IDirectSound3DBuffer = Guid{ .data1 = 0x279AFA86, .data2 = 0x4981, .data3 = 0x11CE, .data4 = .{ 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 } };
+
+fn subOf(p: *anyopaque) *Sub3D {
+    return @ptrCast(@alignCast(p));
+}
+fn s3QueryInterface(p: *anyopaque, iid: ?*const Guid, out: ?*?*anyopaque) callconv(W) HRESULT {
+    return bufQueryInterface(subOf(p).owner.?, iid, out);
+}
+fn s3AddRef(p: *anyopaque) callconv(W) u32 {
+    return bufAddRef(subOf(p).owner.?);
+}
+fn s3Release(p: *anyopaque) callconv(W) u32 {
+    return bufRelease(subOf(p).owner.?);
+}
+fn putVec(dst: ?*[3]f32, src: []const u32) HRESULT {
+    const d = dst orelse return E_INVALIDARG;
+    for (0..3) |i| d[i] = @bitCast(src[i]);
+    return S_OK;
+}
+fn putF(dst: ?*f32, w: u32) HRESULT {
+    (dst orelse return E_INVALIDARG).* = @bitCast(w);
+    return S_OK;
+}
+fn setVec(sub: *Sub3D, at: usize, x: f32, y: f32, z: f32) HRESULT {
+    sub.words[at] = @bitCast(x);
+    sub.words[at + 1] = @bitCast(y);
+    sub.words[at + 2] = @bitCast(z);
+    return S_OK;
+}
+fn getAll(sub: *Sub3D, out: ?[*]u32) HRESULT {
+    const o = out orelse return E_INVALIDARG;
+    if (o[0] < 64) return E_INVALIDARG;
+    @memcpy(o[1..16], &sub.words);
+    return S_OK;
+}
+fn setAll(sub: *Sub3D, in: ?[*]const u32) HRESULT {
+    const i = in orelse return E_INVALIDARG;
+    if (i[0] < 64) return E_INVALIDARG;
+    @memcpy(&sub.words, i[1..16]);
+    return S_OK;
+}
+
+// Listener layout (words): position 0..2, velocity 3..5, front 6..8, top 9..11,
+// distance factor 12, rolloff 13, doppler 14.
+fn lGetAll(p: *anyopaque, o: ?[*]u32) callconv(W) HRESULT {
+    return getAll(subOf(p), o);
+}
+fn lGetDistance(p: *anyopaque, o: ?*f32) callconv(W) HRESULT {
+    return putF(o, subOf(p).words[12]);
+}
+fn lGetDoppler(p: *anyopaque, o: ?*f32) callconv(W) HRESULT {
+    return putF(o, subOf(p).words[14]);
+}
+fn lGetOrientation(p: *anyopaque, front: ?*[3]f32, top: ?*[3]f32) callconv(W) HRESULT {
+    const s = subOf(p);
+    const r = putVec(front, s.words[6..9]);
+    if (r != S_OK) return r;
+    return putVec(top, s.words[9..12]);
+}
+fn lGetPosition(p: *anyopaque, o: ?*[3]f32) callconv(W) HRESULT {
+    return putVec(o, subOf(p).words[0..3]);
+}
+fn lGetRolloff(p: *anyopaque, o: ?*f32) callconv(W) HRESULT {
+    return putF(o, subOf(p).words[13]);
+}
+fn lGetVelocity(p: *anyopaque, o: ?*[3]f32) callconv(W) HRESULT {
+    return putVec(o, subOf(p).words[3..6]);
+}
+fn lSetAll(p: *anyopaque, i: ?[*]const u32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    return setAll(subOf(p), i);
+}
+fn lSetDistance(p: *anyopaque, v: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    subOf(p).words[12] = @bitCast(v);
+    return S_OK;
+}
+fn lSetDoppler(p: *anyopaque, v: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    subOf(p).words[14] = @bitCast(v);
+    return S_OK;
+}
+fn lSetOrientation(p: *anyopaque, fx: f32, fy: f32, fz: f32, tx: f32, ty: f32, tz: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    _ = setVec(subOf(p), 6, fx, fy, fz);
+    return setVec(subOf(p), 9, tx, ty, tz);
+}
+fn lSetPosition(p: *anyopaque, x: f32, y: f32, z: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    return setVec(subOf(p), 0, x, y, z);
+}
+fn lSetRolloff(p: *anyopaque, v: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    subOf(p).words[13] = @bitCast(v);
+    return S_OK;
+}
+fn lSetVelocity(p: *anyopaque, x: f32, y: f32, z: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    return setVec(subOf(p), 3, x, y, z);
+}
+fn s3Commit(p: *anyopaque) callconv(W) HRESULT {
+    _ = p;
+    return S_OK;
+}
+const listener_vtbl = [_]*const anyopaque{
+    @ptrCast(&s3QueryInterface), @ptrCast(&s3AddRef),       @ptrCast(&s3Release),
+    @ptrCast(&lGetAll),          @ptrCast(&lGetDistance),   @ptrCast(&lGetDoppler),
+    @ptrCast(&lGetOrientation),  @ptrCast(&lGetPosition),   @ptrCast(&lGetRolloff),
+    @ptrCast(&lGetVelocity),     @ptrCast(&lSetAll),        @ptrCast(&lSetDistance),
+    @ptrCast(&lSetDoppler),      @ptrCast(&lSetOrientation), @ptrCast(&lSetPosition),
+    @ptrCast(&lSetRolloff),      @ptrCast(&lSetVelocity),   @ptrCast(&s3Commit),
+};
+
+// 3D buffer layout (words): position 0..2, velocity 3..5, inside cone 6,
+// outside cone 7, cone orientation 8..10, cone outside volume 11, min
+// distance 12, max distance 13, mode 14.
+fn bGetAll(p: *anyopaque, o: ?[*]u32) callconv(W) HRESULT {
+    return getAll(subOf(p), o);
+}
+fn bGetConeAngles(p: *anyopaque, inside: ?*u32, outside: ?*u32) callconv(W) HRESULT {
+    const s = subOf(p);
+    if (inside) |x| x.* = s.words[6];
+    if (outside) |x| x.* = s.words[7];
+    return S_OK;
+}
+fn bGetConeOrientation(p: *anyopaque, o: ?*[3]f32) callconv(W) HRESULT {
+    return putVec(o, subOf(p).words[8..11]);
+}
+fn bGetConeOutsideVolume(p: *anyopaque, o: ?*i32) callconv(W) HRESULT {
+    (o orelse return E_INVALIDARG).* = @bitCast(subOf(p).words[11]);
+    return S_OK;
+}
+fn bGetMaxDistance(p: *anyopaque, o: ?*f32) callconv(W) HRESULT {
+    return putF(o, subOf(p).words[13]);
+}
+fn bGetMinDistance(p: *anyopaque, o: ?*f32) callconv(W) HRESULT {
+    return putF(o, subOf(p).words[12]);
+}
+fn bGetMode(p: *anyopaque, o: ?*u32) callconv(W) HRESULT {
+    (o orelse return E_INVALIDARG).* = subOf(p).words[14];
+    return S_OK;
+}
+fn bGetPosition(p: *anyopaque, o: ?*[3]f32) callconv(W) HRESULT {
+    return putVec(o, subOf(p).words[0..3]);
+}
+fn bGetVelocity(p: *anyopaque, o: ?*[3]f32) callconv(W) HRESULT {
+    return putVec(o, subOf(p).words[3..6]);
+}
+fn bSetAll(p: *anyopaque, i: ?[*]const u32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    return setAll(subOf(p), i);
+}
+fn bSetConeAngles(p: *anyopaque, inside: u32, outside: u32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    subOf(p).words[6] = inside;
+    subOf(p).words[7] = outside;
+    return S_OK;
+}
+fn bSetConeOrientation(p: *anyopaque, x: f32, y: f32, z: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    return setVec(subOf(p), 8, x, y, z);
+}
+fn bSetConeOutsideVolume(p: *anyopaque, v: i32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    subOf(p).words[11] = @bitCast(v);
+    return S_OK;
+}
+fn bSetMaxDistance(p: *anyopaque, v: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    subOf(p).words[13] = @bitCast(v);
+    return S_OK;
+}
+fn bSetMinDistance(p: *anyopaque, v: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    subOf(p).words[12] = @bitCast(v);
+    return S_OK;
+}
+fn bSetMode(p: *anyopaque, v: u32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    subOf(p).words[14] = v;
+    return S_OK;
+}
+fn bSetPosition(p: *anyopaque, x: f32, y: f32, z: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    return setVec(subOf(p), 0, x, y, z);
+}
+fn bSetVelocity(p: *anyopaque, x: f32, y: f32, z: f32, apply: u32) callconv(W) HRESULT {
+    _ = apply;
+    return setVec(subOf(p), 3, x, y, z);
+}
+const buffer3d_vtbl = [_]*const anyopaque{
+    @ptrCast(&s3QueryInterface),     @ptrCast(&s3AddRef),             @ptrCast(&s3Release),
+    @ptrCast(&bGetAll),              @ptrCast(&bGetConeAngles),       @ptrCast(&bGetConeOrientation),
+    @ptrCast(&bGetConeOutsideVolume), @ptrCast(&bGetMaxDistance),     @ptrCast(&bGetMinDistance),
+    @ptrCast(&bGetMode),             @ptrCast(&bGetPosition),         @ptrCast(&bGetVelocity),
+    @ptrCast(&bSetAll),              @ptrCast(&bSetConeAngles),       @ptrCast(&bSetConeOrientation),
+    @ptrCast(&bSetConeOutsideVolume), @ptrCast(&bSetMaxDistance),     @ptrCast(&bSetMinDistance),
+    @ptrCast(&bSetMode),             @ptrCast(&bSetPosition),         @ptrCast(&bSetVelocity),
+};
+
+/// DirectSound's defaults for a new listener / 3D buffer.
+fn init3D(b: *Buffer) void {
+    b.i3d = .{ .vtbl = null, .owner = b, .words = [_]u32{0} ** 15 };
+    if (b.flags & DSBCAPS_CTRL3D == 0) return;
+    if (b.primary) {
+        b.i3d.vtbl = @ptrCast(&listener_vtbl);
+        b.i3d.words[8] = @bitCast(@as(f32, 1.0)); // front (0,0,1) at 6..8
+        b.i3d.words[10] = @bitCast(@as(f32, 1.0)); // top (0,1,0) at 9..11
+        b.i3d.words[12] = @bitCast(@as(f32, 1.0)); // DS3D_DEFAULTDISTANCEFACTOR
+        b.i3d.words[13] = @bitCast(@as(f32, 1.0)); // rolloff
+        b.i3d.words[14] = @bitCast(@as(f32, 1.0)); // doppler
+    } else {
+        b.i3d.vtbl = @ptrCast(&buffer3d_vtbl);
+        b.i3d.words[6] = 360; // DS3D_DEFAULTCONEANGLE
+        b.i3d.words[7] = 360;
+        b.i3d.words[10] = @bitCast(@as(f32, 1.0)); // cone orientation (0,0,1)
+        b.i3d.words[12] = @bitCast(@as(f32, 1.0)); // DS3D_DEFAULTMINDISTANCE
+        b.i3d.words[13] = @bitCast(@as(f32, 1000000000.0)); // DS3D_DEFAULTMAXDISTANCE
+    }
+}
 
 pub const BufferVtbl = extern struct {
     QueryInterface: *const fn (*anyopaque, ?*const Guid, ?*?*anyopaque) callconv(W) HRESULT,
@@ -229,6 +464,7 @@ fn bufCursor(self: *Buffer) u32 {
 }
 
 fn bufQueryInterface(p: *anyopaque, iid: ?*const Guid, out: ?*?*anyopaque) callconv(W) HRESULT {
+    traceFirst(0, "bufQueryInterface", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const o = out orelse return E_INVALIDARG;
     if (accepts(&IID_IDirectSoundBuffer8, iid) or accepts(&IID_IDirectSoundBuffer, iid)) {
@@ -236,11 +472,31 @@ fn bufQueryInterface(p: *anyopaque, iid: ?*const Guid, out: ?*?*anyopaque) callc
         o.* = p;
         return S_OK;
     }
+    if (iid) |g| {
+        const want_listener = g.eql(&IID_IDirectSound3DListener);
+        const want_3d = g.eql(&IID_IDirectSound3DBuffer);
+        if (self.i3d.vtbl != null and ((want_listener and self.primary) or (want_3d and !self.primary))) {
+            self.refs += 1;
+            o.* = @ptrCast(&self.i3d);
+            return S_OK;
+        }
+    }
     o.* = null;
+    if (iid) |g| logRefused("buffer", g);
     return E_NOINTERFACE;
 }
 
+var refused_logged: u32 = 0;
+fn logRefused(what: []const u8, g: *const Guid) void {
+    if (refused_logged >= 8) return;
+    refused_logged += 1;
+    std.debug.print("[WINS:DSound] {s} QueryInterface({x:0>8}-{x:0>4}-{x:0>4}-...) refused (E_NOINTERFACE)\n", .{ what, g.data1, g.data2, g.data3 });
+}
+
+var created_logged: u32 = 0;
+
 fn bufAddRef(p: *anyopaque) callconv(W) u32 {
+    traceFirst(1, "bufAddRef", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     self.refs += 1;
     return self.refs;
@@ -256,6 +512,7 @@ fn poolIndexOf(self: *Buffer) ?usize {
 }
 
 fn bufRelease(p: *anyopaque) callconv(W) u32 {
+    traceFirst(2, "bufRelease", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     if (self.refs > 0) self.refs -= 1;
     if (self.refs != 0) return self.refs;
@@ -271,6 +528,7 @@ fn bufRelease(p: *anyopaque) callconv(W) u32 {
 }
 
 fn bufGetCaps(p: *anyopaque, caps: ?*DSCBCAPS) callconv(W) HRESULT {
+    traceFirst(3, "bufGetCaps", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const c = caps orelse return E_INVALIDARG;
     if (c.dwSize < @sizeOf(DSCBCAPS)) return E_INVALIDARG;
@@ -281,6 +539,7 @@ fn bufGetCaps(p: *anyopaque, caps: ?*DSCBCAPS) callconv(W) HRESULT {
 }
 
 fn bufGetCurrentPosition(p: *anyopaque, play: ?*u32, write: ?*u32) callconv(W) HRESULT {
+    traceFirst(4, "bufGetCurrentPosition", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const cur = bufCursor(self);
     if (play) |q| q.* = cur;
@@ -289,6 +548,7 @@ fn bufGetCurrentPosition(p: *anyopaque, play: ?*u32, write: ?*u32) callconv(W) H
 }
 
 fn bufGetFormat(p: *anyopaque, wfx: ?*WAVEFORMATEX, size: u32, written: ?*u32) callconv(W) HRESULT {
+    traceFirst(5, "bufGetFormat", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const dest = wfx orelse return E_INVALIDARG;
     if (size < @sizeOf(WAVEFORMATEX)) return E_INVALIDARG;
@@ -298,6 +558,7 @@ fn bufGetFormat(p: *anyopaque, wfx: ?*WAVEFORMATEX, size: u32, written: ?*u32) c
 }
 
 fn bufGetVolume(p: *anyopaque, v: ?*i32) callconv(W) HRESULT {
+    traceFirst(6, "bufGetVolume", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const q = v orelse return E_INVALIDARG;
     q.* = self.volume;
@@ -305,6 +566,7 @@ fn bufGetVolume(p: *anyopaque, v: ?*i32) callconv(W) HRESULT {
 }
 
 fn bufGetPan(p: *anyopaque, v: ?*i32) callconv(W) HRESULT {
+    traceFirst(7, "bufGetPan", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const q = v orelse return E_INVALIDARG;
     q.* = self.pan;
@@ -312,6 +574,7 @@ fn bufGetPan(p: *anyopaque, v: ?*i32) callconv(W) HRESULT {
 }
 
 fn bufGetFrequency(p: *anyopaque, v: ?*u32) callconv(W) HRESULT {
+    traceFirst(8, "bufGetFrequency", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const q = v orelse return E_INVALIDARG;
     q.* = if (self.frequency != 0) self.frequency else self.wfx.nSamplesPerSec;
@@ -319,8 +582,12 @@ fn bufGetFrequency(p: *anyopaque, v: ?*u32) callconv(W) HRESULT {
 }
 
 fn bufGetStatus(p: *anyopaque, status: ?*u32) callconv(W) HRESULT {
+    traceFirst(9, "bufGetStatus", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const q = status orelse return E_INVALIDARG;
+    // The play cursor runs on the clock; a one-shot buffer that reached its
+    // end has stopped even if nobody asked for the position since.
+    _ = bufCursor(self);
     var s: u32 = 0;
     if (self.playing) s |= DSBSTATUS_PLAYING;
     if (self.playing and self.looping) s |= DSBSTATUS_LOOPING;
@@ -329,6 +596,7 @@ fn bufGetStatus(p: *anyopaque, status: ?*u32) callconv(W) HRESULT {
 }
 
 fn bufInitialize(p: *anyopaque, ds: ?*anyopaque, desc: ?*DSBUFFERDESC) callconv(W) HRESULT {
+    traceFirst(10, "bufInitialize", @returnAddress());
     _ = ds;
     const self: *Buffer = @ptrCast(@alignCast(p));
     const d = desc orelse return E_INVALIDARG;
@@ -382,6 +650,7 @@ fn bufLock(
 }
 
 fn bufPlay(p: *anyopaque, reserved1: u32, priority: u32, flags: u32) callconv(W) HRESULT {
+    traceFirst(11, "bufPlay", @returnAddress());
     _ = reserved1;
     _ = priority;
     const self: *Buffer = @ptrCast(@alignCast(p));
@@ -396,6 +665,7 @@ fn bufPlay(p: *anyopaque, reserved1: u32, priority: u32, flags: u32) callconv(W)
 }
 
 fn bufSetCurrentPosition(p: *anyopaque, pos: u32) callconv(W) HRESULT {
+    traceFirst(12, "bufSetCurrentPosition", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const total = bufBytes(self);
     if (total == 0) return DSERR_UNSUPPORTED;
@@ -405,6 +675,7 @@ fn bufSetCurrentPosition(p: *anyopaque, pos: u32) callconv(W) HRESULT {
 }
 
 fn bufSetFormat(p: *anyopaque, wfx: ?*WAVEFORMATEX) callconv(W) HRESULT {
+    traceFirst(13, "bufSetFormat", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     const src = wfx orelse return E_INVALIDARG;
     if (!self.primary) return DSERR_INVALIDCALL; // only the primary buffer may change format
@@ -414,6 +685,7 @@ fn bufSetFormat(p: *anyopaque, wfx: ?*WAVEFORMATEX) callconv(W) HRESULT {
 }
 
 fn bufSetVolume(p: *anyopaque, v: i32) callconv(W) HRESULT {
+    traceFirst(14, "bufSetVolume", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     if (v > 0 or v < -10000) return E_INVALIDARG;
     self.volume = v;
@@ -421,6 +693,7 @@ fn bufSetVolume(p: *anyopaque, v: i32) callconv(W) HRESULT {
 }
 
 fn bufSetPan(p: *anyopaque, v: i32) callconv(W) HRESULT {
+    traceFirst(15, "bufSetPan", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     if (v > 10000 or v < -10000) return E_INVALIDARG;
     self.pan = v;
@@ -428,6 +701,7 @@ fn bufSetPan(p: *anyopaque, v: i32) callconv(W) HRESULT {
 }
 
 fn bufSetFrequency(p: *anyopaque, v: u32) callconv(W) HRESULT {
+    traceFirst(16, "bufSetFrequency", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     if (v == 0) return E_INVALIDARG;
     self.frequency = v;
@@ -435,6 +709,7 @@ fn bufSetFrequency(p: *anyopaque, v: u32) callconv(W) HRESULT {
 }
 
 fn bufStop(p: *anyopaque) callconv(W) HRESULT {
+    traceFirst(17, "bufStop", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
     self.playing = false;
     self.looping = false;
@@ -442,6 +717,7 @@ fn bufStop(p: *anyopaque) callconv(W) HRESULT {
 }
 
 fn bufUnlock(p: *anyopaque, ptr1: ?*anyopaque, len1: u32, ptr2: ?*anyopaque, len2: u32) callconv(W) HRESULT {
+    traceFirst(18, "bufUnlock", @returnAddress());
     _ = p;
     // Memory-backed buffers need no copy-back, but a mismatched pair is a real
     // error the caller would rely on being reported.
@@ -451,11 +727,13 @@ fn bufUnlock(p: *anyopaque, ptr1: ?*anyopaque, len1: u32, ptr2: ?*anyopaque, len
 }
 
 fn bufRestore(p: *anyopaque) callconv(W) HRESULT {
+    traceFirst(19, "bufRestore", @returnAddress());
     _ = p;
     return S_OK;
 }
 
 fn bufSetFX(p: *anyopaque, count: u32, descs: ?*anyopaque, results: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(20, "bufSetFX", @returnAddress());
     _ = p;
     _ = count;
     _ = descs;
@@ -464,6 +742,7 @@ fn bufSetFX(p: *anyopaque, count: u32, descs: ?*anyopaque, results: ?*anyopaque)
 }
 
 fn bufAcquireResources(p: *anyopaque, flags: u32, count: u32, index: u32, found: ?*anyopaque, aff: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(21, "bufAcquireResources", @returnAddress());
     _ = p;
     _ = flags;
     _ = count;
@@ -474,6 +753,7 @@ fn bufAcquireResources(p: *anyopaque, flags: u32, count: u32, index: u32, found:
 }
 
 fn bufGetObjectInPath(p: *anyopaque, rguid: ?*const Guid, index: u32, path: u32, iid: ?*const Guid, size: u32, obj: ?*?*anyopaque) callconv(W) HRESULT {
+    traceFirst(22, "bufGetObjectInPath", @returnAddress());
     _ = p;
     _ = rguid;
     _ = index;
@@ -577,6 +857,7 @@ pub const DeviceVtbl = extern struct {
 };
 
 fn devQueryInterface(p: *anyopaque, iid: ?*const Guid, out: ?*?*anyopaque) callconv(W) HRESULT {
+    traceFirst(23, "devQueryInterface", @returnAddress());
     const self: *Device = @ptrCast(@alignCast(p));
     const o = out orelse return E_INVALIDARG;
     if (accepts(&IID_IDirectSound8, iid) or accepts(&IID_IDirectSound, iid)) {
@@ -585,30 +866,43 @@ fn devQueryInterface(p: *anyopaque, iid: ?*const Guid, out: ?*?*anyopaque) callc
         return S_OK;
     }
     o.* = null;
+    if (iid) |g| logRefused("device", g);
     return E_NOINTERFACE;
 }
 
 fn devAddRef(p: *anyopaque) callconv(W) u32 {
+    traceFirst(24, "devAddRef", @returnAddress());
     const self: *Device = @ptrCast(@alignCast(p));
     self.refs += 1;
     return self.refs;
 }
 
 fn devRelease(p: *anyopaque) callconv(W) u32 {
+    traceFirst(25, "devRelease", @returnAddress());
     const self: *Device = @ptrCast(@alignCast(p));
     if (self.refs > 0) self.refs -= 1;
     return self.refs;
 }
 
 fn devCreateSoundBuffer(p: *anyopaque, desc: ?*DSBUFFERDESC, out: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(26, "devCreateSoundBuffer", @returnAddress());
     _ = p;
     if (outer != null) return DSERR_INVALIDCALL;
     const d = desc orelse return E_INVALIDARG;
     const o = out orelse return E_INVALIDARG;
     if (d.dwSize < 36) return E_INVALIDARG;
     if ((d.dwFlags & DSBCAPS_PRIMARYBUFFER) == 0 and d.lpwfxFormat == null) return E_INVALIDARG;
-    const slot = poolTake() orelse return E_OUTOFMEMORY;
+    const slot = poolTake() orelse {
+        std.debug.print("[WINS:DSound] CreateSoundBuffer: all {d} buffers are in use; refused\n", .{POOL_MAX});
+        return E_OUTOFMEMORY;
+    };
+    if (created_logged < 12) {
+        created_logged += 1;
+        const f = d.lpwfxFormat;
+        std.debug.print("[WINS:DSound] CreateSoundBuffer(flags 0x{x}, {d} bytes, {d} Hz {d} ch {d} bit)\n", .{ d.dwFlags, d.dwBufferBytes, if (f) |x| x.nSamplesPerSec else 0, if (f) |x| x.nChannels else 0, if (f) |x| x.wBitsPerSample else 0 });
+    }
     const hr = bufAlloc(slot, d);
+    init3D(slot);
     if (hr != S_OK) {
         if (poolIndexOf(slot)) |idx| pool_used[idx] = false;
         return hr;
@@ -618,6 +912,7 @@ fn devCreateSoundBuffer(p: *anyopaque, desc: ?*DSBUFFERDESC, out: ?*?*anyopaque,
 }
 
 fn devGetCaps(p: *anyopaque, caps: ?*DSCAPS) callconv(W) HRESULT {
+    traceFirst(27, "devGetCaps", @returnAddress());
     _ = p;
     const c = caps orelse return E_INVALIDARG;
     const declared: usize = @min(@as(usize, c.dwSize), @sizeOf(DSCAPS));
@@ -638,12 +933,14 @@ fn devGetCaps(p: *anyopaque, caps: ?*DSCAPS) callconv(W) HRESULT {
 }
 
 fn devDuplicateSoundBuffer(p: *anyopaque, src: ?*anyopaque, out: ?*?*anyopaque) callconv(W) HRESULT {
+    traceFirst(28, "devDuplicateSoundBuffer", @returnAddress());
     _ = p;
     if (src == null or out == null) return E_INVALIDARG;
     return E_NOTIMPL;
 }
 
 fn devSetCooperativeLevel(p: *anyopaque, hwnd: usize, level: u32) callconv(W) HRESULT {
+    traceFirst(29, "devSetCooperativeLevel", @returnAddress());
     const self: *Device = @ptrCast(@alignCast(p));
     self.hwnd = hwnd;
     self.cooperative = level;
@@ -651,11 +948,13 @@ fn devSetCooperativeLevel(p: *anyopaque, hwnd: usize, level: u32) callconv(W) HR
 }
 
 fn devCompact(p: *anyopaque) callconv(W) HRESULT {
+    traceFirst(30, "devCompact", @returnAddress());
     _ = p;
     return S_OK;
 }
 
 fn devGetSpeakerConfig(p: *anyopaque, cfg: ?*u32) callconv(W) HRESULT {
+    traceFirst(31, "devGetSpeakerConfig", @returnAddress());
     const self: *Device = @ptrCast(@alignCast(p));
     const q = cfg orelse return E_INVALIDARG;
     q.* = self.speaker_config;
@@ -663,18 +962,21 @@ fn devGetSpeakerConfig(p: *anyopaque, cfg: ?*u32) callconv(W) HRESULT {
 }
 
 fn devSetSpeakerConfig(p: *anyopaque, cfg: u32) callconv(W) HRESULT {
+    traceFirst(32, "devSetSpeakerConfig", @returnAddress());
     const self: *Device = @ptrCast(@alignCast(p));
     self.speaker_config = cfg;
     return S_OK;
 }
 
 fn devInitialize(p: *anyopaque, guid: ?*const Guid) callconv(W) HRESULT {
+    traceFirst(33, "devInitialize", @returnAddress());
     _ = p;
     _ = guid;
     return E_NOTIMPL;
 }
 
 fn devVerifyCertification(p: *anyopaque, cert: ?*u32) callconv(W) HRESULT {
+    traceFirst(34, "devVerifyCertification", @returnAddress());
     _ = p;
     const q = cert orelse return E_INVALIDARG;
     q.* = 1; // DS_CERTIFIED
@@ -717,16 +1019,19 @@ fn makeDevice(out: ?*?*anyopaque, outer: ?*anyopaque) HRESULT {
 // ---------------------------------------------------------------------------
 
 fn DirectSoundCreate(guid: ?*const Guid, out: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(35, "DirectSoundCreate", @returnAddress());
     _ = guid;
     return makeDevice(out, outer);
 }
 
 fn DirectSoundCreate8(guid: ?*const Guid, out: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(36, "DirectSoundCreate8", @returnAddress());
     _ = guid;
     return makeDevice(out, outer);
 }
 
 fn DirectSoundCaptureCreate(guid: ?*const Guid, out: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(37, "DirectSoundCaptureCreate", @returnAddress());
     _ = guid;
     _ = outer;
     if (out) |o| o.* = null;
@@ -734,6 +1039,7 @@ fn DirectSoundCaptureCreate(guid: ?*const Guid, out: ?*?*anyopaque, outer: ?*any
 }
 
 fn DirectSoundCaptureCreate8(guid: ?*const Guid, out: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(38, "DirectSoundCaptureCreate8", @returnAddress());
     return DirectSoundCaptureCreate(guid, out, outer);
 }
 
@@ -770,6 +1076,7 @@ const wide_device_name: [16:0]u16 = .{
 };
 
 fn DirectSoundEnumerateA(cb: ?EnumerateProc, ctx: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(39, "DirectSoundEnumerateA", @returnAddress());
     const f = cb orelse return E_INVALIDARG;
     // One device, no GUID (the default device), then the terminating null entry.
     _ = f(null, "WINS DirectSound", null, ctx);
@@ -778,6 +1085,7 @@ fn DirectSoundEnumerateA(cb: ?EnumerateProc, ctx: ?*anyopaque) callconv(W) HRESU
 }
 
 fn DirectSoundEnumerateW(cb: ?EnumerateProcW, ctx: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(40, "DirectSoundEnumerateW", @returnAddress());
     const f = cb orelse return E_INVALIDARG;
     _ = f(null, &wide_device_name, null, ctx);
     _ = f(null, null, null, ctx);
@@ -785,12 +1093,14 @@ fn DirectSoundEnumerateW(cb: ?EnumerateProcW, ctx: ?*anyopaque) callconv(W) HRES
 }
 
 fn DirectSoundCaptureEnumerateA(cb: ?EnumerateProc, ctx: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(41, "DirectSoundCaptureEnumerateA", @returnAddress());
     _ = cb;
     _ = ctx;
     return S_OK; // no capture device: an empty enumeration is the honest answer
 }
 
 fn DirectSoundCaptureEnumerateW(cb: ?EnumerateProcW, ctx: ?*anyopaque) callconv(W) HRESULT {
+    traceFirst(42, "DirectSoundCaptureEnumerateW", @returnAddress());
     _ = cb;
     _ = ctx;
     return S_OK;
@@ -845,4 +1155,12 @@ pub fn lookupDsound(name: []const u8) ?usize {
         if (std.mem.eql(u8, name, entry[0])) return @intFromPtr(entry[1]);
     }
     return null;
+}
+
+var traced: [64]bool = [_]bool{false} ** 64;
+/// Instrument: the first call of each DirectSound entry point, with its caller.
+fn traceFirst(slot: usize, comptime name: []const u8, caller: usize) void {
+    if (slot >= traced.len or traced[slot]) return;
+    traced[slot] = true;
+    std.debug.print("[WINS:DSound] first call: {s} (caller 0x{x})\n", .{ name, caller });
 }

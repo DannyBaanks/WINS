@@ -2881,17 +2881,24 @@ fn dev9_ColorFill(this: *anyopaque, surf_raw: ?*anyopaque, rect: ?*const D3DRECT
     return D3D_OK;
 }
 
-fn dev9_CreateOffscreenPlainSurface(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: ?*?*anyopaque, p5: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    _ = p4;
-    _ = p5;
-    std.debug.print("[WINS:D3D9] device!CreateOffscreenPlainSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// A plain surface in system or scratch memory (screenshots, readbacks): CPU
+/// pixels with the format's real layout, lockable. D3DPOOL_MANAGED is invalid
+/// for these, as in D3D9.
+fn dev9_CreateOffscreenPlainSurface(this: *anyopaque, width: u32, height: u32, format: u32, pool: u32, ppSurface: ?*?*anyopaque, pShared: ?*anyopaque) callconv(W) HRESULT {
+    _ = pShared;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppSurface orelse return D3DERR_INVALIDCALL;
+    out.* = null;
+    if (width == 0 or height == 0 or pool == 1) return D3DERR_INVALIDCALL;
+    if (surfaceLayout(format, 1, 1) == null) return D3DERR_INVALIDCALL;
+    const sf = WinsSurface9.create(self.allocator, width, height, format) catch return E_OUTOFMEMORY;
+    sf.usage = 0;
+    sf.pool = pool;
+    sf.owner_device = this;
+    out.* = sf;
+    return D3D_OK;
 }
+
 
 /// Slot 0 must stay bound; slots 1..3 (multiple render targets) may be
 /// unbound with null. Setting slot 0 resets the viewport and the scissor
