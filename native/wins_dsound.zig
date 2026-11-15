@@ -105,6 +105,9 @@ pub const WAVEFORMATEX = extern struct {
     wBitsPerSample: u16 = 16,
     cbSize: u16 = 0,
 };
+/// Size of WAVEFORMATEX on the wire (mmreg.h packs it); the extern struct
+/// above is padded to 20.
+pub const WAVEFORMATEX_BYTES: u32 = 18;
 
 pub const DSBUFFERDESC = extern struct {
     dwSize: u32,
@@ -560,11 +563,24 @@ fn bufGetCurrentPosition(p: *anyopaque, play: ?*u32, write: ?*u32) callconv(W) H
 fn bufGetFormat(p: *anyopaque, wfx: ?*WAVEFORMATEX, size: u32, written: ?*u32) callconv(W) HRESULT {
     traceFirst(5, "bufGetFormat", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
-    const dest = wfx orelse return E_INVALIDARG;
-    if (size < @sizeOf(WAVEFORMATEX)) return E_INVALIDARG;
-    dest.* = self.wfx;
-    if (written) |q| q.* = @sizeOf(WAVEFORMATEX);
-    return S_OK;
+    // dsound.h's WAVEFORMATEX is packed: 18 bytes, where @sizeOf() of the
+    // extern struct is 20. FalloutNV's stream reader (0xaf083e) passes exactly
+    // 18; refusing that left its format block unwritten and it then divided by
+    // wBitsPerSample/8 == 0 at 0xaf0a0d.
+    const need: u32 = WAVEFORMATEX_BYTES;
+    const dest = wfx orelse {
+        // NULL is the size query.
+        const q = written orelse return E_INVALIDARG;
+        q.* = need;
+        return S_OK;
+    };
+    const n: u32 = @min(size, need);
+    const src: [*]const u8 = @ptrCast(&self.wfx);
+    const dst: [*]u8 = @ptrCast(dest);
+    @memcpy(dst[0..n], src[0..n]);
+    if (written) |q| q.* = n;
+    // Too small a block still receives its prefix, as dsound does.
+    return if (size < need) E_INVALIDARG else S_OK;
 }
 
 fn bufGetVolume(p: *anyopaque, v: ?*i32) callconv(W) HRESULT {

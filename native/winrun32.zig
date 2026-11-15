@@ -198,24 +198,31 @@ fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque
             // "the whole object is zero" was discovered on 7zr: an entirely blank
             // block means it was never constructed, which no register dump shows.
             const edi_val = uctx.uc_mcontext.edi;
+            // Every read here goes through process_vm_readv: a register that
+            // holds a plain number (EAX = 0xba26 bytes on FalloutNV's SIGFPE)
+            // is not a pointer, and dereferencing it faulted inside this
+            // handler and cut the report short.
             if (edi_val > 0x1000 and edi_val + 8 < 0xFFFFF000) {
-                const obj: usize = @as(*const usize, @ptrFromInt(edi_val)).*;
+                var first: [1]u32 = undefined;
+                const obj: usize = if (crashRead(edi_val, &first)) first[0] else 0;
                 // Not gated to the guest image: a heap block from our own malloc is
-                // a valid host address, and the guest reading obj+0x2b0 without
-                // faulting proves those pages are mapped.
-                const base = if (obj > 0x1000 and obj + 0x300 < 0xFFFFF000) obj else edi_val;
-                if (base > 0x1000) {
+                // a valid host address.
+                var block: [0x300 / 4]u32 = undefined;
+                var base: usize = 0;
+                if (obj > 0x1000 and obj + 0x300 < 0xFFFFF000 and crashRead(obj, &block)) {
+                    base = obj;
+                } else if (crashRead(edi_val, &block)) {
+                    base = edi_val;
+                }
+                if (base != 0) {
                     var nonzeros: usize = 0;
-                    var o: usize = 0;
-                    while (o < 0x300) : (o += 4) {
-                        if (@as(*const u32, @ptrFromInt(base + o)).* != 0) nonzeros += 1;
+                    for (block) |v| {
+                        if (v != 0) nonzeros += 1;
                     }
                     std.debug.print("  Object base [EDI=0x{x}] = 0x{x}: {d} non-zero words in +0x000..0x300\n", .{ edi_val, base, nonzeros });
                     if (nonzeros > 0 and nonzeros < 64) {
-                        o = 0;
-                        while (o < 0x300) : (o += 4) {
-                            const v: u32 = @as(*const u32, @ptrFromInt(base + o)).*;
-                            if (v != 0) std.debug.print("    +0x{x:0>3}: 0x{x:0>8}\n", .{ o, v });
+                        for (block, 0..) |v, i| {
+                            if (v != 0) std.debug.print("    +0x{x:0>3}: 0x{x:0>8}\n", .{ i * 4, v });
                         }
                     } else if (nonzeros >= 64) {
                         std.debug.print("    (too populated to summarise; the object was likely constructed)\n", .{});
@@ -230,18 +237,16 @@ fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque
             // *different* access, and for this crash it names the object whose
             // +4 field came back null.
             const eax_val = uctx.uc_mcontext.eax;
-            if (eax_val > 0x1000 and eax_val + 0x40 < 0xFFFFF000) {
+            var sub: [0x40 / 4]u32 = undefined;
+            if (eax_val > 0x1000 and eax_val + 0x40 < 0xFFFFF000 and crashRead(eax_val, &sub)) {
                 var nn: usize = 0;
-                var o: usize = 0;
-                while (o < 0x40) : (o += 4) {
-                    if (@as(*const u32, @ptrFromInt(eax_val + o)).* != 0) nn += 1;
+                for (sub) |v| {
+                    if (v != 0) nn += 1;
                 }
                 std.debug.print("  Sub-object at EAX=0x{x}: {d} non-zero words in +0x00..0x40\n", .{ eax_val, nn });
                 if (nn > 0 and nn < 24) {
-                    o = 0;
-                    while (o < 0x40) : (o += 4) {
-                        const v: u32 = @as(*const u32, @ptrFromInt(eax_val + o)).*;
-                        if (v != 0) std.debug.print("    +0x{x:0>3}: 0x{x:0>8}\n", .{ o, v });
+                    for (sub, 0..) |v, i| {
+                        if (v != 0) std.debug.print("    +0x{x:0>3}: 0x{x:0>8}\n", .{ i * 4, v });
                     }
                 }
             }
@@ -256,6 +261,16 @@ fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque
     linux.exit_group(139);
 }
 
+/// Copies `out.len` words from `addr` without touching the address directly,
+/// so an unmapped or non-pointer value answers false instead of faulting.
+fn crashRead(addr: usize, out: []u32) bool {
+    const bytes = out.len * @sizeOf(u32);
+    var local = [_]std.posix.iovec{.{ .base = @ptrCast(out.ptr), .len = bytes }};
+    var remote = [_]std.posix.iovec_const{.{ .base = @ptrFromInt(@max(addr, 1)), .len = bytes }};
+    const got = linux.process_vm_readv(linux.getpid(), &local, &remote, 0);
+    return linux.errno(got) == .SUCCESS and got == bytes;
+}
+
 fn installCrashHandlers() void {
     var sa = linux.Sigaction{
         .handler = .{ .sigaction = &sigHandler },
@@ -265,6 +280,9 @@ fn installCrashHandlers() void {
     _ = linux.sigaction(linux.SIG.SEGV, &sa, null);
     _ = linux.sigaction(linux.SIG.BUS, &sa, null);
     _ = linux.sigaction(linux.SIG.ILL, &sa, null);
+    // Integer division by zero: FalloutNV exited with status 136 (SIGFPE)
+    // and no report before this was added.
+    _ = linux.sigaction(linux.SIG.FPE, &sa, null);
 }
 
 // ============================================================================
