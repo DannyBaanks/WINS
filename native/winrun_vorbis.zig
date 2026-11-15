@@ -146,34 +146,42 @@ fn vfSym(comptime name: [:0]const u8) ?*anyopaque {
     return p;
 }
 
+/// How the guest calls these entry points: cdecl, but a Windows caller only
+/// keeps ESP 4-byte aligned. A host library built for the i386 System V ABI
+/// assumes 16 (the Steam runtime's libvorbisfile loads locals with movdqa:
+/// ov_raw_seek+0x6a5, a general-protection fault reported as a NULL read when
+/// FalloutNV's Continue opened its first .ogg). Declaring 4-byte incoming
+/// alignment makes each wrapper realign the stack before calling the library.
+const GuestC: std.builtin.CallingConvention = .{ .x86_sysv = .{ .incoming_stack_alignment = 4 } };
+
 /// The table the import resolver consults. Every entry forwards to the real
 /// library; nothing here answers on the library's behalf.
 pub fn lookupVorbisfile(name: []const u8) ?usize {
     const T = struct {
-        fn f_ov_clear(vf: ?*anyopaque) callconv(.c) i32 {
+        fn f_ov_clear(vf: ?*anyopaque) callconv(GuestC) i32 {
             const f: *const fn (?*anyopaque) callconv(.c) i32 = @ptrCast(vfSym("ov_clear") orelse return -1);
             return f(vf);
         }
-        fn f_ov_seekable(vf: ?*anyopaque) callconv(.c) i32 {
+        fn f_ov_seekable(vf: ?*anyopaque) callconv(GuestC) i32 {
             const f: *const fn (?*anyopaque) callconv(.c) i32 = @ptrCast(vfSym("ov_seekable") orelse return 0);
             return f(vf);
         }
-        fn f_ov_pcm_total(vf: ?*anyopaque, i: i32) callconv(.c) i64 {
+        fn f_ov_pcm_total(vf: ?*anyopaque, i: i32) callconv(GuestC) i64 {
             const f: *const fn (?*anyopaque, i32) callconv(.c) i64 = @ptrCast(vfSym("ov_pcm_total") orelse return -1);
             return f(vf, i);
         }
-        fn f_ov_info(vf: ?*anyopaque, i: i32) callconv(.c) ?*anyopaque {
+        fn f_ov_info(vf: ?*anyopaque, i: i32) callconv(GuestC) ?*anyopaque {
             const f: *const fn (?*anyopaque, i32) callconv(.c) ?*anyopaque = @ptrCast(vfSym("ov_info") orelse return null);
             return f(vf, i);
         }
-        fn f_ov_read(vf: ?*anyopaque, buffer: ?[*]u8, length: i32, bigendianp: i32, word: i32, sgned: i32, bitstream: ?*i32) callconv(.c) i64 {
+        fn f_ov_read(vf: ?*anyopaque, buffer: ?[*]u8, length: i32, bigendianp: i32, word: i32, sgned: i32, bitstream: ?*i32) callconv(GuestC) i64 {
             const f: *const fn (?*anyopaque, ?[*]u8, i32, i32, i32, i32, ?*i32) callconv(.c) i64 = @ptrCast(vfSym("ov_read") orelse {
                 if (bitstream) |b| b.* = 0;
                 return 0;
             });
             return f(vf, buffer, length, bigendianp, word, sgned, bitstream);
         }
-        fn f_ov_open_callbacks(datasource: ?*anyopaque, vf: ?*anyopaque, initial: ?[*:0]const u8, ibytes: i32, callbacks: OvCallbacks) callconv(.c) i32 {
+        fn f_ov_open_callbacks(datasource: ?*anyopaque, vf: ?*anyopaque, initial: ?[*:0]const u8, ibytes: i32, callbacks: OvCallbacks) callconv(GuestC) i32 {
             const f: *const fn (?*anyopaque, ?*anyopaque, ?[*:0]const u8, i32, OvCallbacks) callconv(.c) i32 = @ptrCast(vfSym("ov_open_callbacks") orelse return -132);
             return f(datasource, vf, initial, ibytes, callbacks);
         }
