@@ -3135,9 +3135,11 @@ fn XInputEnable(enable: u32) callconv(C) void {
 /// winmm's mmio*: unbuffered RIFF file I/O. A file is read either through the
 /// caller's own I/O procedure (MMIOINFO.pIOProc -- FalloutNV reads its .wav
 /// effects out of the .bsa archives this way, IOProc 0xaf0400) or, without one,
-/// from a real fd. Descend/Ascend walk the RIFF chunks as winmm does. There is
-/// no internal buffer, so MMIO_ALLOCBUF is accepted and mmioAdvance answers
-/// MMIOERR_UNBUFFERED. Writing is not modelled: a write open fails.
+/// from a real fd. Descend/Ascend walk the RIFF chunks as winmm does. With
+/// MMIO_ALLOCBUF (or a caller's buffer) reads go through an I/O buffer that the
+/// caller may also walk directly: mmioGetInfo hands out its pointers and
+/// mmioAdvance loads the next stretch (FalloutNV reads sample data this way).
+/// Writing is not modelled: a write open fails.
 pub fn lookupWinmm(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "mmioClose")) return @intFromPtr(&mmioClose);
     if (std.mem.eql(u8, name, "mmioDescend")) return @intFromPtr(&mmioDescend);
@@ -3193,7 +3195,11 @@ const MmioFile = struct {
     used: bool = false,
     fd: i32 = -1,
     /// The MMIOINFO the I/O procedure sees; it keeps its own state in adwInfo.
+    /// With an I/O buffer, pchBuffer..pchEndRead holds the file bytes from
+    /// lBufOffset on and pchNext is the read position inside it.
     info: MMIOINFO = std.mem.zeroes(MMIOINFO),
+    /// MMIO_ALLOCBUF's buffer (MMIO_DEFAULTBUFFER bytes).
+    own_buffer: [8192]u8 = undefined,
 };
 
 var g_mmio_table: [32]MmioFile = [_]MmioFile{.{}} ** 32;
@@ -3219,6 +3225,56 @@ fn mmioFile(hmmio: usize) ?*MmioFile {
     return if (f.used) f else null;
 }
 
+/// Read at the device's own position (the I/O procedure or the fd).
+fn mmioRawRead(f: *MmioFile, buf: [*]u8, want: usize) isize {
+    if (f.info.pIOProc) |proc| return proc(&f.info, MMIOM_READ, @intFromPtr(buf), want);
+    var total: usize = 0;
+    while (total < want) {
+        const r = linux.read(f.fd, buf + total, want - total);
+        if (linux.errno(r) != .SUCCESS) return if (total > 0) @intCast(total) else -1;
+        if (r == 0) break;
+        total += r;
+    }
+    f.info.lDiskOffset += @intCast(total);
+    return @intCast(total);
+}
+
+/// Move the device's position; the new position, or -1.
+fn mmioRawSeek(f: *MmioFile, offset: i32, origin: i32) i32 {
+    if (f.info.pIOProc) |proc| {
+        const rc = proc(&f.info, MMIOM_SEEK, @as(usize, @bitCast(@as(isize, offset))), @as(usize, @bitCast(@as(isize, origin))));
+        if (rc == -1) return -1;
+        // The procedure keeps lDiskOffset current; that is the position winmm
+        // itself goes by. Its return value is not reliable: FalloutNV's
+        // (0xaf0583) seeks, stores the position there and returns 0.
+        return f.info.lDiskOffset;
+    }
+    if (origin < 0 or origin > 2) return -1;
+    const r = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, f.fd))), @as(usize, @bitCast(@as(isize, offset))), @as(usize, @intCast(origin)));
+    if (linux.errno(r) != .SUCCESS) return -1;
+    f.info.lDiskOffset = @intCast(r);
+    return @intCast(r);
+}
+
+fn mmioBuffered(f: *const MmioFile) bool {
+    return f.info.cchBuffer > 0 and f.info.pchBuffer != 0;
+}
+/// Bytes of the file held in the buffer.
+fn mmioHeld(f: *const MmioFile) u32 {
+    return f.info.pchEndRead - f.info.pchBuffer;
+}
+/// Load the buffer with the file from `offset` on. False on a device error.
+fn mmioFill(f: *MmioFile, offset: i32) bool {
+    if (f.info.lDiskOffset != offset and mmioRawSeek(f, offset, 0) < 0) return false;
+    f.info.lBufOffset = offset;
+    f.info.pchNext = f.info.pchBuffer;
+    f.info.pchEndRead = f.info.pchBuffer;
+    const got = mmioRawRead(f, @ptrFromInt(f.info.pchBuffer), @intCast(f.info.cchBuffer));
+    if (got < 0) return false;
+    f.info.pchEndRead += @intCast(got);
+    return true;
+}
+
 fn mmioOpenA(szFilename: ?[*:0]const u8, pmioopen: ?*MMIOINFO, dwOpenFlags: u32) callconv(W) usize {
     var slot: ?*MmioFile = null;
     var index: usize = 0;
@@ -3230,11 +3286,14 @@ fn mmioOpenA(szFilename: ?[*:0]const u8, pmioopen: ?*MMIOINFO, dwOpenFlags: u32)
         }
     }
     const f = slot orelse return 0;
-    f.* = .{};
+    f.used = false;
+    f.fd = -1;
+    f.info = std.mem.zeroes(MMIOINFO);
     if (pmioopen) |src| f.info = src.*;
     f.info.dwFlags = dwOpenFlags;
     f.info.hmmio = @intCast(MMIO_HANDLE_BASE + index + 1);
     f.info.lDiskOffset = 0;
+    f.info.lBufOffset = 0;
     if (f.info.pIOProc) |proc| {
         const rc = proc(&f.info, MMIOM_OPEN, @intFromPtr(szFilename), 0);
         if (rc != 0) {
@@ -3250,6 +3309,19 @@ fn mmioOpenA(szFilename: ?[*:0]const u8, pmioopen: ?*MMIOINFO, dwOpenFlags: u32)
         if (linux.errno(fd) != .SUCCESS) return 0;
         f.fd = @intCast(fd);
     }
+    // The I/O buffer: the caller's, or ours for MMIO_ALLOCBUF; empty until read.
+    if (!(f.info.cchBuffer > 0 and f.info.pchBuffer != 0)) {
+        if (dwOpenFlags & 0x10000 != 0) { // MMIO_ALLOCBUF
+            f.info.pchBuffer = @intFromPtr(&f.own_buffer);
+            f.info.cchBuffer = @intCast(f.own_buffer.len);
+        } else {
+            f.info.pchBuffer = 0;
+            f.info.cchBuffer = 0;
+        }
+    }
+    f.info.pchNext = f.info.pchBuffer;
+    f.info.pchEndRead = f.info.pchBuffer;
+    f.info.pchEndWrite = f.info.pchBuffer;
     f.used = true;
     if (pmioopen) |src| src.wErrorRet = 0;
     mmioTrace("mmioOpenA(\"{s}\") -> 0x{x}", .{ if (szFilename) |n| std.mem.sliceTo(n, 0) else "", f.info.hmmio });
@@ -3272,34 +3344,49 @@ fn mmioRead(hmmio: usize, pch: ?[*]u8, cch: i32) callconv(W) i32 {
     const f = mmioFile(hmmio) orelse return -1;
     const buf = pch orelse return 0;
     if (cch <= 0) return 0;
-    if (f.info.pIOProc) |proc| return @intCast(proc(&f.info, MMIOM_READ, @intFromPtr(buf), @intCast(cch)));
-    var total: usize = 0;
     const want: usize = @intCast(cch);
+    if (!mmioBuffered(f)) return @intCast(mmioRawRead(f, buf, want));
+    var total: usize = 0;
     while (total < want) {
-        const r = linux.read(f.fd, buf + total, want - total);
-        if (linux.errno(r) != .SUCCESS) return if (total > 0) @intCast(total) else -1;
-        if (r == 0) break;
-        total += r;
+        var avail: usize = f.info.pchEndRead - f.info.pchNext;
+        if (avail == 0) {
+            if (!mmioFill(f, f.info.lBufOffset + @as(i32, @intCast(mmioHeld(f))))) return if (total > 0) @intCast(total) else -1;
+            avail = mmioHeld(f);
+            if (avail == 0) break; // end of file
+        }
+        const n = @min(avail, want - total);
+        const src: [*]const u8 = @ptrFromInt(f.info.pchNext);
+        @memcpy(buf[total .. total + n], src[0..n]);
+        f.info.pchNext += @intCast(n);
+        total += n;
     }
-    f.info.lDiskOffset += @intCast(total);
     return @intCast(total);
 }
 
 fn mmioSeek(hmmio: usize, lOffset: i32, iOrigin: i32) callconv(W) i32 {
     const f = mmioFile(hmmio) orelse return -1;
-    if (f.info.pIOProc) |proc| {
-        const rc = proc(&f.info, MMIOM_SEEK, @as(usize, @bitCast(@as(isize, lOffset))), @as(usize, @bitCast(@as(isize, iOrigin))));
-        if (rc == -1) return -1;
-        // The procedure keeps lDiskOffset current; that is the position winmm
-        // itself goes by. Its return value is not reliable: FalloutNV's
-        // (0xaf0583) seeks, stores the position there and returns 0.
-        return f.info.lDiskOffset;
+    if (!mmioBuffered(f)) return mmioRawSeek(f, lOffset, iOrigin);
+    const here: i32 = f.info.lBufOffset + @as(i32, @intCast(f.info.pchNext - f.info.pchBuffer));
+    const target: i32 = switch (iOrigin) {
+        0 => lOffset,
+        1 => here +% lOffset,
+        2 => blk: {
+            const end = mmioRawSeek(f, 0, 2);
+            if (end < 0) return -1;
+            break :blk end +% lOffset;
+        },
+        else => return -1,
+    };
+    if (target < 0) return -1;
+    if (target >= f.info.lBufOffset and target <= f.info.lBufOffset + @as(i32, @intCast(mmioHeld(f)))) {
+        f.info.pchNext = f.info.pchBuffer + @as(u32, @intCast(target - f.info.lBufOffset));
+    } else {
+        // Outside what is held: an empty buffer at the target, loaded on the next read.
+        f.info.lBufOffset = target;
+        f.info.pchNext = f.info.pchBuffer;
+        f.info.pchEndRead = f.info.pchBuffer;
     }
-    if (iOrigin < 0 or iOrigin > 2) return -1;
-    const r = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, f.fd))), @as(usize, @bitCast(@as(isize, lOffset))), @as(usize, @intCast(iOrigin)));
-    if (linux.errno(r) != .SUCCESS) return -1;
-    f.info.lDiskOffset = @intCast(r);
-    return @intCast(r);
+    return target;
 }
 
 /// Find a chunk (optionally a given one, optionally inside `parent`) and leave
@@ -3374,6 +3461,7 @@ fn mmioAscend(hmmio: usize, lpck: ?*const MMCKINFO, wFlags: u32) callconv(W) u32
     return 0;
 }
 
+/// Hand the caller the buffer pointers so it can read the bytes in place.
 fn mmioGetInfo(hmmio: usize, pmmioinfo: ?*MMIOINFO, wFlags: u32) callconv(W) u32 {
     _ = wFlags;
     const f = mmioFile(hmmio) orelse return MMSYSERR_INVALHANDLE;
@@ -3381,18 +3469,32 @@ fn mmioGetInfo(hmmio: usize, pmmioinfo: ?*MMIOINFO, wFlags: u32) callconv(W) u32
     return 0;
 }
 
-fn mmioAdvance(hmmio: usize, pmmioinfo: ?*const MMIOINFO, wFlags: u32) callconv(W) u32 {
-    _ = pmmioinfo;
-    _ = wFlags;
-    if (mmioFile(hmmio) == null) return MMSYSERR_INVALHANDLE;
-    return MMIOERR_UNBUFFERED;
+/// The caller walked the buffer to its end (its pchNext says how far): load
+/// the stretch of the file that follows and give it the new pointers. At the
+/// end of the file the buffer comes back empty (pchNext == pchEndRead).
+fn mmioAdvance(hmmio: usize, pmmioinfo: ?*MMIOINFO, wFlags: u32) callconv(W) u32 {
+    const f = mmioFile(hmmio) orelse return MMSYSERR_INVALHANDLE;
+    if (!mmioBuffered(f)) return MMIOERR_UNBUFFERED;
+    if (wFlags & 1 != 0) return 260; // MMIO_WRITE: MMIOERR_CANNOTWRITE, writing is not modelled
+    if (!mmioFill(f, f.info.lBufOffset + @as(i32, @intCast(mmioHeld(f))))) return 261; // MMIOERR_CANNOTREAD
+    if (pmmioinfo) |out| {
+        out.pchNext = f.info.pchNext;
+        out.pchEndRead = f.info.pchEndRead;
+        out.pchEndWrite = f.info.pchEndWrite;
+        out.lBufOffset = f.info.lBufOffset;
+        out.lDiskOffset = f.info.lDiskOffset;
+    }
+    return 0;
 }
 
+/// The caller is done reading in place: take its position back.
 fn mmioSetInfo(hmmio: usize, pmmioinfo: ?*const MMIOINFO, wFlags: u32) callconv(W) u32 {
-    _ = pmmioinfo;
     _ = wFlags;
-    // No internal buffer, so there are no buffer pointers to take back.
-    if (mmioFile(hmmio) == null) return MMSYSERR_INVALHANDLE;
+    const f = mmioFile(hmmio) orelse return MMSYSERR_INVALHANDLE;
+    const in = pmmioinfo orelse return 11; // MMSYSERR_INVALPARAM
+    if (!mmioBuffered(f)) return 0;
+    if (in.pchNext < f.info.pchBuffer or in.pchNext > f.info.pchEndRead) return 11;
+    f.info.pchNext = in.pchNext;
     return 0;
 }
 

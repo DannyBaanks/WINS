@@ -490,6 +490,8 @@ var g_last_y: c_int = 0;
 var g_have_last = false;
 var g_seen_types: u16 = 0;
 var g_keys_logged: u32 = 0;
+var g_last_key_logged: c_uint = 0;
+var g_last_key_type: c_int = 0;
 
 /// Render thread: X11 events of the game window -> DirectInput state. While
 /// the window has the focus the pointer is kept inside it (warped back to the
@@ -499,9 +501,13 @@ fn pumpInput() void {
     var ev: XEvent = undefined;
     while (xlib.XPending(dpy) > 0) {
         _ = xlib.XNextEvent(dpy, &ev);
-        if (ev.type == 2 and g_keys_logged < 40) {
+        // Key presses and releases, logged when the key differs from the last
+        // one logged (holding W to walk would otherwise use the whole budget).
+        if ((ev.type == 2 or ev.type == 3) and g_keys_logged < 600 and (ev.detail != g_last_key_logged or ev.type != g_last_key_type)) {
             g_keys_logged += 1;
-            std.debug.print("[WINS:GL] KeyPress keycode {d} -> DIK 0x{x}\n", .{ ev.detail, input.dikFromX11(ev.detail) });
+            g_last_key_logged = ev.detail;
+            g_last_key_type = ev.type;
+            std.debug.print("[WINS:GL] Key{s} keycode {d} -> DIK 0x{x}\n", .{ if (ev.type == 2) "Press" else "Release", ev.detail, input.dikFromX11(ev.detail) });
         }
         if (ev.type >= 2 and ev.type <= 8 and g_seen_types & (@as(u16, 1) << @intCast(ev.type)) == 0) {
             g_seen_types |= @as(u16, 1) << @intCast(ev.type);
