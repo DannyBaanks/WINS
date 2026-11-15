@@ -10,8 +10,10 @@ Linux** (as a launcher + app folder, or as a single AppImage).
 Most "Windows-only" desktop software is not really Windows code. It is a web app in Electron, an NW.js game, a
 managed .NET program, or a Python bundle, wrapped in a Windows installer. For those, WINS peels the wrapper off and
 runs the real program on its native Linux runtime. For genuinely native Win32 code (C++ against `kernel32`, `user32`,
-Direct3D...) WINS does not pretend: it measures how far away a Linux version is, and builds fuzz-verified Linux
-replacements for the Windows APIs the program calls, one function at a time.
+Direct3D...) WINS does not pretend: it measures how far away a Linux version is, and either builds fuzz-verified Linux
+replacements for the Windows APIs the program calls, one function at a time, or, for 32-bit programs, runs the program
+itself under its own PE loader that answers those APIs natively. Fallout: New Vegas is the worked example of the second
+route.
 
 ---
 
@@ -27,10 +29,13 @@ demonstrated and what has **not** — a launcher existing is not the same as the
 | **Qwen 1.0.3.44** | Electron (NSIS + 7z payload, ASAR) | Installed in `~/.local/share/qwen-desktop` (305 MB) with a launcher | Triage output recorded (see *Quickstart*); installed with a launcher | No desktop-menu entry is registered; no recorded run in this repo |
 | **ShareX 22.3.0** | .NET 10 + Avalonia UI | Installed in `~/.local/share/sharex-desktop` (491 MB), launcher + desktop entry | Runtime correctly identified; Avalonia X11 assemblies present | A successful launch: it ships a Windows-targeted host, so this is not proven |
 | **Notepad++ 8.9.9** | Native Win32 (C++, Scintilla) | Installed via the transpiler path (28 MB); POSIX shims for part of its API surface | Classified, API surface harvested | **The desktop entry is broken** (it points at a deleted temp directory) and a working run is not demonstrated |
-| WinMerge, Greenshot | Native Win32 / legacy .NET Framework + WinForms | Classified only | Correct triage | Nothing runs: the micro-isolation recipe they are routed to is **not implemented** |
+| **Fallout: New Vegas** (Steam build) | Native Win32 (i386 C++; Direct3D 9, DirectSound, DirectInput, DirectShow, Bink) | Runs under the WINS i386 PE loader through a Steam compatibility tool (`launch/falloutnv/`): no Proton, no Wine. The installed game is read-only to it; WINS keeps its own profile and saves | Menu, New Game, character creation, Continue from a save, the Mojave exterior, effects, Pip-Boy sounds, voices, music and the intro video, rendered on the host GPU (the NVIDIA one on a hybrid laptop). Observed in hand play-throughs on one machine | Long sessions, most quests, combat-heavy scenes, water (`SetClipPlane` is unimplemented), controllers, mods and script extenders. One machine only: Ubuntu 24.04, hybrid AMD/NVIDIA laptop |
+| WinMerge, Greenshot | Native Win32 / legacy .NET Framework + WinForms | Classified only | Correct triage | Nothing runs: they are routed to the transpiler recipe, which only analyses and harvests (the port is **NOT_DEMONSTRATED**) |
 
 **Honest scope:** WINS reliably ports *runtime-wrapped* software (Electron, NW.js, modern .NET). It does **not** yet
-run arbitrary native Win32 applications. See *How far can it go?* below for a worked example with a real, huge one.
+run arbitrary native Win32 applications: its own loader runs one large native 32-bit game, after the Windows APIs that
+game needs were implemented one by one, and every other native program is a project of its own. `libs/GAPS.md`
+measures how far each one is. See *How far can it go?* below for a worked example with a real, huge one.
 
 ---
 
@@ -45,7 +50,10 @@ run arbitrary native Win32 applications. See *How far can it go?* below for a wo
 4. **Rebuild Windows APIs for Linux, proven by fuzzing** (`winlux*`) — each replacement is differential- or
    metamorphic-fuzzed in a `bubblewrap` sandbox against an independent oracle, and ships with deliberately broken
    variants that the fuzzer **must** catch.
-5. **Tell you when it will not work** — with numbers (see 3ds Max below).
+5. **Run native 32-bit Windows programs on its own loader** (`winrun32`) — a PE loader plus the Windows APIs it
+   answers, in Zig, split into versioned libraries (`wins-d3d9`, `wins-dsound`, ...). `winrun32 --imports prog.exe`
+   says which imports resolve and which Windows DLLs have no library yet. See [`libs/README.md`](./libs/README.md).
+6. **Tell you when it will not work** — with numbers (see 3ds Max below).
 
 ---
 
@@ -89,7 +97,33 @@ What each one does **not** do is part of its contract:
 - **winluxhttp only chooses proxies.** There is no HTTP transport, PAC script engine or WPAD detection — and none is
   needed by the Qt libraries it was built for, which only ask Windows where the proxy is. Behaviour in corners the
   documentation does not pin down is an assumption, not a verified match with Windows.
-- None of these is a PE loader. Without one, no Windows executable can call them.
+- None of these is itself a PE loader. The loaders are separate programs, described next.
+
+---
+
+## Running native Windows programs: the WINS loaders
+
+| Loader | Runs | State |
+|---|---|---|
+| `winrun32` | 32-bit (i386) PE32 | Runs Fallout: New Vegas (see the table above). `--check` and `--imports` resolve a program's imports without running it; `--libs` prints the library registry |
+| `winrun` | x86-64 console PE32+ | Maps the image, resolves imports and **refuses to run if any is missing**; execution requires the boxed launcher. No program is claimed to run on it here |
+| `winrun_gui` | x86-64 with a window | Same, with the window support. `--check` measures; no program is claimed to run on it here |
+
+Each Windows DLL a loader answers for is a **library** with a version (`wins-d3d9 0.1.0`, ...), recorded in
+[`native/wins_libs.zig`](./native/wins_libs.zig); [`libs/README.md`](./libs/README.md) explains how to read it, and
+[`libs/GAPS.md`](./libs/GAPS.md) (generated) lists the DLLs and imports WINS still lacks compared with what real
+programs ask for. A resolved import is not a working API: the registry's `status` and `evidence` say what was actually
+run.
+
+Fallout: New Vegas (Steam build) as a Steam compatibility tool; the requirements (32-bit libraries, `bubblewrap`) are
+in [`launch/falloutnv/README.txt`](./launch/falloutnv/README.txt):
+
+```bash
+tools/build_all.sh /tmp/wins-build              # a new, empty directory
+launch/falloutnv/install.sh /tmp/wins-build     # then restart Steam and force the "WINS (Fallout: New Vegas)" tool
+```
+
+Your Steam saves are not mounted or touched; WINS keeps its own profile in `~/.local/share/wins/falloutnv/profile`.
 
 ---
 
@@ -110,7 +144,7 @@ WINS was pointed at the full installer (5.76 GB). It deposits every file without
 
 ## Subdirectories & System Boundaries
 
-- **bin**: [./bin/README.md](./bin/README.md) - Unified CLI command dispatcher (`probe`, `transmute`, `harvest`, `fuzz`, `test`, `list`) providing human and agent-facing JSON interfaces.
+- **bin**: [./bin/README.md](./bin/README.md) - Unified CLI command dispatcher (`probe`, `transmute`, `harvest`, `fuzz`, `test`, `list`, `heal-bin`, `port-context`, `fallout`, `corpus-attack`) providing human and agent-facing JSON interfaces.
 - **core**: [./core/README.md](./core/README.md) - Central processing engine providing binary taxonomy inspection and black-box runtime diagnostic telemetry.
   - **healers**: [./core/healers/README.md](./core/healers/README.md) - Native C++ `.node` binary addon auditor, GNU glibc prebuild resolver, and universal JavaScript proxy stubber.
   - **recipes**: [./core/recipes/README.md](./core/recipes/README.md) - Modular extraction and re-hosting transmuters for Electron, .NET Core / Avalonia, PyInstaller, and Native PE.
@@ -159,6 +193,15 @@ python3 -m unittest discover tests
 python3 -m unittest native.test_pe_imports native.test_win32_text native.test_winluxhttp native.test_winluxtrust
 ```
 
+```bash
+# The loaders and the library registry (zig 0.16, bubblewrap; i386 libraries for the loader)
+tools/build_all.sh /tmp/wins-build              # a new, empty directory
+tools/check_libs.sh /tmp/wins-build             # is libs/registry.json current?
+tools/separation_gate.sh                        # the shipped loader does not depend on native/probe
+zig test native/wins_libs.zig
+python3 -m pytest tests/test_winrun32.py
+```
+
 `native.test_winluxtrust` also needs `osslsigncode` (set `WINS_OSSLSIGNCODE` if it is not on `PATH`) and skips itself
 when it is missing.
 
@@ -169,6 +212,7 @@ when it is missing.
 ### Prerequisites
 * Linux x86_64 (tested on Ubuntu 24.04 LTS), `python3`, `7zz` (or `7z`), `unzip`, `curl`.
 * Electron apps: `bunx` or `npx` (ASAR unpacking). Native tools: Zig 0.16 and `bubblewrap`.
+* Native 32-bit programs (Fallout: New Vegas): the i386 libraries named in `launch/falloutnv/README.txt`.
 
 ### Install
 ```bash
@@ -213,7 +257,7 @@ Example `probe` output:
 | **Electron** | Working: ASAR de-layering, platform-check patching, `.node` healing with Linux prebuilds, runtime re-binding. Demonstrated on Notion |
 | **NW.js (RPG Maker MZ games)** | No `wins` recipe yet: Look Outside was packaged as an AppImage separately (its own `GUIA.md` lives next to the AppImage in `~/Documentos/Look Outside Linux/` on the author's machine). Turning that into a recipe is the obvious next step |
 | **.NET (modern) / Avalonia** | Extraction and `runtimeconfig.json` adaptation implemented; a successful launch of ShareX is not demonstrated |
-| **Native Win32 PE** | Triage, API harvest and POSIX-shim launcher; no PE loader. Apps routed to `recipe_micro_wine` do not run: **that recipe is not implemented** |
+| **Native Win32 PE** | i386: the WINS PE loader (`winrun32`) runs Fallout: New Vegas. x86-64: `winrun` / `winrun_gui` resolve imports and refuse anything incomplete; no program is claimed to run. Everything else: triage and API harvest (`recipe_transpiler`, analysis only; the port is NOT_DEMONSTRATED) |
 | **PyInstaller** | Recipe is a stub (`transmute` returns failure) |
 | **JVM / Launch4j** | Planned |
 
@@ -257,7 +301,8 @@ fighting a Wine prefix, an agent can decide, port, or report why not — with ev
 
 A PE import inventory, a compiled shim, or a finite fuzz run is not proof that a Windows program was ported or behaves
 equivalently. No `winlux*` replacement has been compared with a real Windows kernel. Games and apps are verified only
-as far as the table above says.
+as far as the table above says. Fallout: New Vegas was checked by hand on one machine, not by an automated test; the
+gap report measures import resolution, not behaviour.
 
 ---
 
