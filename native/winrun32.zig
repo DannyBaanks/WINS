@@ -450,16 +450,24 @@ fn rangeIsProtected(lo: usize, hi: usize) bool {
     return false;
 }
 
+var g_maps_buf: [512 * 1024]u8 = undefined;
+
 /// Name the mapping that holds `addr`, so a fault can be attributed to a module
 /// instead of guessed at.
 fn describeAddr(addr: usize) void {
     const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
     if (linux.errno(fd) != .SUCCESS) return;
     defer _ = linux.close(@intCast(fd));
-    var buf: [16 * 1024]u8 = undefined;
-    const rn = linux.read(@intCast(fd), &buf, buf.len);
-    if (linux.errno(rn) != .SUCCESS) return;
-    var lines = std.mem.splitScalar(u8, buf[0..@intCast(rn)], '\n');
+    // The whole file: with the host libraries loaded it is far beyond 16 KB,
+    // and a truncated read named real code "(unmapped)". Static buffer, so a
+    // signal handler does not need half a megabyte of stack.
+    var total: usize = 0;
+    while (total < g_maps_buf.len) {
+        const rn = linux.read(@intCast(fd), g_maps_buf[total..].ptr, g_maps_buf.len - total);
+        if (linux.errno(rn) != .SUCCESS or rn == 0) break;
+        total += rn;
+    }
+    var lines = std.mem.splitScalar(u8, g_maps_buf[0..total], '\n');
     while (lines.next()) |line| {
         const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
         const mlo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
@@ -467,7 +475,7 @@ fn describeAddr(addr: usize) void {
         const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
         const mhi = std.fmt.parseInt(usize, rest[0..sp], 16) catch continue;
         if (addr >= mlo and addr < mhi) {
-            std.debug.print("  EIP 0x{x:0>8} is in: {s}\n", .{ addr, line });
+            std.debug.print("  EIP 0x{x:0>8} is in: {s} (+0x{x} into the mapping)\n", .{ addr, line, addr - mlo });
             return;
         }
     }
@@ -480,10 +488,16 @@ fn describeOverlap(lo: usize, hi: usize) void {
     const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
     if (linux.errno(fd) != .SUCCESS) return;
     defer _ = linux.close(@intCast(fd));
-    var buf: [16 * 1024]u8 = undefined;
-    const rn = linux.read(@intCast(fd), &buf, buf.len);
-    if (linux.errno(rn) != .SUCCESS) return;
-    var lines = std.mem.splitScalar(u8, buf[0..@intCast(rn)], '\n');
+    // The whole file: with the host libraries loaded it is far beyond 16 KB,
+    // and a truncated read named real code "(unmapped)". Static buffer, so a
+    // signal handler does not need half a megabyte of stack.
+    var total: usize = 0;
+    while (total < g_maps_buf.len) {
+        const rn = linux.read(@intCast(fd), g_maps_buf[total..].ptr, g_maps_buf.len - total);
+        if (linux.errno(rn) != .SUCCESS or rn == 0) break;
+        total += rn;
+    }
+    var lines = std.mem.splitScalar(u8, g_maps_buf[0..total], '\n');
     while (lines.next()) |line| {
         const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
         const mlo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
@@ -556,10 +570,16 @@ fn protectForeignMemory() void {
     const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
     if (linux.errno(fd) != .SUCCESS) return;
     defer _ = linux.close(@intCast(fd));
-    var buf: [16 * 1024]u8 = undefined;
-    const rn = linux.read(@intCast(fd), &buf, buf.len);
-    if (linux.errno(rn) != .SUCCESS) return;
-    var lines = std.mem.splitScalar(u8, buf[0..@intCast(rn)], '\n');
+    // The whole file: with the host libraries loaded it is far beyond 16 KB,
+    // and a truncated read named real code "(unmapped)". Static buffer, so a
+    // signal handler does not need half a megabyte of stack.
+    var total: usize = 0;
+    while (total < g_maps_buf.len) {
+        const rn = linux.read(@intCast(fd), g_maps_buf[total..].ptr, g_maps_buf.len - total);
+        if (linux.errno(rn) != .SUCCESS or rn == 0) break;
+        total += rn;
+    }
+    var lines = std.mem.splitScalar(u8, g_maps_buf[0..total], '\n');
     while (lines.next()) |line| {
         const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
         const lo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
