@@ -83,6 +83,33 @@ mapcode = [
 ]
 s = s.replace(anchor_map, "\n".join(mapcode), 1)
 
+# 3b. A wide window of the guest's stack around ESP.
+#
+# The 8-dword dump starts at ESP, which cannot tell a "call through a null
+# pointer" (the return address is pushed, so the faulting ESP points AT it)
+# from a "ret into a null slot" (the popped word is one below ESP). The word
+# at ESP-4 and ESP-8 separates the two, and only one of them can be a
+# guest code address.
+anchor_wide = '            std.debug.print("Stack Dump (top 8 dwords at ESP):' + NL + '", .{});'
+assert anchor_wide in s, "stack dump anchor not found"
+wide = [
+    anchor_wide,
+    "            {",
+    '                std.debug.print("  Wide stack window (ESP-0x40 .. ESP+0x80):' + NL + '", .{});',
+    "                var woff: i32 = -0x40;",
+    "                while (woff < 0x80) : (woff += 16) {",
+    "                    const wbase: i64 = @as(i64, esp_val) + woff;",
+    "                    if (wbase > 0x1000 and wbase + 16 < 0xFFFFF000) {",
+    "                        const wp: [*]const u32 = @ptrFromInt(@as(usize, @intCast(wbase)));",
+    '                        std.debug.print("    0x{x:0>8}: 0x{x:0>8} 0x{x:0>8} 0x{x:0>8} 0x{x:0>8}' + NL + '", .{',
+    "                            @as(u32, @intCast(wbase)), wp[0], wp[1], wp[2], wp[3],",
+    "                        });",
+    "                    }",
+    "                }",
+    "            }",
+]
+s = s.replace(anchor_wide, "\n".join(wide), 1)
+
 # 4. Register SIGABRT as well: glibc's malloc_printerr aborts, and that abort is
 #    the only place the corrupted chunk is named.
 anchor3 = "    _ = linux.sigaction(linux.SIG.ILL, &sa, null);"

@@ -44,3 +44,6 @@ node_modules/
 # bypass logic that someone could replicate. `tools/build_probe.sh` regenerates
 # them from the public sources.
 native/probe/
+
+# Output of native/testdata/profile_probe.c, which writes probe.ini where it runs
+probe.ini
