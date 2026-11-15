@@ -5251,6 +5251,11 @@ test "scissor rectangle: starts as the back buffer, round trips, null is INVALID
     try std.testing.expectEqual(want, r);
 }
 
+/// WINS_D3D9_PROF=1 (set by the loader): frame-rate and render-time report.
+pub fn hostgl_prof(on: bool) void {
+    hostgl.prof_enabled = on;
+}
+
 /// WINS_D3D9_CAPTURE=<frame>:<path> (set by the loader).
 pub fn hostgl_capture(frame: u64, path_spec: []const u8) void {
     hostgl.capture_frame = frame;

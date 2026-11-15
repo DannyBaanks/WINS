@@ -458,6 +458,8 @@ const ClearJob = struct {
 
 fn clearJob(raw: ?*anyopaque) void {
     const job: *ClearJob = @ptrCast(@alignCast(raw.?));
+    var mark: u64 = if (prof_enabled) profNow() else 0;
+    defer profLap(&mark, .clear);
     const gl = &host.gl;
     const dev = job.dev;
     applyTargetState(dev);
@@ -773,8 +775,59 @@ fn streamSource(job: *const DrawJob, stream: u16, last_vertex: u64) ?Source {
     return .{ .ptr = vb.data.ptr, .len = vb.data.len, .stride = dev.stream_strides[stream], .offset = dev.stream_offsets[stream] };
 }
 
+// ---- frame-time instrument ---------------------------------------------------
+
+/// WINS_D3D9_PROF=1: every PROF_FRAMES frames, report the frame rate and where
+/// the render thread's time went. Off, it costs one branch per draw.
+pub var prof_enabled: bool = false;
+const PROF_FRAMES = 120;
+const ProfPart = enum(usize) { state, uniforms, attribs, textures, call, clear, present, other_jobs };
+var prof_ns: [8]u64 = [_]u64{0} ** 8;
+var prof_draws: u64 = 0;
+var prof_frames: u64 = 0;
+var prof_since: u64 = 0;
+
+fn profNow() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+/// Charge the time since `mark.*` to `part` and move the mark.
+fn profLap(mark: *u64, part: ProfPart) void {
+    if (!prof_enabled) return;
+    const now = profNow();
+    prof_ns[@intFromEnum(part)] += now - mark.*;
+    mark.* = now;
+}
+fn profFrame() void {
+    prof_frames += 1;
+    if (prof_frames < PROF_FRAMES) return;
+    const now = profNow();
+    if (prof_since != 0) {
+        const wall: f64 = @floatFromInt(now - prof_since);
+        const per = struct {
+            fn ms(ns: u64) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1e6 / PROF_FRAMES;
+            }
+        };
+        std.debug.print("[WINS:D3D9:prof] {d:.1} fps, {d} draws/frame; render thread ms/frame: state {d:.2}, uniforms {d:.2}, attribs {d:.2}, textures {d:.2}, draw call {d:.2}, clear {d:.2}, present {d:.2}; whole frame {d:.2}\n", .{
+            PROF_FRAMES * 1e9 / wall, prof_draws / PROF_FRAMES,
+            per.ms(prof_ns[0]),       per.ms(prof_ns[1]),
+            per.ms(prof_ns[2]),       per.ms(prof_ns[3]),
+            per.ms(prof_ns[4]),       per.ms(prof_ns[5]),
+            per.ms(prof_ns[6]),       wall / 1e6 / PROF_FRAMES,
+        });
+    }
+    prof_since = now;
+    prof_frames = 0;
+    prof_draws = 0;
+    prof_ns = [_]u64{0} ** 8;
+}
+
 fn drawJob(raw: ?*anyopaque) void {
     const job: *DrawJob = @ptrCast(@alignCast(raw.?));
+    var mark: u64 = if (prof_enabled) profNow() else 0;
+    prof_draws += 1;
     const gl = &host.gl;
     const dev = job.dev;
     const elements: []const d3d.D3DVERTEXELEMENT9 = if (dev.use_fvf) dev.fvf_elements[0..] else if (dev.vertex_decl) |dcl| dcl.elements else return warnOnce(2, "a draw with neither a vertex declaration nor an FVF; skipped");
@@ -802,12 +855,14 @@ fn drawJob(raw: ?*anyopaque) void {
 
     applyTargetState(dev);
     applyRenderStates(dev);
+    profLap(&mark, .state);
     gl.glUseProgram(prog.prog);
     if (prog.loc_vs_c >= 0 and prog.vs_const_count != 0) gl.glUniform4fv(prog.loc_vs_c, prog.vs_const_count, @ptrCast(&dev.vs_consts));
     if (prog.loc_ps_c >= 0 and prog.ps_const_count != 0) gl.glUniform4fv(prog.loc_ps_c, prog.ps_const_count, @ptrCast(&dev.ps_consts));
     if (prog.loc_half >= 0) gl.glUniform2f(prog.loc_half, 1.0 / @as(f32, @floatFromInt(@max(1, dev.viewport.Width))), -1.0 / @as(f32, @floatFromInt(@max(1, dev.viewport.Height))));
     if (prog.fixed_key != null) setFixedUniforms(dev, prog);
 
+    profLap(&mark, .uniforms);
     gl.glBindBuffer(0x8892, 0); // ARRAY_BUFFER: client memory
     gl.glBindBuffer(0x8893, 0); // ELEMENT_ARRAY_BUFFER
     const first_u: u64 = @intCast(first);
@@ -849,6 +904,8 @@ fn drawJob(raw: ?*anyopaque) void {
         if (wanted & m == 0 and g_attrib_enabled & m != 0) gl.glDisableVertexAttribArray(bit);
     }
     g_attrib_enabled = wanted;
+    profLap(&mark, .attribs);
+    defer profLap(&mark, .call);
 
     for (prog.samplers, 0..) |kind, unit| {
         if (kind == .none) continue;
@@ -869,6 +926,7 @@ fn drawJob(raw: ?*anyopaque) void {
         applySampler(dev, unit, tex.surfaces.len);
     }
 
+    profLap(&mark, .textures);
     if (job.indexed) {
         var ptr: [*]const u8 = undefined;
         var len: u64 = 0;
@@ -886,7 +944,12 @@ fn drawJob(raw: ?*anyopaque) void {
         const width: u64 = if (fmt == d3d.D3DFMT_INDEX32) 4 else 2;
         const begin = @as(u64, job.start_index) * width;
         if (begin + shape.count * width > len) return warnOnce(9, "a draw reads past the end of its index buffer; skipped");
-        gl.glDrawElements(shape.mode, @intCast(shape.count), if (width == 4) 0x1405 else 0x1403, ptr + @as(usize, @intCast(begin)));
+        // The caller states which vertices the indices can name; passing that
+        // on saves the driver a scan of the index data on every draw (the
+        // vertices are client arrays, so it must know the range to copy).
+        const lo: u32 = job.min_index;
+        const hi: u32 = lo +| @as(u32, @intCast(@min(span, std.math.maxInt(u32)))) -| 1;
+        gl.glDrawRangeElements(shape.mode, lo, hi, @intCast(shape.count), if (width == 4) 0x1405 else 0x1403, ptr + @as(usize, @intCast(begin)));
     } else {
         gl.glDrawArrays(shape.mode, @intCast(first), @intCast(shape.count));
     }
@@ -1196,6 +1259,11 @@ fn writeCapture(frame: u64) void {
 fn presentJob(raw: ?*anyopaque) void {
     const job: *PresentJob = @ptrCast(@alignCast(raw.?));
     const gl = &host.gl;
+    var mark: u64 = if (prof_enabled) profNow() else 0;
+    defer if (prof_enabled) {
+        profLap(&mark, .present);
+        profFrame();
+    };
     if (job.frame == capture_frame) {
         writeCapture(job.frame);
         if (capture_period != 0) capture_frame += capture_period;

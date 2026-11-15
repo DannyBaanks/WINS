@@ -226,6 +226,7 @@ pub const Gl = struct {
     glVertexAttrib4f: *const fn (GLuint, f32, f32, f32, f32) callconv(.c) void,
     glDrawArrays: *const fn (GLenum, GLint, GLsizei) callconv(.c) void,
     glDrawElements: *const fn (GLenum, GLsizei, GLenum, ?*const anyopaque) callconv(.c) void,
+    glDrawRangeElements: *const fn (GLenum, GLuint, GLuint, GLsizei, GLenum, ?*const anyopaque) callconv(.c) void,
 
     glGenFramebuffers: *const fn (GLsizei, *GLuint) callconv(.c) void,
     glBindFramebuffer: *const fn (GLenum, GLuint) callconv(.c) void,
@@ -323,7 +324,36 @@ pub fn ready() bool {
 const StartArgs = struct { w: u32, h: u32, title: [128:0]u8 };
 var g_args: StartArgs = undefined;
 
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn access(path: [*:0]const u8, mode: c_int) c_int;
+
+/// On a laptop with an integrated GPU driving the screen and an NVIDIA one
+/// beside it, GLX renders on the integrated one unless asked otherwise (a
+/// Radeon 760M ran FalloutNV's Mojave at 10-15 fps next to an idle RTX 4050).
+/// Ask for the NVIDIA GPU when its device node and its GLX library for this
+/// architecture are both there. WINS_GPU=integrated keeps the default, and a
+/// choice already made in the environment is left alone.
+fn preferDiscreteGpu() void {
+    if (getenv("WINS_GPU")) |v| {
+        if (std.mem.eql(u8, std.mem.sliceTo(v, 0), "integrated")) return;
+    }
+    if (getenv("__NV_PRIME_RENDER_OFFLOAD") != null or getenv("__GLX_VENDOR_LIBRARY_NAME") != null or getenv("DRI_PRIME") != null) return;
+    if (access("/dev/nvidiactl", 6) != 0) { // R_OK | W_OK
+        if (access("/sys/module/nvidia", 0) == 0) std.debug.print("[WINS:GL] an NVIDIA GPU is present but /dev/nvidiactl is not reachable here; rendering on the default GPU\n", .{});
+        return;
+    }
+    if (dlopen("libGLX_nvidia.so.0", 2) == null) {
+        std.debug.print("[WINS:GL] an NVIDIA GPU is present but libGLX_nvidia.so.0 is not installed for this architecture; rendering on the default GPU\n", .{});
+        return;
+    }
+    _ = setenv("__NV_PRIME_RENDER_OFFLOAD", "1", 1);
+    _ = setenv("__GLX_VENDOR_LIBRARY_NAME", "nvidia", 1);
+    std.debug.print("[WINS:GL] NVIDIA GPU found: asking GLX to render on it (WINS_GPU=integrated to keep the default)\n", .{});
+}
+
 fn openSurface() bool {
+    preferDiscreteGpu();
     const x = dlopen("libX11.so.6", 2) orelse {
         std.debug.print("[WINS:GL] libX11.so.6 is not available for this architecture; no window\n", .{});
         return false;

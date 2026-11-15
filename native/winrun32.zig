@@ -6257,6 +6257,7 @@ pub fn main(init: std.process.Init) !void {
     if (getenv("SteamAppId") != null) loadRealSteamClient();
     // Host GPU rendering for Direct3D 9 devices (WINS_D3D9_HOST=0: headless).
     d3d9.host_enabled = if (getenv("WINS_D3D9_HOST")) |v| v[0] != '0' else true;
+    if (getenv("WINS_D3D9_PROF")) |v| d3d9.hostgl_prof(v[0] != '0');
     if (getenv("WINS_D3D9_CAPTURE")) |v| {
         const spec = std.mem.sliceTo(v, 0);
         if (std.mem.indexOfScalar(u8, spec, ':')) |colon| {
