@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PROBE="$REPO/native/probe"
-ZIG="${ZIG:-/home/danny/.local/opt/zig-x86_64-linux-0.16.0/zig}"
+ZIG="${ZIG:-zig}"
 OUT="${1:-$PROBE/winrun32_probe}"
 
 if [[ ! -f "$PROBE/instrumented_stubs.zig" ]]; then

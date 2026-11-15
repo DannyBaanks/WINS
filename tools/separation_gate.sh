@@ -16,7 +16,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-ZIG="${ZIG:-/home/danny/.local/opt/zig-x86_64-linux-0.16.0/zig}"
+ZIG="${ZIG:-zig}"
 WORK="$(mktemp -d /tmp/wins-gate.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -91,7 +91,7 @@ fi
 
 echo "== G4: a clean build resolves what it implements, and claims nothing more"
 out="$(cd "$WORK" && "$WORK/winrun32" --check \
-        "/home/danny/.local/share/Steam/steamapps/common/Fallout New Vegas/FalloutNV.exe" 2>&1)"
+        "$HOME/.local/share/Steam/steamapps/common/Fallout New Vegas/FalloutNV.exe" 2>&1)"
 if printf '%s' "$out" | grep -q 'Check PASSED'; then
     note "ok: every import of the Steam exe resolves, DSOUND ordinal 11 included"
 else
@@ -125,10 +125,15 @@ else
     note "FAIL: DirectSound is claimed but its implementation is not in the binary"
     fail=1
 fi
-if grep -q 'output device, so playback is silent' "$REPO/native/wins_dsound.zig"; then
-    note "ok: the silent-playback limitation is still documented"
+# The module must keep saying what it does not implement (a DirectSound that looked
+# complete would hide that capture, effects and notifications are missing). The
+# header used to say playback was silent; it no longer does, because a mixer exists.
+if grep -q 'What is NOT implemented' "$REPO/native/wins_dsound.zig" &&
+   grep -q 'DSERR_NODRIVER' "$REPO/native/wins_dsound.zig" &&
+   grep -q 'IDirectSoundNotify' "$REPO/native/wins_dsound.zig"; then
+    note "ok: the DirectSound limitations (capture, notify, effects) are still documented"
 else
-    note "FAIL: the DirectSound limitation note was removed; a mute device would look complete"
+    note "FAIL: the DirectSound limitation note was removed; the module would look complete"
     fail=1
 fi
 

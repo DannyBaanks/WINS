@@ -7,7 +7,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WINRUN32_BIN = REPO_ROOT / "bin/winrun32"
-FALLOUT_EXE = Path("/home/danny/.local/share/Steam/steamapps/common/Fallout New Vegas/FalloutNV.exe")
+FALLOUT_EXE = Path.home() / ".local/share/Steam/steamapps/common/Fallout New Vegas/FalloutNV.exe"
 
 
 def test_winrun32_binary_present():

@@ -1,4 +1,5 @@
-//! WINS native DirectSound (dsound.dll) — COM objects over memory-backed buffers.
+//! WINS native DirectSound (dsound.dll): COM objects over memory-backed buffers,
+//! a software mixer and 3D positioning.
 //!
 //! Why this file exists: the real Steam build of FalloutNV.exe imports
 //! `DSOUND.dll!ordinal 11`, and that ordinal is `DirectSoundCreate8` (measured
@@ -8,23 +9,29 @@
 //! DirectSoundCaptureCreate8). With the slot unresolved the loader refuses to
 //! run the image at all, so the import has to resolve to a real implementation.
 //!
-//! What is implemented here: the object graph a DirectSound app talks to.
-//! `DirectSoundCreate8` returns an IDirectSound8 whose vtable carries the full
-//! method set, and `CreateSoundBuffer` returns an IDirectSoundBuffer8 backed by
-//! real memory, with Lock/Unlock honouring the DSBLOCK flags and wrap-around,
-//! and a play cursor advanced by a monotonic clock at the buffer's own byte
-//! rate. Volume, pan, frequency, format, status and caps answer with the values
-//! that were set, not with fabricated success.
+//! What is implemented: `DirectSoundCreate8` returns an IDirectSound8 whose
+//! vtable carries the full method set, and `CreateSoundBuffer` returns an
+//! IDirectSoundBuffer8 backed by real memory, with Lock/Unlock honouring the
+//! DSBLOCK flags and wrap-around and a play cursor advanced by a monotonic
+//! clock at the buffer's own byte rate. Volume, pan, frequency, format, status
+//! and caps answer with the values that were set. The IDirectSound3DListener and
+//! IDirectSound3DBuffer interfaces store and return their parameters. A mixer
+//! thread mixes every playing buffer (volume, pan, frequency, looping, and the
+//! 3D placement) at 48 kHz stereo and writes it to the host sound server through
+//! wins_audio.zig. FalloutNV's menu clicks, effects and voices were heard through
+//! it in a play-through (WINS 8c50dda).
 //!
-//! What is NOT implemented, deliberately and visibly: no PCM ever reaches an
-//! output device, so playback is silent; capture devices report DSERR_NODRIVER
-//! because this machine has no capture path wired; the 3D listener/buffer
-//! interfaces and the notify interface are REFUSED through QueryInterface with
-//! E_NOINTERFACE instead of handing back an object whose vtable would not match
-//! what the caller is about to call. QueryInterface therefore matches the exact
-//! IIDs of the interfaces this file actually implements, not a GUID prefix.
-//! The next step after a boot is a mixer that writes these same buffers to
-//! ALSA, and this note goes away then.
+//! What is NOT implemented, deliberately and visibly:
+//!   - capture: the DirectSoundCapture* entry points report DSERR_NODRIVER;
+//!   - IDirectSoundNotify and any other interface than the ones above are refused
+//!     through QueryInterface with E_NOINTERFACE (it matches exact IIDs, not a
+//!     GUID prefix), rather than handing back an object whose vtable would not
+//!     match what the caller is about to call;
+//!   - IDirectSound8::Initialize, DuplicateSoundBuffer and SetFX (effects) answer
+//!     E_NOTIMPL; there is no EAX or reverb, and caps report software mixing only;
+//!   - 3D positioning is inverse-distance attenuation plus left/right panning from
+//!     the listener's orientation: no Doppler, no sound cones, no HRTF;
+//!   - with no host sound server the mixer says so and playback stays silent.
 
 const std = @import("std");
 const audio = @import("wins_audio.zig");

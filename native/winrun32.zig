@@ -5609,8 +5609,9 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         // table maps to DirectSoundCreate8; with no implementation the loader
         // refused to run the image. wins_dsound.zig carries the COM object
         // graph (IDirectSound8 + IDirectSoundBuffer8 over memory-backed
-        // buffers). No PCM reaches a device yet, and that is stated in the
-        // module header rather than implied by a silent success.
+        // buffers) with a software mixer to the host sound server; what it does
+        // not implement (capture, notify, effects) is stated in the module header
+        // rather than implied by a silent success.
         if (dsound_mod.lookupDsound(name)) |addr| return @ptrFromInt(addr);
         std.debug.print("[WINS:dsound] dsound!{s} is not available\n", .{name});
         return null;
