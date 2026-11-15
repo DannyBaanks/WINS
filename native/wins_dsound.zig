@@ -27,6 +27,7 @@
 //! ALSA, and this note goes away then.
 
 const std = @import("std");
+const audio = @import("wins_audio.zig");
 const linux = std.os.linux;
 
 pub const W: std.builtin.CallingConvention = .winapi;
@@ -171,6 +172,10 @@ pub const Buffer = extern struct {
     /// (secondary buffers created with DSBCAPS_CTRL3D): a second interface
     /// of the same object, sharing its reference count.
     i3d: Sub3D,
+    /// Mixer read head, in source frames; `mix_restart` asks the mixer to
+    /// take it from the play cursor (Play, SetCurrentPosition).
+    mix_frame: f64,
+    mix_restart: bool,
 };
 
 /// The 3D interface of a buffer. Parameters are stored and answered as set;
@@ -519,6 +524,8 @@ fn bufRelease(p: *anyopaque) callconv(W) u32 {
     const self: *Buffer = @ptrCast(@alignCast(p));
     if (self.refs > 0) self.refs -= 1;
     if (self.refs != 0) return self.refs;
+    mixLock();
+    defer mixUnlock();
     if (self.buf_ptr) |ptr| {
         if (self.buf_len != 0) std.heap.page_allocator.free(ptr[0..self.buf_len]);
     }
@@ -661,9 +668,11 @@ fn bufPlay(p: *anyopaque, reserved1: u32, priority: u32, flags: u32) callconv(W)
     if (!self.playing) {
         self.start_cursor = bufCursor(self);
         self.start_ms = nowMs();
+        self.mix_restart = true;
         self.playing = true;
     }
     self.looping = (flags & DSBPLAY_LOOPING) != 0;
+    if (!self.primary) startMixer();
     return S_OK;
 }
 
@@ -674,6 +683,7 @@ fn bufSetCurrentPosition(p: *anyopaque, pos: u32) callconv(W) HRESULT {
     if (total == 0) return DSERR_UNSUPPORTED;
     self.start_cursor = pos % total;
     self.start_ms = nowMs();
+    self.mix_restart = true;
     return S_OK;
 }
 
@@ -801,6 +811,8 @@ var pool: [POOL_MAX]Buffer = undefined;
 var pool_used: [POOL_MAX]bool = [_]bool{false} ** POOL_MAX;
 
 fn poolTake() ?*Buffer {
+    mixLock();
+    defer mixUnlock();
     for (&pool, 0..) |*slot, i| {
         if (!pool_used[i]) {
             pool_used[i] = true;
@@ -1165,4 +1177,155 @@ fn traceFirst(slot: usize, comptime name: []const u8, caller: usize) void {
     if (slot >= traced.len or traced[slot]) return;
     traced[slot] = true;
     std.debug.print("[WINS:DSound] first call: {s} (caller 0x{x})\n", .{ name, caller });
+}
+
+// ---------------------------------------------------------------------------
+// Mixer: every playing secondary buffer -> one 48 kHz stereo stream on the
+// host sound server (wins_audio.zig), on a native thread.
+// ---------------------------------------------------------------------------
+
+const MIX_RATE: u32 = 48000;
+const MIX_FRAMES: usize = 480; // 10 ms per pass; the server's buffer paces the loop
+
+var g_mix_lock = std.atomic.Value(u32).init(0);
+fn mixLock() void {
+    while (g_mix_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+fn mixUnlock() void {
+    g_mix_lock.store(0, .release);
+}
+var g_mixer_started = std.atomic.Value(bool).init(false);
+
+fn startMixer() void {
+    if (g_mixer_started.swap(true, .acq_rel)) return;
+    if (!audio.outputEnabled()) return;
+    const t = std.Thread.spawn(.{}, mixerMain, .{}) catch {
+        std.debug.print("[WINS:DSound] could not start the mixer thread; sound stays silent\n", .{});
+        return;
+    };
+    t.detach();
+}
+
+/// One source sample as a float in [-1, 1].
+fn sampleAt(b: *const Buffer, frame: usize, ch: usize) f32 {
+    const bits = b.wfx.wBitsPerSample;
+    const chans: usize = @max(1, b.wfx.nChannels);
+    const c = @min(ch, chans - 1);
+    const align_: usize = if (b.wfx.nBlockAlign != 0) b.wfx.nBlockAlign else chans * (bits / 8);
+    const off = frame * align_ + c * (bits / 8);
+    const ptr = b.buf_ptr orelse return 0;
+    if (off + bits / 8 > b.buf_len) return 0;
+    return switch (bits) {
+        8 => (@as(f32, @floatFromInt(ptr[off])) - 128.0) / 128.0,
+        16 => @as(f32, @floatFromInt(std.mem.readInt(i16, ptr[off..][0..2], .little))) / 32768.0,
+        24 => @as(f32, @floatFromInt(@as(i32, std.mem.readInt(i24, ptr[off..][0..3], .little)))) / 8388608.0,
+        32 => if (b.wfx.wFormatTag == 3 or b.wfx.wFormatTag == 0xFFFE)
+            @as(f32, @bitCast(std.mem.readInt(u32, ptr[off..][0..4], .little)))
+        else
+            @as(f32, @floatFromInt(std.mem.readInt(i32, ptr[off..][0..4], .little))) / 2147483648.0,
+        else => 0,
+    };
+}
+
+fn dbToLinear(v: i32) f32 {
+    if (v <= -10000) return 0;
+    return std.math.pow(f32, 10, @as(f32, @floatFromInt(v)) / 2000);
+}
+
+fn vec(w: []const u32) [3]f32 {
+    return .{ @bitCast(w[0]), @bitCast(w[1]), @bitCast(w[2]) };
+}
+
+/// Distance attenuation and left/right placement of a 3D buffer relative to
+/// the listener (inverse-distance rolloff, as DirectSound's software 3D).
+fn spatial(b: *const Buffer, listener: ?*const Buffer) [2]f32 {
+    if (b.i3d.vtbl == null or b.primary) return .{ 1, 1 };
+    const w = &b.i3d.words;
+    const mode = w[14];
+    if (mode == 2) return .{ 1, 1 }; // DS3DMODE_DISABLE
+    var rel = vec(w[0..3]);
+    var front: [3]f32 = .{ 0, 0, 1 };
+    var top: [3]f32 = .{ 0, 1, 0 };
+    var rolloff: f32 = 1;
+    var dist_factor: f32 = 1;
+    if (listener) |l| {
+        const lw = &l.i3d.words;
+        if (mode == 0) { // DS3DMODE_NORMAL: world coordinates
+            const lp = vec(lw[0..3]);
+            rel = .{ rel[0] - lp[0], rel[1] - lp[1], rel[2] - lp[2] };
+        }
+        front = vec(lw[6..9]);
+        top = vec(lw[9..12]);
+        dist_factor = @bitCast(lw[12]);
+        rolloff = @bitCast(lw[13]);
+    }
+    const d = @sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]) * dist_factor;
+    const min_d: f32 = @max(0.0001, @as(f32, @bitCast(w[12])) * dist_factor);
+    const max_d: f32 = @as(f32, @bitCast(w[13])) * dist_factor;
+    if (d > max_d and b.flags & 0x20000 != 0) return .{ 0, 0 }; // DSBCAPS_MUTE3DATMAXDISTANCE
+    const dc = @min(d, max_d);
+    const gain: f32 = if (dc <= min_d) 1 else min_d / (min_d + rolloff * (dc - min_d));
+    // right = top x front (left-handed: x right, y up, z forward)
+    const right: [3]f32 = .{ top[1] * front[2] - top[2] * front[1], top[2] * front[0] - top[0] * front[2], top[0] * front[1] - top[1] * front[0] };
+    var pan: f32 = 0;
+    if (d > 0.0001) pan = std.math.clamp((rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2]) / (d / dist_factor), -1, 1);
+    return .{ gain * @min(1, 1 - pan), gain * @min(1, 1 + pan) };
+}
+
+fn mixerMain() void {
+    const out = audio.Output.open(MIX_RATE, 2, "DirectSound") catch {
+        std.debug.print("[WINS:DSound] no host sound server; effects and voices stay silent\n", .{});
+        return;
+    };
+    defer out.close();
+    std.debug.print("[WINS:DSound] mixer: {d} Hz stereo through the host sound server\n", .{MIX_RATE});
+    var acc: [MIX_FRAMES * 2]f32 = undefined;
+    var pcm: [MIX_FRAMES * 2]i16 = undefined;
+    while (true) {
+        @memset(&acc, 0);
+        mixLock();
+        var listener: ?*const Buffer = null;
+        var master: f32 = 1;
+        for (&pool, 0..) |*b, i| {
+            if (pool_used[i] and b.primary) {
+                master = dbToLinear(b.volume);
+                if (b.i3d.vtbl != null) listener = b;
+            }
+        }
+        for (&pool, 0..) |*b, i| {
+            if (!pool_used[i] or b.primary or b.buf_ptr == null) continue;
+            if (!b.playing) continue;
+            const chans: usize = @max(1, b.wfx.nChannels);
+            const align_: usize = if (b.wfx.nBlockAlign != 0) b.wfx.nBlockAlign else chans * (b.wfx.wBitsPerSample / 8);
+            if (align_ == 0) continue;
+            const frames: f64 = @floatFromInt(b.buf_len / align_);
+            if (frames < 1) continue;
+            if (b.mix_restart) {
+                b.mix_restart = false;
+                b.mix_frame = @as(f64, @floatFromInt(b.start_cursor / align_));
+            }
+            const rate: f64 = @floatFromInt(if (b.frequency != 0) b.frequency else b.wfx.nSamplesPerSec);
+            const step = rate / @as(f64, @floatFromInt(MIX_RATE));
+            const g = audio.gains(b.volume, b.pan);
+            const sp = spatial(b, listener);
+            const gl = g[0] * sp[0] * master;
+            const gr = g[1] * sp[1] * master;
+            var f: usize = 0;
+            while (f < MIX_FRAMES) : (f += 1) {
+                if (b.mix_frame >= frames) {
+                    if (!b.looping) break;
+                    b.mix_frame -= frames;
+                }
+                const fi: usize = @intFromFloat(b.mix_frame);
+                const l = sampleAt(b, fi, 0);
+                const r = if (chans > 1) sampleAt(b, fi, 1) else l;
+                acc[f * 2] += l * gl;
+                acc[f * 2 + 1] += r * gr;
+                b.mix_frame += step;
+            }
+        }
+        mixUnlock();
+        for (acc, 0..) |v, k| pcm[k] = @intFromFloat(std.math.clamp(v, -1.0, 1.0) * 32767.0);
+        if (!out.write(&pcm)) return;
+    }
 }
