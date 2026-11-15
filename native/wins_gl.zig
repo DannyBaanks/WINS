@@ -308,9 +308,17 @@ pub fn run(func: JobFn, ctx: ?*anyopaque) void {
     g_job_ctx = ctx;
     const ticket = g_posted.fetchAdd(1, .release) +% 1;
     futexWake(&g_posted);
+    // Most jobs are a single draw that takes microseconds: look for the answer
+    // a little before sleeping, since a sleep and a wake cost more than the job.
+    var spins: u32 = 0;
     while (true) {
         const done = g_done.load(.acquire);
         if (done == ticket) break;
+        if (spins < SPIN_SUBMIT) {
+            spins += 1;
+            std.atomic.spinLoopHint();
+            continue;
+        }
         futexWait(&g_done, done);
     }
     g_submit.store(0, .release);
@@ -413,14 +421,29 @@ fn openSurface() bool {
     return true;
 }
 
+/// How long each side looks for the other before sleeping in the kernel
+/// (iterations of a pause loop: roughly 0.1-0.3 ms for the render thread).
+const SPIN_RENDER: u32 = 8000;
+const SPIN_SUBMIT: u32 = 4000;
+
 fn renderMain() void {
     const ok = openSurface();
     g_state.store(if (ok) 1 else 2, .release);
     futexWake(&g_state);
     if (!ok) return;
     var served: u32 = 0;
+    var idle_spins: u32 = 0;
     while (true) {
         const posted = g_posted.load(.acquire);
+        if (posted == served and idle_spins < SPIN_RENDER) {
+            // Inside a frame the next draw arrives within microseconds; a
+            // thousand draws each paying a sleep and a wake was most of the
+            // frame (FalloutNV's Mojave: 20 ms of rendering in an 80 ms frame).
+            idle_spins += 1;
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        idle_spins = 0;
         if (posted == served) {
             // Wake at least every 10 ms to serve the window's input even while
             // the game presents nothing (loading screens, long waits).

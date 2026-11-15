@@ -1266,7 +1266,7 @@ fn GetCurrentProcessId() callconv(W) u32 {
 }
 
 fn GetCurrentThreadId() callconv(W) u32 {
-    return @intCast(linux.gettid());
+    return threads_mod.tidNow();
 }
 
 fn ExitProcess(code: u32) callconv(W) noreturn {

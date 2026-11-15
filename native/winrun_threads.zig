@@ -91,8 +91,14 @@ fn wake() void {
     _ = c.pthread_cond_broadcast(&g_cv);
 }
 
-fn tidNow() u32 {
-    return @intCast(linux.gettid());
+threadlocal var t_tid: u32 = 0;
+
+/// This thread's id. Asked once per thread: Windows reads it from the TEB,
+/// so guests call GetCurrentThreadId and take critical sections in their
+/// hottest paths, where a system call each time is most of the cost.
+pub fn tidNow() u32 {
+    if (t_tid == 0) t_tid = @intCast(linux.gettid());
+    return t_tid;
 }
 
 fn handleOf(o: *const Object) usize {
@@ -555,38 +561,102 @@ pub fn csInit(cs: *CriticalSection, spin: u32) void {
     cs.* = .{ .DebugInfo = 0, .LockCount = -1, .RecursionCount = 0, .OwningThread = 0, .LockSemaphore = 0, .SpinCount = spin };
 }
 
+// A critical section is its own lock: OwningThread is claimed with a
+// compare-and-swap, so the uncontended Enter/Leave pair makes no system call
+// and touches nothing shared with other sections. (Before, every Enter and
+// Leave took the one module-wide mutex and every release woke every waiter in
+// the process; FalloutNV's main thread spent most of an exterior frame there.)
+// A thread that finds the section taken looks again for a moment, then sleeps
+// on OwningThread; LockSemaphore counts the sleepers so Leave knows to wake one.
+
+fn csOwner(cs: *CriticalSection) *std.atomic.Value(u32) {
+    return @ptrCast(&cs.OwningThread);
+}
+fn csWaiters(cs: *CriticalSection) *std.atomic.Value(u32) {
+    return @ptrCast(&cs.LockSemaphore);
+}
+
+const CS_SPINS: u32 = 2000;
+
 pub fn csEnter(cs: *CriticalSection) void {
     const tid = tidNow();
-    lock();
-    defer unlock();
-    while (cs.OwningThread != 0 and cs.OwningThread != tid) _ = c.pthread_cond_wait(&g_cv, &g_mu);
-    cs.OwningThread = tid;
-    cs.RecursionCount += 1;
-    cs.LockCount += 1;
+    const owner = csOwner(cs);
+    if (owner.load(.monotonic) == tid) {
+        cs.RecursionCount += 1;
+        cs.LockCount += 1;
+        return;
+    }
+    var spins: u32 = 0;
+    while (true) {
+        if (owner.cmpxchgWeak(0, tid, .acquire, .monotonic) == null) break;
+        if (spins < CS_SPINS) {
+            spins += 1;
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        const waiters = csWaiters(cs);
+        _ = waiters.fetchAdd(1, .seq_cst);
+        const seen = owner.load(.seq_cst);
+        if (seen != 0) _ = linux.syscall4(.futex, @intFromPtr(owner), 0, seen, 0); // FUTEX_WAIT
+        _ = waiters.fetchSub(1, .seq_cst);
+    }
+    cs.RecursionCount = 1;
+    cs.LockCount = 0;
 }
 
 pub fn csTryEnter(cs: *CriticalSection) bool {
     const tid = tidNow();
-    lock();
-    defer unlock();
-    if (cs.OwningThread != 0 and cs.OwningThread != tid) return false;
-    cs.OwningThread = tid;
-    cs.RecursionCount += 1;
-    cs.LockCount += 1;
+    const owner = csOwner(cs);
+    if (owner.load(.monotonic) == tid) {
+        cs.RecursionCount += 1;
+        cs.LockCount += 1;
+        return true;
+    }
+    if (owner.cmpxchgStrong(0, tid, .acquire, .monotonic) != null) return false;
+    cs.RecursionCount = 1;
+    cs.LockCount = 0;
     return true;
 }
 
 pub fn csLeave(cs: *CriticalSection) void {
-    lock();
-    defer unlock();
-    if (cs.RecursionCount <= 0) return; // unbalanced Leave: ignore, never underflow
+    const owner = csOwner(cs);
+    // Only the owner may release; an unbalanced or foreign Leave is ignored.
+    if (owner.load(.monotonic) != tidNow() or cs.RecursionCount <= 0) return;
     cs.RecursionCount -= 1;
-    cs.LockCount -= 1;
-    if (cs.RecursionCount == 0) {
-        cs.OwningThread = 0;
-        cs.LockCount = -1;
-        wake();
+    if (cs.RecursionCount > 0) {
+        cs.LockCount -= 1;
+        return;
     }
+    cs.LockCount = -1;
+    owner.store(0, .seq_cst);
+    if (csWaiters(cs).load(.seq_cst) != 0) _ = linux.syscall3(.futex, @intFromPtr(owner), 1, 1); // FUTEX_WAKE one
+}
+
+test "a critical section excludes other threads and is recursive for its owner" {
+    const Ctx = struct {
+        cs: CriticalSection = undefined,
+        counter: u64 = 0,
+        fn work(self: *@This()) void {
+            var i: u32 = 0;
+            while (i < 200_000) : (i += 1) {
+                csEnter(&self.cs);
+                csEnter(&self.cs); // recursion
+                self.counter += 1; // not atomic: only correct under the lock
+                csLeave(&self.cs);
+                csLeave(&self.cs);
+            }
+        }
+    };
+    var ctx: Ctx = .{};
+    csInit(&ctx.cs, 0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Ctx.work, .{&ctx});
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u64, 800_000), ctx.counter);
+    try testing.expectEqual(@as(i32, -1), ctx.cs.LockCount);
+    try testing.expectEqual(@as(u32, 0), ctx.cs.OwningThread);
+    try testing.expect(csTryEnter(&ctx.cs));
+    csLeave(&ctx.cs);
 }
 
 // ===========================================================================
