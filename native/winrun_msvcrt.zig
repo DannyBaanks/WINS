@@ -2898,10 +2898,12 @@ fn transferToHandler() noreturn {
         // read garbage. The target is pinned to %ecx so the caller cannot alias
         // the two inputs.
         asm volatile (
+            \\ pushl %%ebp
             \\ movl %[b], %%ebp
             \\ call *%[s]
+            \\ popl %%ebp
             \\ movl %%eax, %[n]
-            : [n] "={eax}" (next)
+            : [n] "={eax}" (next),
             : [s] "{ecx}" (state),
               [b] "r" (ebp),
         );

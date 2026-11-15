@@ -83,4 +83,3 @@ wins-crypto	ncrypt.dll	BCryptHashData	1
 wins-crypto	ncrypt.dll	BCryptOpenAlgorithmProvider	1
 wins-crypto	ncrypt.dll	BCryptVerifySignature	1
 wins-dbghelp	dbghelp.dll	ImageNtHeader	1
-wins-msvcrt	msvcrt.dll	_beginthreadex	1

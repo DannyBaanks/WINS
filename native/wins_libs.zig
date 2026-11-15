@@ -44,21 +44,22 @@ pub const Library = struct {
 const I386 = [_][]const u8{"winrun32"};
 const BOTH = [_][]const u8{ "winrun32", "winrun" };
 
-/// The recorded run that exercised the libraries marked below: the Steam build of
-/// FalloutNV.exe played through the menu, New Game and the Mojave exterior; every
-/// listed library appears in that run's loader log (WINS 8c50dda, 2026-11-15).
-const FNV = "FalloutNV.exe (Steam build, i386) played through the menu, New Game and the Mojave exterior; the library appears in that run's loader log (WINS 8c50dda, 2026-11-15)";
+/// The recorded runs that exercised the libraries marked below: the Steam build of
+/// FalloutNV.exe played through the menu, New Game, Mojave exterior, Pip-Boy UI,
+/// and underwater/water scenes; every listed library appears in those runs' logs
+/// (WINS 8c50dda / 250e2af, 2026-11-15).
+const FNV = "FalloutNV.exe (Steam build, i386) played through the menu, New Game, Mojave exterior, Pip-Boy UI and underwater/water scenes; the library appears in those runs' loader logs (WINS 8c50dda / 250e2af, 2026-11-15)";
 const X64 = [_][]const u8{"winrun"};
 
 pub const libraries = [_]Library{
     .{
         .name = "wins-kernel32",
-        .version = "0.1.0",
+        .version = "0.1.1",
         .dlls = &.{"kernel32.dll"},
         .loaders = &BOTH,
         .sources = &.{ "native/winrun32.zig", "native/winrun_kernel32.zig", "native/winrun_threads.zig" },
         .status = .exercised,
-        .summary = "Files, memory, threads and synchronisation (real threads, lock-free critical sections), time, ini files, console. Many of the ~900 kernel32 exports are not implemented.",
+        .summary = "Files (ANSI/Wide attributes, directory enumeration, extended/drive path normalization), memory, threads and synchronisation (real threads, lock-free critical sections), time, ini files, console. Many of the ~900 kernel32 exports are not implemented.",
         .evidence = FNV,
     },
     .{
@@ -103,17 +104,17 @@ pub const libraries = [_]Library{
     },
     .{
         .name = "wins-msvcrt",
-        .version = "0.1.0",
+        .version = "0.2.0",
         .dlls = &.{ "msvcrt.dll", "ucrtbase.dll" },
         .loaders = &BOTH,
-        .sources = &.{"native/winrun_msvcrt.zig"},
-        .status = .unexercised,
-        .summary = "The C runtime a program imports instead of linking statically.",
-        .evidence = "",
+        .sources = &.{ "native/winrun_msvcrt.zig", "native/winrun32.zig" },
+        .status = .exercised,
+        .summary = "The C runtime a program imports instead of linking statically (winrun32 adds _beginthreadex/_endthreadex over real threads).",
+        .evidence = "corpus/7zr.exe (i386) end-to-end compress/list/test/extract/benchmark under winrun32 (2026-11-15)",
     },
     .{
         .name = "wins-user32",
-        .version = "0.1.0",
+        .version = "0.1.1",
         .dlls = &.{"user32.dll"},
         .loaders = &BOTH,
         .sources = &.{ "native/wins_user32.zig", "native/winrun_gui_support.zig", "native/winrun_extra_dlls.zig" },
@@ -183,12 +184,12 @@ pub const libraries = [_]Library{
     },
     .{
         .name = "wins-dinput8",
-        .version = "0.2.0",
+        .version = "0.2.1",
         .dlls = &.{"dinput8.dll"},
         .loaders = &I386,
         .sources = &.{ "native/wins_dinput.zig", "native/wins_xinput.zig" },
         .status = .exercised,
-        .summary = "DirectInput 8 keyboard and mouse fed by the host window, plus gamepads/joysticks backed by XInput/SDL2. No force feedback or action mapping.",
+        .summary = "DirectInput 8 keyboard and mouse fed by the host window (with GetDeviceState fast-tap latching), plus gamepads/joysticks backed by XInput/SDL2. No force feedback or action mapping.",
         .evidence = FNV,
     },
     .{
@@ -253,13 +254,13 @@ pub const libraries = [_]Library{
     },
     .{
         .name = "wins-oleaut32",
-        .version = "0.1.0",
+        .version = "0.2.0",
         .dlls = &.{"oleaut32.dll"},
         .loaders = &BOTH,
-        .sources = &.{"native/winrun_extra_dlls.zig"},
-        .status = .unexercised,
-        .summary = "BSTR and variant helpers.",
-        .evidence = "",
+        .sources = &.{ "native/winrun_extra_dlls.zig", "native/winrun_ordinals.zig" },
+        .status = .exercised,
+        .summary = "BSTR and variant helpers (arch-aware VARIANT size, VT_BSTR VariantCopy, ord 10 VariantCopy / ord 12 VariantChangeType).",
+        .evidence = "corpus/7zr.exe (i386) end-to-end compress/list/test/extract under winrun32 (2026-11-15)",
     },
     .{
         .name = "wins-shell32",

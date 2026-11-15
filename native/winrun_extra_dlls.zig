@@ -1165,18 +1165,29 @@ pub fn lookupShell32(name: []const u8) ?usize {
 // 6. OLEAUT32.dll & ole32.dll
 // ---------------------------------------------------------------------------
 
-var ole_buf: [16384]u8 align(16) = undefined;
+var ole_buf: [256 * 1024]u8 align(16) = undefined;
 var ole_buf_off: usize = 16;
+var ole_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+const VARIANT_SIZE: usize = if (@sizeOf(usize) == 4) 16 else 24;
+const VT_BSTR: u16 = 8;
+
+fn allocBstrBytes(total: usize) ?[*]u8 {
+    if (total > ole_buf.len - 16) return null;
+    while (ole_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {}
+    defer ole_lock.store(0, .release);
+    if (ole_buf_off + total > ole_buf.len) ole_buf_off = 16;
+    const base: [*]u8 = @ptrCast(&ole_buf[ole_buf_off]);
+    ole_buf_off = std.mem.alignForward(usize, ole_buf_off + total, 8);
+    return base;
+}
 
 fn SysAllocString(s: ?[*:0]const u16) callconv(W) ?[*]u16 {
     if (s == null) return null;
     var len: u32 = 0;
     while (s.?[len] != 0) : (len += 1) {}
     const byte_len = len * 2;
-    const total = 4 + byte_len + 2;
-    if (ole_buf_off + total > ole_buf.len) ole_buf_off = 16;
-    const base: [*]u8 = @ptrCast(&ole_buf[ole_buf_off]);
-    ole_buf_off = std.mem.alignForward(usize, ole_buf_off + total, 8);
+    const base = allocBstrBytes(4 + byte_len + 2) orelse return null;
     std.mem.writeInt(u32, base[0..4], byte_len, .little);
     const chars: [*]u16 = @ptrCast(@alignCast(base + 4));
     @memcpy(chars[0..len], s.?[0..len]);
@@ -1186,10 +1197,7 @@ fn SysAllocString(s: ?[*:0]const u16) callconv(W) ?[*]u16 {
 
 fn SysAllocStringLen(s: ?[*]const u16, len: u32) callconv(W) ?[*]u16 {
     const byte_len = len * 2;
-    const total = 4 + byte_len + 2;
-    if (ole_buf_off + total > ole_buf.len) ole_buf_off = 16;
-    const base: [*]u8 = @ptrCast(&ole_buf[ole_buf_off]);
-    ole_buf_off = std.mem.alignForward(usize, ole_buf_off + total, 8);
+    const base = allocBstrBytes(4 + byte_len + 2) orelse return null;
     std.mem.writeInt(u32, base[0..4], byte_len, .little);
     const chars: [*]u16 = @ptrCast(@alignCast(base + 4));
     if (s) |src| @memcpy(chars[0..len], src[0..len]) else @memset(chars[0..len], 0);
@@ -1198,10 +1206,7 @@ fn SysAllocStringLen(s: ?[*]const u16, len: u32) callconv(W) ?[*]u16 {
 }
 
 fn SysAllocStringByteLen(s: ?[*]const u8, len: u32) callconv(W) ?[*]u8 {
-    const total = 4 + len + 2;
-    if (ole_buf_off + total > ole_buf.len) ole_buf_off = 16;
-    const base: [*]u8 = @ptrCast(&ole_buf[ole_buf_off]);
-    ole_buf_off = std.mem.alignForward(usize, ole_buf_off + total, 8);
+    const base = allocBstrBytes(4 + len + 2) orelse return null;
     std.mem.writeInt(u32, base[0..4], len, .little);
     const chars = base + 4;
     if (s) |src| @memcpy(chars[0..len], src[0..len]) else @memset(chars[0..len], 0);
@@ -1225,17 +1230,49 @@ fn SysStringLen(bstr: ?[*]u16) callconv(W) u32 {
 }
 
 fn VariantInit(pv: ?*anyopaque) callconv(W) void {
-    if (pv) |p| @memset(@as([*]u8, @ptrCast(p))[0..24], 0);
+    if (pv) |p| @memset(@as([*]u8, @ptrCast(p))[0..VARIANT_SIZE], 0);
 }
 
 fn VariantClear(pv: ?*anyopaque) callconv(W) i32 {
-    if (pv) |p| @memset(@as([*]u8, @ptrCast(p))[0..24], 0);
+    if (pv) |p| @memset(@as([*]u8, @ptrCast(p))[0..VARIANT_SIZE], 0);
     return 0; // S_OK
 }
 
 fn VariantCopy(pvargDest: ?*anyopaque, pvargSrc: ?*const anyopaque) callconv(W) i32 {
-    _ = pvargDest; _ = pvargSrc;
+    const dst_ptr = pvargDest orelse return @bitCast(@as(u32, 0x80070057)); // E_INVALIDARG
+    const src_ptr = pvargSrc orelse return @bitCast(@as(u32, 0x80070057));
+    if (dst_ptr == src_ptr) return 0; // S_OK
+    const dst: [*]u8 = @ptrCast(dst_ptr);
+    const src: [*]const u8 = @ptrCast(src_ptr);
+    var tmp: [24]u8 = undefined;
+    @memcpy(tmp[0..VARIANT_SIZE], src[0..VARIANT_SIZE]);
+    const vt = std.mem.readInt(u16, tmp[0..2], .little);
+    if (vt == VT_BSTR) {
+        const raw_bstr = std.mem.readInt(usize, tmp[8 .. 8 + @sizeOf(usize)], .little);
+        if (raw_bstr != 0) {
+            const bstr_w: [*]u16 = @ptrFromInt(raw_bstr);
+            const byte_len = SysStringByteLen(bstr_w);
+            const dup = SysAllocStringByteLen(@ptrCast(bstr_w), byte_len) orelse return @bitCast(@as(u32, 0x8007000E)); // E_OUTOFMEMORY
+            std.mem.writeInt(usize, tmp[8 .. 8 + @sizeOf(usize)], @intFromPtr(dup), .little);
+        }
+    }
+    _ = VariantClear(dst_ptr);
+    @memcpy(dst[0..VARIANT_SIZE], tmp[0..VARIANT_SIZE]);
     return 0; // S_OK
+}
+
+fn VariantCopyInd(pvargDest: ?*anyopaque, pvargSrc: ?*const anyopaque) callconv(W) i32 {
+    return VariantCopy(pvargDest, pvargSrc);
+}
+
+fn VariantChangeType(pvargDest: ?*anyopaque, pvarSrc: ?*const anyopaque, wFlags: u16, vt: u16) callconv(W) i32 {
+    _ = wFlags;
+    const dst_ptr = pvargDest orelse return @bitCast(@as(u32, 0x80070057));
+    const src_ptr = pvarSrc orelse return @bitCast(@as(u32, 0x80070057));
+    const src: [*]const u8 = @ptrCast(src_ptr);
+    const src_vt = std.mem.readInt(u16, src[0..2], .little);
+    if (src_vt == vt) return VariantCopy(dst_ptr, src_ptr);
+    return @bitCast(@as(u32, 0x80020005)); // DISP_E_TYPEMISMATCH
 }
 
 fn GetErrorInfo(dwReserved: u32, ppErrInfo: ?*?*anyopaque) callconv(W) i32 {
@@ -1246,6 +1283,8 @@ fn GetErrorInfo(dwReserved: u32, ppErrInfo: ?*?*anyopaque) callconv(W) i32 {
 
 pub fn lookupOleaut32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "VariantCopy")) return @intFromPtr(&VariantCopy);
+    if (std.mem.eql(u8, name, "VariantCopyInd")) return @intFromPtr(&VariantCopyInd);
+    if (std.mem.eql(u8, name, "VariantChangeType")) return @intFromPtr(&VariantChangeType);
     if (std.mem.eql(u8, name, "SysAllocString")) return @intFromPtr(&SysAllocString);
     if (std.mem.eql(u8, name, "SysAllocStringLen")) return @intFromPtr(&SysAllocStringLen);
     if (std.mem.eql(u8, name, "SysAllocStringByteLen")) return @intFromPtr(&SysAllocStringByteLen);
@@ -1950,4 +1989,27 @@ pub fn lookupImm32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "ImmEscapeW")) return @intFromPtr(&ImmEscapeW);
     if (std.mem.eql(u8, name, "ImmSetCompositionStringW")) return @intFromPtr(&ImmSetCompositionStringW);
     return null;
+}
+
+test "oleaut32 VARIANT sizing and VariantCopy VT_BSTR deep copy" {
+    var src: [32]u8 align(8) = [_]u8{0xAA} ** 32;
+    var dst: [32]u8 align(8) = [_]u8{0xBB} ** 32;
+    VariantInit(&src);
+    VariantInit(&dst);
+    // Sentinel bytes immediately past VARIANT_SIZE must stay untouched.
+    try std.testing.expectEqual(@as(u8, 0xAA), src[VARIANT_SIZE]);
+    try std.testing.expectEqual(@as(u8, 0xBB), dst[VARIANT_SIZE]);
+
+    const hello = [_:0]u16{ 'H', 'e', 'l', 'l', 'o' };
+    const bstr = SysAllocString(hello[0..:0].ptr) orelse return error.OutOfMemory;
+    std.mem.writeInt(u16, src[0..2], VT_BSTR, .little);
+    std.mem.writeInt(usize, src[8 .. 8 + @sizeOf(usize)], @intFromPtr(bstr), .little);
+
+    try std.testing.expectEqual(@as(i32, 0), VariantCopy(&dst, &src));
+    try std.testing.expectEqual(@as(u8, 0xBB), dst[VARIANT_SIZE]);
+    try std.testing.expectEqual(VT_BSTR, std.mem.readInt(u16, dst[0..2], .little));
+    const copied_ptr = std.mem.readInt(usize, dst[8 .. 8 + @sizeOf(usize)], .little);
+    try std.testing.expect(copied_ptr != 0);
+    try std.testing.expect(copied_ptr != @intFromPtr(bstr));
+    try std.testing.expectEqual(@as(u32, 5), SysStringLen(@ptrFromInt(copied_ptr)));
 }

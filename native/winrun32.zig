@@ -1226,9 +1226,41 @@ fn GetExitCodeProcess(hProcess: usize, lpExitCode: ?*u32) callconv(W) i32 {
     return 1;
 }
 
+fn wideToUtf8Z(wide_opt: ?[*:0]const u16, buf: *[512]u8) ?[:0]const u8 {
+    const wide = wide_opt orelse return null;
+    var len: usize = 0;
+    while (wide[len] != 0 and len < buf.len - 1) : (len += 1) {
+        // Basic BMP UTF-8 conversion for ASCII/common Latin; multi-byte codepoints
+        // use std.unicode when possible, falling back to '?' only if unpaired.
+        if (wide[len] < 0x80) {
+            buf[len] = @intCast(wide[len]);
+        } else break;
+    }
+    if (wide[len] == 0) {
+        buf[len] = 0;
+        return buf[0..len :0];
+    }
+    var total_w: usize = len;
+    while (wide[total_w] != 0 and total_w < 511) : (total_w += 1) {}
+    const written = std.unicode.utf16LeToUtf8(buf[0 .. buf.len - 1], wide[0..total_w]) catch {
+        var i: usize = 0;
+        while (wide[i] != 0 and i < buf.len - 1) : (i += 1) {
+            buf[i] = if (wide[i] < 128) @intCast(wide[i]) else '?';
+        }
+        buf[i] = 0;
+        return buf[0..i :0];
+    };
+    buf[written] = 0;
+    return buf[0..written :0];
+}
+
 fn GetFileAttributesW(lpFileName: ?[*:0]const u16) callconv(W) u32 {
-    _ = lpFileName;
-    return 0x80; // FILE_ATTRIBUTE_NORMAL
+    var utf8_buf: [512]u8 = undefined;
+    const path = wideToUtf8Z(lpFileName, &utf8_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0xFFFFFFFF;
+    };
+    return GetFileAttributesA(path.ptr);
 }
 
 fn LoadLibraryExW(lpLibFileName: ?[*:0]const u16, hFile: usize, dwFlags: u32) callconv(W) usize {
@@ -1367,6 +1399,29 @@ fn ExitThread(dwExitCode: u32) callconv(W) noreturn {
     // the process, as before.
     _ = threads_mod.exitCurrentThread(dwExitCode);
     linux.exit_group(0);
+}
+
+fn _beginthreadex(
+    security: ?*anyopaque,
+    stack_size: u32,
+    start_address: ?*anyopaque,
+    arglist: ?*anyopaque,
+    initflag: u32,
+    thrdaddr: ?*u32,
+) callconv(.c) usize {
+    _ = security;
+    const start: threads_mod.StartFn = @ptrCast(start_address orelse {
+        g_last_error = 87; // ERROR_INVALID_PARAMETER
+        return 0;
+    });
+    const h = threads_mod.createThread(stack_size, start, arglist, initflag, thrdaddr);
+    if (h == 0) g_last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+    std.debug.print("[WINS:MSVCRT] _beginthreadex(start=0x{x}, flags=0x{x}) -> 0x{x}\n", .{ @intFromPtr(start_address), initflag, h });
+    return h;
+}
+
+fn _endthreadex(retval: u32) callconv(.c) noreturn {
+    ExitThread(retval);
 }
 
 fn GetExitCodeThread(hThread: usize, lpExitCode: ?*u32) callconv(W) i32 {
@@ -1991,12 +2046,10 @@ fn CreateFileA(lpFileName: ?[*:0]const u8, dwDesiredAccess: u32, dwShareMode: u3
         const path = std.mem.sliceTo(fn_ptr, 0);
         std.debug.print("[WINS:Kernel32] CreateFileA(\"{s}\", access=0x{x}, disp={d})\n", .{ path, dwDesiredAccess, dwCreationDisposition });
         var norm_buf: [512]u8 = undefined;
-        const norm_len = @min(norm_buf.len - 1, path.len);
-        for (0..norm_len) |i| {
-            norm_buf[i] = if (path[i] == '\\') '/' else path[i];
-        }
-        norm_buf[norm_len] = 0;
-        const norm_slice = norm_buf[0..norm_len:0];
+        const norm_slice = winNormPathZ(fn_ptr, &norm_buf) orelse {
+            g_last_error = ERROR_FILE_NOT_FOUND;
+            return 0xFFFFFFFF;
+        };
 
         // What the caller asked to do with the file once it has it.
         const wants_read = dwDesiredAccess & GENERIC_READ != 0 or dwDesiredAccess == 0;
@@ -2090,14 +2143,9 @@ fn CreateFileA(lpFileName: ?[*:0]const u8, dwDesiredAccess: u32, dwShareMode: u3
 }
 
 fn CreateFileW(lpFileName: ?[*:0]const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: usize) callconv(W) usize {
-    if (lpFileName) |wide_ptr| {
-        var utf8_buf: [512]u8 = undefined;
-        var len: usize = 0;
-        while (wide_ptr[len] != 0 and len < 510) : (len += 1) {
-            utf8_buf[len] = if (wide_ptr[len] < 128) @intCast(wide_ptr[len]) else '?';
-        }
-        utf8_buf[len] = 0;
-        return CreateFileA(utf8_buf[0..len:0].ptr, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    var utf8_buf: [512]u8 = undefined;
+    if (wideToUtf8Z(lpFileName, &utf8_buf)) |path| {
+        return CreateFileA(path.ptr, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
     }
     g_last_error = 2;
     return 0xFFFFFFFF;
@@ -2281,15 +2329,8 @@ fn fileNotFoundError(path: []const u8) u32 {
 }
 
 fn GetFileAttributesA(lpFileName: ?[*:0]const u8) callconv(W) u32 {
-    if (lpFileName) |name| {
-        const slice = std.mem.sliceTo(name, 0);
-        var norm_buf: [512]u8 = undefined;
-        const norm_len = @min(norm_buf.len - 1, slice.len);
-        for (0..norm_len) |i| {
-            norm_buf[i] = if (slice[i] == '\\') '/' else slice[i];
-        }
-        norm_buf[norm_len] = 0;
-        const norm_slice = norm_buf[0..norm_len:0];
+    var norm_buf: [512]u8 = undefined;
+    if (winNormPathZ(lpFileName, &norm_buf)) |norm_slice| {
 
         var target: [*:0]const u8 = norm_slice.ptr;
         var resolved_buf: [512]u8 = undefined;
@@ -2323,16 +2364,11 @@ fn GetFileAttributesA(lpFileName: ?[*:0]const u8) callconv(W) u32 {
 }
 
 fn DeleteFileA(lpFileName: ?[*:0]const u8) callconv(W) i32 {
-    if (lpFileName) |p| {
-        var buf: [512]u8 = undefined;
-        var len: usize = 0;
-        while (p[len] != 0 and len < 511) : (len += 1) {
-            buf[len] = if (p[len] == '\\') '/' else p[len];
-        }
-        buf[len] = 0;
-        const rc = linux.unlink(buf[0..len:0].ptr);
+    var buf: [512]u8 = undefined;
+    if (winNormPathZ(lpFileName, &buf)) |path| {
+        const rc = linux.unlink(path.ptr);
         if (linux.errno(rc) == .SUCCESS) {
-            std.debug.print("[WINS:Kernel32] DeleteFileA(\"{s}\") -> removed\n", .{buf[0..len]});
+            std.debug.print("[WINS:Kernel32] DeleteFileA(\"{s}\") -> removed\n", .{path});
             return 1;
         }
         g_last_error = switch (linux.errno(rc)) {
@@ -2340,11 +2376,20 @@ fn DeleteFileA(lpFileName: ?[*:0]const u8) callconv(W) i32 {
             .ACCES => 5, // ERROR_ACCESS_DENIED
             else => 5,
         };
-        std.debug.print("[WINS:Kernel32] DeleteFileA(\"{s}\") -> failed (kernel errno {d})\n", .{ buf[0..len], @intFromEnum(linux.errno(rc)) });
+        std.debug.print("[WINS:Kernel32] DeleteFileA(\"{s}\") -> failed (kernel errno {d})\n", .{ path, @intFromEnum(linux.errno(rc)) });
         return 0;
     }
     g_last_error = 2; // ERROR_FILE_NOT_FOUND
     return 0;
+}
+
+fn DeleteFileW(lpFileName: ?[*:0]const u16) callconv(W) i32 {
+    var utf8_buf: [512]u8 = undefined;
+    const path = wideToUtf8Z(lpFileName, &utf8_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    };
+    return DeleteFileA(path.ptr);
 }
 
 /// Move and copy, or an answer that says why not.
@@ -2355,13 +2400,36 @@ fn DeleteFileA(lpFileName: ?[*:0]const u8) callconv(W) i32 {
 /// the path Fallout: New Vegas takes (measured: zero calls), so they are here
 /// to stop claiming work that was never done, not because a symptom named
 /// them.
-fn winNormPathZ(path: ?[*:0]const u8, buf: []u8) ?[:0]u8 {
-    if (path == null) return null;
-    const src = std.mem.sliceTo(path.?, 0);
-    if (src.len >= buf.len) return null;
-    for (src, 0..) |c, i| buf[i] = if (c == '\\') '/' else c;
-    buf[src.len] = 0;
-    return buf[0..src.len :0];
+fn winNormPathZ(path: ?[*:0]const u8, buf: []u8) ?[:0]const u8 {
+    const p = path orelse return null;
+    const raw = std.mem.sliceTo(p, 0);
+    if (raw.len == 0) return null;
+    var tmp: [512]u8 = undefined;
+    if (raw.len >= tmp.len) return null;
+    for (raw, 0..) |c, i| tmp[i] = if (c == '\\') '/' else c;
+    var s: []const u8 = tmp[0..raw.len];
+    if (std.mem.startsWith(u8, s, "//?/")) s = s[4..];
+    if (s.len >= 2 and std.ascii.isAlphabetic(s[0]) and s[1] == ':') {
+        s = if (s.len == 2) "/" else s[2..];
+    }
+    if (s.len == 0 or s.len >= buf.len) return null;
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
+}
+
+fn MoveFileW(lpExistingFileName: ?[*:0]const u16, lpNewFileName: ?[*:0]const u16) callconv(W) i32 {
+    var from_buf: [512]u8 = undefined;
+    var to_buf: [512]u8 = undefined;
+    const from = wideToUtf8Z(lpExistingFileName, &from_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    };
+    const to = wideToUtf8Z(lpNewFileName, &to_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return 0;
+    };
+    return MoveFileA(from.ptr, to.ptr);
 }
 
 fn MoveFileA(lpExistingFileName: ?[*:0]const u8, lpNewFileName: ?[*:0]const u8) callconv(W) i32 {
@@ -2444,16 +2512,11 @@ fn CopyFileA(lpExistingFileName: ?[*:0]const u8, lpNewFileName: ?[*:0]const u8, 
 /// not a failure.
 fn CreateDirectoryA(lpPathName: ?[*:0]const u8, lpSecurityAttributes: ?*anyopaque) callconv(W) i32 {
     _ = lpSecurityAttributes;
-    if (lpPathName) |p| {
-        var buf: [512]u8 = undefined;
-        var len: usize = 0;
-        while (p[len] != 0 and len < 511) : (len += 1) {
-            buf[len] = if (p[len] == '\\') '/' else p[len];
-        }
-        buf[len] = 0;
-        const rc = linux.mkdir(buf[0..len:0].ptr, 0o755);
+    var buf: [512]u8 = undefined;
+    if (winNormPathZ(lpPathName, &buf)) |path| {
+        const rc = linux.mkdir(path.ptr, 0o755);
         if (linux.errno(rc) == .SUCCESS) {
-            std.debug.print("[WINS:Kernel32] CreateDirectoryA(\"{s}\") -> created\n", .{buf[0..len]});
+            std.debug.print("[WINS:Kernel32] CreateDirectoryA(\"{s}\") -> created\n", .{path});
             return 1;
         }
         g_last_error = switch (linux.errno(rc)) {
@@ -2462,11 +2525,20 @@ fn CreateDirectoryA(lpPathName: ?[*:0]const u8, lpSecurityAttributes: ?*anyopaqu
             .ACCES => 5, // ERROR_ACCESS_DENIED
             else => 5,
         };
-        std.debug.print("[WINS:Kernel32] CreateDirectoryA(\"{s}\") -> failed (kernel errno {d})\n", .{ buf[0..len], @intFromEnum(linux.errno(rc)) });
+        std.debug.print("[WINS:Kernel32] CreateDirectoryA(\"{s}\") -> failed (kernel errno {d})\n", .{ path, @intFromEnum(linux.errno(rc)) });
         return 0;
     }
     g_last_error = 3; // ERROR_PATH_NOT_FOUND
     return 0;
+}
+
+fn CreateDirectoryW(lpPathName: ?[*:0]const u16, lpSecurityAttributes: ?*anyopaque) callconv(W) i32 {
+    var utf8_buf: [512]u8 = undefined;
+    const path = wideToUtf8Z(lpPathName, &utf8_buf) orelse {
+        g_last_error = 3; // ERROR_PATH_NOT_FOUND
+        return 0;
+    };
+    return CreateDirectoryA(path.ptr, lpSecurityAttributes);
 }
 
 fn GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: ?[*]u8) callconv(W) u32 {
@@ -2909,12 +2981,10 @@ fn FindFirstFileA(lpFileName: ?[*:0]const u8, lpFindFileData: ?*anyopaque) callc
     }));
     const raw = std.mem.sliceTo(name_p, 0);
     var norm: [512]u8 = undefined;
-    if (raw.len >= norm.len) {
+    const path = winNormPathZ(name_p, &norm) orelse {
         g_last_error = 206; // ERROR_FILENAME_EXCED_RANGE
         return INVALID;
-    }
-    for (raw, 0..) |c, i| norm[i] = if (c == '\\') '/' else c;
-    const path = norm[0..raw.len];
+    };
 
     const slash = std.mem.lastIndexOfScalar(u8, path, '/');
     const pat = if (slash) |s| path[s + 1 ..] else path;
@@ -2981,6 +3051,77 @@ fn FindNextFileA(hFindFile: usize, lpFindFileData: ?*anyopaque) callconv(W) i32 
     if (findAdvance(st, out)) return 1;
     g_last_error = 18; // ERROR_NO_MORE_FILES
     return 0;
+}
+
+const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: [2]u32,
+    ftLastAccessTime: [2]u32,
+    ftLastWriteTime: [2]u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    dwReserved0: u32,
+    dwReserved1: u32,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+
+fn findDataAToW(src: *const WIN32_FIND_DATAA, dst: *WIN32_FIND_DATAW) void {
+    dst.dwFileAttributes = src.dwFileAttributes;
+    dst.ftCreationTime = src.ftCreationTime;
+    dst.ftLastAccessTime = src.ftLastAccessTime;
+    dst.ftLastWriteTime = src.ftLastWriteTime;
+    dst.nFileSizeHigh = src.nFileSizeHigh;
+    dst.nFileSizeLow = src.nFileSizeLow;
+    dst.dwReserved0 = src.dwReserved0;
+    dst.dwReserved1 = src.dwReserved1;
+    @memset(&dst.cFileName, 0);
+    @memset(&dst.cAlternateFileName, 0);
+    const name = std.mem.sliceTo(&src.cFileName, 0);
+    const wlen = std.unicode.utf8ToUtf16Le(&dst.cFileName, name) catch blk: {
+        const n = @min(name.len, dst.cFileName.len - 1);
+        for (0..n) |i| dst.cFileName[i] = name[i];
+        break :blk n;
+    };
+    const safe_len = @min(wlen, dst.cFileName.len - 1);
+    dst.cFileName[safe_len] = 0;
+}
+
+fn FindFirstFileW(lpFileName: ?[*:0]const u16, lpFindFileData: ?*anyopaque) callconv(W) usize {
+    const INVALID: usize = 0xFFFFFFFF;
+    var utf8_buf: [512]u8 = undefined;
+    const path = wideToUtf8Z(lpFileName, &utf8_buf) orelse {
+        g_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return INVALID;
+    };
+    const out: *WIN32_FIND_DATAW = @ptrCast(@alignCast(lpFindFileData orelse {
+        g_last_error = 87; // ERROR_INVALID_PARAMETER
+        return INVALID;
+    }));
+    var data_a: WIN32_FIND_DATAA = undefined;
+    const h = FindFirstFileA(path.ptr, &data_a);
+    if (h == INVALID) return INVALID;
+    findDataAToW(&data_a, out);
+    return h;
+}
+
+fn FindFirstFileExW(lpFileName: ?[*:0]const u16, fInfoLevelId: u32, lpFindFileData: ?*anyopaque, fSearchOp: u32, lpSearchFilter: ?*anyopaque, dwAdditionalFlags: u32) callconv(W) usize {
+    _ = fInfoLevelId;
+    _ = fSearchOp;
+    _ = lpSearchFilter;
+    _ = dwAdditionalFlags;
+    return FindFirstFileW(lpFileName, lpFindFileData);
+}
+
+fn FindNextFileW(hFindFile: usize, lpFindFileData: ?*anyopaque) callconv(W) i32 {
+    const out: *WIN32_FIND_DATAW = @ptrCast(@alignCast(lpFindFileData orelse {
+        g_last_error = 87;
+        return 0;
+    }));
+    var data_a: WIN32_FIND_DATAA = undefined;
+    if (FindNextFileA(hFindFile, &data_a) == 0) return 0;
+    findDataAToW(&data_a, out);
+    return 1;
 }
 
 fn FindClose(hFindFile: usize) callconv(W) i32 {
@@ -5631,14 +5772,20 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (std.mem.eql(u8, name, "FlushFileBuffers")) return @ptrCast(&FlushFileBuffers);
         if (std.mem.eql(u8, name, "GetFileAttributesA")) return @ptrCast(&GetFileAttributesA);
         if (std.mem.eql(u8, name, "DeleteFileA")) return @ptrCast(&DeleteFileA);
+        if (std.mem.eql(u8, name, "DeleteFileW")) return @ptrCast(&DeleteFileW);
         if (std.mem.eql(u8, name, "MoveFileA")) return @ptrCast(&MoveFileA);
+        if (std.mem.eql(u8, name, "MoveFileW")) return @ptrCast(&MoveFileW);
         if (std.mem.eql(u8, name, "CopyFileA")) return @ptrCast(&CopyFileA);
         if (std.mem.eql(u8, name, "CreateDirectoryA")) return @ptrCast(&CreateDirectoryA);
+        if (std.mem.eql(u8, name, "CreateDirectoryW")) return @ptrCast(&CreateDirectoryW);
         if (std.mem.eql(u8, name, "GetCurrentDirectoryA")) return @ptrCast(&GetCurrentDirectoryA);
         if (std.mem.eql(u8, name, "GetFullPathNameA")) return @ptrCast(&GetFullPathNameA);
         if (std.mem.eql(u8, name, "GetDriveTypeA")) return @ptrCast(&GetDriveTypeA);
         if (std.mem.eql(u8, name, "FindFirstFileA")) return @ptrCast(&FindFirstFileA);
         if (std.mem.eql(u8, name, "FindNextFileA")) return @ptrCast(&FindNextFileA);
+        if (std.mem.eql(u8, name, "FindFirstFileW")) return @ptrCast(&FindFirstFileW);
+        if (std.mem.eql(u8, name, "FindFirstFileExW")) return @ptrCast(&FindFirstFileExW);
+        if (std.mem.eql(u8, name, "FindNextFileW")) return @ptrCast(&FindNextFileW);
         if (std.mem.eql(u8, name, "FindClose")) return @ptrCast(&FindClose);
         if (std.mem.eql(u8, name, "GetCommandLineA")) return @ptrCast(&GetCommandLineA);
         if (std.mem.eql(u8, name, "GetCommandLineW")) return @ptrCast(&GetCommandLineW);
@@ -5942,6 +6089,8 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
     // what turns "Diagnostic Fallback API" (a null-returning stub) into a real
     // implementation instead of duplicating the surface a second time.
     if (msvcrtDll(dll)) {
+        if (std.mem.eql(u8, name, "_beginthreadex")) return @ptrCast(&_beginthreadex);
+        if (std.mem.eql(u8, name, "_endthreadex")) return @ptrCast(&_endthreadex);
         if (msvcrt_mod.lookup(name)) |addr| return @ptrFromInt(addr);
     } else if (std.ascii.endsWithIgnoreCase(dll, "kernel32.dll") or std.ascii.endsWithIgnoreCase(dll, "kernel32")) {
         if (kernel32_mod.lookup(name)) |addr| return @ptrFromInt(addr);
@@ -7003,6 +7152,34 @@ test "guest threads get their own TEB, tid and static TLS block" {
     try std.testing.expectEqual(@as(i32, 1), CloseHandle(h2));
 }
 
+test "msvcrt _beginthreadex: runs stdcall start routine on real guest thread and reports exit code" {
+    try std.testing.expect(resolveImport("MSVCRT.dll", "_beginthreadex") != null);
+    try std.testing.expect(resolveImport("ucrtbase.dll", "_endthreadex") != null);
+
+    const State = struct {
+        value: u32 = 0,
+        fn entry(arg: ?*anyopaque) callconv(W) u32 {
+            const s: *@This() = @ptrCast(@alignCast(arg.?));
+            s.value = 1234;
+            return 0x42;
+        }
+    };
+    var st = State{};
+    var tid: u32 = 0;
+    const fp: ?*anyopaque = @ptrCast(@constCast(&State.entry));
+    const h = _beginthreadex(null, 0, fp, &st, threads_mod.CREATE_SUSPENDED, &tid);
+    try std.testing.expect(h != 0);
+    try std.testing.expect(tid != 0);
+    try std.testing.expectEqual(@as(u32, 0), st.value);
+    try std.testing.expectEqual(@as(u32, 1), ResumeThread(h));
+    try std.testing.expectEqual(@as(u32, 0), WaitForSingleObject(h, 5000));
+    try std.testing.expectEqual(@as(u32, 1234), st.value);
+    var code: u32 = 0;
+    try std.testing.expectEqual(@as(i32, 1), GetExitCodeThread(h, &code));
+    try std.testing.expectEqual(@as(u32, 0x42), code);
+    try std.testing.expectEqual(@as(i32, 1), CloseHandle(h));
+}
+
 test "kernel32 wrappers: real sync objects, real wait results, legacy handles unchanged" {
     const e = CreateEventA(null, 1, 0, null);
     try std.testing.expect(e != 0);
@@ -7412,4 +7589,74 @@ test "steam sub-interface thunks bridge MSVC thiscall to aligned SysV cdecl acro
     const fnVoice: *const fn (usize, u32, u32, u32) callconv(Tc) void = @ptrFromInt(fr_vtbl[18]);
     fnVoice(a_fr, @truncate(fsid), @truncate(fsid >> 32), 1);
     try std.testing.expectEqual(@as(u32, 0x55AA), Mock.void_sum);
+}
+
+test "Wide file attributes, FindFirstFileW/FindNextFileW, and OLEAUT32 ordinal 10" {
+    var base_buf: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, "/tmp/wins-findw-{}", .{linux.getpid()});
+    var z: [512]u8 = undefined;
+    const nul = struct {
+        fn f(buf: []u8, comptime fmt: []const u8, args: anytype) [*:0]const u8 {
+            const s = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args) catch unreachable;
+            buf[s.len] = 0;
+            return @ptrCast(buf.ptr);
+        }
+    }.f;
+    try std.testing.expect(linux.errno(linux.mkdir(nul(&z, "{s}", .{base}), 0o755)) == .SUCCESS);
+    try std.testing.expect(linux.errno(linux.mkdir(nul(&z, "{s}/Sub", .{base}), 0o755)) == .SUCCESS);
+    const fd = linux.open(nul(&z, "{s}/Sample.txt", .{base}), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try std.testing.expect(linux.errno(fd) == .SUCCESS);
+    _ = linux.write(@intCast(fd), "hello", 5);
+    _ = linux.close(@intCast(fd));
+    defer {
+        _ = linux.unlinkat(linux.AT.FDCWD, nul(&z, "{s}/Sample.txt", .{base}), 0);
+        _ = linux.rmdir(nul(&z, "{s}/Sub", .{base}));
+        _ = linux.rmdir(nul(&z, "{s}", .{base}));
+    }
+
+    var w_buf: [512]u16 = undefined;
+    var a_buf: [512]u8 = undefined;
+    const file_a = try std.fmt.bufPrint(&a_buf, "{s}\\sample.txt", .{base});
+    const wlen_f = try std.unicode.utf8ToUtf16Le(&w_buf, file_a);
+    w_buf[wlen_f] = 0;
+    try std.testing.expectEqual(@as(u32, 0x20), GetFileAttributesW(w_buf[0..wlen_f :0].ptr));
+
+    const dir_a = try std.fmt.bufPrint(&a_buf, "{s}\\sub", .{base});
+    const wlen_d = try std.unicode.utf8ToUtf16Le(&w_buf, dir_a);
+    w_buf[wlen_d] = 0;
+    try std.testing.expectEqual(@as(u32, 0x10), GetFileAttributesW(w_buf[0..wlen_d :0].ptr));
+
+    // Extended/drive-prefixed Win32 paths targeting Linux paths resolve cleanly.
+    const drive_a = try std.fmt.bufPrint(&a_buf, "C:{s}\\sample.txt", .{base});
+    const wlen_dr = try std.unicode.utf8ToUtf16Le(&w_buf, drive_a);
+    w_buf[wlen_dr] = 0;
+    try std.testing.expectEqual(@as(u32, 0x20), GetFileAttributesW(w_buf[0..wlen_dr :0].ptr));
+
+    const ext_a = try std.fmt.bufPrint(&a_buf, "\\\\?\\C:{s}\\sample.txt", .{base});
+    const wlen_ex = try std.unicode.utf8ToUtf16Le(&w_buf, ext_a);
+    w_buf[wlen_ex] = 0;
+    try std.testing.expectEqual(@as(u32, 0x20), GetFileAttributesW(w_buf[0..wlen_ex :0].ptr));
+
+    const miss_a = try std.fmt.bufPrint(&a_buf, "{s}\\missing.bin", .{base});
+    const wlen_m = try std.unicode.utf8ToUtf16Le(&w_buf, miss_a);
+    w_buf[wlen_m] = 0;
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), GetFileAttributesW(w_buf[0..wlen_m :0].ptr));
+    try std.testing.expectEqual(@as(u32, 2), g_last_error);
+
+    const pat_a = try std.fmt.bufPrint(&a_buf, "{s}\\*.txt", .{base});
+    const wlen_p = try std.unicode.utf8ToUtf16Le(&w_buf, pat_a);
+    w_buf[wlen_p] = 0;
+    var fd_w: WIN32_FIND_DATAW = undefined;
+    const h = FindFirstFileW(w_buf[0..wlen_p :0].ptr, &fd_w);
+    try std.testing.expect(h != 0xFFFFFFFF);
+    try std.testing.expectEqual(@as(u32, 5), fd_w.nFileSizeLow);
+    const fname = std.mem.sliceTo(&fd_w.cFileName, 0);
+    var out_u8: [260]u8 = undefined;
+    const u8_len = try std.unicode.utf16LeToUtf8(&out_u8, fname);
+    try std.testing.expectEqualStrings("Sample.txt", out_u8[0..u8_len]);
+    try std.testing.expectEqual(@as(i32, 0), FindNextFileW(h, &fd_w));
+    _ = FindClose(h);
+
+    try std.testing.expectEqualStrings("VariantCopy", ordinals_mod.getOrdinalName("OLEAUT32.dll", 10).?);
+    try std.testing.expectEqualStrings("VariantChangeType", ordinals_mod.getOrdinalName("OLEAUT32.dll", 12).?);
 }

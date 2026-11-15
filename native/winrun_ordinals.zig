@@ -61,13 +61,14 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(dll, "oleaut32.dll")) {
         return switch (ord) {
             2 => "SysAllocString",
-            10 => "SysAllocStringA",
             4 => "SysAllocStringLen",
             6 => "SysFreeString",
             7 => "SysStringLen",
             8 => "VariantInit",
             9 => "VariantClear",
-            12 => "VariantCopy",
+            10 => "VariantCopy",
+            11 => "VariantCopyInd",
+            12 => "VariantChangeType",
             149 => "SysStringByteLen",
             150 => "SysAllocStringByteLen",
             200 => "GetErrorInfo",
