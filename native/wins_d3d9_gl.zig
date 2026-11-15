@@ -41,8 +41,13 @@ var g_w: u32 = 0;
 var g_h: u32 = 0;
 
 const Program = struct {
-    vs: *const d3d.WinsShader9,
-    ps: *const d3d.WinsShader9,
+    vs: ?*const d3d.WinsShader9,
+    ps: ?*const d3d.WinsShader9,
+    /// Fixed-function programs: the state they were generated for.
+    fixed_key: ?FixedKey = null,
+    loc_wvp: host.GLint = -1,
+    loc_vp: host.GLint = -1,
+    loc_tfactor: host.GLint = -1,
     /// 0 when the pair could not be translated/compiled/linked.
     prog: host.GLuint,
     inputs: []shader.Input,
@@ -403,7 +408,7 @@ fn buildProgram(vs: *const d3d.WinsShader9, ps: *const d3d.WinsShader9) Program 
 
 fn programFor(vs: *const d3d.WinsShader9, ps: *const d3d.WinsShader9) ?*const Program {
     for (g_programs.items) |*p| {
-        if (p.vs == vs and p.ps == ps) return if (p.prog != 0) p else null;
+        if (p.fixed_key == null and p.vs == vs and p.ps == ps) return if (p.prog != 0) p else null;
     }
     const built = buildProgram(vs, ps);
     g_programs.append(alloc, built) catch return null;
@@ -540,6 +545,11 @@ pub const DrawJob = struct {
     num_vertices: u32 = 0,
     start_index: u32 = 0,
     prim_count: u32,
+    /// Draw*PrimitiveUP: stream 0 (and the indices) live in the caller's memory.
+    up_vb: ?[*]const u8 = null,
+    up_stride: u32 = 0,
+    up_ib: ?[*]const u8 = null,
+    up_ib_format: u32 = 0,
 };
 
 fn vertexCount(prim: u32, n: u32) ?struct { mode: host.GLenum, count: u64 } {
@@ -555,17 +565,36 @@ fn vertexCount(prim: u32, n: u32) ?struct { mode: host.GLenum, count: u64 } {
     };
 }
 
+const Source = struct { ptr: [*]const u8, len: usize, stride: u64, offset: u64 };
+
+fn streamSource(job: *const DrawJob, stream: u16, last_vertex: u64) ?Source {
+    const dev = job.dev;
+    if (job.up_vb) |p| {
+        if (stream != 0) return null;
+        // The caller's array is exactly as long as the vertices the draw uses.
+        return .{ .ptr = p, .len = @intCast((last_vertex + 1) * job.up_stride), .stride = job.up_stride, .offset = 0 };
+    }
+    if (stream >= 16) return null;
+    const vb = dev.streams[stream] orelse return null;
+    return .{ .ptr = vb.data.ptr, .len = vb.data.len, .stride = dev.stream_strides[stream], .offset = dev.stream_offsets[stream] };
+}
+
 fn drawJob(raw: ?*anyopaque) void {
     const job: *DrawJob = @ptrCast(@alignCast(raw.?));
     const gl = &host.gl;
     const dev = job.dev;
-    const vs = dev.active_vs orelse return warnOnce(0, "draws without a vertex shader (fixed-function transform) are not implemented; skipped");
-    const ps = dev.active_ps orelse return warnOnce(1, "draws without a pixel shader (fixed-function texturing) are not implemented; skipped");
-    const decl = dev.vertex_decl orelse return warnOnce(2, "draws with an FVF instead of a vertex declaration are not implemented; skipped");
     if (dev.render_target_is_backbuffer == false) return warnOnce(5, "draws into a render target other than the back buffer are not implemented; skipped");
+    const elements: []const d3d.D3DVERTEXELEMENT9 = if (dev.use_fvf) dev.fvf_elements[0..] else if (dev.vertex_decl) |dcl| dcl.elements else return warnOnce(2, "a draw with neither a vertex declaration nor an FVF; skipped");
     const shape = vertexCount(job.prim, job.prim_count) orelse return;
     if (shape.count == 0 or shape.count > std.math.maxInt(i32)) return;
-    const prog = programFor(vs, ps) orelse return;
+    const prog: *const Program = blk: {
+        if (dev.active_vs) |vs| {
+            if (dev.active_ps) |ps| break :blk programFor(vs, ps) orelse return;
+            return warnOnce(1, "a vertex shader with fixed-function texturing is not implemented; skipped");
+        }
+        if (dev.active_ps != null) return warnOnce(0, "fixed-function transform with a pixel shader is not implemented; skipped");
+        break :blk fixedProgramFor(dev, elements) orelse return;
+    };
 
     // The vertices this draw can touch, to keep every read inside the buffers.
     var first: i64 = job.base_vertex;
@@ -576,6 +605,7 @@ fn drawJob(raw: ?*anyopaque) void {
     }
     if (first < 0) return;
     if (job.indexed and job.base_vertex < 0) return warnOnce(10, "indexed draws with a negative base vertex are not implemented; skipped");
+    if (span == 0) return;
 
     applyTargetState(dev);
     applyRenderStates(dev);
@@ -583,39 +613,41 @@ fn drawJob(raw: ?*anyopaque) void {
     if (prog.loc_vs_c >= 0 and prog.vs_const_count != 0) gl.glUniform4fv(prog.loc_vs_c, prog.vs_const_count, @ptrCast(&dev.vs_consts));
     if (prog.loc_ps_c >= 0 and prog.ps_const_count != 0) gl.glUniform4fv(prog.loc_ps_c, prog.ps_const_count, @ptrCast(&dev.ps_consts));
     if (prog.loc_half >= 0) gl.glUniform2f(prog.loc_half, 1.0 / @as(f32, @floatFromInt(@max(1, dev.viewport.Width))), -1.0 / @as(f32, @floatFromInt(@max(1, dev.viewport.Height))));
+    if (prog.fixed_key != null) setFixedUniforms(dev, prog);
 
     gl.glBindBuffer(0x8892, 0); // ARRAY_BUFFER: client memory
     gl.glBindBuffer(0x8893, 0); // ELEMENT_ARRAY_BUFFER
+    const first_u: u64 = @intCast(first);
     var wanted: u16 = 0;
     for (prog.inputs) |in| {
         if (in.reg >= 16) continue;
         var found = false;
-        for (decl.elements) |e| {
+        for (elements) |e| {
             if (e.Stream == 0xFF) break;
             if (e.Usage != in.usage or e.UsageIndex != in.index) continue;
-            if (e.Stream >= 16) break;
-            const vb = dev.streams[e.Stream] orelse break;
+            const src = streamSource(job, e.Stream, first_u + span - 1) orelse break;
             const af = attribFormat(e.Type) orelse {
                 warnOnce(6, "a vertex element type (UDEC3/DEC3N) has no OpenGL path yet; attribute left at its default");
                 break;
             };
-            const stride: u64 = dev.stream_strides[e.Stream];
-            const base: u64 = @as(u64, dev.stream_offsets[e.Stream]) + e.Offset;
-            const first_u: u64 = @intCast(first);
+            const base: u64 = src.offset + e.Offset;
             // Last byte read: the final vertex's element.
-            const end = base + (first_u + span - 1) * stride + af.bytes;
-            if (span == 0 or end > vb.data.len) {
+            const end = base + (first_u + span - 1) * src.stride + af.bytes;
+            if (end > src.len) {
                 warnOnce(7, "a draw reads past the end of its vertex buffer; skipped");
                 return;
             }
             // With client arrays index i reads base + i*stride: fold the base vertex in.
-            const origin: u64 = if (job.indexed) @as(u64, @intCast(job.base_vertex)) * stride else 0;
-            gl.glVertexAttribPointer(in.reg, af.size, af.ty, af.normalized, @intCast(stride), vb.data.ptr + @as(usize, @intCast(base + origin)));
+            const origin: u64 = if (job.indexed) @as(u64, @intCast(job.base_vertex)) * src.stride else 0;
+            gl.glVertexAttribPointer(in.reg, af.size, af.ty, af.normalized, @intCast(src.stride), src.ptr + @as(usize, @intCast(base + origin)));
             wanted |= @as(u16, 1) << @intCast(in.reg);
             found = true;
             break;
         }
-        if (!found) gl.glVertexAttrib4f(in.reg, 0, 0, 0, 1);
+        if (!found) {
+            // D3D9 defaults for a missing input: colour white, the rest (0,0,0,1).
+            if (in.usage == 10 and in.index == 0) gl.glVertexAttrib4f(in.reg, 1, 1, 1, 1) else gl.glVertexAttrib4f(in.reg, 0, 0, 0, 1);
+        }
     }
     var bit: u5 = 0;
     while (bit < 16) : (bit += 1) {
@@ -645,14 +677,292 @@ fn drawJob(raw: ?*anyopaque) void {
     }
 
     if (job.indexed) {
-        const ib = dev.indices orelse return;
-        const width: u64 = if (ib.format == d3d.D3DFMT_INDEX32) 4 else 2;
+        var ptr: [*]const u8 = undefined;
+        var len: u64 = 0;
+        var fmt: u32 = 0;
+        if (job.up_ib) |p| {
+            ptr = p;
+            fmt = job.up_ib_format;
+            len = shape.count * @as(u64, if (fmt == d3d.D3DFMT_INDEX32) 4 else 2);
+        } else {
+            const ib = dev.indices orelse return;
+            ptr = ib.data.ptr;
+            len = ib.data.len;
+            fmt = ib.format;
+        }
+        const width: u64 = if (fmt == d3d.D3DFMT_INDEX32) 4 else 2;
         const begin = @as(u64, job.start_index) * width;
-        if (begin + shape.count * width > ib.data.len) return warnOnce(9, "a draw reads past the end of its index buffer; skipped");
-        gl.glDrawElements(shape.mode, @intCast(shape.count), if (width == 4) 0x1405 else 0x1403, ib.data.ptr + @as(usize, @intCast(begin)));
+        if (begin + shape.count * width > len) return warnOnce(9, "a draw reads past the end of its index buffer; skipped");
+        gl.glDrawElements(shape.mode, @intCast(shape.count), if (width == 4) 0x1405 else 0x1403, ptr + @as(usize, @intCast(begin)));
     } else {
         gl.glDrawArrays(shape.mode, @intCast(first), @intCast(shape.count));
     }
+}
+
+// ---- fixed function ---------------------------------------------------------
+
+/// Everything the generated fixed-function GLSL depends on.
+pub const FixedKey = struct {
+    pretransformed: bool,
+    has_color0: bool,
+    has_color1: bool,
+    tex_coords: u8, // texcoord sets present in the vertex
+    specular: bool,
+    stages: [8][7]u8, // colorop, colorarg1, colorarg2, alphaop, alphaarg1, alphaarg2, texcoordindex | result<<4
+    stage_count: u8,
+    textured: u8, // stages with a bound texture
+};
+
+const TSS_COLOROP = 1;
+const TSS_COLORARG1 = 2;
+const TSS_COLORARG2 = 3;
+const TSS_ALPHAOP = 4;
+const TSS_ALPHAARG1 = 5;
+const TSS_ALPHAARG2 = 6;
+const TSS_TEXCOORDINDEX = 11;
+const TSS_RESULTARG = 28;
+
+fn fixedKey(dev: *const Device, elements: []const d3d.D3DVERTEXELEMENT9) FixedKey {
+    var k: FixedKey = .{ .pretransformed = false, .has_color0 = false, .has_color1 = false, .tex_coords = 0, .specular = dev.render_states[29] != 0, .stages = std.mem.zeroes([8][7]u8), .stage_count = 0, .textured = 0 };
+    for (elements) |e| {
+        if (e.Stream == 0xFF) break;
+        switch (e.Usage) {
+            9 => k.pretransformed = true,
+            10 => if (e.UsageIndex == 0) {
+                k.has_color0 = true;
+            } else {
+                k.has_color1 = true;
+            },
+            5 => if (e.UsageIndex < 8) {
+                k.tex_coords |= @as(u8, 1) << @intCast(e.UsageIndex);
+            },
+            else => {},
+        }
+    }
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const t = dev.tex_stage_states[i];
+        if (t[TSS_COLOROP] == 1 or t[TSS_COLOROP] == 0) break;
+        k.stages[i] = .{ @intCast(t[TSS_COLOROP] & 0xFF), @intCast(t[TSS_COLORARG1] & 0xFF), @intCast(t[TSS_COLORARG2] & 0xFF), @intCast(t[TSS_ALPHAOP] & 0xFF), @intCast(t[TSS_ALPHAARG1] & 0xFF), @intCast(t[TSS_ALPHAARG2] & 0xFF), @intCast((t[TSS_TEXCOORDINDEX] & 7) | ((t[TSS_RESULTARG] & 0xF) << 4)) };
+        if (dev.bound_textures[i] != null) k.textured |= @as(u8, 1) << @intCast(i);
+        k.stage_count += 1;
+    }
+    return k;
+}
+
+fn fixedArg(buf: *std.ArrayList(u8), code: u8, stage: usize, alpha: bool) void {
+    const base: []const u8 = switch (code & 0xF) {
+        0 => "diffuse",
+        1 => "current",
+        2 => "t",
+        3 => "tfactor",
+        4 => "specular",
+        5 => "temp",
+        else => "vec4(1.0)",
+    };
+    _ = stage;
+    var e: [96]u8 = undefined;
+    var x = std.fmt.bufPrint(&e, "{s}", .{base}) catch return;
+    var e2: [128]u8 = undefined;
+    if (code & 0x20 != 0) x = std.fmt.bufPrint(&e2, "vec4(({s}).a)", .{x}) catch return; // ALPHAREPLICATE
+    var e3: [160]u8 = undefined;
+    if (code & 0x10 != 0) x = std.fmt.bufPrint(&e3, "(vec4(1.0) - ({s}))", .{x}) catch return; // COMPLEMENT
+    buf.appendSlice(alloc, x) catch {};
+    buf.appendSlice(alloc, if (alpha) ".a" else ".rgb") catch {};
+}
+
+/// One texture-stage operation as a GLSL expression of a1 / a2.
+fn fixedOp(op: u8) []const u8 {
+    return switch (op) {
+        2 => "a1",
+        3 => "a2",
+        4 => "a1 * a2",
+        5 => "a1 * a2 * 2.0",
+        6 => "a1 * a2 * 4.0",
+        7 => "a1 + a2",
+        8 => "a1 + a2 - 0.5",
+        9 => "(a1 + a2 - 0.5) * 2.0",
+        10 => "a1 - a2",
+        11 => "a1 + a2 - a1 * a2",
+        12 => "mix(a2, a1, diffuse.a)",
+        13 => "mix(a2, a1, t.a)",
+        14 => "mix(a2, a1, tfactor.a)",
+        16 => "mix(a2, a1, current.a)",
+        else => "a1",
+    };
+}
+
+fn buildFixed(k: FixedKey) Program {
+    const gl = &host.gl;
+    var p: Program = .{ .vs = null, .ps = null, .fixed_key = k, .prog = 0, .inputs = &.{}, .samplers = [_]shader.SamplerKind{.none} ** 16, .vs_const_count = 0, .ps_const_count = 0, .loc_vs_c = -1, .loc_ps_c = -1, .loc_half = -1 };
+    var vsb: std.ArrayList(u8) = .empty;
+    defer vsb.deinit(alloc);
+    var psb: std.ArrayList(u8) = .empty;
+    defer psb.deinit(alloc);
+    const w = struct {
+        fn f(b: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) void {
+            const t = std.fmt.allocPrint(alloc, fmt, args) catch return;
+            defer alloc.free(t);
+            b.appendSlice(alloc, t) catch {};
+        }
+    }.f;
+    w(&vsb, "#version 120\nattribute vec4 a_pos;\nattribute vec4 a_col0;\nattribute vec4 a_col1;\n", .{});
+    for (0..8) |i| w(&vsb, "attribute vec4 a_tc{d};\nvarying vec4 v_tc{d};\n", .{ i, i });
+    w(&vsb, "uniform mat4 wvp;\nuniform vec4 vp;\nuniform vec2 wins_half_pixel;\nvarying vec4 v_col0;\nvarying vec4 v_col1;\nvoid main() {{\n", .{});
+    if (k.pretransformed) {
+        // D3DFVF_XYZRHW: screen pixels; w holds 1/w.
+        w(&vsb, "    float ww = a_pos.w != 0.0 ? 1.0 / a_pos.w : 1.0;\n    vec3 ndc = vec3((a_pos.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (a_pos.y - vp.y) / vp.w * 2.0, a_pos.z);\n    gl_Position = vec4(ndc * ww, ww);\n", .{});
+    } else {
+        w(&vsb, "    gl_Position = wvp * vec4(a_pos.xyz, 1.0);\n", .{});
+    }
+    w(&vsb, "    gl_Position.xy += wins_half_pixel * gl_Position.w;\n", .{});
+    w(&vsb, "    v_col0 = {s};\n    v_col1 = {s};\n", .{ if (k.has_color0) "a_col0" else "vec4(1.0)", if (k.has_color1) "a_col1" else "vec4(0.0)" });
+    for (0..8) |i| {
+        if (k.tex_coords & (@as(u8, 1) << @intCast(i)) != 0) w(&vsb, "    v_tc{d} = a_tc{d};\n", .{ i, i }) else w(&vsb, "    v_tc{d} = vec4(0.0, 0.0, 0.0, 1.0);\n", .{i});
+    }
+    w(&vsb, "}}\n", .{});
+
+    w(&psb, "#version 120\nuniform vec4 tfactor;\nvarying vec4 v_col0;\nvarying vec4 v_col1;\n", .{});
+    for (0..8) |i| w(&psb, "varying vec4 v_tc{d};\nuniform sampler2D s{d};\n", .{ i, i });
+    w(&psb, "void main() {{\n    vec4 diffuse = v_col0;\n    vec4 specular = v_col1;\n    vec4 current = diffuse;\n    vec4 temp = vec4(0.0);\n    vec4 t = vec4(1.0);\n", .{});
+    for (0..k.stage_count) |i| {
+        const st = k.stages[i];
+        const tci = st[6] & 7;
+        if (k.textured & (@as(u8, 1) << @intCast(i)) != 0) {
+            w(&psb, "    t = texture2D(s{d}, v_tc{d}.xy);\n", .{ i, tci });
+            p.samplers[i] = .tex2d;
+        } else w(&psb, "    t = vec4(1.0);\n", .{});
+        const dst: []const u8 = if ((st[6] >> 4) == 5) "temp" else "current";
+        // colour
+        w(&psb, "    {{ vec3 a1 = ", .{});
+        fixedArg(&psb, st[1], i, false);
+        w(&psb, "; vec3 a2 = ", .{});
+        fixedArg(&psb, st[2], i, false);
+        w(&psb, "; vec3 rc = clamp({s}, 0.0, 1.0);\n", .{fixedOp(st[0])});
+        // alpha
+        if (st[3] == 1 or st[3] == 0) {
+            w(&psb, "      float ra = current.a;\n", .{});
+        } else {
+            w(&psb, "      float b1 = ", .{});
+            fixedArg(&psb, st[4], i, true);
+            w(&psb, "; float b2 = ", .{});
+            fixedArg(&psb, st[5], i, true);
+            const op = fixedOp(st[3]);
+            // the same expression on floats: a1/a2 -> b1/b2
+            var ob: [64]u8 = undefined;
+            var n: usize = 0;
+            var j: usize = 0;
+            while (j < op.len) : (j += 1) {
+                if (op[j] == 'a' and j + 1 < op.len and (op[j + 1] == '1' or op[j + 1] == '2')) {
+                    ob[n] = 'b';
+                } else ob[n] = op[j];
+                n += 1;
+            }
+            w(&psb, "; float ra = clamp({s}, 0.0, 1.0);\n", .{ob[0..n]});
+        }
+        w(&psb, "      {s} = vec4(rc, ra); }}\n", .{dst});
+    }
+    if (k.specular) w(&psb, "    current.rgb = clamp(current.rgb + specular.rgb, 0.0, 1.0);\n", .{});
+    w(&psb, "    gl_FragColor = current;\n}}\n", .{});
+
+    vsb.append(alloc, 0) catch return p;
+    psb.append(alloc, 0) catch return p;
+    const gv = compile(0x8B31, vsb.items[0 .. vsb.items.len - 1 :0], "fixed-function vertex");
+    if (gv == 0) return p;
+    const gp = compile(0x8B30, psb.items[0 .. psb.items.len - 1 :0], "fixed-function pixel");
+    if (gp == 0) return p;
+    const prog = gl.glCreateProgram();
+    gl.glAttachShader(prog, gv);
+    gl.glAttachShader(prog, gp);
+    gl.glBindAttribLocation(prog, 0, "a_pos");
+    gl.glBindAttribLocation(prog, 2, "a_col0");
+    gl.glBindAttribLocation(prog, 3, "a_col1");
+    var name_buf: [16]u8 = undefined;
+    for (0..8) |i| {
+        const name = std.fmt.bufPrintZ(&name_buf, "a_tc{d}", .{i}) catch continue;
+        gl.glBindAttribLocation(prog, @intCast(4 + i), name.ptr);
+    }
+    gl.glLinkProgram(prog);
+    var ok: host.GLint = 0;
+    gl.glGetProgramiv(prog, 0x8B82, &ok);
+    if (ok == 0) {
+        var log: [1024]u8 = undefined;
+        var n: host.GLsizei = 0;
+        gl.glGetProgramInfoLog(prog, log.len, &n, &log);
+        std.debug.print("[WINS:D3D9:GL] fixed-function program does not link:\n{s}\n", .{log[0..@intCast(@max(0, n))]});
+        return p;
+    }
+    gl.glUseProgram(prog);
+    for (0..8) |i| {
+        const name = std.fmt.bufPrintZ(&name_buf, "s{d}", .{i}) catch continue;
+        const loc = gl.glGetUniformLocation(prog, name.ptr);
+        if (loc >= 0) gl.glUniform1i(loc, @intCast(i));
+    }
+    var inputs: std.ArrayList(shader.Input) = .empty;
+    inputs.append(alloc, .{ .reg = 0, .usage = if (k.pretransformed) 9 else 0, .index = 0 }) catch {};
+    if (k.has_color0) inputs.append(alloc, .{ .reg = 2, .usage = 10, .index = 0 }) catch {};
+    if (k.has_color1) inputs.append(alloc, .{ .reg = 3, .usage = 10, .index = 1 }) catch {};
+    for (0..8) |i| {
+        if (k.tex_coords & (@as(u8, 1) << @intCast(i)) != 0) inputs.append(alloc, .{ .reg = @intCast(4 + i), .usage = 5, .index = @intCast(i) }) catch {};
+    }
+    p.inputs = inputs.toOwnedSlice(alloc) catch &.{};
+    p.prog = prog;
+    p.loc_wvp = gl.glGetUniformLocation(prog, "wvp");
+    p.loc_vp = gl.glGetUniformLocation(prog, "vp");
+    p.loc_tfactor = gl.glGetUniformLocation(prog, "tfactor");
+    p.loc_half = gl.glGetUniformLocation(prog, "wins_half_pixel");
+    return p;
+}
+
+fn fixedProgramFor(dev: *const Device, elements: []const d3d.D3DVERTEXELEMENT9) ?*const Program {
+    const k = fixedKey(dev, elements);
+    if (!k.pretransformed and dev.render_states[137] != 0) warnOnce(11, "fixed-function lighting is not implemented; lit vertices use their own colour");
+    for (g_programs.items) |*p| {
+        if (p.fixed_key) |pk| {
+            if (std.meta.eql(pk, k)) return if (p.prog != 0) p else null;
+        }
+    }
+    g_programs.append(alloc, buildFixed(k)) catch return null;
+    const p = &g_programs.items[g_programs.items.len - 1];
+    return if (p.prog != 0) p else null;
+}
+
+fn matMul(a: [16]f32, b: [16]f32) [16]f32 {
+    var r: [16]f32 = undefined;
+    for (0..4) |i| {
+        for (0..4) |j| {
+            var acc: f32 = 0;
+            for (0..4) |k| acc += a[i * 4 + k] * b[k * 4 + j];
+            r[i * 4 + j] = acc;
+        }
+    }
+    return r;
+}
+
+fn setFixedUniforms(dev: *const Device, prog: *const Program) void {
+    const gl = &host.gl;
+    if (prog.loc_wvp >= 0) {
+        const W: [16]f32 = @bitCast(dev.transform_states[d3d.d3dTransformStateIndex(256).?]);
+        const V: [16]f32 = @bitCast(dev.transform_states[d3d.d3dTransformStateIndex(2).?]);
+        const P: [16]f32 = @bitCast(dev.transform_states[d3d.d3dTransformStateIndex(3).?]);
+        // Row vectors: v * W * V * P; OpenGL reads the row-major array as its transpose.
+        const m = matMul(matMul(W, V), P);
+        glUniformMatrix4fv(prog.loc_wvp, &m);
+    }
+    if (prog.loc_vp >= 0) gl.glUniform4fv(prog.loc_vp, 1, &[4]f32{ @floatFromInt(dev.viewport.X), @floatFromInt(dev.viewport.Y), @floatFromInt(@max(1, dev.viewport.Width)), @floatFromInt(@max(1, dev.viewport.Height)) });
+    if (prog.loc_tfactor >= 0) {
+        const c = dev.render_states[60];
+        gl.glUniform4fv(prog.loc_tfactor, 1, &[4]f32{
+            @as(f32, @floatFromInt((c >> 16) & 0xFF)) / 255.0, @as(f32, @floatFromInt((c >> 8) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt(c & 0xFF)) / 255.0,         @as(f32, @floatFromInt(c >> 24)) / 255.0,
+        });
+    }
+}
+
+/// glUniformMatrix4fv without transposing: the array is D3D's row-major
+/// matrix, which OpenGL takes as columns, i.e. the transpose we need.
+fn glUniformMatrix4fv(loc: host.GLint, m: *const [16]f32) void {
+    host.gl.glUniformMatrix4fv(loc, 1, 0, m);
 }
 
 pub fn draw(job: *DrawJob) void {

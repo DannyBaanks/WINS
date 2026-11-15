@@ -451,7 +451,7 @@ fn d3dIdentityMatrix() D3DMATRIX {
     } };
 }
 
-fn d3dTransformStateIndex(state: u32) ?usize {
+pub fn d3dTransformStateIndex(state: u32) ?usize {
     if (state == 2 or state == 3 or (state >= 16 and state <= 23) or (state >= 256 and state < kTransformStateCount)) {
         return @intCast(state);
     }
@@ -1570,6 +1570,59 @@ fn traceDraw(self: *const WinsD3DDevice9, kind: []const u8, prim: u32, a: i64, b
     }
 }
 
+/// D3D9's documented render-state defaults (d3d9types.h / IDirect3DDevice9::
+/// SetRenderState). A device starts with these, not with zeros: a zero
+/// COLORWRITEENABLE writes nothing, a zero ZFUNC fails every depth test.
+fn defaultRenderStates(auto_depth: bool) [256]u32 {
+    var rs = [_]u32{0} ** 256;
+    rs[7] = @intFromBool(auto_depth); // ZENABLE
+    rs[8] = 3; // FILLMODE solid
+    rs[9] = 2; // SHADEMODE gouraud
+    rs[14] = 1; // ZWRITEENABLE
+    rs[16] = 1; // LASTPIXEL
+    rs[19] = 2; // SRCBLEND one
+    rs[20] = 1; // DESTBLEND zero
+    rs[22] = 3; // CULLMODE ccw
+    rs[23] = 4; // ZFUNC lessequal
+    rs[25] = 8; // ALPHAFUNC always
+    rs[56] = 8; // STENCILFUNC always
+    rs[53] = 1; // STENCILFAIL keep
+    rs[54] = 1; // STENCILZFAIL keep
+    rs[55] = 1; // STENCILPASS keep
+    rs[58] = 0xFFFFFFFF; // STENCILMASK
+    rs[59] = 0xFFFFFFFF; // STENCILWRITEMASK
+    rs[60] = 0xFFFFFFFF; // TEXTUREFACTOR
+    rs[136] = 1; // CLIPPING
+    rs[137] = 1; // LIGHTING
+    rs[141] = 1; // COLORVERTEX
+    rs[142] = 1; // LOCALVIEWER
+    rs[143] = 0; // NORMALIZENORMALS
+    rs[145] = 1; // DIFFUSEMATERIALSOURCE color1
+    rs[146] = 2; // SPECULARMATERIALSOURCE color2
+    rs[154] = @bitCast(@as(f32, 1.0)); // POINTSIZE
+    rs[155] = @bitCast(@as(f32, 1.0)); // POINTSIZE_MIN
+    rs[158] = @bitCast(@as(f32, 1.0)); // POINTSCALE_A
+    rs[161] = 1; // MULTISAMPLEANTIALIAS
+    rs[162] = 0xFFFFFFFF; // MULTISAMPLEMASK
+    rs[166] = @bitCast(@as(f32, 64.0)); // POINTSIZE_MAX
+    rs[168] = 0xF; // COLORWRITEENABLE
+    rs[171] = 1; // BLENDOP add
+    rs[186] = 8; // CCW_STENCILFUNC always
+    rs[187] = 1; // CCW_STENCILFAIL keep
+    rs[188] = 1;
+    rs[189] = 1;
+    rs[190] = 0xF; // COLORWRITEENABLE1
+    rs[191] = 0xF; // COLORWRITEENABLE2
+    rs[192] = 0xF; // COLORWRITEENABLE3
+    rs[193] = 0xFFFFFFFF; // BLENDFACTOR
+    rs[207] = 2; // SRCBLENDALPHA one
+    rs[208] = 1; // DESTBLENDALPHA zero
+    rs[209] = 1; // BLENDOPALPHA add
+    rs[37] = @bitCast(@as(f32, 1.0)); // FOGEND
+    rs[38] = @bitCast(@as(f32, 1.0)); // FOGDENSITY
+    return rs;
+}
+
 pub const WinsD3DDevice9 = struct {
     // Largest alignment in the struct, so the compiler keeps it first (see the
     // comptime check above); the guest dereferences offset 0 as the vtable.
@@ -1608,6 +1661,11 @@ pub const WinsD3DDevice9 = struct {
     active_vs: ?*WinsShader9,
     active_ps: ?*WinsShader9,
     allocator: std.mem.Allocator,
+    /// Last SetFVF; while `use_fvf` it is the vertex layout (SetVertexDeclaration
+    /// switches back), described as the equivalent declaration.
+    fvf: u32 = 0,
+    use_fvf: bool = false,
+    fvf_elements: [24]D3DVERTEXELEMENT9 = undefined,
     /// The host backend draws only into the implicit back buffer.
     render_target_is_backbuffer: bool = true,
     /// True when this device renders through wins_d3d9_gl.zig.
@@ -1649,7 +1707,7 @@ pub const WinsD3DDevice9 = struct {
             .depthbuffer = depths,
             .vs_consts = [_][4]f32{[_]f32{ 0, 0, 0, 0 }} ** 256,
             .ps_consts = [_][4]f32{[_]f32{ 0, 0, 0, 0 }} ** 224,
-            .render_states = [_]u32{0} ** 256,
+            .render_states = defaultRenderStates(params.EnableAutoDepthStencil != 0),
             .tex_stage_states = defaultTextureStageStates(),
             .rt_surface = null,
             .ds_surface = null,
@@ -1794,35 +1852,35 @@ fn d3d9_GetAdapterDisplayMode(this: *anyopaque, adapter: u32, pMode: ?*anyopaque
     m.* = kDisplayMode;
     return D3D_OK;
 }
+/// D3DCAPS9 (304 bytes, 76 dwords) exactly as wined3d reports it for this
+/// adapter, measured with the Proton oracle (replay harness,
+/// ~/.cache/wins-oracle/replay/replay_wine.tsv, "GetDeviceCaps 0 0x1").
+/// The earlier hand-filled caps left most fields at zero: FalloutNV reads
+/// PS20Caps.NumInstructionSlots (> 255) and PS20Caps.NumTemps (>= 32) to pick
+/// its shader tier, and with zeros it never enables the object New Game's
+/// first 3D scene asks for (fault at 0xb57aa9). The host backend runs vs/ps up
+/// to 3_0 through GLSL, so these caps describe what it is asked to do; any
+/// shader it cannot translate is reported and its draw skipped.
+const kOracleCaps = [76]u32{
+    0x00000001, 0x00000000, 0x00000000, 0x60020000, 0x00000320, 0x80000001, 0x00000003, 0x0019aff0,
+    0x002ecff2, 0x07332191, 0x000000ff, 0x00003fff, 0x000027ff, 0x000000ff, 0x00084208, 0x0001ec85,
+    0x07030700, 0x07030700, 0x03030300, 0x0000003f, 0x0000003f, 0x0000001f, 0x00004000, 0x00004000,
+    0x00002000, 0x00008000, 0x00004000, 0x00000010, 0x501502f9, 0xc7000000, 0xc7000000, 0x47000000,
+    0x47000000, 0x00000000, 0x000001ff, 0x00100008, 0x03feffff, 0x00000008, 0x00000008, 0x0000013b,
+    0x00000008, 0x00000008, 0x00000004, 0x00000000, 0x45000000, 0x00555555, 0x00ffffff, 0x00000010,
+    0x00000400, 0xfffe0300, 0x00000100, 0xffff0300, 0x7f7fffff, 0x00000051, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000001, 0x0000030f, 0x00000004, 0x03000300, 0x00000001, 0x00000018,
+    0x00000020, 0x00000004, 0x0000001f, 0x00000018, 0x00000020, 0x00000004, 0x00000200, 0x01000100,
+    0x0000ffff, 0x0000ffff, 0x00000200, 0x00000200,
+};
+
 fn d3d9_GetDeviceCaps(this: *anyopaque, adapter: u32, dev_type: u32, pCaps: ?*D3DCAPS9) callconv(W) HRESULT {
     _ = this;
     std.debug.print("[WINS:D3D9] GetDeviceCaps(adapter={d}, type={d}, out={})\n", .{ adapter, dev_type, pCaps != null });
     if (pCaps) |caps| {
-        @memset(std.mem.asBytes(caps), 0);
+        comptime std.debug.assert(@sizeOf(D3DCAPS9) == @sizeOf(@TypeOf(kOracleCaps)));
+        @memcpy(std.mem.asBytes(caps), std.mem.sliceAsBytes(&kOracleCaps));
         caps.DeviceType = dev_type;
-        // The rasterizer is software, so transform & lighting run on the CPU:
-        // the HWTRANSFORMLIGHT cap is honest here, and guests gate on it
-        // before calling CreateDevice.
-        caps.DevCaps = D3DDEVCAPS_HWTRANSFORMLIGHT;
-        caps.MaxTextureWidth = 8192;
-        caps.MaxTextureHeight = 8192;
-        caps.MaxVolumeExtent = 2048;
-        caps.MaxTextureRepeat = 8192;
-        caps.MaxTextureAspectRatio = 8192;
-        caps.MaxAnisotropy = 16;
-        caps.MaxActiveLights = kMaxDeviceLights;
-        caps.MaxPrimitiveCount = 1048576;
-        caps.MaxVertexIndex = 1048576;
-        caps.MaxStreams = 16;
-        caps.MaxStreamStride = 256;
-        caps.VertexShaderVersion = 0xFFFE0300; // vs_3_0
-        caps.PixelShaderVersion = 0xFFFF0300; // ps_3_0
-        caps.MaxVertexShader30InstructionSlots = 32768;
-        caps.MaxPixelShader30InstructionSlots = 32768;
-        caps.NumSimultaneousRTs = 4;
-        // Derived from what the device stores state for (see kMaxTextureStages).
-        caps.MaxTextureBlendStages = kMaxTextureStages;
-        caps.MaxSimultaneousTextures = kMaxTextureStages;
     }
     return D3D_OK;
 }
@@ -3223,28 +3281,38 @@ fn dev9_GetNPatchMode(this: *anyopaque) callconv(W) f32 {
     return 0;
 }
 
-fn dev9_DrawPrimitiveUP(this: *anyopaque, p0: u32, p1: u32, p2: ?*const anyopaque, p3: u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    std.debug.print("[WINS:D3D9] device!DrawPrimitiveUP is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// Vertices (and indices) from the caller's memory. As in D3D9, stream 0
+/// (and, for the indexed form, the index buffer) is unbound afterwards.
+fn dev9_DrawPrimitiveUP(this: *anyopaque, prim: u32, count: u32, data: ?*const anyopaque, stride: u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const d = data orelse return D3DERR_INVALIDCALL;
+    if (stride == 0) return D3DERR_INVALIDCALL;
+    self.draw_call_count += 1;
+    if (self.host and count != 0) {
+        var job: hostgl.DrawJob = .{ .dev = self, .prim = prim, .indexed = false, .base_vertex = 0, .prim_count = count, .up_vb = @ptrCast(d), .up_stride = stride };
+        hostgl.draw(&job);
+    }
+    self.streams[0] = null;
+    self.stream_offsets[0] = 0;
+    self.stream_strides[0] = 0;
+    return D3D_OK;
 }
 
-fn dev9_DrawIndexedPrimitiveUP(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: ?*const anyopaque, p5: u32, p6: ?*const anyopaque, p7: u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    _ = p4;
-    _ = p5;
-    _ = p6;
-    _ = p7;
-    std.debug.print("[WINS:D3D9] device!DrawIndexedPrimitiveUP is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_DrawIndexedPrimitiveUP(this: *anyopaque, prim: u32, min_index: u32, num_vertices: u32, count: u32, indices: ?*const anyopaque, index_format: u32, data: ?*const anyopaque, stride: u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const d = data orelse return D3DERR_INVALIDCALL;
+    const ix = indices orelse return D3DERR_INVALIDCALL;
+    if (stride == 0 or (index_format != D3DFMT_INDEX16 and index_format != D3DFMT_INDEX32)) return D3DERR_INVALIDCALL;
+    self.draw_call_count += 1;
+    if (self.host and count != 0) {
+        var job: hostgl.DrawJob = .{ .dev = self, .prim = prim, .indexed = true, .base_vertex = 0, .min_index = min_index, .num_vertices = num_vertices, .start_index = 0, .prim_count = count, .up_vb = @ptrCast(d), .up_stride = stride, .up_ib = @ptrCast(ix), .up_ib_format = index_format };
+        hostgl.draw(&job);
+    }
+    self.streams[0] = null;
+    self.stream_offsets[0] = 0;
+    self.stream_strides[0] = 0;
+    self.indices = null;
+    return D3D_OK;
 }
 
 fn dev9_ProcessVertices(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: ?*anyopaque, p4: ?*anyopaque, p5: u32) callconv(W) HRESULT {
@@ -3287,6 +3355,7 @@ fn dev9_SetVertexDeclaration(this: *anyopaque, pDecl: ?*anyopaque) callconv(W) H
         if (old.ref_count > 0) old.ref_count -= 1;
     }
     self.vertex_decl = new;
+    if (new != null) self.use_fvf = false;
     return D3D_OK;
 }
 
@@ -3298,18 +3367,66 @@ fn dev9_GetVertexDeclaration(this: *anyopaque, ppDecl: ?*?*anyopaque) callconv(W
     return D3D_OK;
 }
 
-fn dev9_SetFVF(this: *anyopaque, p0: u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!SetFVF is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+/// The FVF as the declaration it stands for (D3DFVF_* -> D3DVERTEXELEMENT9),
+/// so every draw reads its vertices one way. Returns the element count.
+pub fn fvfElements(fvf: u32, out: *[24]D3DVERTEXELEMENT9) ?usize {
+    var n: usize = 0;
+    var off: u16 = 0;
+    const add = struct {
+        fn f(o: *[24]D3DVERTEXELEMENT9, k: *usize, at: *u16, ty: u8, size: u16, usage: u8, idx: u8) void {
+            o[k.*] = .{ .Stream = 0, .Offset = at.*, .Type = ty, .Method = 0, .Usage = usage, .UsageIndex = idx };
+            k.* += 1;
+            at.* += size;
+        }
+    }.f;
+    switch (fvf & 0x400E) {
+        0 => {},
+        0x002 => add(out, &n, &off, 2, 12, 0, 0), // XYZ
+        0x004 => add(out, &n, &off, 3, 16, 9, 0), // XYZRHW -> POSITIONT
+        0x4002 => add(out, &n, &off, 3, 16, 0, 0), // XYZW
+        0x006, 0x008, 0x00A, 0x00C, 0x00E => {
+            add(out, &n, &off, 2, 12, 0, 0);
+            const weights: u16 = @intCast(((fvf & 0xE) - 4) / 2);
+            off += weights * 4; // blend weights / indices: not used by this device
+        },
+        else => return null,
+    }
+    if (fvf & 0x10 != 0) add(out, &n, &off, 2, 12, 3, 0); // NORMAL
+    if (fvf & 0x20 != 0) add(out, &n, &off, 0, 4, 4, 0); // PSIZE
+    if (fvf & 0x40 != 0) add(out, &n, &off, 4, 4, 10, 0); // DIFFUSE
+    if (fvf & 0x80 != 0) add(out, &n, &off, 4, 4, 10, 1); // SPECULAR
+    const tc = (fvf >> 8) & 0xF;
+    if (tc > 8) return null;
+    var i: u32 = 0;
+    while (i < tc) : (i += 1) {
+        const code = (fvf >> @intCast(16 + 2 * i)) & 3;
+        const t: struct { ty: u8, sz: u16 } = switch (code) {
+            0 => .{ .ty = 1, .sz = 8 },
+            1 => .{ .ty = 2, .sz = 12 },
+            2 => .{ .ty = 3, .sz = 16 },
+            else => .{ .ty = 0, .sz = 4 },
+        };
+        add(out, &n, &off, t.ty, t.sz, 5, @intCast(i));
+    }
+    out[n] = .{ .Stream = 0xFF, .Offset = 0, .Type = kDeclTypeUnused, .Method = 0, .Usage = 0, .UsageIndex = 0 };
+    return n;
+}
+
+fn dev9_SetFVF(this: *anyopaque, fvf: u32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (fvf == 0) return D3D_OK; // D3D9 ignores a zero FVF
+    _ = fvfElements(fvf, &self.fvf_elements) orelse return D3DERR_INVALIDCALL;
+    if (trace_resources and fvf != self.fvf) std.debug.print("[WINS:D3D9:trace] SetFVF(0x{x})\n", .{fvf});
+    self.fvf = fvf;
+    self.use_fvf = true;
+    return D3D_OK;
 }
 
 fn dev9_GetFVF(this: *anyopaque, p0: ?*u32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!GetFVF is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = p0 orelse return D3DERR_INVALIDCALL;
+    out.* = if (self.use_fvf) self.fvf else 0;
+    return D3D_OK;
 }
 
 fn dev9_GetVertexShader(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
@@ -4134,7 +4251,7 @@ test "Direct3DCreate9 and device initialization" {
     try std.testing.expectEqual(D3D_OK, caps_rc);
     try std.testing.expectEqual(@as(u32, 0xFFFE0300), caps.VertexShaderVersion); // vs_3_0
     try std.testing.expectEqual(@as(u32, 0xFFFF0300), caps.PixelShaderVersion); // ps_3_0
-    try std.testing.expectEqual(@as(u32, 8192), caps.MaxTextureWidth);
+    try std.testing.expectEqual(@as(u32, 16384), caps.MaxTextureWidth); // wined3d on this adapter
 
     // Create Device
     var params: D3DPRESENT_PARAMETERS = undefined;
@@ -4976,4 +5093,35 @@ pub fn hostgl_capture(frame: u64, path_spec: []const u8) void {
     const n = @min(path.len, hostgl.capture_path.len - 1);
     @memcpy(hostgl.capture_path[0..n], path[0..n]);
     hostgl.capture_path[n] = 0;
+}
+
+test "device caps carry the oracle's shader limits FalloutNV gates on" {
+    var caps: D3DCAPS9 = undefined;
+    try std.testing.expectEqual(D3D_OK, d3d9_GetDeviceCaps(undefined, 0, 1, &caps));
+    try std.testing.expectEqual(@as(usize, 0x118), @offsetOf(D3DCAPS9, "PS20Caps") + @offsetOf(D3DPSHADERCAPS2_0, "NumInstructionSlots"));
+    try std.testing.expect(caps.PS20Caps.NumInstructionSlots > 0xff);
+    try std.testing.expect(caps.PS20Caps.NumTemps >= 32);
+    try std.testing.expectEqual(@as(u32, 1), caps.DeviceType);
+}
+
+test "FVF XYZRHW|DIFFUSE|TEX1 becomes POSITIONT float4, COLOR0, TEXCOORD0 float2" {
+    var els: [24]D3DVERTEXELEMENT9 = undefined;
+    const n = fvfElements(0x144, &els).?;
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(u8, 9), els[0].Usage);
+    try std.testing.expectEqual(@as(u8, 3), els[0].Type);
+    try std.testing.expectEqual(@as(u16, 16), els[1].Offset);
+    try std.testing.expectEqual(@as(u8, 10), els[1].Usage);
+    try std.testing.expectEqual(@as(u16, 20), els[2].Offset);
+    try std.testing.expectEqual(@as(u8, 1), els[2].Type);
+    try std.testing.expectEqual(@as(u16, 0xFF), els[3].Stream);
+}
+
+test "render states start at the D3D9 defaults" {
+    const rs = defaultRenderStates(true);
+    try std.testing.expectEqual(@as(u32, 0xF), rs[168]);
+    try std.testing.expectEqual(@as(u32, 3), rs[22]);
+    try std.testing.expectEqual(@as(u32, 4), rs[23]);
+    try std.testing.expectEqual(@as(u32, 1), rs[7]);
+    try std.testing.expectEqual(@as(u32, 0), defaultRenderStates(false)[7]);
 }

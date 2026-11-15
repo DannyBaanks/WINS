@@ -28,8 +28,11 @@
 //!  - no pixels: there is no native surface behind a window yet (D3D9 Present
 //!    has nothing to show into); WM_NCPAINT / WM_ERASEBKGND carry a placeholder
 //!    HDC that no GDI call accepts;
-//!  - no input: nothing produces keyboard or mouse messages, and
-//!    TranslateMessage never generates WM_CHAR;
+//!  - keyboard messages come from the host window (wins_gl.zig calls
+//!    hostKey): WM_KEYDOWN/WM_KEYUP (WM_SYSKEY* with Alt) go to the focus
+//!    window, TranslateMessage turns a key-down into WM_CHAR with the
+//!    character the host keyboard layout produced, and GetKeyState /
+//!    GetAsyncKeyState read the same state; no mouse messages yet;
 //!  - no timers, hooks, menus, dialogs, Unicode (W) entry points, window
 //!    properties, DPI, multiple monitors or z-order between sibling windows
 //!    beyond "newest on top";
@@ -87,6 +90,11 @@ pub const WM_NCHITTEST: u32 = 0x0084;
 pub const WM_NCPAINT: u32 = 0x0085;
 pub const WM_NCACTIVATE: u32 = 0x0086;
 pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_KEYUP: u32 = 0x0101;
+pub const WM_CHAR: u32 = 0x0102;
+pub const WM_SYSKEYDOWN: u32 = 0x0104;
+pub const WM_SYSKEYUP: u32 = 0x0105;
+pub const WM_SYSCHAR: u32 = 0x0106;
 pub const WM_SYSCOMMAND: u32 = 0x0112;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_IME_SETCONTEXT: u32 = 0x0281;
@@ -2014,10 +2022,84 @@ pub fn WaitMessage() callconv(W) i32 {
     return 1;
 }
 
+/// Key state for GetKeyState/GetAsyncKeyState, indexed by virtual key.
+var g_vk_down: [256]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** 256;
+/// Character the host layout produced for the last key-down of each scan
+/// code (index: scan | extended << 8); 0 = none (TranslateMessage then makes
+/// no WM_CHAR, as for arrows or F-keys on Windows).
+var g_char_for_scan: [512]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** 512;
+
+const VK_SHIFT = 0x10;
+const VK_CONTROL = 0x11;
+const VK_MENU = 0x12;
+
+/// Render thread: one key changed on the host window. `ch` is the
+/// Windows-1252 character it types (0 for none).
+pub fn hostKey(vk: u8, scan: u8, extended: bool, down: bool, ch: u8) void {
+    if (vk == 0) return;
+    const was = g_vk_down[vk].swap(down, .monotonic);
+    if (!down and !was) return;
+    const generic: u8 = switch (vk) {
+        0xA0, 0xA1 => VK_SHIFT,
+        0xA2, 0xA3 => VK_CONTROL,
+        0xA4, 0xA5 => VK_MENU,
+        else => 0,
+    };
+    if (generic != 0) {
+        const other: u8 = vk ^ 1;
+        g_vk_down[generic].store(down or g_vk_down[other].load(.monotonic), .monotonic);
+    }
+    const key_index: usize = @as(usize, scan) | (@as(usize, @intFromBool(extended)) << 8);
+    if (down) g_char_for_scan[key_index].store(ch, .monotonic);
+    const alt = g_vk_down[VK_MENU].load(.monotonic) and !g_vk_down[VK_CONTROL].load(.monotonic);
+    const msg: u32 = if (down) (if (alt) WM_SYSKEYDOWN else WM_KEYDOWN) else (if (alt or generic == VK_MENU) WM_SYSKEYUP else WM_KEYUP);
+    var lp: usize = 1 | (@as(usize, scan) << 16);
+    if (extended) lp |= 1 << 24;
+    if (alt) lp |= 1 << 29;
+    if (was) lp |= 1 << 30; // previous state: down (autorepeat, or the release)
+    if (!down) lp |= 1 << 31;
+    const wp: usize = if (generic != 0) generic else vk;
+    lock();
+    const target = if (g_focus != 0) g_focus else g_active;
+    const w = win(target);
+    const tid = if (w) |x| x.tid else 0;
+    unlock();
+    if (w == null) return;
+    lock();
+    defer unlock();
+    _ = postLocked(tid, target, msg, wp, lp);
+}
+
+fn postLocked(tid: u32, h: usize, msg: u32, wp: usize, lp: usize) bool {
+    const q = queueFor(tid, true) orelse return false;
+    if (q.len == QUEUE_LEN) return false;
+    q.posted[q.len] = .{ .hwnd = h, .message = msg, .wParam = wp, .lParam = lp, .time = tickNow(), .pt = .{ .x = 0, .y = 0 } };
+    q.len += 1;
+    wake();
+    return true;
+}
+
+/// WM_KEYDOWN / WM_SYSKEYDOWN with a character -> WM_CHAR / WM_SYSCHAR posted
+/// to the same window, as Windows does; nonzero only when one was posted.
 pub fn TranslateMessage(lpMsg: ?*const MSG) callconv(W) i32 {
-    // No keyboard layout is modelled, so no WM_CHAR is ever generated.
-    _ = lpMsg;
-    return 0;
+    const m = lpMsg orelse return 0;
+    if (m.message != WM_KEYDOWN and m.message != WM_SYSKEYDOWN) return 0;
+    const key_index: usize = ((m.lParam >> 16) & 0xFF) | (((m.lParam >> 24) & 1) << 8);
+    const ch = g_char_for_scan[key_index].load(.monotonic);
+    if (ch == 0) return 0;
+    const w = win(m.hwnd) orelse return 0;
+    lock();
+    defer unlock();
+    return @intFromBool(postLocked(w.tid, m.hwnd, if (m.message == WM_SYSKEYDOWN) WM_SYSCHAR else WM_CHAR, ch, m.lParam));
+}
+
+pub fn GetKeyState(vk: i32) callconv(W) i16 {
+    if (vk < 0 or vk > 255) return 0;
+    return if (g_vk_down[@intCast(vk)].load(.monotonic)) @bitCast(@as(u16, 0x8000)) else 0;
+}
+
+pub fn GetAsyncKeyState(vk: i32) callconv(W) i16 {
+    return GetKeyState(vk);
 }
 
 pub fn DispatchMessageA(lpMsg: ?*const MSG) callconv(W) usize {
@@ -2155,4 +2237,19 @@ test "show activates, the window procedure sees the Win32 order" {
     try std.testing.expectEqual(h, GetFocus());
     try std.testing.expectEqual(@as(i32, 1), DestroyWindow(h));
     try std.testing.expectEqual(@as(usize, 0), GetActiveWindow());
+}
+
+test "host keys: GetKeyState follows down/up, left/right Shift feed VK_SHIFT, no window means no message" {
+    hostKey(0xA0, 0x2A, false, true, 0); // left shift down
+    hostKey(0xA1, 0x36, false, true, 0); // right shift down
+    try std.testing.expect(GetKeyState(VK_SHIFT) < 0);
+    hostKey(0xA0, 0x2A, false, false, 0);
+    try std.testing.expect(GetKeyState(VK_SHIFT) < 0); // right still held
+    hostKey(0xA1, 0x36, false, false, 0);
+    try std.testing.expectEqual(@as(i16, 0), GetKeyState(VK_SHIFT));
+    hostKey('A', 0x1E, false, true, 'a');
+    try std.testing.expect(GetAsyncKeyState('A') < 0);
+    hostKey('A', 0x1E, false, false, 0);
+    try std.testing.expectEqual(@as(i16, 0), GetAsyncKeyState('A'));
+    try std.testing.expectEqual(@as(i16, 0), GetKeyState(-1));
 }

@@ -20,6 +20,7 @@ const dsound_mod = @import("wins_dsound.zig");
 const dshow_mod = @import("wins_dshow.zig");
 const user32_mod = @import("wins_user32.zig");
 const dinput_mod = @import("wins_dinput.zig");
+const bink_mod = @import("wins_bink.zig");
 // winrun_gui_support and x11_window are NOT imported: they need static libX11,
 // which is unavailable for the i386 target this loader builds for.
 const ordinals_mod = @import("winrun_ordinals.zig");
@@ -165,6 +166,31 @@ fn sigHandler(sig: linux.SIG, info: *const linux.siginfo_t, ctx_ptr: ?*anyopaque
                 }
             }
             if (printed == 0) std.debug.print("    (none: the stack holds no guest address)\n", .{});
+
+            // Memory behind each register, read with process_vm_readv so an
+            // unmapped address reports "unreadable" instead of faulting again.
+            // (FalloutNV New Game: the factory index lives at [EBX+0x58].)
+            {
+                const regs = [_]struct { n: []const u8, v: usize }{
+                    .{ .n = "EAX", .v = uctx.uc_mcontext.eax }, .{ .n = "EBX", .v = uctx.uc_mcontext.ebx },
+                    .{ .n = "ECX", .v = uctx.uc_mcontext.ecx }, .{ .n = "EDX", .v = uctx.uc_mcontext.edx },
+                    .{ .n = "ESI", .v = uctx.uc_mcontext.esi }, .{ .n = "EDI", .v = uctx.uc_mcontext.edi },
+                    .{ .n = "EBP", .v = uctx.uc_mcontext.ebp },
+                };
+                for (regs) |r| {
+                    var words: [32]u32 = undefined;
+                    var local = [_]std.posix.iovec{.{ .base = @ptrCast(&words), .len = @sizeOf(@TypeOf(words)) }};
+                    var remote = [_]std.posix.iovec_const{.{ .base = @ptrFromInt(@max(r.v, 1)), .len = @sizeOf(@TypeOf(words)) }};
+                    const got = linux.process_vm_readv(linux.getpid(), &local, &remote, 0);
+                    if (r.v < 0x1000 or linux.errno(got) != .SUCCESS or got != @sizeOf(@TypeOf(words))) continue;
+                    std.debug.print("  [{s}=0x{x:0>8}]:", .{ r.n, r.v });
+                    for (words, 0..) |w, i| {
+                        if (i % 8 == 0) std.debug.print("\n    +0x{x:0>2}:", .{i * 4});
+                        std.debug.print(" {x:0>8}", .{w});
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
 
             // The object behind a null field dereference. By the time the fault
             // lands, EAX is the field that was read, but EDI is usually still the
@@ -4550,52 +4576,67 @@ fn SteamUserStats() callconv(W) usize {
 // Bink Video Shims (binkw32.dll)
 // ============================================================================
 
-/// There is no Bink decoder yet, so every open fails the way binkw32 fails
-/// for a file it cannot open: a NULL handle. The old constant handle
-/// (0xB14C0001) was dereferenced by FalloutNV as a BINK structure (Width at
-/// +0, Height at +4): New Game crashed reading 0xB14C0005.
+/// Bink 1 playback (wins_bink.zig): the container is read natively and the
+/// packets decoded by the host's libavcodec. When the file or the host
+/// decoder is missing, the open fails the way binkw32 fails (a NULL handle),
+/// which FalloutNV handles by skipping the video.
 fn BinkOpen(name: ?[*:0]const u8, flags: u32) callconv(W) usize {
-    std.debug.print("[WINS:BinkVideo] _BinkOpen(\"{s}\", flags 0x{x}) -> NULL (no Bink decoder yet; the video is skipped)\n", .{ if (name) |n| std.mem.sliceTo(n, 0) else "(null)", flags });
-    return 0;
+    const n = name orelse return 0;
+    const path = std.mem.sliceTo(n, 0);
+    var norm: [512]u8 = undefined;
+    const len = @min(norm.len - 1, path.len);
+    for (0..len) |i| norm[i] = if (path[i] == '\\') '/' else path[i];
+    norm[len] = 0;
+    var resolved_buf: [512]u8 = undefined;
+    const real: [:0]const u8 = resolvePathCaseInsensitive(norm[0..len], &resolved_buf) orelse norm[0..len :0];
+    const b = bink_mod.open(real, flags);
+    std.debug.print("[WINS:BinkVideo] _BinkOpen(\"{s}\", flags 0x{x}) -> 0x{x}\n", .{ path, flags, @intFromPtr(b) });
+    return @intFromPtr(b);
+}
+
+fn binkOf(h: usize) ?*bink_mod.Bink {
+    return if (h == 0) null else @ptrFromInt(h);
 }
 
 fn BinkClose(bink: usize) callconv(W) void {
-    _ = bink;
+    if (binkOf(bink)) |b| bink_mod.close(b);
 }
 
 fn BinkDoFrame(bink: usize) callconv(W) i32 {
-    _ = bink;
-    return 0; // Completed
+    const b = binkOf(bink) orelse return 0;
+    return bink_mod.doFrame(b);
 }
 
 fn BinkNextFrame(bink: usize) callconv(W) void {
-    _ = bink;
+    if (binkOf(bink)) |b| bink_mod.nextFrame(b);
 }
 
 fn BinkWait(bink: usize) callconv(W) i32 {
-    _ = bink;
-    return 0; // No wait
+    const b = binkOf(bink) orelse return 0;
+    return bink_mod.wait(b);
 }
 
 fn BinkPause(bink: usize, pause: i32) callconv(W) i32 {
-    _ = bink; _ = pause;
-    return 0;
+    const b = binkOf(bink) orelse return 0;
+    return bink_mod.pause(b, pause != 0);
 }
 
 /// _BinkCopyToBufferRect@44: eleven stack words, which the callee pops.
 fn BinkCopyToBufferRect(bink: usize, dest: usize, pitch: u32, height: u32, x: u32, y: u32, sx: u32, sy: u32, sw: u32, sh: u32, flags: u32) callconv(W) i32 {
-    _ = .{ bink, dest, pitch, height, x, y, sx, sy, sw, sh, flags };
-    return 0;
+    const b = binkOf(bink) orelse return 1;
+    return bink_mod.copyToBufferRect(b, dest, pitch, height, x, y, sx, sy, sw, sh, flags);
 }
 
+/// Bink audio is played by wins_bink.zig on the host sound server; selecting
+/// DirectSound as the sound system succeeds.
 fn BinkOpenDirectSound(bink: usize) callconv(W) i32 {
     _ = bink;
-    return 0;
+    return 1;
 }
 
 fn BinkSetSoundSystem(open_fn: ?*anyopaque, param: usize) callconv(W) i32 {
     _ = open_fn; _ = param;
-    return 0;
+    return 1;
 }
 
 // ============================================================================
@@ -4667,8 +4708,7 @@ fn MessageBoxA(hWnd: usize, lpText: ?[*:0]const u8, lpCaption: ?[*:0]const u8, u
 }
 
 fn GetAsyncKeyState(vKey: i32) callconv(W) i16 {
-    _ = vKey;
-    return 0;
+    return user32_mod.GetAsyncKeyState(vKey);
 }
 
 // ============================================================================
@@ -5393,6 +5433,7 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
         if (std.mem.eql(u8, name, "EnumDisplayDevicesA")) return @ptrCast(&EnumDisplayDevicesA);
         if (std.mem.eql(u8, name, "MessageBoxA")) return @ptrCast(&MessageBoxA);
         if (std.mem.eql(u8, name, "GetAsyncKeyState")) return @ptrCast(&GetAsyncKeyState);
+        if (std.mem.eql(u8, name, "GetKeyState")) return @ptrCast(&user32_mod.GetKeyState);
     } else if (std.ascii.eqlIgnoreCase(dll, "steam_api.dll") or std.ascii.eqlIgnoreCase(dll, "steam_api")) {
         if (std.mem.eql(u8, name, "SteamAPI_Init")) return @ptrCast(&SteamAPI_Init);
         if (std.mem.eql(u8, name, "SteamAPI_IsSteamRunning")) return @ptrCast(&SteamAPI_IsSteamRunning);
@@ -6409,8 +6450,15 @@ test "DirectInput8Create returns DI_OK with a real object, not NULL" {
     try std.testing.expectEqual(@as(u32, 1), di8.vtbl.Release(di8));
     try std.testing.expectEqual(@as(i32, 0), di8.vtbl.EnumDevices(di8, 0, null, null, 0));
     var dev: ?*anyopaque = null;
-    try std.testing.expectEqual(DIERR_GENERIC, di8.vtbl.CreateDevice(di8, null, &dev, null));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80004003))), di8.vtbl.CreateDevice(di8, null, &dev, null)); // E_POINTER
     try std.testing.expect(dev == null);
+    const sys_keyboard = [16]u8{ 0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 };
+    try std.testing.expectEqual(@as(i32, 0), di8.vtbl.CreateDevice(di8, &sys_keyboard, &dev, null));
+    try std.testing.expect(dev != null);
+    const joystick = [16]u8{ 0x99, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 };
+    var dev2: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040154))), di8.vtbl.CreateDevice(di8, &joystick, &dev2, null)); // DIERR_DEVICENOTREG
+    try std.testing.expect(dev2 == null);
 }
 
 const ThreadProbe = struct { teb: u32 = 0, tid: u32 = 0, tls_arr: u32 = 0, tls_block: u32 = 0, seh: u32 = 0 };

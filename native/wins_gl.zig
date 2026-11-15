@@ -12,6 +12,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const input = @import("wins_dinput.zig");
+const user32 = @import("wins_user32.zig");
 
 extern fn dlopen(path: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
@@ -40,7 +41,65 @@ const Xlib = struct {
     XCreatePixmapCursor: *const fn (?*anyopaque, c_ulong, c_ulong, *XColor, *XColor, c_uint, c_uint) callconv(.c) c_ulong,
     XDefineCursor: *const fn (?*anyopaque, c_ulong, c_ulong) callconv(.c) c_int,
     XkbSetDetectableAutoRepeat: *const fn (?*anyopaque, c_int, ?*c_int) callconv(.c) c_int,
+    XLookupString: *const fn (*XEvent, [*]u8, c_int, ?*c_ulong, ?*anyopaque) callconv(.c) c_int,
+    XLookupKeysym: *const fn (*XEvent, c_int) callconv(.c) c_ulong,
 };
+
+/// Unshifted X keysym -> Windows virtual key (US-style mapping for the
+/// punctuation keys, as Windows uses for the OEM keys).
+fn vkFromKeysym(ks: c_ulong) u8 {
+    if (ks >= 'a' and ks <= 'z') return @intCast(ks - 'a' + 'A');
+    if (ks >= 'A' and ks <= 'Z') return @intCast(ks);
+    if (ks >= '0' and ks <= '9') return @intCast(ks);
+    if (ks >= 0xffbe and ks <= 0xffc9) return @intCast(0x70 + (ks - 0xffbe)); // F1..F12
+    if (ks >= 0xffb0 and ks <= 0xffb9) return @intCast(0x60 + (ks - 0xffb0)); // keypad 0..9
+    return switch (ks) {
+        0x20 => 0x20,
+        0xff08 => 0x08, // BackSpace
+        0xff09 => 0x09, // Tab
+        0xff0d, 0xff8d => 0x0D, // Return, KP_Enter
+        0xff1b => 0x1B, // Escape
+        0xff13 => 0x13, // Pause
+        0xff50 => 0x24, // Home
+        0xff51 => 0x25, // Left
+        0xff52 => 0x26, // Up
+        0xff53 => 0x27, // Right
+        0xff54 => 0x28, // Down
+        0xff55 => 0x21, // Prior
+        0xff56 => 0x22, // Next
+        0xff57 => 0x23, // End
+        0xff63 => 0x2D, // Insert
+        0xffff => 0x2E, // Delete
+        0xffe1 => 0xA0, // Shift_L
+        0xffe2 => 0xA1, // Shift_R
+        0xffe3 => 0xA2, // Control_L
+        0xffe4 => 0xA3, // Control_R
+        0xffe9, 0xff7e => 0xA4, // Alt_L
+        0xffea, 0xfe03 => 0xA5, // Alt_R / ISO_Level3_Shift (AltGr)
+        0xffe5 => 0x14, // Caps_Lock
+        0xffeb => 0x5B, // Super_L
+        0xffec => 0x5C, // Super_R
+        0xff67 => 0x5D, // Menu
+        0xffaa => 0x6A, // KP_Multiply
+        0xffab => 0x6B, // KP_Add
+        0xffad => 0x6D, // KP_Subtract
+        0xffae => 0x6E, // KP_Decimal
+        0xffaf => 0x6F, // KP_Divide
+        ';' => 0xBA,
+        '=' => 0xBB,
+        ',' => 0xBC,
+        '-' => 0xBD,
+        '.' => 0xBE,
+        '/' => 0xBF,
+        '`' => 0xC0,
+        '[' => 0xDB,
+        '\\' => 0xDC,
+        ']' => 0xDD,
+        '\'' => 0xDE,
+        0xf1, 0xd1 => 0xC0, // ntilde on Spanish layouts sits on the OEM_3 key
+        else => 0,
+    };
+}
 
 /// XEvent is a union of 24 longs; only the common key/button/motion prefix is read.
 const XEvent = extern struct {
@@ -158,6 +217,7 @@ pub const Gl = struct {
     glUniform4iv: *const fn (GLint, GLsizei, [*]const i32) callconv(.c) void,
     glUniform1i: *const fn (GLint, GLint) callconv(.c) void,
     glUniform2f: *const fn (GLint, f32, f32) callconv(.c) void,
+    glUniformMatrix4fv: *const fn (GLint, GLsizei, u8, *const [16]f32) callconv(.c) void,
 
     glBindBuffer: *const fn (GLenum, GLuint) callconv(.c) void,
     glEnableVertexAttribArray: *const fn (GLuint) callconv(.c) void,
@@ -379,7 +439,19 @@ fn pumpInput() void {
             std.debug.print("[WINS:GL] first X11 input event of type {d} (detail {d}, at {d},{d})\n", .{ ev.type, ev.detail, ev.x, ev.y });
         }
         switch (ev.type) {
-            2, 3 => input.keyEvent(input.dikFromX11(ev.detail), ev.type == 2),
+            2, 3 => {
+                const dik = input.dikFromX11(ev.detail);
+                input.keyEvent(dik, ev.type == 2);
+                var buf: [8]u8 = undefined;
+                var ch: u8 = 0;
+                if (ev.type == 2) {
+                    // Latin-1 from the host layout; Windows-1252 agrees on it.
+                    const n = xlib.XLookupString(&ev, &buf, buf.len, null, null);
+                    if (n == 1) ch = buf[0];
+                }
+                const vk = vkFromKeysym(xlib.XLookupKeysym(&ev, 0));
+                user32.hostKey(vk, dik & 0x7F, dik >= 0x80, ev.type == 2, ch);
+            },
             4, 5 => {
                 const down = ev.type == 4;
                 switch (ev.detail) {
