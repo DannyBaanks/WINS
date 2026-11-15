@@ -433,8 +433,8 @@ pub const BufferVtbl = extern struct {
     Restore: *const fn (*anyopaque) callconv(W) HRESULT,
     // IDirectSoundBuffer8
     SetFX: *const fn (*anyopaque, u32, ?*anyopaque, ?*anyopaque) callconv(W) HRESULT,
-    AcquireResources: *const fn (*anyopaque, u32, u32, u32, ?*anyopaque, ?*anyopaque) callconv(W) HRESULT,
-    GetObjectInPath: *const fn (*anyopaque, ?*const Guid, u32, u32, ?*const Guid, u32, ?*?*anyopaque) callconv(W) HRESULT,
+    AcquireResources: *const fn (*anyopaque, u32, u32, ?[*]u32) callconv(W) HRESULT,
+    GetObjectInPath: *const fn (*anyopaque, ?*const Guid, u32, ?*const Guid, ?*?*anyopaque) callconv(W) HRESULT,
 };
 
 fn bufBytes(self: *Buffer) u32 {
@@ -754,27 +754,28 @@ fn bufSetFX(p: *anyopaque, count: u32, descs: ?*anyopaque, results: ?*anyopaque)
     return E_NOTIMPL;
 }
 
-fn bufAcquireResources(p: *anyopaque, flags: u32, count: u32, index: u32, found: ?*anyopaque, aff: ?*anyopaque) callconv(W) HRESULT {
+/// dsound.h: AcquireResources(dwFlags, dwEffectsCount, pdwResultCodes). All
+/// mixing is software here, so a deferred buffer always gets its voice; each
+/// effect slot reports DSFXR_LOCSOFTWARE (2).
+fn bufAcquireResources(p: *anyopaque, flags: u32, count: u32, results: ?[*]u32) callconv(W) HRESULT {
     traceFirst(21, "bufAcquireResources", @returnAddress());
     _ = p;
     _ = flags;
-    _ = count;
-    _ = index;
-    _ = found;
-    _ = aff;
-    return E_NOTIMPL;
+    if (results) |r| {
+        for (0..count) |i| r[i] = 2;
+    }
+    return S_OK;
 }
 
-fn bufGetObjectInPath(p: *anyopaque, rguid: ?*const Guid, index: u32, path: u32, iid: ?*const Guid, size: u32, obj: ?*?*anyopaque) callconv(W) HRESULT {
-    traceFirst(22, "bufGetObjectInPath", @returnAddress());
+/// dsound.h: GetObjectInPath(rguidObject, dwIndex, rguidInterface, ppObject).
+/// These buffers carry no effects, so there is no object to find.
+fn bufGetObjectInPath(p: *anyopaque, rguid: ?*const Guid, index: u32, iid: ?*const Guid, obj: ?*?*anyopaque) callconv(W) HRESULT {
     _ = p;
     _ = rguid;
     _ = index;
-    _ = path;
     _ = iid;
-    _ = size;
     if (obj) |o| o.* = null;
-    return E_NOTIMPL;
+    return @bitCast(@as(u32, 0x88781161)); // DSERR_OBJECTNOTFOUND
 }
 
 const buffer_vtbl = BufferVtbl{
