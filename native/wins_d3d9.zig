@@ -48,6 +48,8 @@ pub const D3DUSAGE_DYNAMIC: u32 = 0x00000200;
 pub const D3DRTYPE_SURFACE: u32 = 1;
 pub const D3DRTYPE_VOLUME: u32 = 2;
 pub const D3DRTYPE_TEXTURE: u32 = 3;
+pub const D3DRTYPE_VOLUMETEXTURE: u32 = 4;
+pub const D3DRTYPE_CUBETEXTURE: u32 = 5;
 pub const D3DMULTISAMPLE_NONE: u32 = 0;
 pub const D3DDEVTYPE_HAL: u32 = 1;
 pub const D3DDEVTYPE_REF: u32 = 2;
@@ -154,6 +156,11 @@ pub const D3DRECT = extern struct {
     y1: i32,
     x2: i32,
     y2: i32,
+};
+
+pub const POINT = extern struct {
+    x: i32,
+    y: i32,
 };
 
 pub const D3DLOCKED_RECT = extern struct {
@@ -316,6 +323,23 @@ pub const IID_IDirect3D9 = GUID{
     .Data3 = 0x426D,
     .Data4 = .{ 0xAE, 0x8D, 0xAD, 0x01, 0x47, 0xF4, 0x27, 0x5C },
 };
+pub const IID_IDirect3DStateBlock9 = GUID{
+    .Data1 = 0xB07C4FE5,
+    .Data2 = 0x310D,
+    .Data3 = 0x4BA8,
+    .Data4 = .{ 0xA2, 0x3C, 0x4F, 0x0F, 0x20, 0x6F, 0x21, 0x8B },
+};
+pub const D3DSBT_ALL: u32 = 1;
+pub const D3DSBT_PIXELSTATE: u32 = 2;
+pub const D3DSBT_VERTEXSTATE: u32 = 3;
+pub const IDirect3DStateBlock9Vtbl = extern struct {
+    QueryInterface: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(W) u32,
+    Release: *const fn (*anyopaque) callconv(W) u32,
+    GetDevice: *const fn (*anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    Capture: *const fn (*anyopaque) callconv(W) HRESULT,
+    Apply: *const fn (*anyopaque) callconv(W) HRESULT,
+};
 pub const IID_IDirect3DDevice9 = GUID{
     .Data1 = 0xD0223B96,
     .Data2 = 0xBF7A,
@@ -351,6 +375,24 @@ pub const IID_IDirect3DVertexDeclaration9 = GUID{
     .Data2 = 0x36FA,
     .Data3 = 0x4098,
     .Data4 = .{ 0xA8, 0xFB, 0xC7, 0xED, 0x39, 0xDC, 0x85, 0x46 },
+};
+pub const IID_IDirect3DVolume9 = GUID{
+    .Data1 = 0x24F416E6,
+    .Data2 = 0x1F67,
+    .Data3 = 0x4AA7,
+    .Data4 = .{ 0xB8, 0x8E, 0xD3, 0x3F, 0x6F, 0x31, 0x28, 0xA1 },
+};
+pub const IID_IDirect3DCubeTexture9 = GUID{
+    .Data1 = 0xFFF32F81,
+    .Data2 = 0xD953,
+    .Data3 = 0x473A,
+    .Data4 = .{ 0x92, 0x23, 0x93, 0xD6, 0x52, 0xAB, 0xA9, 0x3F },
+};
+pub const IID_IDirect3DVolumeTexture9 = GUID{
+    .Data1 = 0x2518526C,
+    .Data2 = 0xE789,
+    .Data3 = 0x4111,
+    .Data4 = .{ 0xA7, 0xB9, 0x47, 0xEF, 0x32, 0x8D, 0x13, 0xE6 },
 };
 
 /// d3d9types.h: D3DVERTEXELEMENT9 (8 bytes). D3DDECL_END() is Stream 0xFF,
@@ -708,6 +750,95 @@ pub const IDirect3DTexture9Vtbl = extern struct {
     AddDirtyRect: *const fn (*anyopaque, ?*const D3DRECT) callconv(W) HRESULT,
 };
 
+pub const D3DBOX = extern struct {
+    Left: u32,
+    Top: u32,
+    Right: u32,
+    Bottom: u32,
+    Front: u32,
+    Back: u32,
+};
+
+pub const D3DLOCKED_BOX = extern struct {
+    RowPitch: i32,
+    SlicePitch: i32,
+    pBits: ?*anyopaque,
+};
+
+pub const D3DVOLUME_DESC = extern struct {
+    Format: u32,
+    Type: u32,
+    Usage: u32,
+    Pool: u32,
+    Width: u32,
+    Height: u32,
+    Depth: u32,
+};
+
+pub const IDirect3DVolume9Vtbl = extern struct {
+    QueryInterface: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(W) u32,
+    Release: *const fn (*anyopaque) callconv(W) u32,
+    GetDevice: *const fn (*anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    SetPrivateData: *const fn (*anyopaque, ?*const anyopaque, ?*const anyopaque, u32, u32) callconv(W) HRESULT,
+    GetPrivateData: *const fn (*anyopaque, ?*const anyopaque, ?*anyopaque, ?*u32) callconv(W) HRESULT,
+    FreePrivateData: *const fn (*anyopaque, ?*const anyopaque) callconv(W) HRESULT,
+    GetContainer: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    GetDesc: *const fn (*anyopaque, ?*D3DVOLUME_DESC) callconv(W) HRESULT,
+    LockBox: *const fn (*anyopaque, ?*D3DLOCKED_BOX, ?*const D3DBOX, u32) callconv(W) HRESULT,
+    UnlockBox: *const fn (*anyopaque) callconv(W) HRESULT,
+};
+
+pub const IDirect3DCubeTexture9Vtbl = extern struct {
+    QueryInterface: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(W) u32,
+    Release: *const fn (*anyopaque) callconv(W) u32,
+    GetDevice: *const fn (*anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    SetPrivateData: *const fn (*anyopaque, ?*const anyopaque, ?*const anyopaque, u32, u32) callconv(W) HRESULT,
+    GetPrivateData: *const fn (*anyopaque, ?*const anyopaque, ?*anyopaque, ?*u32) callconv(W) HRESULT,
+    FreePrivateData: *const fn (*anyopaque, ?*const anyopaque) callconv(W) HRESULT,
+    SetPriority: *const fn (*anyopaque, u32) callconv(W) u32,
+    GetPriority: *const fn (*anyopaque) callconv(W) u32,
+    PreLoad: *const fn (*anyopaque) callconv(W) void,
+    GetType: *const fn (*anyopaque) callconv(W) u32,
+    SetLOD: *const fn (*anyopaque, u32) callconv(W) u32,
+    GetLOD: *const fn (*anyopaque) callconv(W) u32,
+    GetLevelCount: *const fn (*anyopaque) callconv(W) u32,
+    SetAutoGenFilterType: *const fn (*anyopaque, u32) callconv(W) HRESULT,
+    GetAutoGenFilterType: *const fn (*anyopaque) callconv(W) u32,
+    GenerateMipSubLevels: *const fn (*anyopaque) callconv(W) void,
+    GetLevelDesc: *const fn (*anyopaque, u32, ?*D3DSURFACE_DESC) callconv(W) HRESULT,
+    GetCubeMapSurface: *const fn (*anyopaque, u32, u32, ?*?*anyopaque) callconv(W) HRESULT,
+    LockRect: *const fn (*anyopaque, u32, u32, ?*D3DLOCKED_RECT, ?*const D3DRECT, u32) callconv(W) HRESULT,
+    UnlockRect: *const fn (*anyopaque, u32, u32) callconv(W) HRESULT,
+    AddDirtyRect: *const fn (*anyopaque, u32, ?*const D3DRECT) callconv(W) HRESULT,
+};
+
+pub const IDirect3DVolumeTexture9Vtbl = extern struct {
+    QueryInterface: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(W) u32,
+    Release: *const fn (*anyopaque) callconv(W) u32,
+    GetDevice: *const fn (*anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
+    SetPrivateData: *const fn (*anyopaque, ?*const anyopaque, ?*const anyopaque, u32, u32) callconv(W) HRESULT,
+    GetPrivateData: *const fn (*anyopaque, ?*const anyopaque, ?*anyopaque, ?*u32) callconv(W) HRESULT,
+    FreePrivateData: *const fn (*anyopaque, ?*const anyopaque) callconv(W) HRESULT,
+    SetPriority: *const fn (*anyopaque, u32) callconv(W) u32,
+    GetPriority: *const fn (*anyopaque) callconv(W) u32,
+    PreLoad: *const fn (*anyopaque) callconv(W) void,
+    GetType: *const fn (*anyopaque) callconv(W) u32,
+    SetLOD: *const fn (*anyopaque, u32) callconv(W) u32,
+    GetLOD: *const fn (*anyopaque) callconv(W) u32,
+    GetLevelCount: *const fn (*anyopaque) callconv(W) u32,
+    SetAutoGenFilterType: *const fn (*anyopaque, u32) callconv(W) HRESULT,
+    GetAutoGenFilterType: *const fn (*anyopaque) callconv(W) u32,
+    GenerateMipSubLevels: *const fn (*anyopaque) callconv(W) void,
+    GetLevelDesc: *const fn (*anyopaque, u32, ?*D3DVOLUME_DESC) callconv(W) HRESULT,
+    GetVolumeLevel: *const fn (*anyopaque, u32, ?*?*anyopaque) callconv(W) HRESULT,
+    LockBox: *const fn (*anyopaque, u32, ?*D3DLOCKED_BOX, ?*const D3DBOX, u32) callconv(W) HRESULT,
+    UnlockBox: *const fn (*anyopaque, u32) callconv(W) HRESULT,
+    AddDirtyBox: *const fn (*anyopaque, ?*const D3DBOX) callconv(W) HRESULT,
+};
+
 pub const IDirect3DShader9Vtbl = extern struct {
     QueryInterface: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque) callconv(W) HRESULT,
     AddRef: *const fn (*anyopaque) callconv(W) u32,
@@ -782,6 +913,7 @@ pub const WinsVertexBuffer9 = struct {
     pool: u32,
     data: []u8,
     allocator: std.mem.Allocator,
+    owner_device: ?*WinsD3DDevice9 = null,
 
     pub fn create(allocator: std.mem.Allocator, length: u32, usage: u32, fvf: u32, pool: u32) !*WinsVertexBuffer9 {
         const vb = try allocator.create(WinsVertexBuffer9);
@@ -814,6 +946,9 @@ fn vb_AddRef(this: *anyopaque) callconv(W) u32 {
 fn vb_Release(this: *anyopaque) callconv(W) u32 {
     const self: *WinsVertexBuffer9 = @ptrCast(@alignCast(this));
     if (self.ref_count > 0) self.ref_count -= 1;
+    if (self.ref_count == 0) {
+        if (self.owner_device) |dev| dev.untrackDefault(this);
+    }
     return self.ref_count;
 }
 fn vb_Stub(this: *anyopaque) callconv(W) HRESULT {
@@ -872,6 +1007,7 @@ pub const WinsIndexBuffer9 = struct {
     pool: u32,
     data: []u8,
     allocator: std.mem.Allocator,
+    owner_device: ?*WinsD3DDevice9 = null,
 
     pub fn create(allocator: std.mem.Allocator, length: u32, usage: u32, format: u32, pool: u32) !*WinsIndexBuffer9 {
         const ib = try allocator.create(WinsIndexBuffer9);
@@ -904,6 +1040,9 @@ fn ib_AddRef(this: *anyopaque) callconv(W) u32 {
 fn ib_Release(this: *anyopaque) callconv(W) u32 {
     const self: *WinsIndexBuffer9 = @ptrCast(@alignCast(this));
     if (self.ref_count > 0) self.ref_count -= 1;
+    if (self.ref_count == 0) {
+        if (self.owner_device) |dev| dev.untrackDefault(this);
+    }
     return self.ref_count;
 }
 fn ib_Lock(this: *anyopaque, offset: u32, size: u32, ppbData: ?*?*anyopaque, flags: u32) callconv(W) HRESULT {
@@ -980,6 +1119,18 @@ pub fn surfaceLayout(format: u32, width: u32, height: u32) ?SurfaceLayout {
     return .{ .pitch = width * bpp, .size = @as(usize, width * bpp) * height };
 }
 
+pub const VolumeLayout = struct {
+    row_pitch: u32,
+    slice_pitch: u32,
+    size: usize,
+};
+
+pub fn volumeLayout(format: u32, width: u32, height: u32, depth: u32) ?VolumeLayout {
+    const lay = surfaceLayout(format, width, height) orelse return null;
+    const slice: u32 = @intCast(lay.size);
+    return .{ .row_pitch = lay.pitch, .slice_pitch = slice, .size = lay.size * @max(1, depth) };
+}
+
 // Surface 9
 pub const WinsSurface9 = struct {
     vtbl: *const IDirect3DSurface9Vtbl,
@@ -1001,8 +1152,11 @@ pub const WinsSurface9 = struct {
     /// Host GPU object (wins_d3d9_gl.zig): a texture for colour render
     /// targets, a renderbuffer for depth/stencil; 0 until first used.
     gl_name: u32 = 0,
-    /// Set for a level of a texture: the texture owns the GPU storage.
+    gl_dirty: bool = false,
+    /// Set for a level of a texture or cube texture: the texture owns the GPU storage.
     parent: ?*WinsTexture9 = null,
+    cube_parent: ?*WinsCubeTexture9 = null,
+    cube_face: u32 = 0,
     level: u32 = 0,
 
     /// A surface over memory owned elsewhere, e.g. the device's back buffer: the
@@ -1069,7 +1223,22 @@ fn surf_AddRef(this: *anyopaque) callconv(W) u32 {
 fn surf_Release(this: *anyopaque) callconv(W) u32 {
     const self: *WinsSurface9 = @ptrCast(@alignCast(this));
     if (self.ref_count > 0) self.ref_count -= 1;
-    return self.ref_count;
+    const left = self.ref_count;
+    if (left == 0) {
+        if (self.parent == null and self.cube_parent == null) {
+            if (self.owner_device) |od| {
+                const dev: *WinsD3DDevice9 = @ptrCast(@alignCast(od));
+                if (dev.rt_surface != self and dev.ds_surface != self) dev.untrackDefault(this);
+            }
+        }
+    } else if (left == 1) {
+        if (self.parent) |p| {
+            if (p.ref_count == 0) p.destroy();
+        } else if (self.cube_parent) |cp| {
+            if (cp.ref_count == 0) cp.destroy();
+        }
+    }
+    return left;
 }
 fn surf_LockRect(this: *anyopaque, pLocked: ?*D3DLOCKED_RECT, pRect: ?*const D3DRECT, flags: u32) callconv(W) HRESULT {
     _ = flags;
@@ -1083,7 +1252,9 @@ fn surf_LockRect(this: *anyopaque, pLocked: ?*D3DLOCKED_RECT, pRect: ?*const D3D
     return D3D_OK;
 }
 fn surf_UnlockRect(this: *anyopaque) callconv(W) HRESULT {
-    _ = this;
+    const self: *WinsSurface9 = @ptrCast(@alignCast(this));
+    if (self.parent) |p| p.gl_dirty = true;
+    if (self.cube_parent) |cp| cp.gl_dirty = true;
     return D3D_OK;
 }
 fn surf_GetType(this: *anyopaque) callconv(W) u32 {
@@ -1143,6 +1314,7 @@ pub const WinsTexture9 = struct {
     /// Host GPU copy (wins_d3d9_gl.zig): 0 until first sampled; dirty after an unlock.
     gl_name: u32 = 0,
     gl_dirty: bool = true,
+    owner_device: ?*WinsD3DDevice9 = null,
 
     /// Number of levels in a full mip chain down to 1x1: 1 + floor(log2(max(w, h))).
     pub fn fullChain(width: u32, height: u32) u32 {
@@ -1197,6 +1369,7 @@ pub const WinsTexture9 = struct {
         for (self.surfaces) |s| {
             if (s.ref_count > 1) return;
         }
+        if (self.owner_device) |dev| dev.untrackDefault(self);
         const a = self.allocator;
         hostgl.textureGone(self.gl_name);
         for (self.surfaces) |s| s.destroy();
@@ -1298,6 +1471,481 @@ const g_tex9_vtbl: IDirect3DTexture9Vtbl = .{
     .UnlockRect = &tex_UnlockRect,
     .AddDirtyRect = @ptrCast(&vb_Stub),
 };
+
+// Cube Texture 9
+pub const WinsCubeTexture9 = struct {
+    vtbl: *const IDirect3DCubeTexture9Vtbl,
+    ref_count: u32,
+    edge_length: u32,
+    levels: u32,
+    usage: u32,
+    format: u32,
+    pool: u32,
+    /// `6 * levels` faces in D3DCUBEMAP_FACES major order (`face * levels + level`).
+    faces: []*WinsSurface9,
+    allocator: std.mem.Allocator,
+    gl_name: u32 = 0,
+    gl_dirty: bool = true,
+    owner_device: ?*WinsD3DDevice9 = null,
+
+    pub fn create(allocator: std.mem.Allocator, edge_length: u32, levels: u32, usage: u32, format: u32, pool: u32) !*WinsCubeTexture9 {
+        if (edge_length == 0 or surfaceLayout(format, 1, 1) == null) return error.InvalidCall;
+        if ((usage & D3DUSAGE_RENDERTARGET) != 0 and !isRenderTargetFormat(format)) return error.InvalidCall;
+        const full = WinsTexture9.fullChain(edge_length, edge_length);
+        const n: u32 = if (levels == 0) full else levels;
+        if (n > full) return error.InvalidCall;
+        const ct = try allocator.create(WinsCubeTexture9);
+        errdefer allocator.destroy(ct);
+        const total = 6 * @as(usize, n);
+        const faces = try allocator.alloc(*WinsSurface9, total);
+        errdefer allocator.free(faces);
+        var made: usize = 0;
+        errdefer for (faces[0..made]) |s| s.destroy();
+        for (0..6) |f| {
+            for (0..n) |l| {
+                const dim = @max(1, edge_length >> @intCast(l));
+                const s = try WinsSurface9.create(allocator, dim, dim, format);
+                s.usage = usage;
+                s.pool = pool;
+                s.lockable = (usage & D3DUSAGE_RENDERTARGET) == 0;
+                s.cube_parent = ct;
+                s.cube_face = @intCast(f);
+                s.level = @intCast(l);
+                faces[made] = s;
+                made += 1;
+            }
+        }
+        ct.* = .{
+            .vtbl = &g_cubetex9_vtbl,
+            .ref_count = 1,
+            .edge_length = edge_length,
+            .levels = n,
+            .usage = usage,
+            .format = format,
+            .pool = pool,
+            .faces = faces,
+            .allocator = allocator,
+        };
+        return ct;
+    }
+
+    pub fn destroy(self: *WinsCubeTexture9) void {
+        for (self.faces) |s| {
+            if (s.ref_count > 1) return;
+        }
+        if (self.owner_device) |dev| dev.untrackDefault(self);
+        const a = self.allocator;
+        hostgl.textureGone(self.gl_name);
+        for (self.faces) |s| s.destroy();
+        a.free(self.faces);
+        a.destroy(self);
+    }
+};
+
+fn cubetex_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    const out = ppv orelse return E_POINTER;
+    out.* = null;
+    const r = riid orelse return E_POINTER;
+    const id: *align(1) const GUID = @ptrCast(r);
+    if (guidEql(id, &IID_IUnknown) or guidEql(id, &IID_IDirect3DResource9) or
+        guidEql(id, &IID_IDirect3DBaseTexture9) or guidEql(id, &IID_IDirect3DCubeTexture9))
+    {
+        self.ref_count += 1;
+        out.* = this;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+fn cubetex_AddRef(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    self.ref_count += 1;
+    return self.ref_count;
+}
+fn cubetex_Release(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    if (self.ref_count > 0) self.ref_count -= 1;
+    const left = self.ref_count;
+    if (left == 0) self.destroy();
+    return left;
+}
+fn cubetex_GetType(this: *anyopaque) callconv(W) u32 {
+    _ = this;
+    return D3DRTYPE_CUBETEXTURE;
+}
+fn cubetex_GetLevelCount(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    return self.levels;
+}
+fn cubetex_GetLevelDesc(this: *anyopaque, level: u32, pDesc: ?*D3DSURFACE_DESC) callconv(W) HRESULT {
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    if (level >= self.levels) return D3DERR_INVALIDCALL;
+    const s = self.faces[level];
+    return s.vtbl.GetDesc(s, pDesc);
+}
+fn cubetex_GetCubeMapSurface(this: *anyopaque, face: u32, level: u32, ppSurface: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    const out = ppSurface orelse return D3DERR_INVALIDCALL;
+    out.* = null;
+    if (face >= 6 or level >= self.levels) return D3DERR_INVALIDCALL;
+    const s = self.faces[@as(usize, face) * self.levels + level];
+    s.ref_count += 1;
+    out.* = s;
+    return D3D_OK;
+}
+fn cubetex_LockRect(this: *anyopaque, face: u32, level: u32, pLocked: ?*D3DLOCKED_RECT, pRect: ?*const D3DRECT, flags: u32) callconv(W) HRESULT {
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    if (face >= 6 or level >= self.levels) return D3DERR_INVALIDCALL;
+    const s = self.faces[@as(usize, face) * self.levels + level];
+    return s.vtbl.LockRect(s, pLocked, pRect, flags);
+}
+fn cubetex_UnlockRect(this: *anyopaque, face: u32, level: u32) callconv(W) HRESULT {
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    if (face >= 6 or level >= self.levels) return D3DERR_INVALIDCALL;
+    self.gl_dirty = true;
+    const s = self.faces[@as(usize, face) * self.levels + level];
+    return s.vtbl.UnlockRect(s);
+}
+fn cubetex_AddDirtyRect(this: *anyopaque, face: u32, pDirty: ?*const D3DRECT) callconv(W) HRESULT {
+    _ = pDirty;
+    const self: *WinsCubeTexture9 = @ptrCast(@alignCast(this));
+    if (face >= 6) return D3DERR_INVALIDCALL;
+    self.gl_dirty = true;
+    return D3D_OK;
+}
+
+const g_cubetex9_vtbl: IDirect3DCubeTexture9Vtbl = .{
+    .QueryInterface = &cubetex_QueryInterface,
+    .AddRef = &cubetex_AddRef,
+    .Release = &cubetex_Release,
+    .GetDevice = @ptrCast(&vb_Stub),
+    .SetPrivateData = @ptrCast(&vb_Stub),
+    .GetPrivateData = @ptrCast(&vb_Stub),
+    .FreePrivateData = @ptrCast(&vb_Stub),
+    .SetPriority = @ptrCast(&vb_Stub),
+    .GetPriority = @ptrCast(&vb_Stub),
+    .PreLoad = @ptrCast(&vb_Stub),
+    .GetType = &cubetex_GetType,
+    .SetLOD = @ptrCast(&vb_Stub),
+    .GetLOD = @ptrCast(&vb_Stub),
+    .GetLevelCount = &cubetex_GetLevelCount,
+    .SetAutoGenFilterType = @ptrCast(&vb_Stub),
+    .GetAutoGenFilterType = @ptrCast(&vb_Stub),
+    .GenerateMipSubLevels = @ptrCast(&vb_Stub),
+    .GetLevelDesc = &cubetex_GetLevelDesc,
+    .GetCubeMapSurface = &cubetex_GetCubeMapSurface,
+    .LockRect = &cubetex_LockRect,
+    .UnlockRect = &cubetex_UnlockRect,
+    .AddDirtyRect = &cubetex_AddDirtyRect,
+};
+
+// Volume 9 & Volume Texture 9
+pub const WinsVolume9 = struct {
+    vtbl: *const IDirect3DVolume9Vtbl,
+    ref_count: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    format: u32,
+    row_pitch: i32,
+    slice_pitch: i32,
+    data: []u8,
+    allocator: std.mem.Allocator,
+    usage: u32 = 0,
+    pool: u32 = 1,
+    parent: ?*WinsVolumeTexture9 = null,
+    level: u32 = 0,
+
+    pub fn create(allocator: std.mem.Allocator, width: u32, height: u32, depth: u32, format: u32) !*WinsVolume9 {
+        const lay = volumeLayout(format, width, height, depth) orelse return error.InvalidCall;
+        const vol = try allocator.create(WinsVolume9);
+        errdefer allocator.destroy(vol);
+        const mem = try allocator.alloc(u8, lay.size);
+        @memset(mem, 0);
+        vol.* = .{
+            .vtbl = &g_vol9_vtbl,
+            .ref_count = 1,
+            .width = width,
+            .height = height,
+            .depth = depth,
+            .format = format,
+            .row_pitch = @intCast(lay.row_pitch),
+            .slice_pitch = @intCast(lay.slice_pitch),
+            .data = mem,
+            .allocator = allocator,
+        };
+        return vol;
+    }
+
+    pub fn destroy(self: *WinsVolume9) void {
+        const a = self.allocator;
+        a.free(self.data);
+        a.destroy(self);
+    }
+};
+
+fn vol_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsVolume9 = @ptrCast(@alignCast(this));
+    const out = ppv orelse return E_POINTER;
+    out.* = null;
+    const r = riid orelse return E_POINTER;
+    const id: *align(1) const GUID = @ptrCast(r);
+    if (guidEql(id, &IID_IUnknown) or guidEql(id, &IID_IDirect3DVolume9)) {
+        self.ref_count += 1;
+        out.* = this;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+fn vol_AddRef(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsVolume9 = @ptrCast(@alignCast(this));
+    self.ref_count += 1;
+    return self.ref_count;
+}
+fn vol_Release(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsVolume9 = @ptrCast(@alignCast(this));
+    if (self.ref_count > 0) self.ref_count -= 1;
+    const left = self.ref_count;
+    if (left == 1) {
+        if (self.parent) |p| {
+            if (p.ref_count == 0) p.destroy();
+        }
+    }
+    return left;
+}
+fn vol_GetContainer(this: *anyopaque, riid: ?*const anyopaque, ppContainer: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsVolume9 = @ptrCast(@alignCast(this));
+    const out = ppContainer orelse return D3DERR_INVALIDCALL;
+    out.* = null;
+    const p = self.parent orelse return D3DERR_INVALIDCALL;
+    return p.vtbl.QueryInterface(p, riid, out);
+}
+fn vol_GetDesc(this: *anyopaque, pDesc: ?*D3DVOLUME_DESC) callconv(W) HRESULT {
+    const self: *WinsVolume9 = @ptrCast(@alignCast(this));
+    const d = pDesc orelse return D3DERR_INVALIDCALL;
+    d.* = .{
+        .Format = self.format,
+        .Type = D3DRTYPE_VOLUME,
+        .Usage = self.usage,
+        .Pool = self.pool,
+        .Width = self.width,
+        .Height = self.height,
+        .Depth = self.depth,
+    };
+    return D3D_OK;
+}
+fn vol_LockBox(this: *anyopaque, pLockedVolume: ?*D3DLOCKED_BOX, pBox: ?*const D3DBOX, flags: u32) callconv(W) HRESULT {
+    _ = pBox;
+    _ = flags;
+    const self: *WinsVolume9 = @ptrCast(@alignCast(this));
+    const l = pLockedVolume orelse return D3DERR_INVALIDCALL;
+    l.* = .{
+        .RowPitch = self.row_pitch,
+        .SlicePitch = self.slice_pitch,
+        .pBits = self.data.ptr,
+    };
+    return D3D_OK;
+}
+fn vol_UnlockBox(this: *anyopaque) callconv(W) HRESULT {
+    const self: *WinsVolume9 = @ptrCast(@alignCast(this));
+    if (self.parent) |p| p.gl_dirty = true;
+    return D3D_OK;
+}
+
+const g_vol9_vtbl: IDirect3DVolume9Vtbl = .{
+    .QueryInterface = &vol_QueryInterface,
+    .AddRef = &vol_AddRef,
+    .Release = &vol_Release,
+    .GetDevice = @ptrCast(&vb_Stub),
+    .SetPrivateData = @ptrCast(&vb_Stub),
+    .GetPrivateData = @ptrCast(&vb_Stub),
+    .FreePrivateData = @ptrCast(&vb_Stub),
+    .GetContainer = &vol_GetContainer,
+    .GetDesc = &vol_GetDesc,
+    .LockBox = &vol_LockBox,
+    .UnlockBox = &vol_UnlockBox,
+};
+
+pub const WinsVolumeTexture9 = struct {
+    vtbl: *const IDirect3DVolumeTexture9Vtbl,
+    ref_count: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    levels: u32,
+    usage: u32,
+    format: u32,
+    pool: u32,
+    volumes: []*WinsVolume9,
+    allocator: std.mem.Allocator,
+    gl_name: u32 = 0,
+    gl_dirty: bool = true,
+    owner_device: ?*WinsD3DDevice9 = null,
+
+    pub fn fullChain(width: u32, height: u32, depth: u32) u32 {
+        return 1 + (31 - @clz(@max(@max(width, height), depth)));
+    }
+
+    pub fn create(allocator: std.mem.Allocator, width: u32, height: u32, depth: u32, levels: u32, usage: u32, format: u32, pool: u32) !*WinsVolumeTexture9 {
+        if (width == 0 or height == 0 or depth == 0) return error.InvalidCall;
+        if ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0) return error.InvalidCall;
+        if (volumeLayout(format, 1, 1, 1) == null) return error.InvalidCall;
+        const full = fullChain(width, height, depth);
+        const n: u32 = if (levels == 0) full else levels;
+        if (n > full) return error.InvalidCall;
+        const vt = try allocator.create(WinsVolumeTexture9);
+        errdefer allocator.destroy(vt);
+        const vols = try allocator.alloc(*WinsVolume9, n);
+        errdefer allocator.free(vols);
+        var made: usize = 0;
+        errdefer for (vols[0..made]) |v| v.destroy();
+        while (made < n) : (made += 1) {
+            const w = @max(1, width >> @intCast(made));
+            const h = @max(1, height >> @intCast(made));
+            const d = @max(1, depth >> @intCast(made));
+            const v = try WinsVolume9.create(allocator, w, h, d, format);
+            v.usage = usage;
+            v.pool = pool;
+            v.parent = vt;
+            v.level = @intCast(made);
+            vols[made] = v;
+        }
+        vt.* = .{
+            .vtbl = &g_voltex9_vtbl,
+            .ref_count = 1,
+            .width = width,
+            .height = height,
+            .depth = depth,
+            .levels = n,
+            .usage = usage,
+            .format = format,
+            .pool = pool,
+            .volumes = vols,
+            .allocator = allocator,
+        };
+        return vt;
+    }
+
+    pub fn destroy(self: *WinsVolumeTexture9) void {
+        for (self.volumes) |v| {
+            if (v.ref_count > 1) return;
+        }
+        if (self.owner_device) |dev| dev.untrackDefault(self);
+        const a = self.allocator;
+        hostgl.textureGone(self.gl_name);
+        for (self.volumes) |v| v.destroy();
+        a.free(self.volumes);
+        a.destroy(self);
+    }
+};
+
+fn voltex_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    const out = ppv orelse return E_POINTER;
+    out.* = null;
+    const r = riid orelse return E_POINTER;
+    const id: *align(1) const GUID = @ptrCast(r);
+    if (guidEql(id, &IID_IUnknown) or guidEql(id, &IID_IDirect3DResource9) or
+        guidEql(id, &IID_IDirect3DBaseTexture9) or guidEql(id, &IID_IDirect3DVolumeTexture9))
+    {
+        self.ref_count += 1;
+        out.* = this;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+fn voltex_AddRef(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    self.ref_count += 1;
+    return self.ref_count;
+}
+fn voltex_Release(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    if (self.ref_count > 0) self.ref_count -= 1;
+    const left = self.ref_count;
+    if (left == 0) self.destroy();
+    return left;
+}
+fn voltex_GetType(this: *anyopaque) callconv(W) u32 {
+    _ = this;
+    return D3DRTYPE_VOLUMETEXTURE;
+}
+fn voltex_GetLevelCount(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    return self.levels;
+}
+fn voltex_GetLevelDesc(this: *anyopaque, level: u32, pDesc: ?*D3DVOLUME_DESC) callconv(W) HRESULT {
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    if (level >= self.levels) return D3DERR_INVALIDCALL;
+    const v = self.volumes[level];
+    return v.vtbl.GetDesc(v, pDesc);
+}
+fn voltex_GetVolumeLevel(this: *anyopaque, level: u32, ppVolumeLevel: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    const out = ppVolumeLevel orelse return D3DERR_INVALIDCALL;
+    out.* = null;
+    if (level >= self.levels) return D3DERR_INVALIDCALL;
+    const v = self.volumes[level];
+    v.ref_count += 1;
+    out.* = v;
+    return D3D_OK;
+}
+fn voltex_LockBox(this: *anyopaque, level: u32, pLocked: ?*D3DLOCKED_BOX, pBox: ?*const D3DBOX, flags: u32) callconv(W) HRESULT {
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    if (level >= self.levels) return D3DERR_INVALIDCALL;
+    const v = self.volumes[level];
+    return v.vtbl.LockBox(v, pLocked, pBox, flags);
+}
+fn voltex_UnlockBox(this: *anyopaque, level: u32) callconv(W) HRESULT {
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    if (level >= self.levels) return D3DERR_INVALIDCALL;
+    self.gl_dirty = true;
+    const v = self.volumes[level];
+    return v.vtbl.UnlockBox(v);
+}
+fn voltex_AddDirtyBox(this: *anyopaque, pDirtyBox: ?*const D3DBOX) callconv(W) HRESULT {
+    _ = pDirtyBox;
+    const self: *WinsVolumeTexture9 = @ptrCast(@alignCast(this));
+    self.gl_dirty = true;
+    return D3D_OK;
+}
+
+const g_voltex9_vtbl: IDirect3DVolumeTexture9Vtbl = .{
+    .QueryInterface = &voltex_QueryInterface,
+    .AddRef = &voltex_AddRef,
+    .Release = &voltex_Release,
+    .GetDevice = @ptrCast(&vb_Stub),
+    .SetPrivateData = @ptrCast(&vb_Stub),
+    .GetPrivateData = @ptrCast(&vb_Stub),
+    .FreePrivateData = @ptrCast(&vb_Stub),
+    .SetPriority = @ptrCast(&vb_Stub),
+    .GetPriority = @ptrCast(&vb_Stub),
+    .PreLoad = @ptrCast(&vb_Stub),
+    .GetType = &voltex_GetType,
+    .SetLOD = @ptrCast(&vb_Stub),
+    .GetLOD = @ptrCast(&vb_Stub),
+    .GetLevelCount = &voltex_GetLevelCount,
+    .SetAutoGenFilterType = @ptrCast(&vb_Stub),
+    .GetAutoGenFilterType = @ptrCast(&vb_Stub),
+    .GenerateMipSubLevels = @ptrCast(&vb_Stub),
+    .GetLevelDesc = &voltex_GetLevelDesc,
+    .GetVolumeLevel = &voltex_GetVolumeLevel,
+    .LockBox = &voltex_LockBox,
+    .UnlockBox = &voltex_UnlockBox,
+    .AddDirtyBox = &voltex_AddDirtyBox,
+};
+
+/// Returns D3DRTYPE_TEXTURE / CUBETEXTURE / VOLUMETEXTURE for a bound texture,
+/// or 0 if null / unrecognised.
+pub fn textureKind(ptr: ?*const anyopaque) u32 {
+    const p = ptr orelse return 0;
+    const vptr: *const *const anyopaque = @ptrCast(@alignCast(p));
+    const v = @intFromPtr(vptr.*);
+    if (v == @intFromPtr(&g_tex9_vtbl)) return D3DRTYPE_TEXTURE;
+    if (v == @intFromPtr(&g_cubetex9_vtbl)) return D3DRTYPE_CUBETEXTURE;
+    if (v == @intFromPtr(&g_voltex9_vtbl)) return D3DRTYPE_VOLUMETEXTURE;
+    return 0;
+}
 
 // Shader 9
 pub const WinsShader9 = struct {
@@ -1498,7 +2146,7 @@ const g_vdecl9_vtbl: IDirect3DVertexDeclaration9Vtbl = .{
 // to WinsD3DDevice9 once moved `vtbl` away from offset 0: the guest then read a
 // NULL vtable and crashed, while tests that go through fields still passed.)
 comptime {
-    for (.{ WinsD3D9, WinsD3DDevice9, WinsSurface9, WinsTexture9, WinsVertexBuffer9, WinsIndexBuffer9, WinsShader9, WinsD3DXBuffer, WinsVertexDecl9 }) |T| {
+    for (.{ WinsD3D9, WinsD3DDevice9, WinsSurface9, WinsTexture9, WinsCubeTexture9, WinsVolume9, WinsVolumeTexture9, WinsVertexBuffer9, WinsIndexBuffer9, WinsShader9, WinsD3DXBuffer, WinsVertexDecl9 }) |T| {
         if (@offsetOf(T, "vtbl") != 0) @compileError("COM object " ++ @typeName(T) ++ " must keep vtbl at offset 0");
     }
 }
@@ -1573,10 +2221,24 @@ fn traceDraw(self: *const WinsD3DDevice9, kind: []const u8, prim: u32, a: i64, b
     if (self.indices) |ib| std.debug.print("[WINS:D3D9:trace]   ib@{x} len={d} fmt={d}\n", .{ @intFromPtr(ib), ib.data.len, ib.format });
     for (self.bound_textures, 0..) |maybe, i| {
         const t = maybe orelse continue;
-        std.debug.print("[WINS:D3D9:trace]   tex{d} @{x} {d}x{d} fmt={x} levels={d} usage={x} min={d} mag={d} mip={d} addr={d}/{d}\n", .{
-            i,                           @intFromPtr(t),              t.width,                     t.height, t.format, t.levels, t.usage,
-            self.sampler_states[i][6],   self.sampler_states[i][5],   self.sampler_states[i][7],   self.sampler_states[i][1], self.sampler_states[i][2],
-        });
+        switch (textureKind(t)) {
+            D3DRTYPE_TEXTURE => {
+                const tex: *const WinsTexture9 = @ptrCast(@alignCast(t));
+                std.debug.print("[WINS:D3D9:trace]   tex{d} @{x} {d}x{d} fmt={x} levels={d} usage={x} min={d} mag={d} mip={d} addr={d}/{d}\n", .{
+                    i,                           @intFromPtr(t),               tex.width,                   tex.height, tex.format, tex.levels, tex.usage,
+                    self.sampler_states[i][6],   self.sampler_states[i][5],   self.sampler_states[i][7],   self.sampler_states[i][1], self.sampler_states[i][2],
+                });
+            },
+            D3DRTYPE_CUBETEXTURE => {
+                const ct: *const WinsCubeTexture9 = @ptrCast(@alignCast(t));
+                std.debug.print("[WINS:D3D9:trace]   cube{d} @{x} {d} fmt={x} levels={d} usage={x}\n", .{ i, @intFromPtr(t), ct.edge_length, ct.format, ct.levels, ct.usage });
+            },
+            D3DRTYPE_VOLUMETEXTURE => {
+                const vt: *const WinsVolumeTexture9 = @ptrCast(@alignCast(t));
+                std.debug.print("[WINS:D3D9:trace]   vol{d} @{x} {d}x{d}x{d} fmt={x} levels={d} usage={x}\n", .{ i, @intFromPtr(t), vt.width, vt.height, vt.depth, vt.format, vt.levels, vt.usage });
+            },
+            else => {},
+        }
     }
 }
 
@@ -1633,6 +2295,92 @@ fn defaultRenderStates(auto_depth: bool) [256]u32 {
     return rs;
 }
 
+const DefaultKind = enum { vb, ib, surf, tex, cube, vol };
+const DefaultRes = struct { kind: DefaultKind, ptr: *anyopaque };
+
+const RecordedLight = struct {
+    has_light: bool = false,
+    light: D3DLIGHT9 = undefined,
+    has_enable: bool = false,
+    enabled: bool = false,
+};
+
+pub const WinsStateBlock9 = struct {
+    vtbl: *const IDirect3DStateBlock9Vtbl align(16),
+    ref_count: u32,
+    device: *WinsD3DDevice9,
+    allocator: std.mem.Allocator,
+    capture_all_lights: bool = false,
+
+    has_viewport: bool = false,
+    viewport: D3DVIEWPORT9 = undefined,
+    has_scissor: bool = false,
+    scissor: D3DRECT = undefined,
+    has_material: bool = false,
+    material: D3DMATERIAL9 = undefined,
+
+    has_transform: [kTransformStateCount]bool = [_]bool{false} ** kTransformStateCount,
+    transform_states: [kTransformStateCount]D3DMATRIX = undefined,
+
+    has_vs_const: [256]bool = [_]bool{false} ** 256,
+    vs_consts: [256][4]f32 = undefined,
+    has_ps_const: [224]bool = [_]bool{false} ** 224,
+    ps_consts: [224][4]f32 = undefined,
+
+    has_render_state: [256]bool = [_]bool{false} ** 256,
+    render_states: [256]u32 = undefined,
+
+    has_tss: [kMaxTextureStages][kTssSlots]bool = [_][kTssSlots]bool{[_]bool{false} ** kTssSlots} ** kMaxTextureStages,
+    tex_stage_states: [kMaxTextureStages][kTssSlots]u32 = undefined,
+
+    has_samp: [16][kSampSlots]bool = [_][kSampSlots]bool{[_]bool{false} ** kSampSlots} ** 16,
+    sampler_states: [16][kSampSlots]u32 = undefined,
+
+    has_clip: u32 = 0,
+    clip_planes: [32][4]f32 = undefined,
+
+    has_stream: [16]bool = [_]bool{false} ** 16,
+    streams: [16]?*WinsVertexBuffer9 = undefined,
+    stream_strides: [16]u32 = undefined,
+    stream_offsets: [16]u32 = undefined,
+
+    has_indices: bool = false,
+    indices: ?*WinsIndexBuffer9 = undefined,
+
+    has_texture: [16]bool = [_]bool{false} ** 16,
+    bound_textures: [16]?*anyopaque = undefined,
+
+    has_vs: bool = false,
+    active_vs: ?*WinsShader9 = undefined,
+    has_ps: bool = false,
+    active_ps: ?*WinsShader9 = undefined,
+
+    has_vdecl_mode: bool = false,
+    vertex_decl: ?*WinsVertexDecl9 = null,
+    use_fvf: bool = false,
+    fvf: u32 = 0,
+    fvf_elements: [24]D3DVERTEXELEMENT9 = undefined,
+
+    lights: std.AutoHashMapUnmanaged(u32, RecordedLight) = .empty,
+
+    pub fn create(allocator: std.mem.Allocator, dev: *WinsD3DDevice9) !*WinsStateBlock9 {
+        const sb = try allocator.create(WinsStateBlock9);
+        @memset(std.mem.asBytes(sb), 0);
+        sb.vtbl = &g_stateblock9_vtbl;
+        sb.ref_count = 1;
+        sb.device = dev;
+        sb.allocator = allocator;
+        sb.lights = .empty;
+        return sb;
+    }
+
+    pub fn destroy(self: *WinsStateBlock9) void {
+        const a = self.allocator;
+        self.lights.deinit(a);
+        a.destroy(self);
+    }
+};
+
 pub const WinsD3DDevice9 = struct {
     // Largest alignment in the struct, so the compiler keeps it first (see the
     // comptime check above); the guest dereferences offset 0 as the vtable.
@@ -1667,10 +2415,11 @@ pub const WinsD3DDevice9 = struct {
     stream_strides: [16]u32,
     stream_offsets: [16]u32,
     indices: ?*WinsIndexBuffer9,
-    bound_textures: [16]?*WinsTexture9,
+    bound_textures: [16]?*anyopaque,
     active_vs: ?*WinsShader9,
     active_ps: ?*WinsShader9,
     allocator: std.mem.Allocator,
+    clip_planes: [32][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 32,
     /// Last SetFVF; while `use_fvf` it is the vertex layout (SetVertexDeclaration
     /// switches back), described as the equivalent declaration.
     fvf: u32 = 0,
@@ -1680,6 +2429,70 @@ pub const WinsD3DDevice9 = struct {
     render_targets: [4]?*WinsSurface9 = .{ null, null, null, null },
     /// True when this device renders through wins_d3d9_gl.zig.
     host: bool = false,
+    default_resources: std.ArrayListUnmanaged(DefaultRes) = .empty,
+    recording_sb: ?*WinsStateBlock9 = null,
+
+    pub fn trackDefault(self: *WinsD3DDevice9, kind: DefaultKind, ptr: *anyopaque) void {
+        self.default_resources.append(self.allocator, .{ .kind = kind, .ptr = ptr }) catch {};
+    }
+
+    pub fn untrackDefault(self: *WinsD3DDevice9, ptr: *const anyopaque) void {
+        var i: usize = 0;
+        while (i < self.default_resources.items.len) {
+            if (@intFromPtr(self.default_resources.items[i].ptr) == @intFromPtr(ptr)) {
+                _ = self.default_resources.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    pub fn hasLiveDefaultResources(self: *const WinsD3DDevice9) bool {
+        if (self.rt_surface) |rt| {
+            if (rt.ref_count > 1) return true;
+        }
+        if (self.ds_surface) |ds| {
+            if (ds.ref_count > 1) return true;
+        }
+        for (self.default_resources.items) |item| {
+            switch (item.kind) {
+                .vb => {
+                    const vb: *const WinsVertexBuffer9 = @ptrCast(@alignCast(item.ptr));
+                    if (vb.ref_count > 0) return true;
+                },
+                .ib => {
+                    const ib: *const WinsIndexBuffer9 = @ptrCast(@alignCast(item.ptr));
+                    if (ib.ref_count > 0) return true;
+                },
+                .surf => {
+                    const s: *const WinsSurface9 = @ptrCast(@alignCast(item.ptr));
+                    if (s.ref_count > 0) return true;
+                },
+                .tex => {
+                    const t: *const WinsTexture9 = @ptrCast(@alignCast(item.ptr));
+                    if (t.ref_count > 0) return true;
+                    for (t.surfaces) |s| {
+                        if (s.ref_count > 1) return true;
+                    }
+                },
+                .cube => {
+                    const c: *const WinsCubeTexture9 = @ptrCast(@alignCast(item.ptr));
+                    if (c.ref_count > 0) return true;
+                    for (c.faces) |s| {
+                        if (s.ref_count > 1) return true;
+                    }
+                },
+                .vol => {
+                    const v: *const WinsVolumeTexture9 = @ptrCast(@alignCast(item.ptr));
+                    if (v.ref_count > 0) return true;
+                    for (v.volumes) |vol| {
+                        if (vol.ref_count > 1) return true;
+                    }
+                },
+            }
+        }
+        return false;
+    }
 
     pub fn init(allocator: std.mem.Allocator, adapter: u32, device_type: u32, params: D3DPRESENT_PARAMETERS) !*WinsD3DDevice9 {
         const dev = try allocator.create(WinsD3DDevice9);
@@ -1729,7 +2542,7 @@ pub const WinsD3DDevice9 = struct {
             .stream_strides = [_]u32{0} ** 16,
             .stream_offsets = [_]u32{0} ** 16,
             .indices = null,
-            .bound_textures = [_]?*WinsTexture9{null} ** 16,
+            .bound_textures = [_]?*anyopaque{null} ** 16,
             .active_vs = null,
             .active_ps = null,
             .allocator = allocator,
@@ -1990,7 +2803,7 @@ fn d3d9_CheckDeviceFormat(
     if (dev_type != D3DDEVTYPE_HAL and dev_type != D3DDEVTYPE_REF) return D3DERR_INVALIDARG;
     if (!isRenderTargetFormat(adapter_format)) return D3DERR_NOTAVAILABLE;
     if ((usage & D3DUSAGE_RENDERTARGET) != 0) {
-        if (rtype != 0 and rtype != D3DRTYPE_SURFACE and rtype != D3DRTYPE_TEXTURE) {
+        if (rtype != 0 and rtype != D3DRTYPE_SURFACE and rtype != D3DRTYPE_TEXTURE and rtype != D3DRTYPE_CUBETEXTURE) {
             return D3DERR_NOTAVAILABLE;
         }
         if (!isRenderTargetFormat(check_format)) return D3DERR_NOTAVAILABLE;
@@ -2001,10 +2814,12 @@ fn d3d9_CheckDeviceFormat(
         if (!isDepthStencilFormat(check_format)) return D3DERR_NOTAVAILABLE;
         return D3D_OK;
     }
-    // A plain 2D texture (optionally DYNAMIC). Only what CreateTexture can back:
-    // volume/cube textures, auto-generated mipmaps and every other usage flag are
-    // not implemented, and neither are the 16-bit and compressed formats.
-    if (rtype == D3DRTYPE_TEXTURE and (usage & ~D3DUSAGE_DYNAMIC) == 0 and isTextureFormat(check_format)) return D3D_OK;
+    // 2D, cube and volume textures (optionally DYNAMIC).
+    if ((rtype == D3DRTYPE_TEXTURE or rtype == D3DRTYPE_CUBETEXTURE or rtype == D3DRTYPE_VOLUMETEXTURE) and
+        (usage & ~D3DUSAGE_DYNAMIC) == 0 and isTextureFormat(check_format))
+    {
+        return D3D_OK;
+    }
     return D3DERR_NOTAVAILABLE;
 }
 
@@ -2156,7 +2971,14 @@ fn dev9_Release(this: *anyopaque) callconv(W) u32 {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (self.ref_count > 0) {
         self.ref_count -= 1;
-        if (self.ref_count == 0) self.lights.deinit(self.allocator);
+        if (self.ref_count == 0) {
+            self.lights.deinit(self.allocator);
+            self.default_resources.deinit(self.allocator);
+            if (self.recording_sb) |sb| {
+                sb.destroy();
+                self.recording_sb = null;
+            }
+        }
     }
     return self.ref_count;
 }
@@ -2222,6 +3044,11 @@ fn dev9_Present(
 fn dev9_SetViewport(this: *anyopaque, pViewport: ?*const D3DVIEWPORT9) callconv(W) HRESULT {
     if (pViewport) |vp| {
         const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+        if (self.recording_sb) |sb| {
+            sb.viewport = vp.*;
+            sb.has_viewport = true;
+            return D3D_OK;
+        }
         self.viewport = vp.*;
     }
     return D3D_OK;
@@ -2248,6 +3075,10 @@ fn dev9_CreateVertexBuffer(
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (ppVertexBuffer == null) return E_FAIL;
     const vb = WinsVertexBuffer9.create(self.allocator, Length, Usage, FVF, Pool) catch return E_OUTOFMEMORY;
+    if (Pool == 0) {
+        vb.owner_device = self;
+        self.trackDefault(.vb, vb);
+    }
     ppVertexBuffer.?.* = @ptrCast(vb);
     return D3D_OK;
 }
@@ -2265,6 +3096,10 @@ fn dev9_CreateIndexBuffer(
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (ppIndexBuffer == null) return E_FAIL;
     const ib = WinsIndexBuffer9.create(self.allocator, Length, Usage, Format, Pool) catch return E_OUTOFMEMORY;
+    if (Pool == 0) {
+        ib.owner_device = self;
+        self.trackDefault(.ib, ib);
+    }
     ppIndexBuffer.?.* = @ptrCast(ib);
     return D3D_OK;
 }
@@ -2287,6 +3122,10 @@ fn dev9_CreateTexture(
         if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateTexture({d}x{d}, levels={d}, usage={x}, fmt={x}, pool={d}) REFUSED\n", .{ Width, Height, Levels, Usage, Format, Pool });
         return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
     };
+    if (Pool == 0) {
+        tex.owner_device = self;
+        self.trackDefault(.tex, tex);
+    }
     if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateTexture({d}x{d}, levels={d}, usage={x}, fmt={x}, pool={d}) -> @{x}\n", .{ Width, Height, Levels, Usage, Format, Pool, @intFromPtr(tex) });
     ppTexture.?.* = @ptrCast(tex);
     return D3D_OK;
@@ -2312,6 +3151,15 @@ fn dev9_CreatePixelShader(this: *anyopaque, pFunction: ?*const u32, ppShader: ?*
 
 fn dev9_SetStreamSource(this: *anyopaque, StreamNumber: u32, pStreamData: ?*anyopaque, OffsetInBytes: u32, Stride: u32) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.recording_sb) |sb| {
+        if (StreamNumber < 16) {
+            sb.streams[StreamNumber] = if (pStreamData) |ps| @ptrCast(@alignCast(ps)) else null;
+            sb.stream_strides[StreamNumber] = Stride;
+            sb.stream_offsets[StreamNumber] = OffsetInBytes;
+            sb.has_stream[StreamNumber] = true;
+        }
+        return D3D_OK;
+    }
     if (StreamNumber < 16) {
         self.streams[StreamNumber] = if (pStreamData) |ps| @ptrCast(@alignCast(ps)) else null;
         self.stream_strides[StreamNumber] = Stride;
@@ -2322,18 +3170,33 @@ fn dev9_SetStreamSource(this: *anyopaque, StreamNumber: u32, pStreamData: ?*anyo
 
 fn dev9_SetIndices(this: *anyopaque, pIndexData: ?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.recording_sb) |sb| {
+        sb.indices = if (pIndexData) |pi| @ptrCast(@alignCast(pi)) else null;
+        sb.has_indices = true;
+        return D3D_OK;
+    }
     self.indices = if (pIndexData) |pi| @ptrCast(@alignCast(pi)) else null;
     return D3D_OK;
 }
 
 fn dev9_SetVertexShader(this: *anyopaque, pShader: ?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.recording_sb) |sb| {
+        sb.active_vs = if (pShader) |ps| @ptrCast(@alignCast(ps)) else null;
+        sb.has_vs = true;
+        return D3D_OK;
+    }
     self.active_vs = if (pShader) |ps| @ptrCast(@alignCast(ps)) else null;
     return D3D_OK;
 }
 
 fn dev9_SetPixelShader(this: *anyopaque, pShader: ?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.recording_sb) |sb| {
+        sb.active_ps = if (pShader) |ps| @ptrCast(@alignCast(ps)) else null;
+        sb.has_ps = true;
+        return D3D_OK;
+    }
     self.active_ps = if (pShader) |ps| @ptrCast(@alignCast(ps)) else null;
     return D3D_OK;
 }
@@ -2342,6 +3205,15 @@ fn dev9_SetVertexShaderConstantF(this: *anyopaque, StartRegister: u32, pConstant
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (pConstantData) |cd| {
         const ptr: [*]const f32 = @ptrCast(cd);
+        if (self.recording_sb) |sb| {
+            var i: u32 = 0;
+            while (i < Vector4fCount and StartRegister + i < 256) : (i += 1) {
+                const src = ptr + i * 4;
+                sb.vs_consts[StartRegister + i] = [4]f32{ src[0], src[1], src[2], src[3] };
+                sb.has_vs_const[StartRegister + i] = true;
+            }
+            return D3D_OK;
+        }
         var i: u32 = 0;
         while (i < Vector4fCount and StartRegister + i < 256) : (i += 1) {
             const src = ptr + i * 4;
@@ -2355,6 +3227,15 @@ fn dev9_SetPixelShaderConstantF(this: *anyopaque, StartRegister: u32, pConstantD
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (pConstantData) |cd| {
         const ptr: [*]const f32 = @ptrCast(cd);
+        if (self.recording_sb) |sb| {
+            var i: u32 = 0;
+            while (i < Vector4fCount and StartRegister + i < 224) : (i += 1) {
+                const src = ptr + i * 4;
+                sb.ps_consts[StartRegister + i] = [4]f32{ src[0], src[1], src[2], src[3] };
+                sb.has_ps_const[StartRegister + i] = true;
+            }
+            return D3D_OK;
+        }
         var i: u32 = 0;
         while (i < Vector4fCount and StartRegister + i < 224) : (i += 1) {
             const src = ptr + i * 4;
@@ -2366,6 +3247,13 @@ fn dev9_SetPixelShaderConstantF(this: *anyopaque, StartRegister: u32, pConstantD
 
 fn dev9_SetRenderState(this: *anyopaque, State: u32, Value: u32) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.recording_sb) |sb| {
+        if (State < 256) {
+            sb.render_states[State] = Value;
+            sb.has_render_state[State] = true;
+        }
+        return D3D_OK;
+    }
     if (State < 256) self.render_states[State] = Value;
     return D3D_OK;
 }
@@ -2380,8 +3268,15 @@ fn dev9_GetRenderState(this: *anyopaque, State: u32, pValue: ?*u32) callconv(W) 
 
 fn dev9_SetTexture(this: *anyopaque, Sampler: u32, pTexture: ?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.recording_sb) |sb| {
+        if (Sampler < 16) {
+            sb.bound_textures[Sampler] = pTexture;
+            sb.has_texture[Sampler] = true;
+        }
+        return D3D_OK;
+    }
     if (Sampler < 16) {
-        self.bound_textures[Sampler] = if (pTexture) |pt| @ptrCast(@alignCast(pt)) else null;
+        self.bound_textures[Sampler] = pTexture;
     }
     return D3D_OK;
 }
@@ -2681,10 +3576,76 @@ fn dev9_GetNumberOfSwapChains(this: *anyopaque) callconv(W) u32 {
 }
 
 fn dev9_Reset(this: *anyopaque, p0: ?*D3DPRESENT_PARAMETERS) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!Reset is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const p = p0 orelse return D3DERR_INVALIDCALL;
+    if (self.recording_sb != null) return D3DERR_INVALIDCALL;
+    if (self.hasLiveDefaultResources()) return D3DERR_INVALIDCALL;
+
+    const w: u32 = if (p.BackBufferWidth > 0) p.BackBufferWidth else 800;
+    const h: u32 = if (p.BackBufferHeight > 0) p.BackBufferHeight else 600;
+    const total = @as(usize, w) * h;
+    const new_pixels = self.allocator.alloc(u32, total) catch return E_OUTOFMEMORY;
+    errdefer self.allocator.free(new_pixels);
+    const new_depths = self.allocator.alloc(f32, total) catch return E_OUTOFMEMORY;
+    @memset(new_pixels, 0xFF000000);
+    @memset(new_depths, 1.0);
+
+    for (0..4) |i| {
+        if (self.render_targets[i]) |old_rt| {
+            if (old_rt.ref_count > 0) old_rt.ref_count -= 1;
+            self.render_targets[i] = null;
+        }
+    }
+    if (self.depth_stencil_explicit) {
+        if (self.bound_ds_surface) |old_ds| {
+            if (old_ds.ref_count > 0) old_ds.ref_count -= 1;
+        }
+    }
+    self.bound_ds_surface = null;
+    self.depth_stencil_explicit = false;
+    if (self.vertex_decl) |dcl| {
+        if (dcl.ref_count > 0) dcl.ref_count -= 1;
+        self.vertex_decl = null;
+    }
+
+    if (self.rt_surface) |rt| {
+        rt.destroy();
+        self.rt_surface = null;
+    }
+    if (self.ds_surface) |ds| {
+        ds.destroy();
+        self.ds_surface = null;
+    }
+    self.allocator.free(self.backbuffer);
+    self.allocator.free(self.depthbuffer);
+    self.backbuffer = new_pixels;
+    self.depthbuffer = new_depths;
+
+    self.params = p.*;
+    self.viewport = .{ .X = 0, .Y = 0, .Width = w, .Height = h, .MinZ = 0.0, .MaxZ = 1.0 };
+    self.scissor = .{ .x1 = 0, .y1 = 0, .x2 = @intCast(w), .y2 = @intCast(h) };
+    self.material = defaultMaterial9();
+    self.transform_states = [_]D3DMATRIX{d3dIdentityMatrix()} ** kTransformStateCount;
+    self.lights.clearRetainingCapacity();
+    self.in_scene = false;
+    self.vs_consts = [_][4]f32{[_]f32{ 0, 0, 0, 0 }} ** 256;
+    self.ps_consts = [_][4]f32{[_]f32{ 0, 0, 0, 0 }} ** 224;
+    self.render_states = defaultRenderStates(p.EnableAutoDepthStencil != 0);
+    self.tex_stage_states = defaultTextureStageStates();
+    self.sampler_states = defaultSamplerStates();
+    self.clip_planes = [_][4]f32{.{ 0, 0, 0, 0 }} ** 32;
+    self.streams = [_]?*WinsVertexBuffer9{null} ** 16;
+    self.stream_strides = [_]u32{0} ** 16;
+    self.stream_offsets = [_]u32{0} ** 16;
+    self.indices = null;
+    self.bound_textures = [_]?*anyopaque{null} ** 16;
+    self.active_vs = null;
+    self.active_ps = null;
+    self.use_fvf = false;
+    self.fvf = 0;
+
+    if (self.host) hostgl.resize(w, h);
+    return D3D_OK;
 }
 
 /// The device's persistent render-target surface: wraps the back buffer the
@@ -2754,32 +3715,58 @@ fn dev9_GetGammaRamp(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) voi
     std.debug.print("[WINS:D3D9] device!GetGammaRamp is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
 }
 
-fn dev9_CreateVolumeTexture(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32, p7: ?*?*anyopaque, p8: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    _ = p4;
-    _ = p5;
-    _ = p6;
-    _ = p7;
-    _ = p8;
-    std.debug.print("[WINS:D3D9] device!CreateVolumeTexture is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_CreateVolumeTexture(
+    this: *anyopaque,
+    Width: u32,
+    Height: u32,
+    Depth: u32,
+    Levels: u32,
+    Usage: u32,
+    Format: u32,
+    Pool: u32,
+    ppVolumeTexture: ?*?*anyopaque,
+    pSharedHandle: ?*anyopaque,
+) callconv(W) HRESULT {
+    _ = pSharedHandle;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppVolumeTexture orelse return D3DERR_INVALIDCALL;
+    const vt = WinsVolumeTexture9.create(self.allocator, Width, Height, Depth, Levels, Usage, Format, Pool) catch |e| {
+        if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateVolumeTexture({d}x{d}x{d}, levels={d}, usage={x}, fmt={x}, pool={d}) REFUSED\n", .{ Width, Height, Depth, Levels, Usage, Format, Pool });
+        return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
+    };
+    if (Pool == 0) {
+        vt.owner_device = self;
+        self.trackDefault(.vol, vt);
+    }
+    if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateVolumeTexture({d}x{d}x{d}, levels={d}, usage={x}, fmt={x}, pool={d}) -> @{x}\n", .{ Width, Height, Depth, Levels, Usage, Format, Pool, @intFromPtr(vt) });
+    out.* = @ptrCast(vt);
+    return D3D_OK;
 }
 
-fn dev9_CreateCubeTexture(this: *anyopaque, p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: ?*?*anyopaque, p6: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    _ = p4;
-    _ = p5;
-    _ = p6;
-    std.debug.print("[WINS:D3D9] device!CreateCubeTexture is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_CreateCubeTexture(
+    this: *anyopaque,
+    EdgeLength: u32,
+    Levels: u32,
+    Usage: u32,
+    Format: u32,
+    Pool: u32,
+    ppCubeTexture: ?*?*anyopaque,
+    pSharedHandle: ?*anyopaque,
+) callconv(W) HRESULT {
+    _ = pSharedHandle;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppCubeTexture orelse return D3DERR_INVALIDCALL;
+    const ct = WinsCubeTexture9.create(self.allocator, EdgeLength, Levels, Usage, Format, Pool) catch |e| {
+        if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateCubeTexture({d}, levels={d}, usage={x}, fmt={x}, pool={d}) REFUSED\n", .{ EdgeLength, Levels, Usage, Format, Pool });
+        return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
+    };
+    if (Pool == 0) {
+        ct.owner_device = self;
+        self.trackDefault(.cube, ct);
+    }
+    if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateCubeTexture({d}, levels={d}, usage={x}, fmt={x}, pool={d}) -> @{x}\n", .{ EdgeLength, Levels, Usage, Format, Pool, @intFromPtr(ct) });
+    out.* = @ptrCast(ct);
+    return D3D_OK;
 }
 
 /// A colour surface the device can render into (default pool). Its pixels
@@ -2798,6 +3785,7 @@ fn dev9_CreateRenderTarget(this: *anyopaque, width: u32, height: u32, format: u3
     s.pool = 0;
     s.lockable = false;
     s.owner_device = this;
+    self.trackDefault(.surf, s);
     if (trace_resources) std.debug.print("[WINS:D3D9:trace] CreateRenderTarget({d}x{d}, fmt={x}) -> @{x}\n", .{ width, height, format, @intFromPtr(s) });
     out.* = s;
     return D3D_OK;
@@ -2820,26 +3808,152 @@ fn dev9_CreateDepthStencilSurface(this: *anyopaque, width: u32, height: u32, for
     s.lockable = false;
     s.owner_device = this;
     s.multi_sample_type = multi_sample;
+    self.trackDefault(.surf, s);
     out.* = s;
     return D3D_OK;
 }
 
-fn dev9_UpdateSurface(this: *anyopaque, p0: ?*anyopaque, p1: ?*const D3DRECT, p2: ?*anyopaque, p3: ?*const anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    _ = p2;
-    _ = p3;
-    std.debug.print("[WINS:D3D9] device!UpdateSurface is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn copySurfaceRect(src: *const WinsSurface9, sr: D3DRECT, dst: *WinsSurface9, dp: POINT) HRESULT {
+    if (sr.x1 < 0 or sr.y1 < 0 or sr.x2 <= sr.x1 or sr.y2 <= sr.y1) return D3DERR_INVALIDCALL;
+    if (sr.x2 > @as(i32, @intCast(src.width)) or sr.y2 > @as(i32, @intCast(src.height))) return D3DERR_INVALIDCALL;
+    if (dp.x < 0 or dp.y < 0) return D3DERR_INVALIDCALL;
+    const cw: u32 = @intCast(sr.x2 - sr.x1);
+    const ch: u32 = @intCast(sr.y2 - sr.y1);
+    if (@as(u64, @intCast(dp.x)) + cw > dst.width or @as(u64, @intCast(dp.y)) + ch > dst.height) return D3DERR_INVALIDCALL;
+    if (src.pitch < 0 or dst.pitch < 0) return D3DERR_INVALIDCALL;
+    const src_pitch: usize = @intCast(src.pitch);
+    const dst_pitch: usize = @intCast(dst.pitch);
+
+    if (src.format == D3DFMT_DXT1 or src.format == D3DFMT_DXT3 or src.format == D3DFMT_DXT5) {
+        if ((@as(u32, @intCast(sr.x1)) & 3) != 0 or (@as(u32, @intCast(sr.y1)) & 3) != 0 or
+            (@as(u32, @intCast(dp.x)) & 3) != 0 or (@as(u32, @intCast(dp.y)) & 3) != 0)
+        {
+            return D3DERR_INVALIDCALL;
+        }
+        const block_bytes: usize = if (src.format == D3DFMT_DXT1) 8 else 16;
+        const bx_s: usize = @as(usize, @intCast(sr.x1)) / 4;
+        const by_s: usize = @as(usize, @intCast(sr.y1)) / 4;
+        const bx_d: usize = @as(usize, @intCast(dp.x)) / 4;
+        const by_d: usize = @as(usize, @intCast(dp.y)) / 4;
+        const bw: usize = @max(1, (cw + 3) / 4);
+        const bh: usize = @max(1, (ch + 3) / 4);
+        const row_bytes = bw * block_bytes;
+        for (0..bh) |r| {
+            const s_off = (by_s + r) * src_pitch + bx_s * block_bytes;
+            const d_off = (by_d + r) * dst_pitch + bx_d * block_bytes;
+            if (s_off + row_bytes > src.data.len or d_off + row_bytes > dst.data.len) return D3DERR_INVALIDCALL;
+            @memcpy(dst.data[d_off .. d_off + row_bytes], src.data[s_off .. s_off + row_bytes]);
+        }
+        return D3D_OK;
+    }
+
+    const lay = surfaceLayout(src.format, 1, 1) orelse return D3DERR_INVALIDCALL;
+    const bpp: usize = @intCast(lay.pitch);
+    const row_bytes = @as(usize, cw) * bpp;
+    for (0..ch) |r| {
+        const s_off = (@as(usize, @intCast(sr.y1)) + r) * src_pitch + @as(usize, @intCast(sr.x1)) * bpp;
+        const d_off = (@as(usize, @intCast(dp.y)) + r) * dst_pitch + @as(usize, @intCast(dp.x)) * bpp;
+        if (s_off + row_bytes > src.data.len or d_off + row_bytes > dst.data.len) return D3DERR_INVALIDCALL;
+        @memcpy(dst.data[d_off .. d_off + row_bytes], src.data[s_off .. s_off + row_bytes]);
+    }
+    return D3D_OK;
+}
+
+fn markSurfaceUpdated(self: *WinsD3DDevice9, dst: *WinsSurface9) void {
+    dst.gl_dirty = true;
+    if (dst.parent) |t| {
+        if (t.usage & D3DUSAGE_RENDERTARGET == 0) t.gl_dirty = true;
+    }
+    if (dst.cube_parent) |ct| {
+        if (ct.usage & D3DUSAGE_RENDERTARGET == 0) ct.gl_dirty = true;
+    }
+    if (self.host) hostgl.uploadSurface(self, dst);
+}
+
+fn dev9_UpdateSurface(this: *anyopaque, p0: ?*anyopaque, p1: ?*const D3DRECT, p2: ?*anyopaque, p3: ?*const POINT) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const src_raw = p0 orelse return D3DERR_INVALIDCALL;
+    const dst_raw = p2 orelse return D3DERR_INVALIDCALL;
+    const src: *WinsSurface9 = @ptrCast(@alignCast(src_raw));
+    const dst: *WinsSurface9 = @ptrCast(@alignCast(dst_raw));
+    if (src.vtbl != &g_surf9_vtbl or dst.vtbl != &g_surf9_vtbl) return D3DERR_INVALIDCALL;
+    if (src.pool != 2 or dst.pool != 0) return D3DERR_INVALIDCALL;
+    if ((src.usage & D3DUSAGE_DEPTHSTENCIL) != 0 or (dst.usage & D3DUSAGE_DEPTHSTENCIL) != 0) return D3DERR_INVALIDCALL;
+    if (dst.multi_sample_type != 0 or src.format != dst.format) return D3DERR_INVALIDCALL;
+    const sr: D3DRECT = if (p1) |r| r.* else .{ .x1 = 0, .y1 = 0, .x2 = @intCast(src.width), .y2 = @intCast(src.height) };
+    const dp: POINT = if (p3) |pt| pt.* else .{ .x = 0, .y = 0 };
+    const rc = copySurfaceRect(src, sr, dst, dp);
+    if (rc != D3D_OK) return rc;
+    markSurfaceUpdated(self, dst);
+    return D3D_OK;
 }
 
 fn dev9_UpdateTexture(this: *anyopaque, p0: ?*anyopaque, p1: ?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!UpdateTexture is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const src_raw = p0 orelse return D3DERR_INVALIDCALL;
+    const dst_raw = p1 orelse return D3DERR_INVALIDCALL;
+    const kind = textureKind(src_raw);
+    if (kind == 0 or kind != textureKind(dst_raw)) return D3DERR_INVALIDCALL;
+    switch (kind) {
+        D3DRTYPE_TEXTURE => {
+            const src: *WinsTexture9 = @ptrCast(@alignCast(src_raw));
+            const dst: *WinsTexture9 = @ptrCast(@alignCast(dst_raw));
+            if (src.pool != 2 or dst.pool != 0 or src.format != dst.format) return D3DERR_INVALIDCALL;
+            if (src.width != dst.width or src.height != dst.height) return D3DERR_INVALIDCALL;
+            const n = @min(src.surfaces.len, dst.surfaces.len);
+            for (0..n) |i| {
+                const s_lvl = src.surfaces[i];
+                const d_lvl = dst.surfaces[i];
+                const sr: D3DRECT = .{ .x1 = 0, .y1 = 0, .x2 = @intCast(s_lvl.width), .y2 = @intCast(s_lvl.height) };
+                const rc = copySurfaceRect(s_lvl, sr, d_lvl, .{ .x = 0, .y = 0 });
+                if (rc != D3D_OK) return rc;
+                d_lvl.gl_dirty = true;
+            }
+            if (dst.usage & D3DUSAGE_RENDERTARGET == 0) dst.gl_dirty = true;
+            if (self.host) {
+                for (0..n) |i| hostgl.uploadSurface(self, dst.surfaces[i]);
+            }
+        },
+        D3DRTYPE_CUBETEXTURE => {
+            const src: *WinsCubeTexture9 = @ptrCast(@alignCast(src_raw));
+            const dst: *WinsCubeTexture9 = @ptrCast(@alignCast(dst_raw));
+            if (src.pool != 2 or dst.pool != 0 or src.format != dst.format) return D3DERR_INVALIDCALL;
+            if (src.edge_length != dst.edge_length) return D3DERR_INVALIDCALL;
+            const n = @min(src.levels, dst.levels);
+            for (0..6) |face| {
+                for (0..n) |lvl| {
+                    const s_lvl = src.faces[face * src.levels + lvl];
+                    const d_lvl = dst.faces[face * dst.levels + lvl];
+                    const sr: D3DRECT = .{ .x1 = 0, .y1 = 0, .x2 = @intCast(s_lvl.width), .y2 = @intCast(s_lvl.height) };
+                    const rc = copySurfaceRect(s_lvl, sr, d_lvl, .{ .x = 0, .y = 0 });
+                    if (rc != D3D_OK) return rc;
+                    d_lvl.gl_dirty = true;
+                }
+            }
+            if (dst.usage & D3DUSAGE_RENDERTARGET == 0) dst.gl_dirty = true;
+            if (self.host) {
+                for (0..6) |face| {
+                    for (0..n) |lvl| hostgl.uploadSurface(self, dst.faces[face * dst.levels + lvl]);
+                }
+            }
+        },
+        D3DRTYPE_VOLUMETEXTURE => {
+            const src: *WinsVolumeTexture9 = @ptrCast(@alignCast(src_raw));
+            const dst: *WinsVolumeTexture9 = @ptrCast(@alignCast(dst_raw));
+            if (src.pool != 2 or dst.pool != 0 or src.format != dst.format) return D3DERR_INVALIDCALL;
+            if (src.width != dst.width or src.height != dst.height or src.depth != dst.depth) return D3DERR_INVALIDCALL;
+            const n = @min(src.volumes.len, dst.volumes.len);
+            for (0..n) |i| {
+                const sv = src.volumes[i];
+                const dv = dst.volumes[i];
+                if (sv.data.len != dv.data.len) return D3DERR_INVALIDCALL;
+                @memcpy(dv.data, sv.data);
+            }
+            dst.gl_dirty = true;
+        },
+        else => return D3DERR_INVALIDCALL,
+    }
+    return D3D_OK;
 }
 
 /// Render target -> system-memory surface of the same size and format.
@@ -2895,6 +4009,7 @@ fn dev9_CreateOffscreenPlainSurface(this: *anyopaque, width: u32, height: u32, f
     sf.usage = 0;
     sf.pool = pool;
     sf.owner_device = this;
+    if (pool == 0) self.trackDefault(.surf, sf);
     out.* = sf;
     return D3D_OK;
 }
@@ -3002,6 +4117,11 @@ fn dev9_SetTransform(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(
     const state = d3dTransformStateIndex(p0) orelse return D3DERR_INVALIDCALL;
     const source = p1 orelse return D3DERR_INVALIDCALL;
     const matrix: *const D3DMATRIX = @ptrCast(@alignCast(source));
+    if (self.recording_sb) |sb| {
+        sb.transform_states[state] = matrix.*;
+        sb.has_transform[state] = true;
+        return D3D_OK;
+    }
     self.transform_states[state] = matrix.*;
     return D3D_OK;
 }
@@ -3028,6 +4148,11 @@ fn dev9_SetMaterial(this: *anyopaque, p0: ?*const anyopaque) callconv(W) HRESULT
     const source = p0 orelse return D3DERR_INVALIDCALL;
     var value: D3DMATERIAL9 = undefined;
     @memcpy(std.mem.asBytes(&value), @as([*]const u8, @ptrCast(source))[0..@sizeOf(D3DMATERIAL9)]);
+    if (self.recording_sb) |sb| {
+        sb.material = value;
+        sb.has_material = true;
+        return D3D_OK;
+    }
     self.material = value;
     return D3D_OK;
 }
@@ -3045,6 +4170,15 @@ fn dev9_SetLight(this: *anyopaque, p0: u32, p1: ?*const anyopaque) callconv(W) H
     var value: D3DLIGHT9 = undefined;
     @memcpy(std.mem.asBytes(&value), @as([*]const u8, @ptrCast(source))[0..@sizeOf(D3DLIGHT9)]);
     if (value.Type < D3DLIGHT_POINT or value.Type > D3DLIGHT_DIRECTIONAL) return D3DERR_INVALIDCALL;
+    if (self.recording_sb) |sb| {
+        if (sb.lights.getPtr(p0)) |rl| {
+            rl.has_light = true;
+            rl.light = value;
+        } else {
+            sb.lights.put(sb.allocator, p0, .{ .has_light = true, .light = value, .has_enable = false, .enabled = false }) catch return E_OUTOFMEMORY;
+        }
+        return D3D_OK;
+    }
     if (self.lights.getPtr(p0)) |state| {
         state.light = value;
     } else {
@@ -3149,6 +4283,15 @@ fn dev9_GetLight(this: *anyopaque, p0: u32, p1: ?*anyopaque) callconv(W) HRESULT
 
 fn dev9_LightEnable(this: *anyopaque, p0: u32, p1: i32) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.recording_sb) |sb| {
+        if (sb.lights.getPtr(p0)) |rl| {
+            rl.has_enable = true;
+            rl.enabled = p1 != 0;
+        } else {
+            sb.lights.put(sb.allocator, p0, .{ .has_light = false, .light = defaultLight9(), .has_enable = true, .enabled = p1 != 0 }) catch return E_OUTOFMEMORY;
+        }
+        return D3D_OK;
+    }
     if (self.lights.getPtr(p0)) |state| {
         state.enabled = p1 != 0;
     } else {
@@ -3165,41 +4308,322 @@ fn dev9_GetLightEnable(this: *anyopaque, p0: u32, p1: ?*i32) callconv(W) HRESULT
     return D3D_OK;
 }
 
-fn dev9_SetClipPlane(this: *anyopaque, p0: u32, p1: ?*const f32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!SetClipPlane is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_SetClipPlane(this: *anyopaque, index: u32, pPlane: ?*const f32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const src = pPlane orelse return D3DERR_INVALIDCALL;
+    if (index >= self.clip_planes.len) return D3DERR_INVALIDCALL;
+    const p: [*]const f32 = @ptrCast(src);
+    if (self.recording_sb) |sb| {
+        if (index < sb.clip_planes.len and index < 32) {
+            sb.clip_planes[index] = .{ p[0], p[1], p[2], p[3] };
+            sb.has_clip |= @as(u32, 1) << @as(u5, @intCast(index));
+        }
+        return D3D_OK;
+    }
+    self.clip_planes[index] = .{ p[0], p[1], p[2], p[3] };
+    return D3D_OK;
 }
 
-fn dev9_GetClipPlane(this: *anyopaque, p0: u32, p1: ?*f32) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!GetClipPlane is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_GetClipPlane(this: *anyopaque, index: u32, pPlane: ?*f32) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const dst = pPlane orelse return D3DERR_INVALIDCALL;
+    if (index >= self.clip_planes.len) return D3DERR_INVALIDCALL;
+    const p: [*]f32 = @ptrCast(dst);
+    const v = self.clip_planes[index];
+    p[0] = v[0];
+    p[1] = v[1];
+    p[2] = v[2];
+    p[3] = v[3];
+    return D3D_OK;
 }
+
+fn isPixelRenderState(rs: u32) bool {
+    return switch (rs) {
+        7, 8, 9, 14, 15, 16, 19, 20, 23, 24, 25, 26, 27, 28, 34...38, 52...60, 128...135, 168, 171, 174, 175, 176, 185...195, 198...209 => true,
+        else => false,
+    };
+}
+
+fn isVertexRenderState(rs: u32) bool {
+    return switch (rs) {
+        9, 22, 28, 29, 34, 36, 37, 38, 48, 136, 137, 139...143, 145...148, 151, 152, 154...163, 166, 167, 170, 172, 173, 178...184 => true,
+        else => false,
+    };
+}
+
+fn isPixelTss(ty: u32) bool {
+    return switch (ty) {
+        1...10, 22, 23, 26, 27, 28, 32 => true,
+        else => false,
+    };
+}
+
+fn initStateBlockMask(sb: *WinsStateBlock9, block_type: u32) void {
+    switch (block_type) {
+        D3DSBT_ALL => {
+            sb.has_viewport = true;
+            sb.has_scissor = true;
+            sb.has_material = true;
+            @memset(&sb.has_transform, true);
+            @memset(&sb.has_vs_const, true);
+            @memset(&sb.has_ps_const, true);
+            @memset(&sb.has_render_state, true);
+            for (&sb.has_tss) |*row| @memset(row, true);
+            for (&sb.has_samp) |*row| @memset(row, true);
+            sb.has_clip = 0xFFFFFFFF;
+            @memset(&sb.has_stream, true);
+            sb.has_indices = true;
+            @memset(&sb.has_texture, true);
+            sb.has_vs = true;
+            sb.has_ps = true;
+            sb.has_vdecl_mode = true;
+            sb.capture_all_lights = true;
+        },
+        D3DSBT_PIXELSTATE => {
+            for (0..256) |rs| sb.has_render_state[rs] = isPixelRenderState(@intCast(rs));
+            for (0..kMaxTextureStages) |st| {
+                for (1..kTssSlots) |ty| sb.has_tss[st][ty] = isPixelTss(@intCast(ty));
+            }
+            for (0..16) |s| {
+                for (1..13) |ty| sb.has_samp[s][ty] = true;
+            }
+            sb.has_ps = true;
+            @memset(&sb.has_ps_const, true);
+        },
+        D3DSBT_VERTEXSTATE => {
+            for (0..256) |rs| sb.has_render_state[rs] = isVertexRenderState(@intCast(rs));
+            for (0..kMaxTextureStages) |st| {
+                sb.has_tss[st][11] = true;
+                sb.has_tss[st][24] = true;
+            }
+            for (0..16) |s| sb.has_samp[s][13] = true;
+            sb.has_vs = true;
+            @memset(&sb.has_vs_const, true);
+            sb.has_vdecl_mode = true;
+            sb.capture_all_lights = true;
+        },
+        else => {},
+    }
+}
+
+fn sb_QueryInterface(this: *anyopaque, riid: ?*const anyopaque, ppv: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsStateBlock9 = @ptrCast(@alignCast(this));
+    const out = ppv orelse return E_POINTER;
+    out.* = null;
+    const r = riid orelse return E_POINTER;
+    const id: *align(1) const GUID = @ptrCast(r);
+    if (guidEql(id, &IID_IUnknown) or guidEql(id, &IID_IDirect3DStateBlock9)) {
+        self.ref_count += 1;
+        out.* = this;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+fn sb_AddRef(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsStateBlock9 = @ptrCast(@alignCast(this));
+    self.ref_count += 1;
+    return self.ref_count;
+}
+
+fn sb_Release(this: *anyopaque) callconv(W) u32 {
+    const self: *WinsStateBlock9 = @ptrCast(@alignCast(this));
+    if (self.ref_count > 0) self.ref_count -= 1;
+    const left = self.ref_count;
+    if (left == 0) self.destroy();
+    return left;
+}
+
+fn sb_GetDevice(this: *anyopaque, out: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsStateBlock9 = @ptrCast(@alignCast(this));
+    const p = out orelse return D3DERR_INVALIDCALL;
+    self.device.ref_count += 1;
+    p.* = self.device;
+    return D3D_OK;
+}
+
+fn sb_Capture(this: *anyopaque) callconv(W) HRESULT {
+    const self: *WinsStateBlock9 = @ptrCast(@alignCast(this));
+    const dev = self.device;
+    if (self.has_viewport) self.viewport = dev.viewport;
+    if (self.has_scissor) self.scissor = dev.scissor;
+    if (self.has_material) self.material = dev.material;
+    for (0..kTransformStateCount) |i| {
+        if (self.has_transform[i]) self.transform_states[i] = dev.transform_states[i];
+    }
+    for (0..256) |i| {
+        if (self.has_vs_const[i]) self.vs_consts[i] = dev.vs_consts[i];
+        if (self.has_render_state[i]) self.render_states[i] = dev.render_states[i];
+    }
+    for (0..224) |i| {
+        if (self.has_ps_const[i]) self.ps_consts[i] = dev.ps_consts[i];
+    }
+    for (0..kMaxTextureStages) |st| {
+        for (1..kTssSlots) |ty| {
+            if (self.has_tss[st][ty]) self.tex_stage_states[st][ty] = dev.tex_stage_states[st][ty];
+        }
+    }
+    for (0..16) |s| {
+        for (1..kSampSlots) |ty| {
+            if (self.has_samp[s][ty]) self.sampler_states[s][ty] = dev.sampler_states[s][ty];
+        }
+        if (self.has_stream[s]) {
+            self.streams[s] = dev.streams[s];
+            self.stream_strides[s] = dev.stream_strides[s];
+            self.stream_offsets[s] = dev.stream_offsets[s];
+        }
+        if (self.has_texture[s]) self.bound_textures[s] = dev.bound_textures[s];
+    }
+    for (0..32) |ci| {
+        if ((self.has_clip & (@as(u32, 1) << @intCast(ci))) != 0) self.clip_planes[ci] = dev.clip_planes[ci];
+    }
+    if (self.has_indices) self.indices = dev.indices;
+    if (self.has_vs) self.active_vs = dev.active_vs;
+    if (self.has_ps) self.active_ps = dev.active_ps;
+    if (self.has_vdecl_mode) {
+        self.vertex_decl = dev.vertex_decl;
+        self.use_fvf = dev.use_fvf;
+        self.fvf = dev.fvf;
+        self.fvf_elements = dev.fvf_elements;
+    }
+    if (self.capture_all_lights) {
+        self.lights.clearRetainingCapacity();
+        var it = dev.lights.iterator();
+        while (it.next()) |entry| {
+            self.lights.put(self.allocator, entry.key_ptr.*, .{
+                .has_light = true,
+                .light = entry.value_ptr.light,
+                .has_enable = true,
+                .enabled = entry.value_ptr.enabled,
+            }) catch return E_OUTOFMEMORY;
+        }
+    } else {
+        var it = self.lights.iterator();
+        while (it.next()) |entry| {
+            if (dev.lights.get(entry.key_ptr.*)) |cur| {
+                if (entry.value_ptr.has_light) entry.value_ptr.light = cur.light;
+                if (entry.value_ptr.has_enable) entry.value_ptr.enabled = cur.enabled;
+            }
+        }
+    }
+    return D3D_OK;
+}
+
+fn sb_Apply(this: *anyopaque) callconv(W) HRESULT {
+    const self: *WinsStateBlock9 = @ptrCast(@alignCast(this));
+    const dev = self.device;
+    if (self.has_viewport) dev.viewport = self.viewport;
+    if (self.has_scissor) dev.scissor = self.scissor;
+    if (self.has_material) dev.material = self.material;
+    for (0..kTransformStateCount) |i| {
+        if (self.has_transform[i]) dev.transform_states[i] = self.transform_states[i];
+    }
+    for (0..256) |i| {
+        if (self.has_vs_const[i]) dev.vs_consts[i] = self.vs_consts[i];
+        if (self.has_render_state[i]) dev.render_states[i] = self.render_states[i];
+    }
+    for (0..224) |i| {
+        if (self.has_ps_const[i]) dev.ps_consts[i] = self.ps_consts[i];
+    }
+    for (0..kMaxTextureStages) |st| {
+        for (1..kTssSlots) |ty| {
+            if (self.has_tss[st][ty]) dev.tex_stage_states[st][ty] = self.tex_stage_states[st][ty];
+        }
+    }
+    for (0..16) |s| {
+        for (1..kSampSlots) |ty| {
+            if (self.has_samp[s][ty]) dev.sampler_states[s][ty] = self.sampler_states[s][ty];
+        }
+        if (self.has_stream[s]) {
+            dev.streams[s] = self.streams[s];
+            dev.stream_strides[s] = self.stream_strides[s];
+            dev.stream_offsets[s] = self.stream_offsets[s];
+        }
+        if (self.has_texture[s]) dev.bound_textures[s] = self.bound_textures[s];
+    }
+    for (0..32) |ci| {
+        if ((self.has_clip & (@as(u32, 1) << @intCast(ci))) != 0) dev.clip_planes[ci] = self.clip_planes[ci];
+    }
+    if (self.has_indices) dev.indices = self.indices;
+    if (self.has_vs) dev.active_vs = self.active_vs;
+    if (self.has_ps) dev.active_ps = self.active_ps;
+    if (self.has_vdecl_mode) {
+        if (!self.use_fvf) {
+            if (self.vertex_decl) |n| n.ref_count += 1;
+            if (dev.vertex_decl) |o| {
+                if (o.ref_count > 0) o.ref_count -= 1;
+            }
+            dev.vertex_decl = self.vertex_decl;
+            dev.use_fvf = false;
+        } else {
+            dev.fvf = self.fvf;
+            dev.fvf_elements = self.fvf_elements;
+            dev.use_fvf = true;
+        }
+    }
+    if (self.capture_all_lights) {
+        var dev_it = dev.lights.iterator();
+        while (dev_it.next()) |entry| {
+            if (!self.lights.contains(entry.key_ptr.*)) entry.value_ptr.enabled = false;
+        }
+    }
+    var it = self.lights.iterator();
+    while (it.next()) |entry| {
+        const idx = entry.key_ptr.*;
+        const rl = entry.value_ptr.*;
+        if (dev.lights.getPtr(idx)) |dst| {
+            if (rl.has_light) dst.light = rl.light;
+            if (rl.has_enable) dst.enabled = rl.enabled;
+        } else {
+            dev.lights.put(dev.allocator, idx, .{
+                .light = if (rl.has_light) rl.light else defaultLight9(),
+                .enabled = if (rl.has_enable) rl.enabled else false,
+            }) catch return E_OUTOFMEMORY;
+        }
+    }
+    return D3D_OK;
+}
+
+const g_stateblock9_vtbl: IDirect3DStateBlock9Vtbl = .{
+    .QueryInterface = &sb_QueryInterface,
+    .AddRef = &sb_AddRef,
+    .Release = &sb_Release,
+    .GetDevice = &sb_GetDevice,
+    .Capture = &sb_Capture,
+    .Apply = &sb_Apply,
+};
 
 fn dev9_CreateStateBlock(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!CreateStateBlock is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = p1 orelse return D3DERR_INVALIDCALL;
+    if (self.recording_sb != null) return D3DERR_INVALIDCALL;
+    if (p0 != D3DSBT_ALL and p0 != D3DSBT_PIXELSTATE and p0 != D3DSBT_VERTEXSTATE) return D3DERR_INVALIDCALL;
+    const sb = WinsStateBlock9.create(self.allocator, self) catch return E_OUTOFMEMORY;
+    initStateBlockMask(sb, p0);
+    const rc = sb_Capture(sb);
+    if (rc != D3D_OK) {
+        sb.destroy();
+        return rc;
+    }
+    out.* = @ptrCast(sb);
+    return D3D_OK;
 }
 
 fn dev9_BeginStateBlock(this: *anyopaque) callconv(W) HRESULT {
-    _ = this;
-    std.debug.print("[WINS:D3D9] device!BeginStateBlock is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    if (self.recording_sb != null) return D3DERR_INVALIDCALL;
+    const sb = WinsStateBlock9.create(self.allocator, self) catch return E_OUTOFMEMORY;
+    self.recording_sb = sb;
+    return D3D_OK;
 }
 
 fn dev9_EndStateBlock(this: *anyopaque, p0: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    std.debug.print("[WINS:D3D9] device!EndStateBlock is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const sb = self.recording_sb orelse return D3DERR_INVALIDCALL;
+    const out = p0 orelse return D3DERR_INVALIDCALL;
+    self.recording_sb = null;
+    out.* = @ptrCast(sb);
+    return D3D_OK;
 }
 
 fn dev9_SetClipStatus(this: *anyopaque, p0: ?*const anyopaque) callconv(W) HRESULT {
@@ -3216,12 +4640,17 @@ fn dev9_GetClipStatus(this: *anyopaque, p0: ?*anyopaque) callconv(W) HRESULT {
     return E_NOTIMPL;
 }
 
-fn dev9_GetTexture(this: *anyopaque, p0: u32, p1: ?*?*anyopaque) callconv(W) HRESULT {
-    _ = this;
-    _ = p0;
-    _ = p1;
-    std.debug.print("[WINS:D3D9] device!GetTexture is not implemented yet (caller 0x{x})\n", .{@returnAddress()});
-    return E_NOTIMPL;
+fn dev9_GetTexture(this: *anyopaque, Sampler: u32, ppTexture: ?*?*anyopaque) callconv(W) HRESULT {
+    const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
+    const out = ppTexture orelse return D3DERR_INVALIDCALL;
+    out.* = null;
+    if (Sampler >= 16) return D3DERR_INVALIDCALL;
+    out.* = self.bound_textures[Sampler];
+    if (out.*) |t| {
+        const vt: *const *const IDirect3DTexture9Vtbl = @ptrCast(@alignCast(t));
+        _ = vt.*.AddRef(t);
+    }
+    return D3D_OK;
 }
 
 fn dev9_GetTextureStageState(this: *anyopaque, stage: u32, ty: u32, pValue: ?*u32) callconv(W) HRESULT {
@@ -3235,6 +4664,11 @@ fn dev9_GetTextureStageState(this: *anyopaque, stage: u32, ty: u32, pValue: ?*u3
 fn dev9_SetTextureStageState(this: *anyopaque, stage: u32, ty: u32, value: u32) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (stage >= kMaxTextureStages or ty == 0 or ty >= kTssSlots) return D3DERR_INVALIDCALL;
+    if (self.recording_sb) |sb| {
+        sb.tex_stage_states[stage][ty] = value;
+        sb.has_tss[stage][ty] = true;
+        return D3D_OK;
+    }
     self.tex_stage_states[stage][ty] = value;
     return D3D_OK;
 }
@@ -3250,6 +4684,11 @@ fn dev9_GetSamplerState(this: *anyopaque, sampler: u32, ty: u32, pValue: ?*u32) 
 fn dev9_SetSamplerState(this: *anyopaque, sampler: u32, ty: u32, value: u32) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (sampler >= 16 or ty == 0 or ty >= kSampSlots) return D3DERR_INVALIDCALL;
+    if (self.recording_sb) |sb| {
+        sb.sampler_states[sampler][ty] = value;
+        sb.has_samp[sampler][ty] = true;
+        return D3D_OK;
+    }
     self.sampler_states[sampler][ty] = value;
     return D3D_OK;
 }
@@ -3297,6 +4736,11 @@ fn dev9_GetCurrentTexturePalette(this: *anyopaque, p0: ?*u32) callconv(W) HRESUL
 fn dev9_SetScissorRect(this: *anyopaque, p0: ?*const D3DRECT) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     const r = p0 orelse return D3DERR_INVALIDCALL;
+    if (self.recording_sb) |sb| {
+        sb.scissor = r.*;
+        sb.has_scissor = true;
+        return D3D_OK;
+    }
     self.scissor = r.*;
     if (trace_frames != 0) std.debug.print("[WINS:D3D9:trace] f{d} SetScissorRect({d},{d},{d},{d})\n", .{ self.frame_count, r.x1, r.y1, r.x2, r.y2 });
     return D3D_OK;
@@ -3404,6 +4848,12 @@ fn dev9_CreateVertexDeclaration(this: *anyopaque, pElements: ?*const anyopaque, 
 fn dev9_SetVertexDeclaration(this: *anyopaque, pDecl: ?*anyopaque) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     const new: ?*WinsVertexDecl9 = if (pDecl) |p| @ptrCast(@alignCast(p)) else null;
+    if (self.recording_sb) |sb| {
+        sb.vertex_decl = new;
+        if (new != null) sb.use_fvf = false;
+        sb.has_vdecl_mode = true;
+        return D3D_OK;
+    }
     if (new) |n| n.ref_count += 1;
     if (self.vertex_decl) |old| {
         if (old.ref_count > 0) old.ref_count -= 1;
@@ -3469,6 +4919,13 @@ pub fn fvfElements(fvf: u32, out: *[24]D3DVERTEXELEMENT9) ?usize {
 fn dev9_SetFVF(this: *anyopaque, fvf: u32) callconv(W) HRESULT {
     const self: *WinsD3DDevice9 = @ptrCast(@alignCast(this));
     if (fvf == 0) return D3D_OK; // D3D9 ignores a zero FVF
+    if (self.recording_sb) |sb| {
+        _ = fvfElements(fvf, &sb.fvf_elements) orelse return D3DERR_INVALIDCALL;
+        sb.fvf = fvf;
+        sb.use_fvf = true;
+        sb.has_vdecl_mode = true;
+        return D3D_OK;
+    }
     _ = fvfElements(fvf, &self.fvf_elements) orelse return D3DERR_INVALIDCALL;
     if (trace_resources and fvf != self.fvf) std.debug.print("[WINS:D3D9:trace] SetFVF(0x{x})\n", .{fvf});
     self.fvf = fvf;
@@ -4302,21 +5759,119 @@ pub export fn D3DXCompileShaderFromFileA(
     return D3DXCompileShader(null, 0, pDefines, pInclude, pFunctionName, pProfile, Flags, ppShader, ppErrorMsgs, ppConstantTable);
 }
 
+const DdsParsed = struct {
+    info: D3DXIMAGE_INFO,
+    data_offset: usize,
+    face_mask: u32,
+};
+
+fn ddsFormat(pf_flags: u32, fourcc: u32, bpp: u32, rm: u32, gm: u32, bm: u32, am: u32, dxgi: u32) u32 {
+    if ((pf_flags & 0x4) != 0) {
+        return switch (fourcc) {
+            D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, 111, 112, 113, 114, 115, 116 => fourcc,
+            0x30315844 => switch (dxgi) { // DX10
+                70, 71, 72 => D3DFMT_DXT1,
+                73, 74, 75 => D3DFMT_DXT3,
+                76, 77, 78 => D3DFMT_DXT5,
+                87, 91 => D3DFMT_A8R8G8B8,
+                88, 93 => D3DFMT_X8R8G8B8,
+                28, 29 => D3DFMT_A8B8G8R8,
+                10 => 113,
+                2 => 116,
+                41 => 114,
+                54 => 111,
+                61 => 50,
+                65 => 28,
+                else => 0,
+            },
+            else => 0,
+        };
+    }
+    if ((pf_flags & 0x40) != 0) {
+        if (bpp == 32) {
+            if (rm == 0x00FF0000 and gm == 0x0000FF00 and bm == 0x000000FF) {
+                return if (am != 0 or (pf_flags & 1) != 0) D3DFMT_A8R8G8B8 else D3DFMT_X8R8G8B8;
+            }
+            if (rm == 0x000000FF and gm == 0x0000FF00 and bm == 0x00FF0000) {
+                return if (am != 0 or (pf_flags & 1) != 0) D3DFMT_A8B8G8R8 else 33;
+            }
+        } else if (bpp == 16) {
+            if (rm == 0xF800 and gm == 0x07E0 and bm == 0x001F) return 23;
+            if (rm == 0x7C00 and gm == 0x03E0 and bm == 0x001F) return if (am != 0 or (pf_flags & 1) != 0) 25 else 24;
+            if (rm == 0x0F00 and gm == 0x00F0 and bm == 0x000F) return 26;
+        }
+    }
+    if ((pf_flags & 0x20000) != 0) return if (bpp == 8) 50 else if (bpp == 16) 51 else 0;
+    if ((pf_flags & 0x80000) != 0 and bpp == 16) return 60;
+    if ((pf_flags & 0x2) != 0 and bpp == 8) return 28;
+    return 0;
+}
+
+fn parseDds(bytes: []const u8) ?DdsParsed {
+    if (bytes.len < 128 or !std.mem.eql(u8, bytes[0..4], "DDS ")) return null;
+    const flags = std.mem.readInt(u32, bytes[8..12], .little);
+    const h = @max(1, std.mem.readInt(u32, bytes[12..16], .little));
+    const w = @max(1, std.mem.readInt(u32, bytes[16..20], .little));
+    const raw_d = std.mem.readInt(u32, bytes[24..28], .little);
+    const raw_mips = std.mem.readInt(u32, bytes[28..32], .little);
+    const pf_flags = std.mem.readInt(u32, bytes[80..84], .little);
+    const fourcc = std.mem.readInt(u32, bytes[84..88], .little);
+    const bpp = std.mem.readInt(u32, bytes[88..92], .little);
+    const rm = std.mem.readInt(u32, bytes[92..96], .little);
+    const gm = std.mem.readInt(u32, bytes[96..100], .little);
+    const bm = std.mem.readInt(u32, bytes[100..104], .little);
+    const am = std.mem.readInt(u32, bytes[104..108], .little);
+    const caps2 = std.mem.readInt(u32, bytes[112..116], .little);
+
+    var data_off: usize = 128;
+    var dxgi: u32 = 0;
+    if ((pf_flags & 0x4) != 0 and fourcc == 0x30315844) {
+        if (bytes.len < 148) return null;
+        dxgi = std.mem.readInt(u32, bytes[128..132], .little);
+        data_off = 148;
+    }
+    const fmt = ddsFormat(pf_flags, fourcc, bpp, rm, gm, bm, am, dxgi);
+    if (fmt == 0) return null;
+
+    const is_cube = (caps2 & 0x200) != 0;
+    const is_vol = !is_cube and ((caps2 & 0x200000) != 0 or ((flags & 0x800000) != 0 and raw_d > 1));
+    const d: u32 = if (is_vol) @max(1, raw_d) else 1;
+    const max_mips = if (is_vol) WinsVolumeTexture9.fullChain(w, h, d) else WinsTexture9.fullChain(w, h);
+    const mips = @min(@max(1, raw_mips), max_mips);
+    const rtype: u32 = if (is_cube) D3DRTYPE_CUBETEXTURE else if (is_vol) D3DRTYPE_VOLUMETEXTURE else D3DRTYPE_TEXTURE;
+    const face_mask: u32 = if (is_cube) (if ((caps2 & 0xFC00) != 0) ((caps2 >> 10) & 0x3F) else 0x3F) else 0;
+    return .{
+        .info = .{
+            .Width = w,
+            .Height = h,
+            .Depth = d,
+            .MipLevels = mips,
+            .Format = fmt,
+            .ResourceType = rtype,
+            .ImageFileFormat = 4, // D3DXIFF_DDS
+        },
+        .data_offset = data_off,
+        .face_mask = face_mask,
+    };
+}
+
+fn copyDdsSlice(src: []const u8, off: *usize, dst: []u8) void {
+    const rem = src.len -| off.*;
+    const take = @min(dst.len, rem);
+    if (take > 0) @memcpy(dst[0..take], src[off.* .. off.* + take]);
+    off.* += dst.len;
+}
+
 pub export fn D3DXGetImageInfoFromFileInMemory(
     pSrcData: ?*const anyopaque,
     SrcDataSize: u32,
     pSrcInfo: ?*D3DXIMAGE_INFO,
 ) callconv(W) HRESULT {
     if (pSrcData == null or SrcDataSize < 32 or pSrcInfo == null) return E_FAIL;
-    const bytes: [*]const u8 = @ptrCast(pSrcData.?);
-    if (SrcDataSize >= 128 and std.mem.eql(u8, bytes[0..4], "DDS ")) {
-        pSrcInfo.?.Height = std.mem.readInt(u32, bytes[12..16], .little);
-        pSrcInfo.?.Width = std.mem.readInt(u32, bytes[16..20], .little);
-        pSrcInfo.?.MipLevels = std.mem.readInt(u32, bytes[28..32], .little);
-        pSrcInfo.?.Depth = 1;
-        pSrcInfo.?.Format = D3DFMT_A8R8G8B8;
-        pSrcInfo.?.ResourceType = 1;
-        pSrcInfo.?.ImageFileFormat = 4;
+    const raw: [*]const u8 = @ptrCast(pSrcData.?);
+    const bytes = raw[0..SrcDataSize];
+    if (parseDds(bytes)) |parsed| {
+        pSrcInfo.?.* = parsed.info;
         return D3D_OK;
     }
     pSrcInfo.?.Width = 256;
@@ -4324,7 +5879,7 @@ pub export fn D3DXGetImageInfoFromFileInMemory(
     pSrcInfo.?.Depth = 1;
     pSrcInfo.?.MipLevels = 1;
     pSrcInfo.?.Format = D3DFMT_A8R8G8B8;
-    pSrcInfo.?.ResourceType = 1;
+    pSrcInfo.?.ResourceType = D3DRTYPE_TEXTURE;
     pSrcInfo.?.ImageFileFormat = 4;
     return D3D_OK;
 }
@@ -4336,11 +5891,21 @@ pub export fn D3DXCreateTextureFromFileInMemory(
     ppTexture: ?*?*anyopaque,
 ) callconv(W) HRESULT {
     _ = pDevice;
-    if (ppTexture == null) return E_FAIL;
-    var info: D3DXIMAGE_INFO = undefined;
-    _ = D3DXGetImageInfoFromFileInMemory(pSrcData, SrcDataSize, &info);
+    if (pSrcData == null or SrcDataSize == 0 or ppTexture == null) return D3DERR_INVALIDCALL;
+    const raw: [*]const u8 = @ptrCast(pSrcData.?);
+    const bytes = raw[0..SrcDataSize];
     const gpa = std.heap.page_allocator;
-    const tex = WinsTexture9.create(gpa, info.Width, info.Height, info.MipLevels, 0, info.Format, 1) catch return E_OUTOFMEMORY;
+    if (parseDds(bytes)) |parsed| {
+        const tex = WinsTexture9.create(gpa, parsed.info.Width, parsed.info.Height, parsed.info.MipLevels, 0, parsed.info.Format, 1) catch |e| {
+            return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
+        };
+        var off = parsed.data_offset;
+        for (tex.surfaces) |s| copyDdsSlice(bytes, &off, s.data);
+        tex.gl_dirty = true;
+        ppTexture.?.* = @ptrCast(tex);
+        return D3D_OK;
+    }
+    const tex = WinsTexture9.create(gpa, 256, 256, 1, 0, D3DFMT_A8R8G8B8, 1) catch return E_OUTOFMEMORY;
     ppTexture.?.* = @ptrCast(tex);
     return D3D_OK;
 }
@@ -4351,7 +5916,31 @@ pub export fn D3DXCreateCubeTextureFromFileInMemory(
     SrcDataSize: u32,
     ppCubeTexture: ?*?*anyopaque,
 ) callconv(W) HRESULT {
-    return D3DXCreateTextureFromFileInMemory(pDevice, pSrcData, SrcDataSize, ppCubeTexture);
+    _ = pDevice;
+    if (pSrcData == null or SrcDataSize == 0 or ppCubeTexture == null) return D3DERR_INVALIDCALL;
+    const raw: [*]const u8 = @ptrCast(pSrcData.?);
+    const bytes = raw[0..SrcDataSize];
+    const gpa = std.heap.page_allocator;
+    if (parseDds(bytes)) |parsed| {
+        const edge = @max(parsed.info.Width, parsed.info.Height);
+        const ct = WinsCubeTexture9.create(gpa, edge, parsed.info.MipLevels, 0, parsed.info.Format, 1) catch |e| {
+            return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
+        };
+        var off = parsed.data_offset;
+        const fmask = if (parsed.face_mask != 0) parsed.face_mask else 0x3F;
+        for (0..6) |face| {
+            if ((fmask & (@as(u32, 1) << @intCast(face))) == 0) continue;
+            for (0..ct.levels) |level| {
+                copyDdsSlice(bytes, &off, ct.faces[face * ct.levels + level].data);
+            }
+        }
+        ct.gl_dirty = true;
+        ppCubeTexture.?.* = @ptrCast(ct);
+        return D3D_OK;
+    }
+    const ct = WinsCubeTexture9.create(gpa, 1, 1, 0, D3DFMT_A8R8G8B8, 1) catch return E_OUTOFMEMORY;
+    ppCubeTexture.?.* = @ptrCast(ct);
+    return D3D_OK;
 }
 
 pub export fn D3DXCreateVolumeTextureFromFileInMemory(
@@ -4360,7 +5949,24 @@ pub export fn D3DXCreateVolumeTextureFromFileInMemory(
     SrcDataSize: u32,
     ppVolumeTexture: ?*?*anyopaque,
 ) callconv(W) HRESULT {
-    return D3DXCreateTextureFromFileInMemory(pDevice, pSrcData, SrcDataSize, ppVolumeTexture);
+    _ = pDevice;
+    if (pSrcData == null or SrcDataSize == 0 or ppVolumeTexture == null) return D3DERR_INVALIDCALL;
+    const raw: [*]const u8 = @ptrCast(pSrcData.?);
+    const bytes = raw[0..SrcDataSize];
+    const gpa = std.heap.page_allocator;
+    if (parseDds(bytes)) |parsed| {
+        const vt = WinsVolumeTexture9.create(gpa, parsed.info.Width, parsed.info.Height, parsed.info.Depth, parsed.info.MipLevels, 0, parsed.info.Format, 1) catch |e| {
+            return if (e == error.InvalidCall) D3DERR_INVALIDCALL else E_OUTOFMEMORY;
+        };
+        var off = parsed.data_offset;
+        for (vt.volumes) |v| copyDdsSlice(bytes, &off, v.data);
+        vt.gl_dirty = true;
+        ppVolumeTexture.?.* = @ptrCast(vt);
+        return D3D_OK;
+    }
+    const vt = WinsVolumeTexture9.create(gpa, 1, 1, 1, 1, 0, D3DFMT_A8R8G8B8, 1) catch return E_OUTOFMEMORY;
+    ppVolumeTexture.?.* = @ptrCast(vt);
+    return D3D_OK;
 }
 
 pub export fn D3DXLoadSurfaceFromSurface(
@@ -4745,8 +6351,12 @@ test "CheckDeviceFormat: plain textures are available exactly for the formats Cr
     for (refused) |f| {
         try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, tex, f));
     }
-    // Other resource types and usages that are not implemented are refused.
-    try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, 4, D3DFMT_A8R8G8B8)); // volume texture
+    // Cube & volume textures are available for all texture formats; volume cannot be RT, while cube can.
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_VOLUMETEXTURE, D3DFMT_A8R8G8B8));
+    try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_VOLUMETEXTURE, D3DFMT_A8R8G8B8));
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_CUBETEXTURE, D3DFMT_DXT1));
+    try std.testing.expectEqual(D3D_OK, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_CUBETEXTURE, D3DFMT_A8R8G8B8));
+    try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, 99, D3DFMT_A8R8G8B8));
     try std.testing.expectEqual(D3DERR_NOTAVAILABLE, d3d.vtbl.CheckDeviceFormat(d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0x400, tex, D3DFMT_A8R8G8B8)); // AUTOGENMIPMAP
     // What is advertised can actually be created, 4 bytes per pixel.
     var params: D3DPRESENT_PARAMETERS = undefined;
@@ -5301,4 +6911,417 @@ test "render states start at the D3D9 defaults" {
     try std.testing.expectEqual(@as(u32, 4), rs[23]);
     try std.testing.expectEqual(@as(u32, 1), rs[7]);
     try std.testing.expectEqual(@as(u32, 0), defaultRenderStates(false)[7]);
+}
+
+test "clip planes: SetClipPlane / GetClipPlane round-trip, OOB and null INVALIDCALL, RS 152 default 0" {
+    var d3d = WinsD3D9.init();
+    const dev = try testDevice(&d3d);
+    defer _ = dev.vtbl.Release(dev);
+
+    var rs: u32 = 0xDEADBEEF;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderState(dev, 152, &rs));
+    try std.testing.expectEqual(@as(u32, 0), rs);
+
+    var out: [4]f32 = .{ 9, 9, 9, 9 };
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetClipPlane(dev, 0, &out[0]));
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, out);
+
+    const p: [4]f32 = .{ 1.5, -2.25, 0.5, 3.0 };
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetClipPlane(dev, 7, &p[0]));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetClipPlane(dev, 7, &out[0]));
+    try std.testing.expectEqual(p, out);
+
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetClipPlane(dev, 0, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetClipPlane(dev, 0, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.SetClipPlane(dev, 32, &p[0]));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetClipPlane(dev, 32, &out[0]));
+
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 152, 0xFF));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderState(dev, 152, &rs));
+    try std.testing.expectEqual(@as(u32, 0xFF), rs);
+}
+
+test "cube and volume textures: creation, descriptors, locks, SetTexture/GetTexture, and DDS loader" {
+    var d3d = WinsD3D9.init();
+    const dev = try testDevice(&d3d);
+    defer _ = dev.vtbl.Release(dev);
+
+    // Cube texture creation + invalid edge + face access
+    var bad: ?*anyopaque = null;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateCubeTexture(dev, 0, 1, 0, D3DFMT_A8R8G8B8, 1, &bad, null));
+    var ct_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateCubeTexture(dev, 4, 0, 0, D3DFMT_A8R8G8B8, 1, &ct_raw, null));
+    const ct: *WinsCubeTexture9 = @ptrCast(@alignCast(ct_raw.?));
+    defer _ = ct.vtbl.Release(ct);
+    try std.testing.expectEqual(D3DRTYPE_CUBETEXTURE, ct.vtbl.GetType(ct));
+    try std.testing.expectEqual(@as(u32, 3), ct.vtbl.GetLevelCount(ct));
+    try std.testing.expectEqual(D3DRTYPE_CUBETEXTURE, textureKind(ct));
+
+    var sdesc: D3DSURFACE_DESC = undefined;
+    try std.testing.expectEqual(D3D_OK, ct.vtbl.GetLevelDesc(ct, 1, &sdesc));
+    try std.testing.expectEqual(D3DRTYPE_SURFACE, sdesc.Type);
+    try std.testing.expectEqual(@as(u32, 2), sdesc.Width);
+    try std.testing.expectEqual(@as(u32, 2), sdesc.Height);
+
+    var surf_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, ct.vtbl.GetCubeMapSurface(ct, 6, 0, &surf_raw));
+    try std.testing.expectEqual(D3D_OK, ct.vtbl.GetCubeMapSurface(ct, 2, 0, &surf_raw));
+    const face2: *WinsSurface9 = @ptrCast(@alignCast(surf_raw.?));
+    defer _ = face2.vtbl.Release(face2);
+    try std.testing.expectEqual(@as(u32, 2), face2.cube_face);
+
+    // Volume texture creation + LockBox + GetVolumeLevel
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateVolumeTexture(dev, 0, 4, 4, 1, 0, D3DFMT_A8R8G8B8, 1, &bad, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateVolumeTexture(dev, 4, 4, 4, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, 0, &bad, null));
+    var vt_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateVolumeTexture(dev, 4, 4, 4, 0, 0, D3DFMT_A8R8G8B8, 1, &vt_raw, null));
+    const vt: *WinsVolumeTexture9 = @ptrCast(@alignCast(vt_raw.?));
+    defer _ = vt.vtbl.Release(vt);
+    try std.testing.expectEqual(D3DRTYPE_VOLUMETEXTURE, vt.vtbl.GetType(vt));
+    try std.testing.expectEqual(@as(u32, 3), vt.vtbl.GetLevelCount(vt));
+    try std.testing.expectEqual(D3DRTYPE_VOLUMETEXTURE, textureKind(vt));
+
+    var vdesc: D3DVOLUME_DESC = undefined;
+    try std.testing.expectEqual(D3D_OK, vt.vtbl.GetLevelDesc(vt, 1, &vdesc));
+    try std.testing.expectEqual(D3DRTYPE_VOLUME, vdesc.Type);
+    try std.testing.expectEqual(@as(u32, 2), vdesc.Depth);
+
+    var vol_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, vt.vtbl.GetVolumeLevel(vt, 0, &vol_raw));
+    const vol0: *WinsVolume9 = @ptrCast(@alignCast(vol_raw.?));
+    defer _ = vol0.vtbl.Release(vol0);
+    var lb: D3DLOCKED_BOX = undefined;
+    try std.testing.expectEqual(D3D_OK, vol0.vtbl.LockBox(vol0, &lb, null, 0));
+    try std.testing.expectEqual(@as(i32, 16), lb.RowPitch);
+    try std.testing.expectEqual(@as(i32, 64), lb.SlicePitch);
+    try std.testing.expectEqual(D3D_OK, vol0.vtbl.UnlockBox(vol0));
+
+    // SetTexture + GetTexture round-trip for CubeTexture
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTexture(dev, 0, ct));
+    var got_tex: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTexture(dev, 0, &got_tex));
+    try std.testing.expectEqual(@as(?*anyopaque, ct), got_tex);
+    _ = ct.vtbl.Release(ct);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTexture(dev, 0, null));
+
+    // D3DXGetImageInfoFromFileInMemory + CreateCube/Volume from DDS
+    var dds_cube: [128 + 24]u8 = [_]u8{0} ** (128 + 24);
+    @memcpy(dds_cube[0..4], "DDS ");
+    std.mem.writeInt(u32, dds_cube[4..8], 124, .little);
+    std.mem.writeInt(u32, dds_cube[8..12], 0x1007, .little);
+    std.mem.writeInt(u32, dds_cube[12..16], 1, .little);
+    std.mem.writeInt(u32, dds_cube[16..20], 1, .little);
+    std.mem.writeInt(u32, dds_cube[28..32], 1, .little);
+    std.mem.writeInt(u32, dds_cube[76..80], 32, .little);
+    std.mem.writeInt(u32, dds_cube[80..84], 0x41, .little);
+    std.mem.writeInt(u32, dds_cube[88..92], 32, .little);
+    std.mem.writeInt(u32, dds_cube[92..96], 0x00FF0000, .little);
+    std.mem.writeInt(u32, dds_cube[96..100], 0x0000FF00, .little);
+    std.mem.writeInt(u32, dds_cube[100..104], 0x000000FF, .little);
+    std.mem.writeInt(u32, dds_cube[104..108], 0xFF000000, .little);
+    std.mem.writeInt(u32, dds_cube[112..116], 0xFE00, .little);
+    std.mem.writeInt(u32, dds_cube[128 + 8 .. 128 + 12], 0xFF0000FF, .little); // +Y face
+
+    var info: D3DXIMAGE_INFO = undefined;
+    try std.testing.expectEqual(D3D_OK, D3DXGetImageInfoFromFileInMemory(&dds_cube, dds_cube.len, &info));
+    try std.testing.expectEqual(D3DRTYPE_CUBETEXTURE, info.ResourceType);
+    try std.testing.expectEqual(D3DFMT_A8R8G8B8, info.Format);
+
+    var dds_ct_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, D3DXCreateCubeTextureFromFileInMemory(dev, &dds_cube, dds_cube.len, &dds_ct_raw));
+    const dds_ct: *WinsCubeTexture9 = @ptrCast(@alignCast(dds_ct_raw.?));
+    defer _ = dds_ct.vtbl.Release(dds_ct);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), std.mem.readInt(u32, dds_ct.faces[2].data[0..4], .little));
+}
+
+test "IDirect3DStateBlock9: Begin/End isolation, partial Apply, CreateStateBlock Capture/Apply, QI and GetDevice" {
+    var d3d = WinsD3D9.init();
+    const dev = try testDevice(&d3d);
+    defer _ = dev.vtbl.Release(dev);
+
+    // Errors outside valid sequence
+    var dummy_sb: ?*anyopaque = null;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.EndStateBlock(dev, &dummy_sb));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateStateBlock(dev, 99, &dummy_sb));
+
+    // Baseline live device state
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 7, 1)); // ZENABLE = 1
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 14, 0)); // ZWRITEENABLE = 0
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTextureStageState(dev, 0, 1, 4)); // COLOROP = MODULATE
+    var m_live = d3dIdentityMatrix();
+    m_live.m[3][0] = 10.0;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTransform(dev, 2, &m_live)); // VIEW
+
+    // BeginStateBlock records without mutating live device state
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.BeginStateBlock(dev));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.BeginStateBlock(dev)); // nested
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.CreateStateBlock(dev, D3DSBT_ALL, &dummy_sb));
+
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 14, 1)); // recorded only
+    var m_rec = d3dIdentityMatrix();
+    m_rec.m[3][0] = 42.0;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTransform(dev, 2, &m_rec));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTextureStageState(dev, 0, 1, 2)); // SELECTARG1
+    var l_rec = defaultLight9();
+    l_rec.Diffuse = .{ .r = 0.25, .g = 0.5, .b = 0.75, .a = 1.0 };
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetLight(dev, 1, &l_rec));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.LightEnable(dev, 1, 1));
+
+    var rec_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.EndStateBlock(dev, &rec_raw));
+    const rec_sb: *WinsStateBlock9 = @ptrCast(@alignCast(rec_raw.?));
+    defer _ = rec_sb.vtbl.Release(rec_sb);
+
+    // Live state must NOT have changed during Begin/End
+    var rs_val: u32 = 999;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderState(dev, 14, &rs_val));
+    try std.testing.expectEqual(@as(u32, 0), rs_val);
+    var m_out: D3DMATRIX = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTransform(dev, 2, &m_out));
+    try std.testing.expectEqual(@as(f32, 10.0), m_out.m[3][0]);
+
+    // Change unrelated live RS 7 before partial Apply()
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 7, 0));
+    try std.testing.expectEqual(D3D_OK, rec_sb.vtbl.Apply(rec_sb));
+
+    // Recorded fields changed; unrecorded RS 7 remained untouched
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderState(dev, 7, &rs_val));
+    try std.testing.expectEqual(@as(u32, 0), rs_val);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderState(dev, 14, &rs_val));
+    try std.testing.expectEqual(@as(u32, 1), rs_val);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTransform(dev, 2, &m_out));
+    try std.testing.expectEqual(@as(f32, 42.0), m_out.m[3][0]);
+    var l_en: i32 = 0;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetLightEnable(dev, 1, &l_en));
+    try std.testing.expectEqual(@as(i32, 1), l_en);
+
+    // QI + GetDevice checks
+    var qi_ptr: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, rec_sb.vtbl.QueryInterface(rec_sb, &IID_IDirect3DStateBlock9, &qi_ptr));
+    _ = rec_sb.vtbl.Release(rec_sb);
+    var got_dev_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, rec_sb.vtbl.GetDevice(rec_sb, &got_dev_raw));
+    try std.testing.expectEqual(@as(?*anyopaque, dev), got_dev_raw);
+    const got_dev: *WinsD3DDevice9 = @ptrCast(@alignCast(got_dev_raw.?));
+    _ = got_dev.vtbl.Release(got_dev);
+
+    // CreateStateBlock(PIXELSTATE) captures RS 14 / TSS, NOT Transform 2 / Lights
+    var pix_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateStateBlock(dev, D3DSBT_PIXELSTATE, &pix_raw));
+    const pix_sb: *WinsStateBlock9 = @ptrCast(@alignCast(pix_raw.?));
+    defer _ = pix_sb.vtbl.Release(pix_sb);
+    try std.testing.expect(!pix_sb.has_transform[d3dTransformStateIndex(2).?]);
+    try std.testing.expect(pix_sb.has_render_state[14]);
+
+    // Capture overwrites pixel state when RS 14 mutates, while Transform stays independent
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 14, 0));
+    try std.testing.expectEqual(D3D_OK, pix_sb.vtbl.Capture(pix_sb));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 14, 1));
+    m_rec.m[3][0] = 99.0;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTransform(dev, 2, &m_rec));
+    try std.testing.expectEqual(D3D_OK, pix_sb.vtbl.Apply(pix_sb));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderState(dev, 14, &rs_val));
+    try std.testing.expectEqual(@as(u32, 0), rs_val);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTransform(dev, 2, &m_out));
+    try std.testing.expectEqual(@as(f32, 99.0), m_out.m[3][0]);
+
+    // CreateStateBlock(ALL) captures & restores everything including transform & lights
+    var all_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateStateBlock(dev, D3DSBT_ALL, &all_raw));
+    const all_sb: *WinsStateBlock9 = @ptrCast(@alignCast(all_raw.?));
+    defer _ = all_sb.vtbl.Release(all_sb);
+    m_rec.m[3][0] = 5.0;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTransform(dev, 2, &m_rec));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.LightEnable(dev, 1, 0));
+    try std.testing.expectEqual(D3D_OK, all_sb.vtbl.Apply(all_sb));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTransform(dev, 2, &m_out));
+    try std.testing.expectEqual(@as(f32, 99.0), m_out.m[3][0]);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetLightEnable(dev, 1, &l_en));
+    try std.testing.expectEqual(@as(i32, 1), l_en);
+
+    // CreateStateBlock(VERTEXSTATE) captures vertex states (e.g. LIGHTING=137, TEXCOORDINDEX=11, lights), excludes pixel RS 14 & transforms
+    var vs_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateStateBlock(dev, D3DSBT_VERTEXSTATE, &vs_raw));
+    const vs_sb: *WinsStateBlock9 = @ptrCast(@alignCast(vs_raw.?));
+    defer _ = vs_sb.vtbl.Release(vs_sb);
+    try std.testing.expect(!vs_sb.has_render_state[14]);
+    try std.testing.expect(!vs_sb.has_transform[d3dTransformStateIndex(2).?]);
+    try std.testing.expect(vs_sb.has_render_state[137]);
+    try std.testing.expect(vs_sb.has_tss[0][11]);
+    try std.testing.expect(vs_sb.capture_all_lights);
+}
+
+test "UpdateSurface and UpdateTexture: SYSTEMMEM to DEFAULT upload, subrect copy, and invalid directions" {
+    var d3d = WinsD3D9.init();
+    const dev = try testDevice(&d3d);
+    defer _ = dev.vtbl.Release(dev);
+
+    // Surfaces: SYSTEMMEM (pool 2) -> DEFAULT (pool 0)
+    var src_raw: ?*anyopaque = null;
+    var dst_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateOffscreenPlainSurface(dev, 4, 4, D3DFMT_A8R8G8B8, 2, &src_raw, null));
+    defer _ = @as(*WinsSurface9, @ptrCast(@alignCast(src_raw.?))).vtbl.Release(src_raw.?);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateOffscreenPlainSurface(dev, 4, 4, D3DFMT_A8R8G8B8, 0, &dst_raw, null));
+    defer _ = @as(*WinsSurface9, @ptrCast(@alignCast(dst_raw.?))).vtbl.Release(dst_raw.?);
+
+    const src_s: *WinsSurface9 = @ptrCast(@alignCast(src_raw.?));
+    const dst_s: *WinsSurface9 = @ptrCast(@alignCast(dst_raw.?));
+    var lr: D3DLOCKED_RECT = undefined;
+    try std.testing.expectEqual(D3D_OK, src_s.vtbl.LockRect(src_s, &lr, null, 0));
+    const spx: [*]u32 = @ptrCast(@alignCast(lr.pBits.?));
+    for (0..16) |i| spx[i] = 0xAA000000 | @as(u32, @intCast(i));
+    try std.testing.expectEqual(D3D_OK, src_s.vtbl.UnlockRect(src_s));
+
+    const rect = D3DRECT{ .x1 = 1, .y1 = 1, .x2 = 3, .y2 = 3 };
+    const pt = POINT{ .x = 2, .y = 1 };
+    dst_s.gl_dirty = false;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.UpdateSurface(dev, src_s, &rect, dst_s, &pt));
+    try std.testing.expect(dst_s.gl_dirty);
+    const dst_px: [*]const u32 = @ptrCast(@alignCast(dst_s.data.ptr));
+    // dst(2,1) <- src(1,1) = index 5; dst(3,2) <- src(2,2) = index 10
+    try std.testing.expectEqual(@as(u32, 0xAA000005), dst_px[1 * 4 + 2]);
+    try std.testing.expectEqual(@as(u32, 0xAA00000A), dst_px[2 * 4 + 3]);
+
+    // Invalid UpdateSurface directions & pools
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.UpdateSurface(dev, dst_s, null, src_s, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.UpdateSurface(dev, src_s, null, src_s, null));
+
+    // Textures: SYSTEMMEM -> DEFAULT (2D + Cube + Volume)
+    var stex_raw: ?*anyopaque = null;
+    var dtex_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 4, 4, 2, 0, D3DFMT_A8R8G8B8, 2, &stex_raw, null));
+    defer _ = @as(*WinsTexture9, @ptrCast(@alignCast(stex_raw.?))).vtbl.Release(stex_raw.?);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 4, 4, 2, 0, D3DFMT_A8R8G8B8, 0, &dtex_raw, null));
+    defer _ = @as(*WinsTexture9, @ptrCast(@alignCast(dtex_raw.?))).vtbl.Release(dtex_raw.?);
+    const stex: *WinsTexture9 = @ptrCast(@alignCast(stex_raw.?));
+    const dtex: *WinsTexture9 = @ptrCast(@alignCast(dtex_raw.?));
+    std.mem.writeInt(u32, stex.surfaces[0].data[0..4], 0x11223344, .little);
+    std.mem.writeInt(u32, stex.surfaces[1].data[0..4], 0x55667788, .little);
+    dtex.gl_dirty = false;
+    dtex.surfaces[0].gl_dirty = false;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.UpdateTexture(dev, stex, dtex));
+    try std.testing.expect(dtex.gl_dirty);
+    try std.testing.expect(dtex.surfaces[0].gl_dirty);
+    try std.testing.expectEqual(@as(u32, 0x11223344), std.mem.readInt(u32, dtex.surfaces[0].data[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x55667788), std.mem.readInt(u32, dtex.surfaces[1].data[0..4], .little));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.UpdateTexture(dev, dtex, stex));
+
+    var sct_raw: ?*anyopaque = null;
+    var dct_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateCubeTexture(dev, 2, 1, 0, D3DFMT_A8R8G8B8, 2, &sct_raw, null));
+    defer _ = @as(*WinsCubeTexture9, @ptrCast(@alignCast(sct_raw.?))).vtbl.Release(sct_raw.?);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateCubeTexture(dev, 2, 1, 0, D3DFMT_A8R8G8B8, 0, &dct_raw, null));
+    defer _ = @as(*WinsCubeTexture9, @ptrCast(@alignCast(dct_raw.?))).vtbl.Release(dct_raw.?);
+    const sct: *WinsCubeTexture9 = @ptrCast(@alignCast(sct_raw.?));
+    const dct: *WinsCubeTexture9 = @ptrCast(@alignCast(dct_raw.?));
+    std.mem.writeInt(u32, sct.faces[3].data[0..4], 0xDEADBEEF, .little);
+    dct.gl_dirty = false;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.UpdateTexture(dev, sct, dct));
+    try std.testing.expect(dct.gl_dirty);
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), std.mem.readInt(u32, dct.faces[3].data[0..4], .little));
+
+    var svt_raw: ?*anyopaque = null;
+    var dvt_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateVolumeTexture(dev, 2, 2, 2, 1, 0, D3DFMT_A8R8G8B8, 2, &svt_raw, null));
+    defer _ = @as(*WinsVolumeTexture9, @ptrCast(@alignCast(svt_raw.?))).vtbl.Release(svt_raw.?);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateVolumeTexture(dev, 2, 2, 2, 1, 0, D3DFMT_A8R8G8B8, 0, &dvt_raw, null));
+    defer _ = @as(*WinsVolumeTexture9, @ptrCast(@alignCast(dvt_raw.?))).vtbl.Release(dvt_raw.?);
+    const svt: *WinsVolumeTexture9 = @ptrCast(@alignCast(svt_raw.?));
+    const dvt: *WinsVolumeTexture9 = @ptrCast(@alignCast(dvt_raw.?));
+    std.mem.writeInt(u32, svt.volumes[0].data[0..4], 0xCAFEBABE, .little);
+    dvt.gl_dirty = false;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.UpdateTexture(dev, svt, dvt));
+    try std.testing.expect(dvt.gl_dirty);
+    try std.testing.expectEqual(@as(u32, 0xCAFEBABE), std.mem.readInt(u32, dvt.volumes[0].data[0..4], .little));
+}
+
+test "device Reset: enforces DEFAULT pool + backbuffer + recording gates, resets state and resizes targets" {
+    var d3d = WinsD3D9.init();
+    const dev = try testDevice(&d3d);
+    defer _ = dev.vtbl.Release(dev);
+
+    var pp = dev.params;
+    pp.BackBufferWidth = 128;
+    pp.BackBufferHeight = 96;
+    pp.EnableAutoDepthStencil = 1;
+    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
+
+    // Gate 1: active BeginStateBlock blocks Reset
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.BeginStateBlock(dev));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.Reset(dev, &pp));
+    var sb_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.EndStateBlock(dev, &sb_raw));
+    _ = @as(*WinsStateBlock9, @ptrCast(@alignCast(sb_raw.?))).vtbl.Release(sb_raw.?);
+
+    // Gate 2: live D3DPOOL_DEFAULT VertexBuffer blocks Reset until Release
+    var vb_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateVertexBuffer(dev, 64, 0, 0, 0, &vb_raw, null));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.Reset(dev, &pp));
+    _ = @as(*WinsVertexBuffer9, @ptrCast(@alignCast(vb_raw.?))).vtbl.Release(vb_raw.?);
+
+    // Gate 3: orphaned child GetSurfaceLevel ref on D3DPOOL_DEFAULT texture blocks Reset until Release
+    var tex_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateTexture(dev, 4, 4, 1, 0, D3DFMT_A8R8G8B8, 0, &tex_raw, null));
+    const tex: *WinsTexture9 = @ptrCast(@alignCast(tex_raw.?));
+    var lvl0_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, tex.vtbl.GetSurfaceLevel(tex, 0, &lvl0_raw));
+    _ = tex.vtbl.Release(tex);
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.Reset(dev, &pp));
+    _ = @as(*WinsSurface9, @ptrCast(@alignCast(lvl0_raw.?))).vtbl.Release(lvl0_raw.?);
+
+    // Gate 4: extra GetBackBuffer ref blocks Reset until Release
+    var bb_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetBackBuffer(dev, 0, 0, 0, &bb_raw));
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.Reset(dev, &pp));
+    _ = @as(*WinsSurface9, @ptrCast(@alignCast(bb_raw.?))).vtbl.Release(bb_raw.?);
+
+    // Mutate states before valid Reset
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 14, 0));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 137, 0)); // LIGHTING = 0
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetRenderState(dev, 174, 1)); // SCISSORTESTENABLE = 1
+    var mv = d3dIdentityMatrix();
+    mv.m[3][0] = 77.0;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetTransform(dev, 2, &mv));
+    const l0 = defaultLight9();
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetLight(dev, 0, &l0));
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.LightEnable(dev, 0, 1));
+
+    // MANAGED VB survives Reset (only DEFAULT blocks)
+    var mvb_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.CreateVertexBuffer(dev, 64, 0, 0, 1, &mvb_raw, null));
+    defer _ = @as(*WinsVertexBuffer9, @ptrCast(@alignCast(mvb_raw.?))).vtbl.Release(mvb_raw.?);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.SetStreamSource(dev, 0, mvb_raw, 0, 12));
+
+    // Reset succeeds now
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.Reset(dev, &pp));
+
+    // Verify resized targets & reset states
+    var vp: D3DVIEWPORT9 = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetViewport(dev, &vp));
+    try std.testing.expectEqual(@as(u32, 128), vp.Width);
+    try std.testing.expectEqual(@as(u32, 96), vp.Height);
+    try std.testing.expectEqual(@as(i32, 128), dev.scissor.x2);
+    try std.testing.expectEqual(@as(i32, 96), dev.scissor.y2);
+
+    var bb2_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetBackBuffer(dev, 0, 0, 0, &bb2_raw));
+    const bb2: *WinsSurface9 = @ptrCast(@alignCast(bb2_raw.?));
+    defer _ = bb2.vtbl.Release(bb2);
+    var bb2_desc: D3DSURFACE_DESC = undefined;
+    try std.testing.expectEqual(D3D_OK, bb2.vtbl.GetDesc(bb2, &bb2_desc));
+    try std.testing.expectEqual(@as(u32, 128), bb2_desc.Width);
+    try std.testing.expectEqual(@as(u32, 96), bb2_desc.Height);
+
+    var rs: u32 = 0;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderState(dev, 137, &rs));
+    try std.testing.expectEqual(@as(u32, 1), rs);
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetRenderState(dev, 174, &rs));
+    try std.testing.expectEqual(@as(u32, 0), rs);
+
+    var m_after: D3DMATRIX = undefined;
+    try std.testing.expectEqual(D3D_OK, dev.vtbl.GetTransform(dev, 2, &m_after));
+    try std.testing.expectEqual(@as(f32, 0.0), m_after.m[3][0]);
+    var l_en: i32 = 1;
+    try std.testing.expectEqual(D3DERR_INVALIDCALL, dev.vtbl.GetLightEnable(dev, 0, &l_en));
+    try std.testing.expect(dev.streams[0] == null);
 }

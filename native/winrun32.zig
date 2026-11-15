@@ -20,6 +20,7 @@ const dsound_mod = @import("wins_dsound.zig");
 const dshow_mod = @import("wins_dshow.zig");
 const user32_mod = @import("wins_user32.zig");
 const dinput_mod = @import("wins_dinput.zig");
+const xinput_mod = @import("wins_xinput.zig");
 const bink_mod = @import("wins_bink.zig");
 // winrun_gui_support and x11_window are NOT imported: they need static libX11,
 // which is unavailable for the i386 target this loader builds for.
@@ -3305,6 +3306,11 @@ fn LoadLibraryA(lpLibFileName: ?[*:0]const u8) callconv(W) usize {
         if (std.ascii.eqlIgnoreCase(slice, "dbghelp") or std.ascii.eqlIgnoreCase(slice, "dbghelp.dll")) return 0x72A00000;
         if (std.ascii.eqlIgnoreCase(slice, "winmm") or std.ascii.eqlIgnoreCase(slice, "winmm.dll")) return 0x76B00000;
         if (std.ascii.eqlIgnoreCase(slice, "dinput8") or std.ascii.eqlIgnoreCase(slice, "dinput8.dll")) return 0x72200000;
+        if (std.ascii.eqlIgnoreCase(slice, "dsound") or std.ascii.eqlIgnoreCase(slice, "dsound.dll")) return 0x73F10000;
+        if (std.ascii.eqlIgnoreCase(slice, "xinput1_3") or std.ascii.eqlIgnoreCase(slice, "xinput1_3.dll") or
+            std.ascii.eqlIgnoreCase(slice, "xinput1_4") or std.ascii.eqlIgnoreCase(slice, "xinput1_4.dll") or
+            std.ascii.eqlIgnoreCase(slice, "xinput1_2") or std.ascii.eqlIgnoreCase(slice, "xinput1_2.dll") or
+            std.ascii.eqlIgnoreCase(slice, "xinput9_1_0") or std.ascii.eqlIgnoreCase(slice, "xinput9_1_0.dll")) return 0x72500000;
         if (std.ascii.eqlIgnoreCase(slice, "comctl32") or std.ascii.eqlIgnoreCase(slice, "comctl32.dll")) return 0x773D0000;
         if (std.ascii.eqlIgnoreCase(slice, "gdi32") or std.ascii.eqlIgnoreCase(slice, "gdi32.dll")) return 0x77F10000;
         return 0x10000000;
@@ -4034,6 +4040,49 @@ fn callAligned3(fnptr: usize, a0: usize, a1: usize, a2: usize) usize {
     return ret;
 }
 
+const CallAlignedCtx = struct {
+    fnptr: usize,
+    ptr: [*]const usize,
+    len: usize,
+    pad_bytes: usize,
+};
+
+/// Forward a variable slice of 32-bit arguments into a Linux SysV cdecl callee
+/// on a 16-byte aligned stack, capturing the full EDX:EAX 64-bit return value.
+/// Restoring ESP unconditionally also supports SysV sret callees (`ret $4`).
+fn callAlignedU64(fnptr: usize, args: []const usize) u64 {
+    const ctx = CallAlignedCtx{
+        .fnptr = fnptr,
+        .ptr = args.ptr,
+        .len = args.len,
+        .pad_bytes = ((4 - (args.len & 3)) & 3) * 4,
+    };
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile (
+        \\ movl %%esp, %%ebx
+        \\ subl $12, %%esp
+        \\ andl $-16, %%esp
+        \\ subl 12(%[ctx]), %%esp
+        \\ movl 8(%[ctx]), %%ecx
+        \\ movl 4(%[ctx]), %%esi
+        \\ 1:
+        \\ testl %%ecx, %%ecx
+        \\ jz 2f
+        \\ decl %%ecx
+        \\ pushl (%%esi, %%ecx, 4)
+        \\ jmp 1b
+        \\ 2:
+        \\ call *0(%[ctx])
+        \\ movl %%ebx, %%esp
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+        : [ctx] "r" (&ctx),
+        : .{ .memory = true, .cc = true, .ecx = true, .ebx = true, .esi = true }
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
+
 // ---- ISteamClient010 -------------------------------------------------------
 
 fn a000_CreateSteamPipe(self: usize) callconv(Tc) u32 {
@@ -4105,6 +4154,10 @@ fn a003_ReleaseUser(self: usize, hSteamPipe: u32, hSteamUser: u32) callconv(Tc) 
 fn kindForVersion(version: ?[*:0]const u8) usize {
     const v = if (version) |p| std.mem.sliceTo(p, 0) else "";
     if (std.mem.indexOf(u8, v, "APPTICKET") != null) return SubAppTicket;
+    // Check UserStats before User because "SteamUserStats*" contains "SteamUser".
+    if (std.mem.indexOf(u8, v, "STEAMUSERSTATS") != null or std.mem.indexOf(u8, v, "SteamUserStats") != null) return SubUserStats;
+    if (std.mem.indexOf(u8, v, "STEAMAPPS") != null or std.mem.indexOf(u8, v, "SteamApps") != null) return SubApps;
+    if (std.mem.indexOf(u8, v, "SteamFriends") != null) return SubFriends;
     if (std.mem.indexOf(u8, v, "SteamUtils") != null) return SubUtils;
     if (std.mem.indexOf(u8, v, "SteamUser") != null) return SubUser;
     return SubGeneric;
@@ -4142,28 +4195,47 @@ fn a009_GetISteamUtils(self: usize, hSteamPipe: u32, pchVersion: ?[*:0]const u8)
     return wrapSubKind(SubUtils, obj);
 }
 
-/// ISteamClient slot 13: the generic getter. It dispatches on the version
-/// name and hands back the object for it -- the ticket name gives the ticket
-/// object, the utils name the utils object. This is where the app-ownership
-/// ticket comes from: the real client answers GetAppOwnershipTicketData(22380)
-/// with 238 bytes of ticket and a 128-byte signature.
-fn a013_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+fn clientGetInterface(self: usize, slot: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8, fallback_kind: ?usize, label: []const u8) usize {
     const ver = if (pchVersion) |v| std.mem.sliceTo(v, 0) else "?";
     const vptr: usize = if (pchVersion) |v| @intFromPtr(v) else 0;
-    std.debug.print("[WINS:Steam] ISteamClient010::GetISteamGenericInterface(\"{s}\") -> real client\n", .{ver});
+    std.debug.print("[WINS:Steam] ISteamClient010::{s}(\"{s}\") -> real client\n", .{ label, ver });
     std.debug.print("[WINS:Steam]   (guest pid={d} pipe={d})\n", .{ hSteamUser, hSteamPipe });
     // The client's own pipe and user, not the ones the guest passes: the
     // client validates that pair (IsValidHSteamUserPipe) and the guest's
     // pair is not the one the client issued.
     const use_user = if (g_guest_user != 0) g_guest_user else hSteamUser;
     const use_pipe = if (g_guest_pipe != 0) g_guest_pipe else hSteamPipe;
-    const obj = callAligned4(realSlot(self, 13), realOf(self), use_user, use_pipe, vptr);
-    std.debug.print("[WINS:Steam] generic interface -> 0x{x} (client pid={d} pipe={d})\n", .{ obj, use_user, use_pipe });
-    const kind = kindForVersion(pchVersion);
+    const obj = callAligned4(realSlot(self, slot), realOf(self), use_user, use_pipe, vptr);
+    std.debug.print("[WINS:Steam] {s} -> 0x{x} (client pid={d} pipe={d})\n", .{ label, obj, use_user, use_pipe });
+    var kind = kindForVersion(pchVersion);
+    if (kind == SubGeneric) {
+        if (fallback_kind) |fk| kind = fk;
+    }
     // The ticket object is the one the DRM will ask for the ownership ticket
     // on, and the SteamID the DRM asks for comes out of that same ticket.
     if (kind == SubAppTicket and obj != 0) g_real_ticket = obj;
     return wrapSubKind(kind, obj);
+}
+
+fn a008_GetISteamFriends(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+    return clientGetInterface(self, 8, hSteamUser, hSteamPipe, pchVersion, SubFriends, "GetISteamFriends");
+}
+
+/// ISteamClient slot 13: the generic getter. It dispatches on the version
+/// name and hands back the object for it -- the ticket name gives the ticket
+/// object, the utils name the utils object. This is where the app-ownership
+/// ticket comes from: the real client answers GetAppOwnershipTicketData(22380)
+/// with 238 bytes of ticket and a 128-byte signature.
+fn a013_GetISteamGenericInterface(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+    return clientGetInterface(self, 13, hSteamUser, hSteamPipe, pchVersion, null, "generic interface");
+}
+
+fn a014_GetISteamUserStats(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+    return clientGetInterface(self, 14, hSteamUser, hSteamPipe, pchVersion, SubUserStats, "GetISteamUserStats");
+}
+
+fn a016_GetISteamApps(self: usize, hSteamUser: u32, hSteamPipe: u32, pchVersion: ?[*:0]const u8) callconv(Tc) usize {
+    return clientGetInterface(self, 16, hSteamUser, hSteamPipe, pchVersion, SubApps, "GetISteamApps");
 }
 
 fn a_stub(self: usize) callconv(Tc) u32 {
@@ -4194,8 +4266,11 @@ fn ensureSteamClient010Vt() void {
     g_steamclient010_vt[3] = @intFromPtr(&a003_ReleaseUser);
     g_steamclient010_vt[4] = @intFromPtr(&a004_DisconnectGlobalUser);
     g_steamclient010_vt[5] = @intFromPtr(&a005_GetISteamUser);
+    g_steamclient010_vt[8] = @intFromPtr(&a008_GetISteamFriends);
     g_steamclient010_vt[9] = @intFromPtr(&a009_GetISteamUtils);
     g_steamclient010_vt[13] = @intFromPtr(&a013_GetISteamGenericInterface);
+    g_steamclient010_vt[14] = @intFromPtr(&a014_GetISteamUserStats);
+    g_steamclient010_vt[16] = @intFromPtr(&a016_GetISteamApps);
     g_steamclient010_vt_ready = true;
 }
 
@@ -4211,14 +4286,227 @@ var g_steamclient010_adapter: Adapter = .{ .vt = 0, .real = 0 };
 // table. Everything else forwards, so a wrong guess forwards wrongly rather than
 // silently inventing an answer.
 
-var g_sub_adapters: [8]Adapter = [_]Adapter{.{ .vt = 0, .real = 0 }} ** 8;
+var g_sub_adapters: [32]Adapter = [_]Adapter{.{ .vt = 0, .real = 0 }} ** 32;
 
 fn subVt(comptime n: usize) *[64]usize {
     return &g_sub_vt[n];
 }
 
-var g_sub_vt: [4][64]usize = [_][64]usize{[_]usize{0} ** 64} ** 4;
+var g_sub_vt: [7][64]usize = [_][64]usize{[_]usize{0} ** 64} ** 7;
 var g_sub_vt_ready: bool = false;
+var g_sub_logged: [7]u64 = [_]u64{0} ** 7;
+
+const RetKind = enum { u32_raw, bool_ret, u64_ret, void_ret, sret8 };
+
+const SubSlotSpec = struct {
+    slot: usize,
+    name: []const u8,
+    ret: RetKind,
+    nargs: usize,
+};
+
+const user_stats_007_slots = [_]SubSlotSpec{
+    .{ .slot = 0, .name = "ISteamUserStats007::RequestCurrentStats", .ret = .bool_ret, .nargs = 0 },
+    .{ .slot = 1, .name = "ISteamUserStats007::GetStat(int32)", .ret = .bool_ret, .nargs = 2 },
+    .{ .slot = 2, .name = "ISteamUserStats007::GetStat(float)", .ret = .bool_ret, .nargs = 2 },
+    .{ .slot = 3, .name = "ISteamUserStats007::SetStat(int32)", .ret = .bool_ret, .nargs = 2 },
+    .{ .slot = 4, .name = "ISteamUserStats007::SetStat(float)", .ret = .bool_ret, .nargs = 2 },
+    .{ .slot = 5, .name = "ISteamUserStats007::UpdateAvgRateStat", .ret = .bool_ret, .nargs = 4 },
+    .{ .slot = 6, .name = "ISteamUserStats007::GetAchievement", .ret = .bool_ret, .nargs = 2 },
+    .{ .slot = 7, .name = "ISteamUserStats007::SetAchievement", .ret = .bool_ret, .nargs = 1 },
+    .{ .slot = 8, .name = "ISteamUserStats007::ClearAchievement", .ret = .bool_ret, .nargs = 1 },
+    .{ .slot = 9, .name = "ISteamUserStats007::GetAchievementAndUnlockTime", .ret = .bool_ret, .nargs = 3 },
+    .{ .slot = 10, .name = "ISteamUserStats007::StoreStats", .ret = .bool_ret, .nargs = 0 },
+    .{ .slot = 11, .name = "ISteamUserStats007::GetAchievementIcon", .ret = .u32_raw, .nargs = 1 },
+    .{ .slot = 12, .name = "ISteamUserStats007::GetAchievementDisplayAttribute", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 13, .name = "ISteamUserStats007::IndicateAchievementProgress", .ret = .bool_ret, .nargs = 3 },
+    .{ .slot = 14, .name = "ISteamUserStats007::RequestUserStats", .ret = .u64_ret, .nargs = 2 },
+    .{ .slot = 15, .name = "ISteamUserStats007::GetUserStat(int32)", .ret = .bool_ret, .nargs = 4 },
+    .{ .slot = 16, .name = "ISteamUserStats007::GetUserStat(float)", .ret = .bool_ret, .nargs = 4 },
+    .{ .slot = 17, .name = "ISteamUserStats007::GetUserAchievement", .ret = .bool_ret, .nargs = 4 },
+    .{ .slot = 18, .name = "ISteamUserStats007::GetUserAchievementAndUnlockTime", .ret = .bool_ret, .nargs = 5 },
+    .{ .slot = 19, .name = "ISteamUserStats007::ResetAllStats", .ret = .bool_ret, .nargs = 1 },
+    .{ .slot = 20, .name = "ISteamUserStats007::FindOrCreateLeaderboard", .ret = .u64_ret, .nargs = 3 },
+    .{ .slot = 21, .name = "ISteamUserStats007::FindLeaderboard", .ret = .u64_ret, .nargs = 1 },
+    .{ .slot = 22, .name = "ISteamUserStats007::GetLeaderboardName", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 23, .name = "ISteamUserStats007::GetLeaderboardEntryCount", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 24, .name = "ISteamUserStats007::GetLeaderboardSortMethod", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 25, .name = "ISteamUserStats007::GetLeaderboardDisplayType", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 26, .name = "ISteamUserStats007::DownloadLeaderboardEntries", .ret = .u64_ret, .nargs = 5 },
+    .{ .slot = 27, .name = "ISteamUserStats007::GetDownloadedLeaderboardEntry", .ret = .bool_ret, .nargs = 6 },
+    .{ .slot = 28, .name = "ISteamUserStats007::UploadLeaderboardScore", .ret = .u64_ret, .nargs = 6 },
+    .{ .slot = 29, .name = "ISteamUserStats007::GetNumberOfCurrentPlayers", .ret = .u64_ret, .nargs = 0 },
+};
+
+const apps_003_slots = [_]SubSlotSpec{
+    .{ .slot = 0, .name = "ISteamApps003::BIsSubscribed", .ret = .bool_ret, .nargs = 0 },
+    .{ .slot = 1, .name = "ISteamApps003::BIsLowViolence", .ret = .bool_ret, .nargs = 0 },
+    .{ .slot = 2, .name = "ISteamApps003::BIsCybercafe", .ret = .bool_ret, .nargs = 0 },
+    .{ .slot = 3, .name = "ISteamApps003::BIsVACBanned", .ret = .bool_ret, .nargs = 0 },
+    .{ .slot = 4, .name = "ISteamApps003::GetCurrentGameLanguage", .ret = .u32_raw, .nargs = 0 },
+    .{ .slot = 5, .name = "ISteamApps003::GetAvailableGameLanguages", .ret = .u32_raw, .nargs = 0 },
+    .{ .slot = 6, .name = "ISteamApps003::BIsSubscribedApp", .ret = .bool_ret, .nargs = 1 },
+    .{ .slot = 7, .name = "ISteamApps003::BIsDlcInstalled", .ret = .bool_ret, .nargs = 1 },
+};
+
+const friends_005_slots = [_]SubSlotSpec{
+    .{ .slot = 0, .name = "ISteamFriends005::GetPersonaName", .ret = .u32_raw, .nargs = 0 },
+    .{ .slot = 1, .name = "ISteamFriends005::SetPersonaName", .ret = .void_ret, .nargs = 1 },
+    .{ .slot = 2, .name = "ISteamFriends005::GetPersonaState", .ret = .u32_raw, .nargs = 0 },
+    .{ .slot = 3, .name = "ISteamFriends005::GetFriendCount", .ret = .u32_raw, .nargs = 1 },
+    .{ .slot = 4, .name = "ISteamFriends005::GetFriendByIndex", .ret = .sret8, .nargs = 2 },
+    .{ .slot = 5, .name = "ISteamFriends005::GetFriendRelationship", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 6, .name = "ISteamFriends005::GetFriendPersonaState", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 7, .name = "ISteamFriends005::GetFriendPersonaName", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 8, .name = "ISteamFriends005::GetFriendAvatar", .ret = .u32_raw, .nargs = 3 },
+    .{ .slot = 9, .name = "ISteamFriends005::GetFriendGamePlayed", .ret = .bool_ret, .nargs = 3 },
+    .{ .slot = 10, .name = "ISteamFriends005::GetFriendPersonaNameHistory", .ret = .u32_raw, .nargs = 3 },
+    .{ .slot = 11, .name = "ISteamFriends005::HasFriend", .ret = .bool_ret, .nargs = 3 },
+    .{ .slot = 12, .name = "ISteamFriends005::GetClanCount", .ret = .u32_raw, .nargs = 0 },
+    .{ .slot = 13, .name = "ISteamFriends005::GetClanByIndex", .ret = .sret8, .nargs = 1 },
+    .{ .slot = 14, .name = "ISteamFriends005::GetClanName", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 15, .name = "ISteamFriends005::GetFriendCountFromSource", .ret = .u32_raw, .nargs = 2 },
+    .{ .slot = 16, .name = "ISteamFriends005::GetFriendFromSourceByIndex", .ret = .sret8, .nargs = 3 },
+    .{ .slot = 17, .name = "ISteamFriends005::IsUserInSource", .ret = .bool_ret, .nargs = 4 },
+    .{ .slot = 18, .name = "ISteamFriends005::SetInGameVoiceSpeaking", .ret = .void_ret, .nargs = 3 },
+    .{ .slot = 19, .name = "ISteamFriends005::ActivateGameOverlay", .ret = .void_ret, .nargs = 1 },
+    .{ .slot = 20, .name = "ISteamFriends005::ActivateGameOverlayToUser", .ret = .void_ret, .nargs = 3 },
+    .{ .slot = 21, .name = "ISteamFriends005::ActivateGameOverlayToWebPage", .ret = .void_ret, .nargs = 1 },
+    .{ .slot = 22, .name = "ISteamFriends005::ActivateGameOverlayToStore", .ret = .void_ret, .nargs = 1 },
+    .{ .slot = 23, .name = "ISteamFriends005::SetPlayedWith", .ret = .void_ret, .nargs = 2 },
+};
+
+fn logSubOnce(kind: usize, label: []const u8, slot: usize, rk: RetKind, raw: u64) void {
+    const bit: u64 = @as(u64, 1) << @intCast(slot);
+    if ((g_sub_logged[kind] & bit) != 0) return;
+    g_sub_logged[kind] |= bit;
+    switch (rk) {
+        .bool_ret => std.debug.print("[WINS:Steam] {s} (slot {d}) -> {d}\n", .{ label, slot, @intFromBool((raw & 0xff) != 0) }),
+        .u32_raw => std.debug.print("[WINS:Steam] {s} (slot {d}) -> 0x{x}\n", .{ label, slot, @as(u32, @truncate(raw)) }),
+        .u64_ret => std.debug.print("[WINS:Steam] {s} (slot {d}) -> 0x{x}\n", .{ label, slot, raw }),
+        .void_ret => std.debug.print("[WINS:Steam] {s} (slot {d})\n", .{ label, slot }),
+        .sret8 => std.debug.print("[WINS:Steam] {s} (slot {d}) -> 0x{x} (sret)\n", .{ label, slot, raw }),
+    }
+}
+
+fn forwardSub(comptime kind: usize, comptime label: []const u8, comptime slot: usize, comptime rk: RetKind, self: usize, args: []const usize) u64 {
+    const fnptr = realSlot(self, slot);
+    if (fnptr == 0) {
+        std.debug.print("[WINS:Steam] {s} (slot {d}) -> NULL real slot\n", .{ label, slot });
+        return 0;
+    }
+    var call_buf: [8]usize = undefined;
+    call_buf[0] = realOf(self);
+    @memcpy(call_buf[1 .. 1 + args.len], args);
+    const raw = callAlignedU64(fnptr, call_buf[0 .. 1 + args.len]);
+    logSubOnce(kind, label, slot, rk, raw);
+    return raw;
+}
+
+fn forwardSubSret8(comptime kind: usize, comptime label: []const u8, comptime slot: usize, self: usize, out: ?*u64, args: []const usize) usize {
+    var tmp: u64 = 0;
+    const fnptr = realSlot(self, slot);
+    if (fnptr == 0) {
+        if (out) |p| p.* = 0;
+        std.debug.print("[WINS:Steam] {s} (slot {d}) -> NULL real slot\n", .{ label, slot });
+        return @intFromPtr(out);
+    }
+    var call_buf: [8]usize = undefined;
+    call_buf[0] = @intFromPtr(&tmp);
+    call_buf[1] = realOf(self);
+    @memcpy(call_buf[2 .. 2 + args.len], args);
+    _ = callAlignedU64(fnptr, call_buf[0 .. 2 + args.len]);
+    if (out) |p| p.* = tmp;
+    logSubOnce(kind, label, slot, .sret8, tmp);
+    return @intFromPtr(out);
+}
+
+fn RetType(comptime rk: RetKind) type {
+    return switch (rk) {
+        .u32_raw, .bool_ret => u32,
+        .u64_ret => u64,
+        .void_ret => void,
+        .sret8 => usize,
+    };
+}
+
+fn castSubRet(comptime rk: RetKind, raw: u64) RetType(rk) {
+    return switch (rk) {
+        .u32_raw => @truncate(raw),
+        .bool_ret => @intFromBool((raw & 0xff) != 0),
+        .u64_ret => raw,
+        .void_ret => {},
+        .sret8 => unreachable,
+    };
+}
+
+fn subThunk(comptime kind: usize, comptime label: []const u8, comptime slot: usize, comptime rk: RetKind, comptime nargs: usize) usize {
+    if (rk == .sret8) {
+        return switch (nargs) {
+            1 => @intFromPtr(&struct {
+                fn f(self: usize, out: ?*u64, a0: usize) callconv(Tc) usize {
+                    return forwardSubSret8(kind, label, slot, self, out, &.{a0});
+                }
+            }.f),
+            2 => @intFromPtr(&struct {
+                fn f(self: usize, out: ?*u64, a0: usize, a1: usize) callconv(Tc) usize {
+                    return forwardSubSret8(kind, label, slot, self, out, &.{ a0, a1 });
+                }
+            }.f),
+            3 => @intFromPtr(&struct {
+                fn f(self: usize, out: ?*u64, a0: usize, a1: usize, a2: usize) callconv(Tc) usize {
+                    return forwardSubSret8(kind, label, slot, self, out, &.{ a0, a1, a2 });
+                }
+            }.f),
+            else => @compileError("unsupported sret8 arg count"),
+        };
+    }
+    const R = RetType(rk);
+    return switch (nargs) {
+        0 => @intFromPtr(&struct {
+            fn f(self: usize) callconv(Tc) R {
+                return castSubRet(rk, forwardSub(kind, label, slot, rk, self, &.{}));
+            }
+        }.f),
+        1 => @intFromPtr(&struct {
+            fn f(self: usize, a0: usize) callconv(Tc) R {
+                return castSubRet(rk, forwardSub(kind, label, slot, rk, self, &.{a0}));
+            }
+        }.f),
+        2 => @intFromPtr(&struct {
+            fn f(self: usize, a0: usize, a1: usize) callconv(Tc) R {
+                return castSubRet(rk, forwardSub(kind, label, slot, rk, self, &.{ a0, a1 }));
+            }
+        }.f),
+        3 => @intFromPtr(&struct {
+            fn f(self: usize, a0: usize, a1: usize, a2: usize) callconv(Tc) R {
+                return castSubRet(rk, forwardSub(kind, label, slot, rk, self, &.{ a0, a1, a2 }));
+            }
+        }.f),
+        4 => @intFromPtr(&struct {
+            fn f(self: usize, a0: usize, a1: usize, a2: usize, a3: usize) callconv(Tc) R {
+                return castSubRet(rk, forwardSub(kind, label, slot, rk, self, &.{ a0, a1, a2, a3 }));
+            }
+        }.f),
+        5 => @intFromPtr(&struct {
+            fn f(self: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize) callconv(Tc) R {
+                return castSubRet(rk, forwardSub(kind, label, slot, rk, self, &.{ a0, a1, a2, a3, a4 }));
+            }
+        }.f),
+        6 => @intFromPtr(&struct {
+            fn f(self: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) callconv(Tc) R {
+                return castSubRet(rk, forwardSub(kind, label, slot, rk, self, &.{ a0, a1, a2, a3, a4, a5 }));
+            }
+        }.f),
+        else => @compileError("unsupported subThunk arg count"),
+    };
+}
+
+fn wireSubSlots(comptime kind: usize, comptime specs: []const SubSlotSpec) void {
+    inline for (specs) |s| {
+        g_sub_vt[kind][s.slot] = subThunk(kind, s.name, s.slot, s.ret, s.nargs);
+    }
+}
 
 /// A thunk that says which slot was reached and that it has no implementation
 /// yet. The old stub returned 0 without a word, and that silence is what hid
@@ -4250,6 +4538,9 @@ fn ensureSubVt() void {
     g_sub_vt[SubUser][2] = @intFromPtr(&sub_GetSteamID);
     g_sub_vt[SubUtils][9] = @intFromPtr(&sub_GetAppID);
     g_sub_vt[SubAppTicket][0] = @intFromPtr(&sub_GetAppOwnershipTicketData);
+    wireSubSlots(SubUserStats, &user_stats_007_slots);
+    wireSubSlots(SubApps, &apps_003_slots);
+    wireSubSlots(SubFriends, &friends_005_slots);
     g_sub_vt_ready = true;
 }
 
@@ -4260,23 +4551,17 @@ var g_sub_used: [3]usize = [_]usize{0} ** 3;
 /// pool does not matter: each adapter carries its own real pointer, and the
 /// slot the guest asks for is forwarded to the object it belongs to.
 /// Wrap a real sub-interface in an adapter, with the vtable that matches its
-/// type. The pool is keyed by the real object; the vtable is chosen by `kind`,
-/// NOT by pool position.
-///
-/// Choosing by position was measured wrong: the DRM asks for ISteamUser first
-/// (pool slot 0 -> User table) and for ISteamAppTicket second (pool slot 1 ->
-/// the Utils table). Utils slot 0 is a_stub, which returns 0 without a log
-/// line, so GetAppOwnershipTicketData answered "no ticket" silently and the
-/// DRM fell back to the Steam2 SteamStart path. The fix is to name the kind at
-/// the call site and let the pool position mean nothing but storage.
+/// type. The pool is keyed by `(real_obj, vtable)` so the vtable is chosen by
+/// `kind`, NOT by pool position.
 fn wrapSubKind(kind: usize, real_obj: usize) usize {
     if (real_obj == 0) return 0;
     ensureSubVt();
+    const want_vt = @intFromPtr(&g_sub_vt[kind % g_sub_vt.len]);
     var i: usize = 0;
     while (i < g_sub_adapters.len) : (i += 1) {
-        if (g_sub_adapters[i].real == real_obj) return @intFromPtr(&g_sub_adapters[i]);
+        if (g_sub_adapters[i].real == real_obj and g_sub_adapters[i].vt == want_vt) return @intFromPtr(&g_sub_adapters[i]);
         if (g_sub_adapters[i].real == 0) {
-            g_sub_adapters[i] = .{ .vt = @intFromPtr(&g_sub_vt[kind % g_sub_vt.len]), .real = real_obj };
+            g_sub_adapters[i] = .{ .vt = want_vt, .real = real_obj };
             return @intFromPtr(&g_sub_adapters[i]);
         }
     }
@@ -4287,10 +4572,10 @@ fn wrapSubKind(kind: usize, real_obj: usize) usize {
 const SubUser: usize = 0;
 const SubUtils: usize = 1;
 const SubAppTicket: usize = 2;
-/// Interfaces with no modelled method yet (Apps, Friends, UserStats, the
-/// generic one): they get their own table so a call into them is logged as an
-/// unimplemented slot instead of landing on another interface's thunk.
-const SubGeneric: usize = 3;
+const SubUserStats: usize = 3;
+const SubApps: usize = 4;
+const SubFriends: usize = 5;
+const SubGeneric: usize = 6;
 
 /// The pipe and the global user the guest itself created, and the app id the
 /// client reported. The ticket fetch needs them: the client's ticket call is
@@ -4578,6 +4863,7 @@ fn steamFlatIface(comptime versions: []const [*:0]const u8, kind: usize) usize {
             return wrapSubKind(kind, got);
         }
     }
+    std.debug.print("[WINS:Steam] real client did not supply any of {d} requested versions (first=\"{s}\")\n", .{ versions.len, versions[0] });
     return 0;
 }
 
@@ -4592,22 +4878,33 @@ fn SteamUtils() callconv(W) usize {
 }
 
 fn SteamApps() callconv(W) usize {
-    if (g_flat.apps == 0) g_flat.apps = steamFlatIface(&[_][*:0]const u8{ "SteamApps008", "SteamApps003", "SteamApps005", "SteamApps006", "SteamApps007" }, SubGeneric);
+    if (g_flat.apps == 0) g_flat.apps = steamFlatIface(&[_][*:0]const u8{
+        "STEAMAPPS_INTERFACE_VERSION003",
+        "STEAMAPPS_INTERFACE_VERSION008",
+        "STEAMAPPS_INTERFACE_VERSION007",
+        "STEAMAPPS_INTERFACE_VERSION006",
+        "STEAMAPPS_INTERFACE_VERSION005",
+    }, SubApps);
     return g_flat.apps;
 }
 
 fn SteamFriends() callconv(W) usize {
-    if (g_flat.friends == 0) g_flat.friends = steamFlatIface(&[_][*:0]const u8{ "SteamFriends015", "SteamFriends014", "SteamFriends013" }, SubGeneric);
+    if (g_flat.friends == 0) g_flat.friends = steamFlatIface(&[_][*:0]const u8{
+        "SteamFriends005",
+        "SteamFriends014",
+        "SteamFriends013",
+    }, SubFriends);
     return g_flat.friends;
 }
 
 fn SteamUserStats() callconv(W) usize {
     if (g_flat.stats == 0) g_flat.stats = steamFlatIface(&[_][*:0]const u8{
         "STEAMUSERSTATS_INTERFACE_VERSION007",
+        "STEAMUSERSTATS_INTERFACE_VERSION011",
         "SteamUserStats012",
         "SteamUserStats011",
         "SteamUserStats010",
-    }, SubGeneric);
+    }, SubUserStats);
     return g_flat.stats;
 }
 
@@ -5145,7 +5442,7 @@ const WinsDirectInput8Vtbl = struct {
     Release: *const fn (*anyopaque) callconv(W) u32,
     CreateDevice: *const fn (*anyopaque, ?*const anyopaque, ?*?*anyopaque, ?*anyopaque) callconv(W) i32,
     EnumDevices: *const fn (*anyopaque, u32, ?*anyopaque, ?*anyopaque, u32) callconv(W) i32,
-    GetDeviceInfo: *const fn (*anyopaque, ?*const anyopaque, ?*anyopaque) callconv(W) i32,
+    GetDeviceStatus: *const fn (*anyopaque, ?*const anyopaque) callconv(W) i32,
     RunControlPanel: *const fn (*anyopaque, usize, u32) callconv(W) i32,
     Initialize: *const fn (*anyopaque, usize, u32) callconv(W) i32,
     FindDevice: *const fn (*anyopaque, ?*const anyopaque, ?[*:0]const u8, ?*anyopaque) callconv(W) i32,
@@ -5177,8 +5474,8 @@ fn di8_Release(this: *anyopaque) callconv(W) u32 {
     self.ref_count -= 1;
     return self.ref_count;
 }
-/// The system keyboard and mouse are real devices fed by the game window
-/// (wins_dinput.zig); anything else does not exist on this adapter.
+/// The system keyboard, mouse, and attached gamepads (wins_dinput.zig +
+/// wins_xinput.zig); anything else does not exist on this adapter.
 fn di8_CreateDevice(this: *anyopaque, guid: ?*const anyopaque, ppv: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) i32 {
     _ = outer;
     const self: *WinsDirectInput8 = @ptrCast(@alignCast(this));
@@ -5186,12 +5483,12 @@ fn di8_CreateDevice(this: *anyopaque, guid: ?*const anyopaque, ppv: ?*?*anyopaqu
     return dinput_mod.createDevice(@ptrCast(guid), self.wide, out);
 }
 fn di8_EnumDevices(this: *anyopaque, dev_type: u32, cb: ?*anyopaque, ref: ?*anyopaque, flags: u32) callconv(W) i32 {
-    _ = this; _ = dev_type; _ = cb; _ = ref; _ = flags;
-    return DI_OK; // zero devices: the callback is never invoked
+    const self: *WinsDirectInput8 = @ptrCast(@alignCast(this));
+    return dinput_mod.enumDevices(dev_type, self.wide, cb, ref, flags);
 }
-fn di8_GetDeviceInfo(this: *anyopaque, guid: ?*const anyopaque, inst: ?*anyopaque) callconv(W) i32 {
-    _ = this; _ = guid; _ = inst;
-    return DIERR_GENERIC;
+fn di8_GetDeviceStatus(this: *anyopaque, guid: ?*const anyopaque) callconv(W) i32 {
+    _ = this;
+    return dinput_mod.getDeviceStatus(@ptrCast(guid));
 }
 fn di8_RunControlPanel(this: *anyopaque, hwnd: usize, flags: u32) callconv(W) i32 {
     _ = this; _ = hwnd; _ = flags;
@@ -5202,12 +5499,12 @@ fn di8_Initialize(this: *anyopaque, hinst: usize, version: u32) callconv(W) i32 
     return DI_OK;
 }
 fn di8_FindDevice(this: *anyopaque, guid: ?*const anyopaque, name: ?[*:0]const u8, out: ?*anyopaque) callconv(W) i32 {
-    _ = this; _ = guid; _ = name; _ = out;
-    return DIERR_GENERIC;
+    const self: *WinsDirectInput8 = @ptrCast(@alignCast(this));
+    return dinput_mod.findDevice(@ptrCast(guid), name, self.wide, @ptrCast(out));
 }
 fn di8_EnumDevicesBySemantics(this: *anyopaque, name: ?[*:0]const u8, fmt: ?*anyopaque, cb: ?*anyopaque, ref: ?*anyopaque, flags: u32) callconv(W) i32 {
     _ = this; _ = name; _ = fmt; _ = cb; _ = ref; _ = flags;
-    return DI_OK; // zero devices
+    return DI_OK; // action mapping not implemented
 }
 
 const g_di8_vtbl = WinsDirectInput8Vtbl{
@@ -5216,7 +5513,7 @@ const g_di8_vtbl = WinsDirectInput8Vtbl{
     .Release = &di8_Release,
     .CreateDevice = &di8_CreateDevice,
     .EnumDevices = &di8_EnumDevices,
-    .GetDeviceInfo = &di8_GetDeviceInfo,
+    .GetDeviceStatus = &di8_GetDeviceStatus,
     .RunControlPanel = &di8_RunControlPanel,
     .Initialize = &di8_Initialize,
     .FindDevice = &di8_FindDevice,
@@ -5583,13 +5880,10 @@ fn resolveImport(dll: []const u8, name: []const u8) ?*const anyopaque {
     } else if (std.ascii.eqlIgnoreCase(dll, "winmm.dll") or std.ascii.eqlIgnoreCase(dll, "winmm")) {
         if (std.mem.eql(u8, name, "timeGetTime")) return @ptrCast(&timeGetTime);
         if (msvcrt_mod.lookupWinmm(name)) |addr| return @ptrFromInt(addr);
-    } else if (std.ascii.eqlIgnoreCase(dll, "xinput1_3.dll") or std.ascii.eqlIgnoreCase(dll, "xinput1_2.dll") or
-        std.ascii.eqlIgnoreCase(dll, "xinput9_1_0.dll"))
+    } else if (std.ascii.eqlIgnoreCase(dll, "xinput1_3.dll") or std.ascii.eqlIgnoreCase(dll, "xinput1_4.dll") or
+        std.ascii.eqlIgnoreCase(dll, "xinput1_2.dll") or std.ascii.eqlIgnoreCase(dll, "xinput9_1_0.dll"))
     {
-        // FalloutNV imports XINPUT1_3 by ordinal; winrun_ordinals maps
-        // ord2/ord3 to XInputGetState/XInputSetState, both implemented in
-        // winrun_directx.zig, which is not otherwise reachable from this loader.
-        if (msvcrt_mod.lookupXinput(name)) |addr| return @ptrFromInt(addr);
+        if (xinput_mod.lookupXinput(name)) |addr| return @ptrFromInt(addr);
     } else if (std.ascii.eqlIgnoreCase(dll, "dinput8.dll") or std.ascii.eqlIgnoreCase(dll, "dinput8")) {
         if (std.mem.eql(u8, name, "DirectInput8Create")) return @ptrCast(&DirectInput8Create);
     } else if (std.ascii.eqlIgnoreCase(dll, "comctl32.dll") or std.ascii.eqlIgnoreCase(dll, "comctl32")) {
@@ -5695,8 +5989,34 @@ fn msvcrtDll(dll: []const u8) bool {
         std.ascii.endsWithIgnoreCase(dll, "ucrtbase");
 }
 
+fn dllNameForHandle(hModule: usize) ?[]const u8 {
+    return switch (hModule) {
+        0x72500000 => "xinput1_3.dll",
+        0x73F10000 => "dsound.dll",
+        0x773D0000 => "comctl32.dll",
+        0x72200000 => "dinput8.dll",
+        0x7C800000 => "kernel32.dll",
+        0x77E00000 => "user32.dll",
+        else => null,
+    };
+}
+
 fn GetProcAddress(hModule: usize, lpProcName: ?[*:0]const u8) callconv(W) ?*const anyopaque {
     if (lpProcName) |name| {
+        const raw = @intFromPtr(name);
+        if (raw <= 0xFFFF) {
+            const ord: u16 = @intCast(raw);
+            if (dllNameForHandle(hModule)) |dll| {
+                if (ordinals_mod.getOrdinalName(dll, ord)) |ord_name| {
+                    if (resolveImport(dll, ord_name)) |fn_ptr| {
+                        std.debug.print("[WINS:Kernel32] GetProcAddress(0x{x}, #{d} -> \"{s}\") -> 0x{x:0>8}\n", .{ hModule, ord, ord_name, @intFromPtr(fn_ptr) });
+                        return fn_ptr;
+                    }
+                }
+            }
+            g_last_error = 127; // ERROR_PROC_NOT_FOUND
+            return null;
+        }
         const slice = std.mem.sliceTo(name, 0);
 
         // steamclient.dll exports CreateInterface — handle before generic search
@@ -5705,19 +6025,23 @@ fn GetProcAddress(hModule: usize, lpProcName: ?[*:0]const u8) callconv(W) ?*cons
             return @ptrCast(&steamclient_CreateInterface);
         }
 
-        const res = resolveImport("kernel32.dll", slice) orelse
+        const mod_hit = if (dllNameForHandle(hModule)) |dll| resolveImport(dll, slice) else null;
+        const res = mod_hit orelse
+            resolveImport("kernel32.dll", slice) orelse
             resolveImport("user32.dll", slice) orelse
             resolveImport("steam_api.dll", slice) orelse
             resolveImport("steamclient.dll", slice) orelse
             resolveImport("binkw32.dll", slice) orelse
             resolveImport("d3d9.dll", slice) orelse
             resolveImport("d3dx9_38.dll", slice) orelse
+            resolveImport("dsound.dll", slice) orelse
+            resolveImport("xinput1_3.dll", slice) orelse
+            resolveImport("dinput8.dll", slice) orelse
             resolveImport("advapi32.dll", slice) orelse
             resolveImport("ole32.dll", slice) orelse
             resolveImport("shell32.dll", slice) orelse
             resolveImport("gdi32.dll", slice) orelse
             resolveImport("winmm.dll", slice) orelse
-            resolveImport("dinput8.dll", slice) orelse
             resolveImport("comctl32.dll", slice) orelse
             resolveImport("ntdll.dll", slice) orelse
             resolveImport("psapi.dll", slice) orelse
@@ -6213,6 +6537,10 @@ pub fn main(init: std.process.Init) !void {
                                     resolved_imports += 1;
                                 }
                             }
+                        } else if (ordinals_mod.getOrdinalName(dll_name, @truncate(val))) |ord_name| {
+                            if (resolveImport(dll_name, ord_name) != null) {
+                                resolved_imports += 1;
+                            }
                         }
                     }
                 }
@@ -6330,6 +6658,12 @@ pub fn main(init: std.process.Init) !void {
     kernel32_mod.setImageBase(@intCast(image_base));
     // Give the module's VirtualFree a way to prove ownership before it unmaps.
     kernel32_mod.release_hook = releaseOwnedBlock;
+    // DirectSound offset/stop notifications wake Win32 events via winrun_threads.
+    dsound_mod.notify_signal_fn = struct {
+        fn signal(h: usize) void {
+            _ = threads_mod.setEvent(h);
+        }
+    }.signal;
     msvcrt_mod.setArgs(guest_args.items);
     kernel32_mod.setCommandLine(guest_args.items);
     setGuestCommandLine(guest_args.items);
@@ -6580,7 +6914,18 @@ test "DirectInput8Create returns DI_OK with a real object, not NULL" {
     const di8: *WinsDirectInput8 = @ptrCast(@alignCast(obj.?));
     try std.testing.expectEqual(@as(u32, 2), di8.vtbl.AddRef(di8));
     try std.testing.expectEqual(@as(u32, 1), di8.vtbl.Release(di8));
-    try std.testing.expectEqual(@as(i32, 0), di8.vtbl.EnumDevices(di8, 0, null, null, 0));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80070057))), di8.vtbl.EnumDevices(di8, 0, null, null, 0)); // DIERR_INVALIDPARAM
+    var enum_count: u32 = 0;
+    const enum_cb = struct {
+        fn f(inst: *const anyopaque, ref: ?*anyopaque) callconv(W) i32 {
+            _ = inst;
+            const c: *u32 = @ptrCast(@alignCast(ref.?));
+            c.* += 1;
+            return 1;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i32, 0), di8.vtbl.EnumDevices(di8, 0, @constCast(@ptrCast(&enum_cb)), &enum_count, 0));
+    try std.testing.expect(enum_count >= 2);
     var dev: ?*anyopaque = null;
     try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80004003))), di8.vtbl.CreateDevice(di8, null, &dev, null)); // E_POINTER
     try std.testing.expect(dev == null);
@@ -6588,6 +6933,8 @@ test "DirectInput8Create returns DI_OK with a real object, not NULL" {
     try std.testing.expectEqual(@as(i32, 0), di8.vtbl.CreateDevice(di8, &sys_keyboard, &dev, null));
     try std.testing.expect(dev != null);
     const joystick = [16]u8{ 0x99, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 };
+    try std.testing.expectEqual(@as(i32, 0), di8.vtbl.GetDeviceStatus(di8, &sys_keyboard));
+    try std.testing.expectEqual(@as(i32, 1), di8.vtbl.GetDeviceStatus(di8, &joystick));
     var dev2: ?*anyopaque = null;
     try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040154))), di8.vtbl.CreateDevice(di8, &joystick, &dev2, null)); // DIERR_DEVICENOTREG
     try std.testing.expect(dev2 == null);
@@ -6873,4 +7220,196 @@ test "CoCreateInstance: unregistered classes fail and never hand out NULL as suc
     try std.testing.expect(hr < 0);
     try std.testing.expectEqual(REGDB_E_CLASSNOTREG, hr);
     try std.testing.expect(out == null);
+}
+
+test "steam kindForVersion dispatches UserStats, Apps, Friends before User" {
+    try std.testing.expectEqual(SubUserStats, kindForVersion("STEAMUSERSTATS_INTERFACE_VERSION007"));
+    try std.testing.expectEqual(SubUserStats, kindForVersion("SteamUserStats011"));
+    try std.testing.expectEqual(SubApps, kindForVersion("STEAMAPPS_INTERFACE_VERSION003"));
+    try std.testing.expectEqual(SubApps, kindForVersion("SteamApps008"));
+    try std.testing.expectEqual(SubFriends, kindForVersion("SteamFriends005"));
+    try std.testing.expectEqual(SubFriends, kindForVersion("SteamFriends014"));
+    try std.testing.expectEqual(SubUtils, kindForVersion("SteamUtils005"));
+    try std.testing.expectEqual(SubUser, kindForVersion("SteamUser016"));
+    try std.testing.expectEqual(SubAppTicket, kindForVersion("STEAMAPPTICKET_INTERFACE_VERSION001"));
+    try std.testing.expectEqual(SubGeneric, kindForVersion("UnknownInterface001"));
+}
+
+test "steam sub-interface thunks bridge MSVC thiscall to aligned SysV cdecl across bool, u32, u64, sret8" {
+    const Mock = struct {
+        const RealObj = extern struct {
+            vt: [*]const usize,
+            tag: u32,
+        };
+        var void_sum: u32 = 0;
+
+        // UserStats[0]: RequestCurrentStats() -> bool with dirty upper 24 bits in EAX
+        fn realRequestCurrentStats(self_ptr: *const RealObj) callconv(Cc) u32 {
+            if (self_ptr.tag != 0xCAFEBABE) return 0;
+            return 0x12345601; // AL == 1, upper bytes dirty -> bool_ret must mask to 1
+        }
+        // UserStats[7]: SetAchievement(const char*) -> bool
+        fn realSetAchievement(self_ptr: *const RealObj, name: [*:0]const u8) callconv(Cc) u32 {
+            if (self_ptr.tag != 0xCAFEBABE) return 0;
+            return if (std.mem.eql(u8, std.mem.sliceTo(name, 0), "ACH_TEST")) 1 else 0;
+        }
+        // UserStats[10]: StoreStats() -> bool 0
+        fn realStoreStats(self_ptr: *const RealObj) callconv(Cc) u32 {
+            _ = self_ptr;
+            return 0xABCDEF00; // AL == 0 -> bool_ret must mask to 0
+        }
+        // UserStats[26]: DownloadLeaderboardEntries(u64, enum, int, int) -> u64 SteamAPICall_t
+        fn realDownloadLb(self_ptr: *const RealObj, lb: u64, req: u32, rstart: i32, rend: i32) callconv(Cc) u64 {
+            if (self_ptr.tag != 0xCAFEBABE) return 0;
+            if (lb != 0x11223344_55667788 or req != 2 or rstart != -5 or rend != 10) return 0;
+            return 0xFEDCBA98_76543210;
+        }
+        // UserStats[27]: GetDownloadedLeaderboardEntry(u64, int, ptr, ptr, int) -> bool
+        fn realGetLbEntry(self_ptr: *const RealObj, entries: u64, idx: i32, p_entry: *u32, p_det: *i32, cmax: i32) callconv(Cc) u32 {
+            if (self_ptr.tag != 0xCAFEBABE) return 0;
+            if (entries != 0xAABBCCDD_11223344 or idx != 3 or cmax != 16) return 0;
+            p_entry.* = 42;
+            p_det.* = -7;
+            return 1;
+        }
+        // Apps[4]: GetCurrentGameLanguage() -> const char*
+        fn realGetLang(self_ptr: *const RealObj) callconv(Cc) [*:0]const u8 {
+            return if (self_ptr.tag == 0xB00BFACE) "spanish" else "bad";
+        }
+        // Apps[7]: BIsDlcInstalled(AppId_t) -> bool
+        fn realIsDlcInstalled(self_ptr: *const RealObj, appid: u32) callconv(Cc) u32 {
+            return if (self_ptr.tag == 0xB00BFACE and appid == 72730) 1 else 0;
+        }
+        // Friends[4]: SysV sret `ret $4` taking (out_sret, this, iFriend, iFlags)
+        fn realGetFriendByIndexNaked() callconv(.naked) void {
+            asm volatile (
+                \\ movl 4(%esp), %eax
+                \\ movl 8(%esp), %ecx
+                \\ movl 4(%ecx), %edx
+                \\ cmpl $0xD00DFEED, %edx
+                \\ jne 1f
+                \\ movl 12(%esp), %edx
+                \\ movl %edx, (%eax)
+                \\ movl 16(%esp), %edx
+                \\ movl %edx, 4(%eax)
+                \\ ret $4
+                \\ 1:
+                \\ movl $0, (%eax)
+                \\ movl $0, 4(%eax)
+                \\ ret $4
+            );
+        }
+        // Friends[8]: GetFriendAvatar(CSteamID, int eAvatar) -> u32
+        fn realGetFriendAvatar(self_ptr: *const RealObj, sid: u64, avatar: i32) callconv(Cc) u32 {
+            if (self_ptr.tag != 0xD00DFEED) return 0;
+            return if (sid == 0x01100001_00001234 and avatar == 1) 77 else 0;
+        }
+        // Friends[17]: IsUserInSource(CSteamID, CSteamID) -> bool
+        fn realIsUserInSource(self_ptr: *const RealObj, user: u64, src: u64) callconv(Cc) u32 {
+            if (self_ptr.tag != 0xD00DFEED) return 0;
+            return if (user == 0x01020304_05060708 and src == 0x11121314_15161718) 1 else 0;
+        }
+        // Friends[18]: SetInGameVoiceSpeaking(CSteamID, bool) -> void
+        fn realVoiceSpeaking(self_ptr: *const RealObj, sid: u64, speaking: u32) callconv(Cc) void {
+            if (self_ptr.tag == 0xD00DFEED and sid == 0x01100001_00001234 and (speaking & 0xff) == 1) {
+                void_sum = 0x55AA;
+            }
+        }
+    };
+
+    // Check strict 16-byte stack alignment inside callAlignedU64 callee for 0..7 args
+    const AlignProbe = struct {
+        fn probe() callconv(.naked) void {
+            // At callee entry after `call`: ESP % 16 MUST be 12 (ret addr pushed on 16-aligned ESP).
+            asm volatile (
+                \\ movl %esp, %eax
+                \\ andl $15, %eax
+                \\ xorl %edx, %edx
+                \\ ret
+            );
+        }
+    };
+    var probe_args: [7]usize = .{ 1, 2, 3, 4, 5, 6, 7 };
+    inline for (0..8) |argc| {
+        const mod16: u32 = @truncate(callAlignedU64(@intFromPtr(&AlignProbe.probe), probe_args[0..argc]));
+        try std.testing.expectEqual(@as(u32, 12), mod16);
+    }
+
+    var us_vt = [_]usize{0} ** 30;
+    us_vt[0] = @intFromPtr(&Mock.realRequestCurrentStats);
+    us_vt[7] = @intFromPtr(&Mock.realSetAchievement);
+    us_vt[10] = @intFromPtr(&Mock.realStoreStats);
+    us_vt[26] = @intFromPtr(&Mock.realDownloadLb);
+    us_vt[27] = @intFromPtr(&Mock.realGetLbEntry);
+    var real_us = Mock.RealObj{ .vt = &us_vt, .tag = 0xCAFEBABE };
+
+    var apps_vt = [_]usize{0} ** 8;
+    apps_vt[4] = @intFromPtr(&Mock.realGetLang);
+    apps_vt[7] = @intFromPtr(&Mock.realIsDlcInstalled);
+    var real_apps = Mock.RealObj{ .vt = &apps_vt, .tag = 0xB00BFACE };
+
+    var fr_vt = [_]usize{0} ** 24;
+    fr_vt[4] = @intFromPtr(&Mock.realGetFriendByIndexNaked);
+    fr_vt[8] = @intFromPtr(&Mock.realGetFriendAvatar);
+    fr_vt[17] = @intFromPtr(&Mock.realIsUserInSource);
+    fr_vt[18] = @intFromPtr(&Mock.realVoiceSpeaking);
+    var real_fr = Mock.RealObj{ .vt = &fr_vt, .tag = 0xD00DFEED };
+
+    const a_us = wrapSubKind(SubUserStats, @intFromPtr(&real_us));
+    const a_apps = wrapSubKind(SubApps, @intFromPtr(&real_apps));
+    const a_fr = wrapSubKind(SubFriends, @intFromPtr(&real_fr));
+    try std.testing.expect(a_us != @intFromPtr(&real_us));
+    try std.testing.expect(a_apps != @intFromPtr(&real_apps));
+    try std.testing.expect(a_fr != @intFromPtr(&real_fr));
+
+    // Confirm UserStats slot thunks (0, 7, 10, 26, 27) via MSVC thiscall function pointers
+    const us_vtbl: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(a_us)).*);
+    const fnReq: *const fn (usize) callconv(Tc) u32 = @ptrFromInt(us_vtbl[0]);
+    try std.testing.expectEqual(@as(u32, 1), fnReq(a_us));
+    const fnSetAch: *const fn (usize, [*:0]const u8) callconv(Tc) u32 = @ptrFromInt(us_vtbl[7]);
+    try std.testing.expectEqual(@as(u32, 1), fnSetAch(a_us, "ACH_TEST"));
+    try std.testing.expectEqual(@as(u32, 0), fnSetAch(a_us, "OTHER"));
+    const fnStore: *const fn (usize) callconv(Tc) u32 = @ptrFromInt(us_vtbl[10]);
+    try std.testing.expectEqual(@as(u32, 0), fnStore(a_us));
+
+    const fnDl: *const fn (usize, u32, u32, u32, i32, i32) callconv(Tc) u64 = @ptrFromInt(us_vtbl[26]);
+    const lb_val: u64 = 0x11223344_55667788;
+    try std.testing.expectEqual(@as(u64, 0xFEDCBA98_76543210), fnDl(a_us, @truncate(lb_val), @truncate(lb_val >> 32), 2, -5, 10));
+
+    const fnEntry: *const fn (usize, u32, u32, i32, *u32, *i32, i32) callconv(Tc) u32 = @ptrFromInt(us_vtbl[27]);
+    var out_entry: u32 = 0;
+    var out_det: i32 = 0;
+    const entries_h: u64 = 0xAABBCCDD_11223344;
+    try std.testing.expectEqual(@as(u32, 1), fnEntry(a_us, @truncate(entries_h), @truncate(entries_h >> 32), 3, &out_entry, &out_det, 16));
+    try std.testing.expectEqual(@as(u32, 42), out_entry);
+    try std.testing.expectEqual(@as(i32, -7), out_det);
+
+    // Confirm Apps slot thunks (4, 7)
+    const apps_vtbl: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(a_apps)).*);
+    const fnLang: *const fn (usize) callconv(Tc) [*:0]const u8 = @ptrFromInt(apps_vtbl[4]);
+    try std.testing.expectEqualStrings("spanish", std.mem.sliceTo(fnLang(a_apps), 0));
+    const fnDlc: *const fn (usize, u32) callconv(Tc) u32 = @ptrFromInt(apps_vtbl[7]);
+    try std.testing.expectEqual(@as(u32, 1), fnDlc(a_apps, 72730));
+    try std.testing.expectEqual(@as(u32, 0), fnDlc(a_apps, 12345));
+
+    // Confirm Friends slot thunks (4 sret8 `ret $4`, 8 3-dword avatar, 17 4-dword two CSteamIDs, 18 void)
+    const fr_vtbl: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(a_fr)).*);
+    const fnByIdx: *const fn (usize, *u64, i32, i32) callconv(Tc) usize = @ptrFromInt(fr_vtbl[4]);
+    var sret_sid: u64 = 0;
+    try std.testing.expectEqual(@intFromPtr(&sret_sid), fnByIdx(a_fr, &sret_sid, 0x11223344, 0x55667788));
+    try std.testing.expectEqual(@as(u64, 0x55667788_11223344), sret_sid);
+
+    const fnAv: *const fn (usize, u32, u32, i32) callconv(Tc) u32 = @ptrFromInt(fr_vtbl[8]);
+    const fsid: u64 = 0x01100001_00001234;
+    try std.testing.expectEqual(@as(u32, 77), fnAv(a_fr, @truncate(fsid), @truncate(fsid >> 32), 1));
+
+    const fnInSrc: *const fn (usize, u32, u32, u32, u32) callconv(Tc) u32 = @ptrFromInt(fr_vtbl[17]);
+    const src_user: u64 = 0x01020304_05060708;
+    const src_clan: u64 = 0x11121314_15161718;
+    try std.testing.expectEqual(@as(u32, 1), fnInSrc(a_fr, @truncate(src_user), @truncate(src_user >> 32), @truncate(src_clan), @truncate(src_clan >> 32)));
+
+    Mock.void_sum = 0;
+    const fnVoice: *const fn (usize, u32, u32, u32) callconv(Tc) void = @ptrFromInt(fr_vtbl[18]);
+    fnVoice(a_fr, @truncate(fsid), @truncate(fsid >> 32), 1);
+    try std.testing.expectEqual(@as(u32, 0x55AA), Mock.void_sum);
 }

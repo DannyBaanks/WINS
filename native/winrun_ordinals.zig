@@ -122,8 +122,8 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
     // (DirectX redistributable xinput1_3.dll, and Proton's dsound.dll), not from
     // memory: both use ordinal base 1, so ordinal 2 in XINPUT1_3 really is
     // XInputGetState, and ordinal 11 in DSOUND really is DirectSoundCreate8.
-    if (std.ascii.eqlIgnoreCase(dll, "xinput1_3.dll") or std.ascii.eqlIgnoreCase(dll, "xinput1_2.dll") or
-        std.ascii.eqlIgnoreCase(dll, "xinput9_1_0.dll"))
+    if (std.ascii.eqlIgnoreCase(dll, "xinput1_3.dll") or std.ascii.eqlIgnoreCase(dll, "xinput1_4.dll") or
+        std.ascii.eqlIgnoreCase(dll, "xinput1_2.dll") or std.ascii.eqlIgnoreCase(dll, "xinput9_1_0.dll"))
     {
         return switch (ord) {
             2 => "XInputGetState",
@@ -133,6 +133,7 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
             6 => "XInputGetDSoundAudioDeviceGuids",
             7 => "XInputGetBatteryInformation",
             8 => "XInputGetKeystroke",
+            100 => "XInputGetStateEx",
             else => null,
         };
     }

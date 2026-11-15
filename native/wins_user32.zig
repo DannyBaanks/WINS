@@ -2024,6 +2024,7 @@ pub fn WaitMessage() callconv(W) i32 {
 
 /// Key state for GetKeyState/GetAsyncKeyState, indexed by virtual key.
 var g_vk_down: [256]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** 256;
+var g_vk_pressed_since: [256]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** 256;
 /// Character the host layout produced for the last key-down of each scan
 /// code (index: scan | extended << 8); 0 = none (TranslateMessage then makes
 /// no WM_CHAR, as for arrows or F-keys on Windows).
@@ -2039,6 +2040,7 @@ pub fn hostKey(vk: u8, scan: u8, extended: bool, down: bool, ch: u8) void {
     if (vk == 0) return;
     const was = g_vk_down[vk].swap(down, .monotonic);
     if (!down and !was) return;
+    if (down and !was) g_vk_pressed_since[vk].store(true, .monotonic);
     const generic: u8 = switch (vk) {
         0xA0, 0xA1 => VK_SHIFT,
         0xA2, 0xA3 => VK_CONTROL,
@@ -2047,7 +2049,9 @@ pub fn hostKey(vk: u8, scan: u8, extended: bool, down: bool, ch: u8) void {
     };
     if (generic != 0) {
         const other: u8 = vk ^ 1;
-        g_vk_down[generic].store(down or g_vk_down[other].load(.monotonic), .monotonic);
+        const g_down = down or g_vk_down[other].load(.monotonic);
+        const g_was = g_vk_down[generic].swap(g_down, .monotonic);
+        if (g_down and !g_was) g_vk_pressed_since[generic].store(true, .monotonic);
     }
     const key_index: usize = @as(usize, scan) | (@as(usize, @intFromBool(extended)) << 8);
     if (down) g_char_for_scan[key_index].store(ch, .monotonic);
@@ -2099,7 +2103,11 @@ pub fn GetKeyState(vk: i32) callconv(W) i16 {
 }
 
 pub fn GetAsyncKeyState(vk: i32) callconv(W) i16 {
-    return GetKeyState(vk);
+    if (vk < 0 or vk > 255) return 0;
+    const u: usize = @intCast(vk);
+    var res: u16 = if (g_vk_down[u].load(.monotonic)) 0x8000 else 0;
+    if (g_vk_pressed_since[u].swap(false, .monotonic)) res |= 0x0001;
+    return @bitCast(res);
 }
 
 pub fn DispatchMessageA(lpMsg: ?*const MSG) callconv(W) usize {
@@ -2251,5 +2259,10 @@ test "host keys: GetKeyState follows down/up, left/right Shift feed VK_SHIFT, no
     try std.testing.expect(GetAsyncKeyState('A') < 0);
     hostKey('A', 0x1E, false, false, 0);
     try std.testing.expectEqual(@as(i16, 0), GetAsyncKeyState('A'));
+    // Fast tap (down+up before GetAsyncKeyState) still sets bit 0 once.
+    hostKey(0x09, 0x0F, false, true, '\t');
+    hostKey(0x09, 0x0F, false, false, 0);
+    try std.testing.expectEqual(@as(i16, 1), GetAsyncKeyState(0x09));
+    try std.testing.expectEqual(@as(i16, 0), GetAsyncKeyState(0x09));
     try std.testing.expectEqual(@as(i16, 0), GetKeyState(-1));
 }

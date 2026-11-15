@@ -779,7 +779,7 @@ pub fn translate(a: std.mem.Allocator, tokens: []const u32, link_in: []const Usa
     if (ctx.indent != 1) return error.Malformed;
 
     const p: []const u8 = if (ctx.is_pixel) "ps" else "vs";
-    try ctx.head("#version 120\n", .{});
+    try ctx.head("#version 130\n", .{});
     if (ctx.is_pixel) try ctx.head("#extension GL_ARB_shader_texture_lod : enable\n", .{});
     const const_count: u16 = if (ctx.const_rel) (if (ctx.is_pixel) 224 else 256) else ctx.const_max;
     if (const_count != 0) try ctx.head("uniform vec4 {s}_c[{d}];\n", .{ p, const_count });
@@ -788,6 +788,8 @@ pub fn translate(a: std.mem.Allocator, tokens: []const u32, link_in: []const Usa
 
     if (!ctx.is_pixel) {
         try ctx.head("uniform vec2 wins_half_pixel;\n", .{});
+        try ctx.head("uniform vec4 wins_clip[8];\n", .{});
+        try ctx.head("uniform int wins_clip_mask;\n", .{});
         for (ctx.inputs.items) |in| try ctx.head("attribute vec4 v{d};\n", .{in.reg});
         // Declare the union of what this shader writes and what the pixel shader reads.
         for (link_in) |u| try ctx.noteVarying(u);
@@ -840,9 +842,23 @@ pub fn translate(a: std.mem.Allocator, tokens: []const u32, link_in: []const Usa
     }
     ctx.out.appendSlice(ctx.arena, ctx.body.items) catch return error.OutOfMemory;
     if (!ctx.is_pixel) {
-        // Direct3D 9 puts pixel centres on integer coordinates, OpenGL on
-        // half-integers: move the geometry by half a pixel.
-        try ctx.head("    gl_Position = oPos;\n    gl_Position.xy += wins_half_pixel * gl_Position.w;\n", .{});
+        // User clip planes in programmable vertex shaders are evaluated in clip space
+        // on oPos before the half-pixel screen alignment offset.
+        try ctx.head(
+            \\    if (wins_clip_mask != 0) {{
+            \\        gl_ClipDistance[0] = dot(oPos, wins_clip[0]);
+            \\        gl_ClipDistance[1] = dot(oPos, wins_clip[1]);
+            \\        gl_ClipDistance[2] = dot(oPos, wins_clip[2]);
+            \\        gl_ClipDistance[3] = dot(oPos, wins_clip[3]);
+            \\        gl_ClipDistance[4] = dot(oPos, wins_clip[4]);
+            \\        gl_ClipDistance[5] = dot(oPos, wins_clip[5]);
+            \\        gl_ClipDistance[6] = dot(oPos, wins_clip[6]);
+            \\        gl_ClipDistance[7] = dot(oPos, wins_clip[7]);
+            \\    }}
+            \\    gl_Position = oPos;
+            \\    gl_Position.xy += wins_half_pixel * gl_Position.w;
+            \\
+        , .{});
         if (ctx.uses_psize) try ctx.head("    gl_PointSize = oPts.x;\n", .{});
     } else {
         for (ctx.color_out, 0..) |used, i| {
@@ -922,4 +938,13 @@ test "unsupported shaders are refused, not guessed" {
     try std.testing.expectError(error.Unsupported, translate(std.testing.allocator, &ps11, &.{}));
     const truncated = [_]u32{ 0xfffe0200, 0x02000001, 0x800f0000 };
     try std.testing.expectError(error.Malformed, translate(std.testing.allocator, &truncated, &.{}));
+}
+
+test "vertex shaders emit #version 130 clip uniforms and gl_ClipDistance assignment" {
+    var t = try translate(std.testing.allocator, &test_vs_menu, &.{});
+    defer t.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, t.glsl, "#version 130") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t.glsl, "uniform vec4 wins_clip[8];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t.glsl, "uniform int wins_clip_mask;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t.glsl, "gl_ClipDistance[0] = dot(oPos, wins_clip[0]);") != null);
 }

@@ -3097,41 +3097,6 @@ fn wcsstr(h: ?[*:0]const u16, n: ?[*:0]const u16) callconv(C) ?[*]u16 {
 // 12. Lookup Dispatch Table
 // ============================================================================
 
-/// XInput9/10/13 shims. Ordinals 2 and 3 of XINPUT1_3 (derived from the real
-/// DLL's export table) are XInputGetState and XInputSetState.
-///
-/// No gamepad is modelled, so the honest answer is ERROR_DEVICE_NOT_CONNECTED
-/// (1167), which is what Windows also returns with no controller and what makes
-/// the game fall back to keyboard/mouse. A zeroed "connected" state would make
-/// the game sit still in its menus believing a stick was centred at 0.
-pub fn lookupXinput(name: []const u8) ?usize {
-    if (std.mem.eql(u8, name, "XInputGetState")) return @intFromPtr(&XInputGetState);
-    if (std.mem.eql(u8, name, "XInputSetState")) return @intFromPtr(&XInputSetState);
-    if (std.mem.eql(u8, name, "XInputGetCapabilities")) return @intFromPtr(&XInputGetCapabilities);
-    if (std.mem.eql(u8, name, "XInputEnable")) return @intFromPtr(&XInputEnable);
-    return null;
-}
-
-fn XInputGetState(dwUserIndex: u32, pState: ?*anyopaque) callconv(C) u32 {
-    _ = dwUserIndex;
-    if (pState) |p| @memset(@as([*]u8, @ptrCast(p))[0..12], 0);
-    return 1167; // ERROR_DEVICE_NOT_CONNECTED
-}
-
-fn XInputSetState(dwUserIndex: u32, pVibration: ?*const anyopaque) callconv(C) u32 {
-    _ = dwUserIndex; _ = pVibration;
-    return 1167; // ERROR_DEVICE_NOT_CONNECTED
-}
-
-fn XInputGetCapabilities(dwUserIndex: u32, dwFlags: u32, pCapabilities: ?*anyopaque) callconv(C) u32 {
-    _ = dwUserIndex; _ = dwFlags; _ = pCapabilities;
-    return 1167; // ERROR_DEVICE_NOT_CONNECTED
-}
-
-fn XInputEnable(enable: u32) callconv(C) void {
-    _ = enable;
-}
-
 /// winmm's mmio*: unbuffered RIFF file I/O. A file is read either through the
 /// caller's own I/O procedure (MMIOINFO.pIOProc -- FalloutNV reads its .wav
 /// effects out of the .bsa archives this way, IOProc 0xaf0400) or, without one,

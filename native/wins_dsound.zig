@@ -23,14 +23,11 @@
 //!
 //! What is NOT implemented, deliberately and visibly:
 //!   - capture: the DirectSoundCapture* entry points report DSERR_NODRIVER;
-//!   - IDirectSoundNotify and any other interface than the ones above are refused
-//!     through QueryInterface with E_NOINTERFACE (it matches exact IIDs, not a
-//!     GUID prefix), rather than handing back an object whose vtable would not
-//!     match what the caller is about to call;
-//!   - IDirectSound8::Initialize, DuplicateSoundBuffer and SetFX (effects) answer
-//!     E_NOTIMPL; there is no EAX or reverb, and caps report software mixing only;
-//!   - 3D positioning is inverse-distance attenuation plus left/right panning from
-//!     the listener's orientation: no Doppler, no sound cones, no HRTF;
+//!   - IDirectSound8::Initialize and SetFX (effects) answer E_NOTIMPL; there is
+//!     no EAX or reverb, caps report software mixing only, and
+//!     IDirectSoundNotify requires DSBCAPS_CTRLPOSITIONNOTIFY;
+//!   - 3D positioning models inverse-distance rolloff, stereo panning, sound
+//!     cones, and Doppler pitch shift, without HRTF;
 //!   - with no host sound server the mixer says so and playback stays silent.
 
 const std = @import("std");
@@ -48,6 +45,7 @@ pub const E_OUTOFMEMORY: HRESULT = -2147024882; // 0x8007000E
 pub const E_NOTIMPL: HRESULT = -2147467263; // 0x80004001
 pub const DSERR_NODRIVER: HRESULT = -2004287368; // 0x88780078
 pub const DSERR_INVALIDCALL: HRESULT = -2004287328; // 0x887800A0
+const DSERR_INVALIDCALL_DX: HRESULT = @bitCast(@as(u32, 0x88780032)); // MAKE_DSHRESULT(50)
 pub const DSERR_UNSUPPORTED: HRESULT = -2004287314; // 0x887800AE
 
 // DSBCAPS
@@ -163,11 +161,38 @@ pub const DSCAPS = extern struct {
 // Sound buffer object (IDirectSoundBuffer8)
 // ---------------------------------------------------------------------------
 
+pub const DSBPOSITIONNOTIFY = extern struct {
+    dwOffset: u32,
+    hEventNotify: usize,
+};
+pub const DSBPN_OFFSETSTOP: u32 = 0xFFFFFFFF;
+
+const Backing = struct {
+    refs: u32,
+    ptr: [*]u8,
+    len: u32,
+};
+
+pub const NotifyVtbl = extern struct {
+    QueryInterface: *const fn (*anyopaque, ?*const Guid, ?*?*anyopaque) callconv(W) HRESULT,
+    AddRef: *const fn (*anyopaque) callconv(W) u32,
+    Release: *const fn (*anyopaque) callconv(W) u32,
+    SetNotificationPositions: *const fn (*anyopaque, u32, ?[*]const DSBPOSITIONNOTIFY) callconv(W) HRESULT,
+};
+
+pub const SubNotify = extern struct {
+    vtbl: ?*const NotifyVtbl,
+    owner: ?*Buffer,
+    entries: ?[*]DSBPOSITIONNOTIFY,
+    count: u32,
+};
+
 pub const Buffer = extern struct {
     vtbl: *const BufferVtbl,
     refs: u32,
     buf_ptr: ?[*]u8,
     buf_len: u32,
+    backing: ?*Backing,
     wfx: WAVEFORMATEX,
     flags: u32,
     volume: i32,
@@ -182,14 +207,22 @@ pub const Buffer = extern struct {
     /// (secondary buffers created with DSBCAPS_CTRL3D): a second interface
     /// of the same object, sharing its reference count.
     i3d: Sub3D,
+    /// IDirectSoundNotify (secondary buffers created with DSBCAPS_CTRLPOSITIONNOTIFY).
+    notify: SubNotify,
+    notify_cursor: u32,
+    notify_armed: bool,
+    notify_total: u64,
     /// Mixer read head, in source frames; `mix_restart` asks the mixer to
     /// take it from the play cursor (Play, SetCurrentPosition).
     mix_frame: f64,
     mix_restart: bool,
 };
 
-/// The 3D interface of a buffer. Parameters are stored and answered as set;
-/// positional mixing is not done (there is no mixer output yet).
+pub var notify_signal_fn: ?*const fn (usize) void = null;
+
+const IID_IDirectSoundNotify = Guid{ .data1 = 0xB0210783, .data2 = 0x89CD, .data3 = 0x11D0, .data4 = .{ 0xAF, 0x08, 0x00, 0xA0, 0xC9, 0x25, 0xCD, 0x16 } };
+
+/// The 3D interface of a buffer. Parameters feed spatialization, cones, and Doppler.
 pub const Sub3D = extern struct {
     vtbl: ?*const anyopaque,
     owner: ?*Buffer,
@@ -399,6 +432,66 @@ const buffer3d_vtbl = [_]*const anyopaque{
 };
 
 /// DirectSound's defaults for a new listener / 3D buffer.
+fn notifyOwner(p: *anyopaque) ?*Buffer {
+    const s: *SubNotify = @ptrCast(@alignCast(p));
+    return s.owner;
+}
+fn notifyQueryInterface(p: *anyopaque, iid: ?*const Guid, out: ?*?*anyopaque) callconv(W) HRESULT {
+    const b = notifyOwner(p) orelse return E_INVALIDARG;
+    return bufQueryInterface(@ptrCast(b), iid, out);
+}
+fn notifyAddRef(p: *anyopaque) callconv(W) u32 {
+    const b = notifyOwner(p) orelse return 0;
+    return bufAddRef(@ptrCast(b));
+}
+fn notifyRelease(p: *anyopaque) callconv(W) u32 {
+    const b = notifyOwner(p) orelse return 0;
+    return bufRelease(@ptrCast(b));
+}
+fn notifySetNotificationPositions(p: *anyopaque, count: u32, descs: ?[*]const DSBPOSITIONNOTIFY) callconv(W) HRESULT {
+    const s: *SubNotify = @ptrCast(@alignCast(p));
+    const b = s.owner orelse return E_INVALIDARG;
+    if (count > 0 and descs == null) return E_INVALIDARG;
+    if (count > 4096) return E_INVALIDARG;
+    var fresh: ?[*]DSBPOSITIONNOTIFY = null;
+    if (count > 0) {
+        const mem = std.heap.page_allocator.alloc(DSBPOSITIONNOTIFY, count) catch return E_OUTOFMEMORY;
+        @memcpy(mem, descs.?[0..count]);
+        fresh = mem.ptr;
+    }
+    mixLock();
+    const old_ptr = s.entries;
+    const old_cnt = s.count;
+    s.entries = fresh;
+    s.count = count;
+    b.notify_armed = b.playing and count > 0;
+    const need_ticker = b.notify_armed;
+    mixUnlock();
+    if (old_ptr) |op| {
+        if (old_cnt > 0) std.heap.page_allocator.free(op[0..old_cnt]);
+    }
+    if (need_ticker) startNotifyTicker();
+    return S_OK;
+}
+
+const notify_vtbl = NotifyVtbl{
+    .QueryInterface = notifyQueryInterface,
+    .AddRef = notifyAddRef,
+    .Release = notifyRelease,
+    .SetNotificationPositions = notifySetNotificationPositions,
+};
+
+fn initNotify(b: *Buffer) void {
+    b.notify = .{
+        .vtbl = if (!b.primary and (b.flags & DSBCAPS_CTRLPOSITIONNOTIFY) != 0) &notify_vtbl else null,
+        .owner = b,
+        .entries = null,
+        .count = 0,
+    };
+    b.notify_cursor = 0;
+    b.notify_armed = false;
+}
+
 fn init3D(b: *Buffer) void {
     b.i3d = .{ .vtbl = null, .owner = b, .words = [_]u32{0} ** 15 };
     if (b.flags & DSBCAPS_CTRL3D == 0) return;
@@ -460,10 +553,36 @@ fn nowMs() i64 {
 }
 
 fn bufRate(self: *Buffer) u32 {
+    if (self.frequency != 0 and self.wfx.nBlockAlign != 0) return self.frequency * self.wfx.nBlockAlign;
     return if (self.wfx.nAvgBytesPerSec != 0) self.wfx.nAvgBytesPerSec else 44100 * 4;
 }
 
-fn bufCursor(self: *Buffer) u32 {
+const NotifyBatch = struct {
+    handles: [64]usize = [_]usize{0} ** 64,
+    count: usize = 0,
+
+    fn push(self: *NotifyBatch, h: usize) void {
+        if (h == 0 or self.count >= self.handles.len) return;
+        self.handles[self.count] = h;
+        self.count += 1;
+    }
+
+    fn flush(self: *const NotifyBatch) void {
+        const f = notify_signal_fn orelse return;
+        for (self.handles[0..self.count]) |h| f(h);
+    }
+};
+
+fn emitStopNotifiesLocked(self: *Buffer, batch: *NotifyBatch) void {
+    if (!self.notify_armed) return;
+    self.notify_armed = false;
+    const entries = self.notify.entries orelse return;
+    for (entries[0..self.notify.count]) |e| {
+        if (e.dwOffset == DSBPN_OFFSETSTOP) batch.push(e.hEventNotify);
+    }
+}
+
+fn stepBufferCursorLocked(self: *Buffer, batch: *NotifyBatch) u32 {
     const rate = bufRate(self);
     const len = bufBytes(self);
     if (len == 0) return 0;
@@ -471,14 +590,76 @@ fn bufCursor(self: *Buffer) u32 {
     const elapsed: i64 = nowMs() - self.start_ms;
     if (elapsed <= 0) return self.start_cursor % len;
     const advanced: u64 = @as(u64, @intCast(elapsed)) * @as(u64, rate) / 1000;
-    var pos: u64 = @as(u64, self.start_cursor) + advanced;
+    const len64: u64 = len;
+    const start64: u64 = self.start_cursor % len;
+    const prev_total = self.notify_total;
+    const pos: u64 = start64 + advanced;
+
     if (self.looping) {
-        pos %= len;
-    } else if (pos >= len) {
+        const cur: u32 = @intCast(pos % len64);
+        if (self.notify_armed and advanced > prev_total) {
+            if (self.notify.entries) |entries| {
+                const span = advanced - prev_total;
+                const prev_off: u32 = @intCast((start64 + prev_total) % len64);
+                for (entries[0..self.notify.count]) |e| {
+                    if (e.dwOffset == DSBPN_OFFSETSTOP or e.dwOffset >= len) continue;
+                    const hit = if (span >= len64)
+                        true
+                    else if (cur > prev_off)
+                        e.dwOffset > prev_off and e.dwOffset <= cur
+                    else if (cur < prev_off)
+                        e.dwOffset > prev_off or e.dwOffset <= cur
+                    else
+                        false;
+                    if (hit) batch.push(e.hEventNotify);
+                }
+            }
+        }
+        self.notify_total = advanced;
+        self.notify_cursor = cur;
+        return cur;
+    }
+
+    if (pos >= len64) {
+        if (self.notify_armed) {
+            const prev_off: u32 = @intCast(@min(len64, start64 + prev_total));
+            if (self.notify.entries) |entries| {
+                for (entries[0..self.notify.count]) |e| {
+                    if (e.dwOffset == DSBPN_OFFSETSTOP or e.dwOffset >= len) continue;
+                    if (e.dwOffset > prev_off) batch.push(e.hEventNotify);
+                }
+            }
+            emitStopNotifiesLocked(self, batch);
+        }
         self.playing = false;
+        self.start_cursor = len - 1;
+        self.notify_cursor = len - 1;
+        self.notify_total = len64 - start64;
         return len - 1;
     }
-    return @intCast(pos);
+
+    const cur: u32 = @intCast(pos);
+    if (self.notify_armed and advanced > prev_total) {
+        const prev_off: u32 = @intCast(@min(len64, start64 + prev_total));
+        if (self.notify.entries) |entries| {
+            for (entries[0..self.notify.count]) |e| {
+                if (e.dwOffset == DSBPN_OFFSETSTOP or e.dwOffset >= len) continue;
+                if (e.dwOffset > prev_off and e.dwOffset <= cur) batch.push(e.hEventNotify);
+            }
+        }
+    }
+    self.notify_total = advanced;
+    self.notify_cursor = cur;
+    return cur;
+}
+
+fn bufCursor(self: *Buffer) u32 {
+    var batch = NotifyBatch{};
+    mixLock();
+    const cur = stepBufferCursorLocked(self, &batch);
+    mixUnlock();
+    batch.flush();
+    return cur;
 }
 
 fn bufQueryInterface(p: *anyopaque, iid: ?*const Guid, out: ?*?*anyopaque) callconv(W) HRESULT {
@@ -491,6 +672,11 @@ fn bufQueryInterface(p: *anyopaque, iid: ?*const Guid, out: ?*?*anyopaque) callc
         return S_OK;
     }
     if (iid) |g| {
+        if (self.notify.vtbl != null and g.eql(&IID_IDirectSoundNotify)) {
+            self.refs += 1;
+            o.* = @ptrCast(&self.notify);
+            return S_OK;
+        }
         const want_listener = g.eql(&IID_IDirectSound3DListener);
         const want_3d = g.eql(&IID_IDirectSound3DBuffer);
         if (self.i3d.vtbl != null and ((want_listener and self.primary) or (want_3d and !self.primary))) {
@@ -536,16 +722,42 @@ fn bufRelease(p: *anyopaque) callconv(W) u32 {
     const self: *Buffer = @ptrCast(@alignCast(p));
     if (self.refs > 0) self.refs -= 1;
     if (self.refs != 0) return self.refs;
+    var free_backing: ?*Backing = null;
+    var free_raw: ?[*]u8 = null;
+    var free_raw_len: u32 = 0;
+    var free_entries: ?[*]DSBPOSITIONNOTIFY = null;
+    var free_entries_cnt: u32 = 0;
     mixLock();
-    defer mixUnlock();
-    if (self.buf_ptr) |ptr| {
-        if (self.buf_len != 0) std.heap.page_allocator.free(ptr[0..self.buf_len]);
+    if (self.backing) |b| {
+        if (b.refs > 0) b.refs -= 1;
+        if (b.refs == 0) free_backing = b;
+        self.backing = null;
+    } else if (self.buf_ptr) |ptr| {
+        free_raw = ptr;
+        free_raw_len = self.buf_len;
     }
+    free_entries = self.notify.entries;
+    free_entries_cnt = self.notify.count;
+    self.notify.entries = null;
+    self.notify.count = 0;
+    self.notify.vtbl = null;
+    self.notify.owner = null;
+    self.notify_armed = false;
     self.buf_ptr = null;
     self.buf_len = 0;
     self.playing = false;
     self.looping = false;
     if (poolIndexOf(self)) |idx| pool_used[idx] = false;
+    mixUnlock();
+    if (free_backing) |b| {
+        if (b.len != 0) std.heap.page_allocator.free(b.ptr[0..b.len]);
+        std.heap.page_allocator.destroy(b);
+    } else if (free_raw) |ptr| {
+        if (free_raw_len != 0) std.heap.page_allocator.free(ptr[0..free_raw_len]);
+    }
+    if (free_entries) |e| {
+        if (free_entries_cnt != 0) std.heap.page_allocator.free(e[0..free_entries_cnt]);
+    }
     return 0;
 }
 
@@ -622,10 +834,14 @@ fn bufGetStatus(p: *anyopaque, status: ?*u32) callconv(W) HRESULT {
     const q = status orelse return E_INVALIDARG;
     // The play cursor runs on the clock; a one-shot buffer that reached its
     // end has stopped even if nobody asked for the position since.
-    _ = bufCursor(self);
+    var batch = NotifyBatch{};
+    mixLock();
+    _ = stepBufferCursorLocked(self, &batch);
     var s: u32 = 0;
     if (self.playing) s |= DSBSTATUS_PLAYING;
     if (self.playing and self.looping) s |= DSBSTATUS_LOOPING;
+    mixUnlock();
+    batch.flush();
     q.* = s;
     return S_OK;
 }
@@ -636,7 +852,10 @@ fn bufInitialize(p: *anyopaque, ds: ?*anyopaque, desc: ?*DSBUFFERDESC) callconv(
     const self: *Buffer = @ptrCast(@alignCast(p));
     const d = desc orelse return E_INVALIDARG;
     if (self.buf_len != 0) return DSERR_INVALIDCALL;
-    return bufAlloc(self, d);
+    const hr = bufAlloc(self, d);
+    init3D(self);
+    initNotify(self);
+    return hr;
 }
 
 fn bufLock(
@@ -695,14 +914,27 @@ fn bufPlay(p: *anyopaque, reserved1: u32, priority: u32, flags: u32) callconv(W)
         std.debug.print("[WINS:DSound] first Play of a flags 0x{x} buffer: {d} bytes, tag {d}, {d} Hz {d} ch {d} bit, volume {d}, play flags 0x{x}\n", .{ self.flags, self.buf_len, self.wfx.wFormatTag, self.wfx.nSamplesPerSec, self.wfx.nChannels, self.wfx.wBitsPerSample, self.volume, flags });
     }
     if (self.buf_len == 0) return DSERR_UNSUPPORTED;
+    var need_mixer = false;
+    var need_ticker = false;
+    mixLock();
     if (!self.playing) {
-        self.start_cursor = bufCursor(self);
+        self.start_cursor = if (self.buf_len != 0) self.start_cursor % self.buf_len else 0;
         self.start_ms = nowMs();
         self.mix_restart = true;
+        self.notify_cursor = self.start_cursor;
+        self.notify_total = 0;
+        self.notify_armed = !self.primary and self.notify.count > 0;
         self.playing = true;
+        need_mixer = !self.primary;
+        need_ticker = self.notify_armed;
+    } else if (!self.primary and self.notify.count > 0) {
+        self.notify_armed = true;
+        need_ticker = true;
     }
     self.looping = (flags & DSBPLAY_LOOPING) != 0;
-    if (!self.primary) startMixer();
+    mixUnlock();
+    if (need_mixer) startMixer();
+    if (need_ticker) startNotifyTicker();
     return S_OK;
 }
 
@@ -711,9 +943,14 @@ fn bufSetCurrentPosition(p: *anyopaque, pos: u32) callconv(W) HRESULT {
     const self: *Buffer = @ptrCast(@alignCast(p));
     const total = bufBytes(self);
     if (total == 0) return DSERR_UNSUPPORTED;
+    mixLock();
     self.start_cursor = pos % total;
     self.start_ms = nowMs();
     self.mix_restart = true;
+    self.notify_cursor = self.start_cursor;
+    self.notify_total = 0;
+    self.notify_armed = self.playing and !self.primary and self.notify.count > 0;
+    mixUnlock();
     return S_OK;
 }
 
@@ -754,8 +991,19 @@ fn bufSetFrequency(p: *anyopaque, v: u32) callconv(W) HRESULT {
 fn bufStop(p: *anyopaque) callconv(W) HRESULT {
     traceFirst(17, "bufStop", @returnAddress());
     const self: *Buffer = @ptrCast(@alignCast(p));
+    var batch = NotifyBatch{};
+    mixLock();
+    if (self.playing) {
+        const cur = stepBufferCursorLocked(self, &batch);
+        if (self.playing) {
+            self.start_cursor = cur;
+            emitStopNotifiesLocked(self, &batch);
+        }
+    }
     self.playing = false;
     self.looping = false;
+    mixUnlock();
+    batch.flush();
     return S_OK;
 }
 
@@ -869,6 +1117,12 @@ fn bufAlloc(self: *Buffer, desc: *DSBUFFERDESC) HRESULT {
     else
         65536;
     const mem = std.heap.page_allocator.alloc(u8, wanted) catch return E_OUTOFMEMORY;
+    const backing = std.heap.page_allocator.create(Backing) catch {
+        std.heap.page_allocator.free(mem);
+        return E_OUTOFMEMORY;
+    };
+    backing.* = .{ .refs = 1, .ptr = mem.ptr, .len = @intCast(mem.len) };
+    self.backing = backing;
     self.buf_ptr = mem.ptr;
     self.buf_len = @intCast(mem.len);
     @memset(mem, 0);
@@ -967,6 +1221,7 @@ fn devCreateSoundBuffer(p: *anyopaque, desc: ?*DSBUFFERDESC, out: ?*?*anyopaque,
     logFormatOnce(d);
     const hr = bufAlloc(slot, d);
     init3D(slot);
+    initNotify(slot);
     if (hr != S_OK) {
         if (poolIndexOf(slot)) |idx| pool_used[idx] = false;
         return hr;
@@ -998,8 +1253,36 @@ fn devGetCaps(p: *anyopaque, caps: ?*DSCAPS) callconv(W) HRESULT {
 fn devDuplicateSoundBuffer(p: *anyopaque, src: ?*anyopaque, out: ?*?*anyopaque) callconv(W) HRESULT {
     traceFirst(28, "devDuplicateSoundBuffer", @returnAddress());
     _ = p;
-    if (src == null or out == null) return E_INVALIDARG;
-    return E_NOTIMPL;
+    const o = out orelse return E_INVALIDARG;
+    o.* = null;
+    const s_ptr = src orelse return E_INVALIDARG;
+    const orig: *Buffer = @ptrCast(@alignCast(s_ptr));
+    if (orig.primary) return DSERR_INVALIDCALL_DX;
+    const slot = poolTake() orelse return E_OUTOFMEMORY;
+    mixLock();
+    const backing = orig.backing orelse {
+        if (poolIndexOf(slot)) |idx| pool_used[idx] = false;
+        mixUnlock();
+        return DSERR_INVALIDCALL_DX;
+    };
+    backing.refs += 1;
+    slot.backing = backing;
+    slot.buf_ptr = backing.ptr;
+    slot.buf_len = backing.len;
+    slot.wfx = orig.wfx;
+    slot.flags = orig.flags;
+    slot.volume = orig.volume;
+    slot.pan = orig.pan;
+    slot.frequency = orig.frequency;
+    slot.primary = false;
+    init3D(slot);
+    if (orig.i3d.vtbl != null and slot.i3d.vtbl != null) {
+        slot.i3d.words = orig.i3d.words;
+    }
+    initNotify(slot);
+    mixUnlock();
+    o.* = @ptrCast(slot);
+    return S_OK;
 }
 
 fn devSetCooperativeLevel(p: *anyopaque, hwnd: usize, level: u32) callconv(W) HRESULT {
@@ -1244,6 +1527,38 @@ fn mixUnlock() void {
     g_mix_lock.store(0, .release);
 }
 var g_mixer_started = std.atomic.Value(bool).init(false);
+var g_notify_started = std.atomic.Value(bool).init(false);
+
+fn startNotifyTicker() void {
+    if (g_notify_started.swap(true, .acq_rel)) return;
+    const t = std.Thread.spawn(.{}, notifyTickerMain, .{}) catch {
+        g_notify_started.store(false, .release);
+        return;
+    };
+    t.detach();
+}
+
+fn notifyTickerMain() void {
+    while (true) {
+        var batch = NotifyBatch{};
+        var any_active = false;
+        mixLock();
+        for (&pool, 0..) |*b, i| {
+            if (!pool_used[i] or !b.playing) continue;
+            if (b.notify.count > 0) {
+                any_active = true;
+                _ = stepBufferCursorLocked(b, &batch);
+            }
+        }
+        mixUnlock();
+        batch.flush();
+        const ts = linux.timespec{
+            .sec = 0,
+            .nsec = if (any_active) 1_000_000 else 10_000_000,
+        };
+        _ = linux.nanosleep(&ts, null);
+    }
+}
 
 fn startMixer() void {
     if (g_mixer_started.swap(true, .acq_rel)) return;
@@ -1313,12 +1628,66 @@ fn spatial(b: *const Buffer, listener: ?*const Buffer) [2]f32 {
     const max_d: f32 = @as(f32, @bitCast(w[13])) * dist_factor;
     if (d > max_d and b.flags & 0x20000 != 0) return .{ 0, 0 }; // DSBCAPS_MUTE3DATMAXDISTANCE
     const dc = @min(d, max_d);
-    const gain: f32 = if (dc <= min_d) 1 else min_d / (min_d + rolloff * (dc - min_d));
+    var gain: f32 = if (dc <= min_d) 1 else min_d / (min_d + rolloff * (dc - min_d));
+    const inside_deg = w[6];
+    const outside_deg = @max(inside_deg, w[7]);
+    const out_vol: i32 = @bitCast(w[11]);
+    if (inside_deg < 360 and out_vol < 0) {
+        const cone = vec(w[8..11]);
+        const c_len = @sqrt(cone[0] * cone[0] + cone[1] * cone[1] + cone[2] * cone[2]);
+        const r_len = @sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
+        if (c_len > 0.0001 and r_len > 0.0001) {
+            // `rel` points listener->source; compare source->listener (-rel) against cone axis.
+            const cos_t = std.math.clamp((-rel[0] * cone[0] - rel[1] * cone[1] - rel[2] * cone[2]) / (r_len * c_len), -1.0, 1.0);
+            const angle_deg = std.math.acos(cos_t) * (360.0 / std.math.pi);
+            if (angle_deg >= @as(f32, @floatFromInt(outside_deg))) {
+                gain *= dbToLinear(out_vol);
+            } else if (angle_deg > @as(f32, @floatFromInt(inside_deg))) {
+                const span = @as(f32, @floatFromInt(outside_deg - inside_deg));
+                const t = std.math.clamp((angle_deg - @as(f32, @floatFromInt(inside_deg))) / span, 0.0, 1.0);
+                const db: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(out_vol)) * t));
+                gain *= dbToLinear(db);
+            }
+        }
+    }
     // right = top x front (left-handed: x right, y up, z forward)
     const right: [3]f32 = .{ top[1] * front[2] - top[2] * front[1], top[2] * front[0] - top[0] * front[2], top[0] * front[1] - top[1] * front[0] };
     var pan: f32 = 0;
     if (d > 0.0001) pan = std.math.clamp((rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2]) / (d / dist_factor), -1, 1);
     return .{ gain * @min(1, 1 - pan), gain * @min(1, 1 + pan) };
+}
+
+fn dopplerRatio(b: *const Buffer, listener: ?*const Buffer) f64 {
+    if (b.i3d.vtbl == null or b.primary) return 1.0;
+    const w = &b.i3d.words;
+    const mode = w[14];
+    if (mode == 2) return 1.0; // DS3DMODE_DISABLE
+    var rel = vec(w[0..3]);
+    var lv: [3]f32 = .{ 0, 0, 0 };
+    var dist_factor: f32 = 1.0;
+    var doppler_factor: f32 = 1.0;
+    if (listener) |l| {
+        const lw = &l.i3d.words;
+        if (mode == 0) {
+            const lp = vec(lw[0..3]);
+            rel = .{ rel[0] - lp[0], rel[1] - lp[1], rel[2] - lp[2] };
+            lv = vec(lw[3..6]);
+        }
+        dist_factor = @max(0.0, @as(f32, @bitCast(lw[12])));
+        doppler_factor = std.math.clamp(@as(f32, @bitCast(lw[14])), 0.0, 10.0);
+    }
+    if (doppler_factor == 0.0 or dist_factor == 0.0) return 1.0;
+    const d = @sqrt(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
+    if (d <= 0.0001) return 1.0;
+    const bv = vec(w[3..6]);
+    const nx = rel[0] / d;
+    const ny = rel[1] / d;
+    const nz = rel[2] / d;
+    const c: f64 = 343.2;
+    const scale: f64 = @as(f64, dist_factor) * @as(f64, doppler_factor);
+    const vl = std.math.clamp(@as(f64, lv[0] * nx + lv[1] * ny + lv[2] * nz) * scale, -c * 0.9, c * 0.9);
+    const vs = std.math.clamp(@as(f64, bv[0] * nx + bv[1] * ny + bv[2] * nz) * scale, -c * 0.9, c * 0.9);
+    return std.math.clamp((c + vl) / (c + vs), 0.25, 4.0);
 }
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -1390,7 +1759,7 @@ fn mixerMain() void {
                 b.mix_frame = @as(f64, @floatFromInt(b.start_cursor / align_));
             }
             const rate: f64 = @floatFromInt(if (b.frequency != 0) b.frequency else b.wfx.nSamplesPerSec);
-            const step = rate / @as(f64, @floatFromInt(MIX_RATE));
+            const step = (rate * dopplerRatio(b, listener)) / @as(f64, @floatFromInt(MIX_RATE));
             const g = audio.gains(b.volume, b.pan);
             const sp = spatial(b, listener);
             const gl = g[0] * sp[0] * master;
@@ -1415,3 +1784,231 @@ fn mixerMain() void {
         if (!out.write(&pcm)) return;
     }
 }
+
+var test_notify_log: [16]usize = [_]usize{0} ** 16;
+var test_notify_count = std.atomic.Value(usize).init(0);
+
+fn testNotifyRecord(h: usize) void {
+    const idx = test_notify_count.fetchAdd(1, .acq_rel);
+    if (idx < test_notify_log.len) test_notify_log[idx] = h;
+}
+
+fn testHasNotify(h: usize) bool {
+    const n = @min(test_notify_count.load(.acquire), test_notify_log.len);
+    for (test_notify_log[0..n]) |x| {
+        if (x == h) return true;
+    }
+    return false;
+}
+
+test "DuplicateSoundBuffer shares memory, preserves state, and rejects primary" {
+    var ds_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, DirectSoundCreate8(null, &ds_raw, null));
+    const ds: *Device = @ptrCast(@alignCast(ds_raw.?));
+    defer _ = ds.vtbl.Release(ds);
+
+    var pdesc = DSBUFFERDESC{
+        .dwSize = @sizeOf(DSBUFFERDESC),
+        .dwFlags = DSBCAPS_PRIMARYBUFFER,
+        .dwBufferBytes = 0,
+        .dwReserved = 0,
+        .lpwfxFormat = null,
+    };
+    var pri_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, ds.vtbl.CreateSoundBuffer(ds, &pdesc, &pri_raw, null));
+    const pri: *Buffer = @ptrCast(@alignCast(pri_raw.?));
+    defer _ = pri.vtbl.Release(pri);
+
+    var dup_pri: ?*anyopaque = null;
+    try std.testing.expectEqual(DSERR_INVALIDCALL_DX, ds.vtbl.DuplicateSoundBuffer(ds, pri, &dup_pri));
+    try std.testing.expect(dup_pri == null);
+
+    var wfx = WAVEFORMATEX{
+        .nChannels = 1,
+        .nSamplesPerSec = 22050,
+        .nAvgBytesPerSec = 44100,
+        .nBlockAlign = 2,
+        .wBitsPerSample = 16,
+    };
+    var sdesc = DSBUFFERDESC{
+        .dwSize = @sizeOf(DSBUFFERDESC),
+        .dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPOSITIONNOTIFY,
+        .dwBufferBytes = 4096,
+        .dwReserved = 0,
+        .lpwfxFormat = &wfx,
+    };
+    var orig_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, ds.vtbl.CreateSoundBuffer(ds, &sdesc, &orig_raw, null));
+    const orig: *Buffer = @ptrCast(@alignCast(orig_raw.?));
+
+    try std.testing.expectEqual(S_OK, orig.vtbl.SetVolume(orig, -650));
+    try std.testing.expectEqual(S_OK, orig.vtbl.SetFrequency(orig, 32000));
+
+    var lp1: ?*anyopaque = null;
+    var ll1: u32 = 0;
+    try std.testing.expectEqual(S_OK, orig.vtbl.Lock(orig, 0, 16, &lp1, &ll1, null, null, 0));
+    @as([*]u8, @ptrCast(lp1.?))[0] = 0x5A;
+    @as([*]u8, @ptrCast(lp1.?))[7] = 0xC3;
+    try std.testing.expectEqual(S_OK, orig.vtbl.Unlock(orig, lp1, ll1, null, 0));
+
+    var dup_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, ds.vtbl.DuplicateSoundBuffer(ds, orig, &dup_raw));
+    const dup: *Buffer = @ptrCast(@alignCast(dup_raw.?));
+    defer _ = dup.vtbl.Release(dup);
+
+    // Release original immediately; duplicate keeps backing alive.
+    try std.testing.expectEqual(@as(u32, 0), orig.vtbl.Release(orig));
+
+    var vol: i32 = 0;
+    var freq: u32 = 0;
+    try std.testing.expectEqual(S_OK, dup.vtbl.GetVolume(dup, &vol));
+    try std.testing.expectEqual(@as(i32, -650), vol);
+    try std.testing.expectEqual(S_OK, dup.vtbl.GetFrequency(dup, &freq));
+    try std.testing.expectEqual(@as(u32, 32000), freq);
+
+    var n_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, dup.vtbl.QueryInterface(dup, &IID_IDirectSoundNotify, &n_raw));
+    const notify_if: *SubNotify = @ptrCast(@alignCast(n_raw.?));
+    _ = notify_if.vtbl.?.Release(notify_if);
+
+    var dp1: ?*anyopaque = null;
+    var dl1: u32 = 0;
+    try std.testing.expectEqual(S_OK, dup.vtbl.Lock(dup, 0, 16, &dp1, &dl1, null, null, 0));
+    try std.testing.expectEqual(@as(u8, 0x5A), @as([*]const u8, @ptrCast(dp1.?))[0]);
+    try std.testing.expectEqual(@as(u8, 0xC3), @as([*]const u8, @ptrCast(dp1.?))[7]);
+    try std.testing.expectEqual(S_OK, dup.vtbl.Unlock(dup, dp1, dl1, null, 0));
+}
+
+test "IDirectSoundNotify gating, offset crossings, and OFFSETSTOP" {
+    const prev_fn = notify_signal_fn;
+    notify_signal_fn = testNotifyRecord;
+    defer notify_signal_fn = prev_fn;
+
+    var ds_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, DirectSoundCreate8(null, &ds_raw, null));
+    const ds: *Device = @ptrCast(@alignCast(ds_raw.?));
+    defer _ = ds.vtbl.Release(ds);
+
+    var wfx = WAVEFORMATEX{
+        .nChannels = 1,
+        .nSamplesPerSec = 44100,
+        .nAvgBytesPerSec = 88200,
+        .nBlockAlign = 2,
+        .wBitsPerSample = 16,
+    };
+    var no_notify_desc = DSBUFFERDESC{
+        .dwSize = @sizeOf(DSBUFFERDESC),
+        .dwFlags = 0,
+        .dwBufferBytes = 8820,
+        .dwReserved = 0,
+        .lpwfxFormat = &wfx,
+    };
+    var plain_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, ds.vtbl.CreateSoundBuffer(ds, &no_notify_desc, &plain_raw, null));
+    const plain: *Buffer = @ptrCast(@alignCast(plain_raw.?));
+    defer _ = plain.vtbl.Release(plain);
+    var bad_n: ?*anyopaque = null;
+    try std.testing.expectEqual(E_NOINTERFACE, plain.vtbl.QueryInterface(plain, &IID_IDirectSoundNotify, &bad_n));
+
+    var desc = DSBUFFERDESC{
+        .dwSize = @sizeOf(DSBUFFERDESC),
+        .dwFlags = DSBCAPS_CTRLPOSITIONNOTIFY,
+        .dwBufferBytes = 4410, // ~50 ms at 88200 B/s
+        .dwReserved = 0,
+        .lpwfxFormat = &wfx,
+    };
+    var buf_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, ds.vtbl.CreateSoundBuffer(ds, &desc, &buf_raw, null));
+    const buf: *Buffer = @ptrCast(@alignCast(buf_raw.?));
+    defer _ = buf.vtbl.Release(buf);
+
+    var n_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, buf.vtbl.QueryInterface(buf, &IID_IDirectSoundNotify, &n_raw));
+    const notif: *SubNotify = @ptrCast(@alignCast(n_raw.?));
+    defer _ = notif.vtbl.?.Release(notif);
+
+    try std.testing.expectEqual(E_INVALIDARG, notif.vtbl.?.SetNotificationPositions(notif, 1, null));
+
+    const items = [_]DSBPOSITIONNOTIFY{
+        .{ .dwOffset = 882, .hEventNotify = 0x101 },
+        .{ .dwOffset = DSBPN_OFFSETSTOP, .hEventNotify = 0x102 },
+    };
+    try std.testing.expectEqual(S_OK, notif.vtbl.?.SetNotificationPositions(notif, items.len, &items));
+
+    test_notify_count.store(0, .release);
+    try std.testing.expectEqual(S_OK, buf.vtbl.Play(buf, 0, 0, DSBPLAY_LOOPING));
+    const ts = linux.timespec{ .sec = 0, .nsec = 25_000_000 };
+    _ = linux.nanosleep(&ts, null);
+    var status: u32 = 0;
+    try std.testing.expectEqual(S_OK, buf.vtbl.GetStatus(buf, &status));
+    try std.testing.expect(testHasNotify(0x101));
+    try std.testing.expect(!testHasNotify(0x102));
+
+    try std.testing.expectEqual(S_OK, buf.vtbl.Stop(buf));
+    try std.testing.expect(testHasNotify(0x102));
+}
+
+test "spatial sound cone attenuation and Doppler pitch shift" {
+    var ds_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, DirectSoundCreate8(null, &ds_raw, null));
+    const ds: *Device = @ptrCast(@alignCast(ds_raw.?));
+    defer _ = ds.vtbl.Release(ds);
+
+    var pdesc = DSBUFFERDESC{
+        .dwSize = @sizeOf(DSBUFFERDESC),
+        .dwFlags = DSBCAPS_PRIMARYBUFFER | DSBCAPS_CTRL3D,
+        .dwBufferBytes = 0,
+        .dwReserved = 0,
+        .lpwfxFormat = null,
+    };
+    var pri_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, ds.vtbl.CreateSoundBuffer(ds, &pdesc, &pri_raw, null));
+    const pri: *Buffer = @ptrCast(@alignCast(pri_raw.?));
+    defer _ = pri.vtbl.Release(pri);
+
+    var wfx = WAVEFORMATEX{};
+    var sdesc = DSBUFFERDESC{
+        .dwSize = @sizeOf(DSBUFFERDESC),
+        .dwFlags = DSBCAPS_CTRL3D,
+        .dwBufferBytes = 4096,
+        .dwReserved = 0,
+        .lpwfxFormat = &wfx,
+    };
+    var b_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, ds.vtbl.CreateSoundBuffer(ds, &sdesc, &b_raw, null));
+    const b: *Buffer = @ptrCast(@alignCast(b_raw.?));
+    defer _ = b.vtbl.Release(b);
+
+    // Listener at origin (0,0,0). Source at (0,0,-1) pointing (0,0,1) faces straight at listener.
+    _ = bSetPosition(&b.i3d, 0, 0, -1, 0);
+    _ = bSetConeOrientation(&b.i3d, 0, 0, 1, 0);
+    _ = bSetConeAngles(&b.i3d, 60, 120, 0);
+    _ = bSetConeOutsideVolume(&b.i3d, -2000, 0); // 0.1 linear gain
+    const sp_inside = spatial(b, pri);
+
+    // 45 deg half-angle (angle_deg = 90) sits halfway between 60 and 120.
+    _ = bSetConeOrientation(&b.i3d, 1, 0, 1, 0);
+    const sp_mid = spatial(b, pri);
+
+    // Pointing away from listener -> full outside cone attenuation.
+    _ = bSetConeOrientation(&b.i3d, 0, 0, -1, 0);
+    const sp_outside = spatial(b, pri);
+
+    try std.testing.expect(sp_inside[0] > sp_mid[0]);
+    try std.testing.expect(sp_mid[0] > sp_outside[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), sp_outside[0], 0.02);
+
+    // Doppler: listener at origin, source at (0,0,100).
+    _ = bSetPosition(&b.i3d, 0, 0, 100, 0);
+    _ = bSetVelocity(&b.i3d, 0, 0, -50, 0); // approaching listener -> higher pitch
+    const r_approach = dopplerRatio(b, pri);
+    try std.testing.expect(r_approach > 1.1);
+
+    _ = bSetVelocity(&b.i3d, 0, 0, 50, 0); // receding from listener -> lower pitch
+    const r_recede = dopplerRatio(b, pri);
+    try std.testing.expect(r_recede < 0.9);
+
+    _ = lSetDoppler(&pri.i3d, 0.0, 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), dopplerRatio(b, pri), 0.0001);
+}
+

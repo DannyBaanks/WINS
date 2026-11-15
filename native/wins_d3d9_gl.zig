@@ -46,8 +46,29 @@ const Program = struct {
     /// Fixed-function programs: the state they were generated for.
     fixed_key: ?FixedKey = null,
     loc_wvp: host.GLint = -1,
+    loc_world: host.GLint = -1,
+    loc_wv: host.GLint = -1,
+    loc_norm_mat: host.GLint = -1,
     loc_vp: host.GLint = -1,
     loc_tfactor: host.GLint = -1,
+    loc_clip: host.GLint = -1,
+    loc_clip_mask: host.GLint = -1,
+    loc_light_count: host.GLint = -1,
+    loc_global_amb: host.GLint = -1,
+    loc_mat_diff: host.GLint = -1,
+    loc_mat_amb: host.GLint = -1,
+    loc_mat_spec: host.GLint = -1,
+    loc_mat_emis: host.GLint = -1,
+    loc_mat_power: host.GLint = -1,
+    loc_mat_src: host.GLint = -1,
+    loc_light_flags: host.GLint = -1,
+    loc_light_pos: host.GLint = -1,
+    loc_light_dir: host.GLint = -1,
+    loc_light_diff: host.GLint = -1,
+    loc_light_amb: host.GLint = -1,
+    loc_light_spec: host.GLint = -1,
+    loc_light_atten: host.GLint = -1,
+    loc_light_spot: host.GLint = -1,
     /// 0 when the pair could not be translated/compiled/linked.
     prog: host.GLuint,
     inputs: []shader.Input,
@@ -70,6 +91,10 @@ fn warnOnce(bit: u5, comptime msg: []const u8) void {
 }
 
 const GL_TEXTURE_2D = 0x0DE1;
+const GL_TEXTURE_3D: host.GLenum = 0x806F;
+const GL_TEXTURE_CUBE_MAP: host.GLenum = 0x8513;
+const GL_TEXTURE_CUBE_MAP_POSITIVE_X: host.GLenum = 0x8515;
+const GL_TEXTURE_WRAP_R: host.GLenum = 0x8072;
 const GL_FRAMEBUFFER = 0x8D40;
 const GL_READ_FRAMEBUFFER = 0x8CA8;
 const GL_DRAW_FRAMEBUFFER = 0x8CA9;
@@ -133,6 +158,47 @@ pub fn attach(w: u32, h: u32, title: []const u8) bool {
     host.run(&attachJob, &job);
     active = job.ok;
     return active;
+}
+
+const ResizeJob = struct { w: u32, h: u32 };
+
+fn resizeJob(raw: ?*anyopaque) void {
+    const j: *ResizeJob = @ptrCast(@alignCast(raw.?));
+    const gl = &host.gl;
+    const w = @max(j.w, 1);
+    const h = @max(j.h, 1);
+    g_w = w;
+    g_h = h;
+    host.resize(w, h);
+    if (g_color != 0) {
+        gl.glBindTexture(GL_TEXTURE_2D, g_color);
+        gl.glTexImage2D(GL_TEXTURE_2D, 0, 0x8058, @intCast(w), @intCast(h), 0, GL_BGRA, GL_UNSIGNED_BYTE, null);
+        gl.glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    if (g_depth != 0) {
+        gl.glBindRenderbuffer(GL_RENDERBUFFER, g_depth);
+        gl.glRenderbufferStorage(GL_RENDERBUFFER, 0x88F0, @intCast(w), @intCast(h));
+    }
+    if (g_fbo != 0) {
+        gl.glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+        gl.glFramebufferTexture2D(GL_FRAMEBUFFER, 0x8CE0, GL_TEXTURE_2D, g_color, 0);
+        gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, 0x821A, GL_RENDERBUFFER, g_depth);
+        gl.glDisable(GL_SCISSOR_TEST);
+        gl.glColorMask(1, 1, 1, 1);
+        gl.glDepthMask(1);
+        gl.glClearColor(0, 0, 0, 1);
+        gl.glClearDepth(1.0);
+        gl.glClear(0x4000 | 0x0100 | 0x0400);
+    }
+    g_rt_bound = [_]ColorRef{.{ .tex = 0, .target = GL_TEXTURE_2D, .level = 0 }} ** 4;
+    g_rt_depth = 0;
+}
+
+/// Resize the implicit back buffer, depth buffer, and host window after Device::Reset.
+pub fn resize(w: u32, h: u32) void {
+    if (!active) return;
+    var job: ResizeJob = .{ .w = w, .h = h };
+    host.run(&resizeJob, &job);
 }
 
 // ---- state ------------------------------------------------------------------
@@ -207,6 +273,16 @@ fn rtFormat(format: u32) RtFormat {
     };
 }
 
+fn setRtTexParams(target: host.GLenum, f: RtFormat, levels: usize) void {
+    const gl = &host.gl;
+    gl.glTexParameteri(target, 0x813D, @intCast(levels - 1)); // MAX_LEVEL
+    if (f.channels < 2) gl.glTexParameteri(target, 0x8E43, 1); // SWIZZLE_G = ONE
+    if (f.channels < 3) gl.glTexParameteri(target, 0x8E44, 1); // SWIZZLE_B = ONE
+    if (f.channels < 4) gl.glTexParameteri(target, 0x8E45, 1); // SWIZZLE_A = ONE
+    gl.glTexParameteri(target, 0x2801, 0x2601);
+    gl.glTexParameteri(target, 0x2800, 0x2601);
+}
+
 fn allocRtTexture(name: *host.GLuint, format: u32, w: u32, h: u32, levels: usize) void {
     const gl = &host.gl;
     const f = rtFormat(format);
@@ -216,15 +292,25 @@ fn allocRtTexture(name: *host.GLuint, format: u32, w: u32, h: u32, levels: usize
     while (l < levels) : (l += 1) {
         gl.glTexImage2D(GL_TEXTURE_2D, @intCast(l), f.internal, @intCast(@max(1, w >> @intCast(l))), @intCast(@max(1, h >> @intCast(l))), 0, f.format, f.ty, null);
     }
-    gl.glTexParameteri(GL_TEXTURE_2D, 0x813D, @intCast(levels - 1)); // MAX_LEVEL
-    if (f.channels < 2) gl.glTexParameteri(GL_TEXTURE_2D, 0x8E43, 1); // SWIZZLE_G = ONE
-    if (f.channels < 3) gl.glTexParameteri(GL_TEXTURE_2D, 0x8E44, 1); // SWIZZLE_B = ONE
-    if (f.channels < 4) gl.glTexParameteri(GL_TEXTURE_2D, 0x8E45, 1); // SWIZZLE_A = ONE
-    gl.glTexParameteri(GL_TEXTURE_2D, 0x2801, 0x2601);
-    gl.glTexParameteri(GL_TEXTURE_2D, 0x2800, 0x2601);
+    setRtTexParams(GL_TEXTURE_2D, f, levels);
 }
 
-const ColorRef = struct { tex: host.GLuint, level: host.GLint };
+fn allocRtCubeTexture(name: *host.GLuint, format: u32, edge: u32, levels: usize) void {
+    const gl = &host.gl;
+    const f = rtFormat(format);
+    gl.glGenTextures(1, name);
+    gl.glBindTexture(GL_TEXTURE_CUBE_MAP, name.*);
+    for (0..6) |face| {
+        var l: usize = 0;
+        while (l < levels) : (l += 1) {
+            const dim: host.GLsizei = @intCast(@max(1, edge >> @intCast(l)));
+            gl.glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + @as(host.GLenum, @intCast(face)), @intCast(l), f.internal, dim, dim, 0, f.format, f.ty, null);
+        }
+    }
+    setRtTexParams(GL_TEXTURE_CUBE_MAP, f, levels);
+}
+
+const ColorRef = struct { tex: host.GLuint, target: host.GLenum = GL_TEXTURE_2D, level: host.GLint };
 
 /// The GPU texture (and level) behind a colour surface the device renders
 /// into or copies from. The back buffer is the presentation texture.
@@ -236,16 +322,82 @@ fn colorOf(dev: *Device, s: *d3d.WinsSurface9) ColorRef {
         if (t.gl_name == 0) allocRtTexture(&t.gl_name, t.format, t.width, t.height, t.surfaces.len);
         return .{ .tex = t.gl_name, .level = @intCast(s.level) };
     }
+    if (s.cube_parent) |ct| {
+        if (ct.gl_name == 0) allocRtCubeTexture(&ct.gl_name, ct.format, ct.edge_length, ct.levels);
+        return .{ .tex = ct.gl_name, .target = GL_TEXTURE_CUBE_MAP_POSITIVE_X + @as(host.GLenum, @intCast(s.cube_face)), .level = @intCast(s.level) };
+    }
     if (s.gl_name == 0) {
         allocRtTexture(&s.gl_name, s.format, s.width, s.height, 1);
         // A surface with CPU pixels (off-screen plain) starts with them.
-        if (s.usage & d3d.D3DUSAGE_RENDERTARGET == 0) {
-            if (texFormat(s.format)) |tf| {
-                if (!tf.compressed) host.gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(tf.internal), @intCast(s.width), @intCast(s.height), 0, tf.format, tf.ty, s.data.ptr);
+        if (s.usage & d3d.D3DUSAGE_RENDERTARGET == 0) s.gl_dirty = true;
+    }
+    if (s.gl_dirty) {
+        s.gl_dirty = false;
+        if (texFormat(s.format)) |tf| {
+            if (!tf.compressed) {
+                host.gl.glBindTexture(GL_TEXTURE_2D, s.gl_name);
+                uploadSurface2D(GL_TEXTURE_2D, 0, tf, s);
             }
         }
     }
     return .{ .tex = s.gl_name, .level = 0 };
+}
+
+const UploadJob = struct { dev: *Device, s: *d3d.WinsSurface9 };
+
+fn uploadSurfaceJob(raw: ?*anyopaque) void {
+    const j: *UploadJob = @ptrCast(@alignCast(raw.?));
+    const s = j.s;
+    const tf = texFormat(s.format) orelse return;
+    if (d3d.deviceRenderTarget(j.dev)) |bb| {
+        if (s == bb) {
+            if (!tf.compressed and g_color != 0) {
+                host.gl.glBindTexture(GL_TEXTURE_2D, g_color);
+                host.gl.glTexImage2D(GL_TEXTURE_2D, 0, 0x8058, @intCast(s.width), @intCast(s.height), 0, tf.format, tf.ty, s.data.ptr);
+            }
+            s.gl_dirty = false;
+            return;
+        }
+    }
+    if (s.parent) |t| {
+        if (t.gl_name == 0) {
+            if (t.usage & d3d.D3DUSAGE_RENDERTARGET != 0) {
+                allocRtTexture(&t.gl_name, t.format, t.width, t.height, t.surfaces.len);
+            } else {
+                host.gl.glGenTextures(1, &t.gl_name);
+                host.gl.glBindTexture(GL_TEXTURE_2D, t.gl_name);
+                host.gl.glTexParameteri(GL_TEXTURE_2D, 0x813D, @intCast(t.surfaces.len - 1));
+                for (t.surfaces, 0..) |lvl_s, lvl| uploadSurface2D(GL_TEXTURE_2D, lvl, tf, lvl_s);
+                t.gl_dirty = false;
+                s.gl_dirty = false;
+                return;
+            }
+        }
+        host.gl.glBindTexture(GL_TEXTURE_2D, t.gl_name);
+        uploadSurface2D(GL_TEXTURE_2D, s.level, tf, s);
+        t.gl_dirty = false;
+        s.gl_dirty = false;
+        return;
+    }
+    if (s.cube_parent) |ct| {
+        if (ct.gl_name == 0) allocRtCubeTexture(&ct.gl_name, ct.format, ct.edge_length, ct.levels);
+        host.gl.glBindTexture(GL_TEXTURE_CUBE_MAP, ct.gl_name);
+        uploadSurface2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + @as(host.GLenum, @intCast(s.cube_face)), s.level, tf, s);
+        ct.gl_dirty = false;
+        s.gl_dirty = false;
+        return;
+    }
+    if (s.gl_name == 0) allocRtTexture(&s.gl_name, s.format, s.width, s.height, 1);
+    host.gl.glBindTexture(GL_TEXTURE_2D, s.gl_name);
+    uploadSurface2D(GL_TEXTURE_2D, 0, tf, s);
+    s.gl_dirty = false;
+}
+
+/// Push CPU surface pixels into the corresponding OpenGL texture/surface after UpdateSurface.
+pub fn uploadSurface(dev: *Device, s: *d3d.WinsSurface9) void {
+    if (!active) return;
+    var j: UploadJob = .{ .dev = dev, .s = s };
+    host.run(&uploadSurfaceJob, &j);
 }
 
 /// The renderbuffer behind a depth/stencil surface; the device's automatic
@@ -264,7 +416,7 @@ fn depthOf(dev: *Device, s: *d3d.WinsSurface9) host.GLuint {
 }
 
 var g_rt_fbo: host.GLuint = 0;
-var g_rt_bound: [4]ColorRef = [_]ColorRef{.{ .tex = 0, .level = 0 }} ** 4;
+var g_rt_bound: [4]ColorRef = [_]ColorRef{.{ .tex = 0, .target = GL_TEXTURE_2D, .level = 0 }} ** 4;
 var g_rt_depth: host.GLuint = 0;
 var g_copy_fbo: [2]host.GLuint = .{ 0, 0 };
 
@@ -272,7 +424,7 @@ fn bindTargets(dev: *Device) void {
     const gl = &host.gl;
     if (g_rt_fbo == 0) gl.glGenFramebuffers(1, &g_rt_fbo);
     gl.glBindFramebuffer(GL_FRAMEBUFFER, g_rt_fbo);
-    var want: [4]ColorRef = [_]ColorRef{.{ .tex = 0, .level = 0 }} ** 4;
+    var want: [4]ColorRef = [_]ColorRef{.{ .tex = 0, .target = GL_TEXTURE_2D, .level = 0 }} ** 4;
     for (0..4) |i| {
         if (dev.render_targets[i]) |s| {
             want[i] = colorOf(dev, s);
@@ -281,8 +433,9 @@ fn bindTargets(dev: *Device) void {
     const ds: host.GLuint = if (d3d.deviceBoundDepthStencil(dev)) |s| depthOf(dev, s) else 0;
     var changed = false;
     for (0..4) |i| {
-        if (want[i].tex != g_rt_bound[i].tex or want[i].level != g_rt_bound[i].level) {
-            gl.glFramebufferTexture2D(GL_FRAMEBUFFER, 0x8CE0 + @as(host.GLenum, @intCast(i)), GL_TEXTURE_2D, want[i].tex, want[i].level);
+        if (want[i].tex != g_rt_bound[i].tex or want[i].target != g_rt_bound[i].target or want[i].level != g_rt_bound[i].level) {
+            const fb_target = if (want[i].tex != 0) want[i].target else GL_TEXTURE_2D;
+            gl.glFramebufferTexture2D(GL_FRAMEBUFFER, 0x8CE0 + @as(host.GLenum, @intCast(i)), fb_target, want[i].tex, want[i].level);
             g_rt_bound[i] = want[i];
             changed = true;
         }
@@ -317,7 +470,7 @@ fn bindCopy(dev: *Device, which: usize, s: *d3d.WinsSurface9) bool {
     } else {
         const c = colorOf(dev, s);
         gl.glFramebufferRenderbuffer(target, 0x821A, GL_RENDERBUFFER, 0);
-        gl.glFramebufferTexture2D(target, 0x8CE0, GL_TEXTURE_2D, c.tex, c.level);
+        gl.glFramebufferTexture2D(target, 0x8CE0, c.target, c.tex, c.level);
     }
     return gl.glCheckFramebufferStatus(target) == 0x8CD5;
 }
@@ -597,6 +750,8 @@ fn buildProgram(vs: *const d3d.WinsShader9, ps: *const d3d.WinsShader9) Program 
     p.loc_vs_c = gl.glGetUniformLocation(prog, "vs_c");
     p.loc_ps_c = gl.glGetUniformLocation(prog, "ps_c");
     p.loc_half = gl.glGetUniformLocation(prog, "wins_half_pixel");
+    p.loc_clip = gl.glGetUniformLocation(prog, "wins_clip");
+    p.loc_clip_mask = gl.glGetUniformLocation(prog, "wins_clip_mask");
     return p;
 }
 
@@ -633,6 +788,15 @@ fn texFormat(format: u32) ?TexFormat {
     };
 }
 
+fn uploadSurface2D(target: host.GLenum, level: usize, tf: TexFormat, s: *const d3d.WinsSurface9) void {
+    const gl = &host.gl;
+    if (tf.compressed) {
+        gl.glCompressedTexImage2D(target, @intCast(level), tf.internal, @intCast(s.width), @intCast(s.height), 0, @intCast(s.data.len), s.data.ptr);
+    } else {
+        gl.glTexImage2D(target, @intCast(level), @intCast(tf.internal), @intCast(s.width), @intCast(s.height), 0, tf.format, tf.ty, s.data.ptr);
+    }
+}
+
 /// Bind `tex` to the active unit, uploading its levels when they changed.
 fn bindTexture(tex: *d3d.WinsTexture9) bool {
     const gl = &host.gl;
@@ -653,14 +817,64 @@ fn bindTexture(tex: *d3d.WinsTexture9) bool {
     gl.glBindTexture(GL_TEXTURE_2D, tex.gl_name);
     if (tex.gl_dirty) {
         tex.gl_dirty = false;
-        for (tex.surfaces, 0..) |s, level| {
-            if (tf.compressed) {
-                gl.glCompressedTexImage2D(GL_TEXTURE_2D, @intCast(level), tf.internal, @intCast(s.width), @intCast(s.height), 0, @intCast(s.data.len), s.data.ptr);
-            } else {
-                gl.glTexImage2D(GL_TEXTURE_2D, @intCast(level), @intCast(tf.internal), @intCast(s.width), @intCast(s.height), 0, tf.format, tf.ty, s.data.ptr);
+        for (tex.surfaces, 0..) |s, level| uploadSurface2D(GL_TEXTURE_2D, level, tf, s);
+        gl.glTexParameteri(GL_TEXTURE_2D, 0x813D, @intCast(tex.surfaces.len - 1)); // MAX_LEVEL
+    }
+    return true;
+}
+
+/// Bind `ct` to the active unit as a GL cubemap, uploading faces when dirty.
+fn bindCubeTexture(ct: *d3d.WinsCubeTexture9) bool {
+    const gl = &host.gl;
+    if (ct.usage & d3d.D3DUSAGE_RENDERTARGET != 0) {
+        if (ct.gl_name == 0) allocRtCubeTexture(&ct.gl_name, ct.format, ct.edge_length, ct.levels);
+        gl.glBindTexture(GL_TEXTURE_CUBE_MAP, ct.gl_name);
+        return true;
+    }
+    const tf = texFormat(ct.format) orelse {
+        warnOnce(3, "a texture format has no OpenGL upload path yet; it samples as empty");
+        return false;
+    };
+    if (ct.gl_name == 0) {
+        gl.glGenTextures(1, &ct.gl_name);
+        ct.gl_dirty = true;
+    }
+    gl.glBindTexture(GL_TEXTURE_CUBE_MAP, ct.gl_name);
+    if (ct.gl_dirty) {
+        ct.gl_dirty = false;
+        for (0..6) |face| {
+            for (0..ct.levels) |level| {
+                const s = ct.faces[face * ct.levels + level];
+                uploadSurface2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + @as(host.GLenum, @intCast(face)), level, tf, s);
             }
         }
-        gl.glTexParameteri(GL_TEXTURE_2D, 0x813D, @intCast(tex.surfaces.len - 1)); // MAX_LEVEL
+        gl.glTexParameteri(GL_TEXTURE_CUBE_MAP, 0x813D, @intCast(ct.levels - 1)); // MAX_LEVEL
+    }
+    return true;
+}
+
+/// Bind `vt` to the active unit as a GL 3D texture, uploading levels when dirty.
+fn bindVolumeTexture(vt: *d3d.WinsVolumeTexture9) bool {
+    const gl = &host.gl;
+    const tf = texFormat(vt.format) orelse {
+        warnOnce(3, "a texture format has no OpenGL upload path yet; it samples as empty");
+        return false;
+    };
+    if (vt.gl_name == 0) {
+        gl.glGenTextures(1, &vt.gl_name);
+        vt.gl_dirty = true;
+    }
+    gl.glBindTexture(GL_TEXTURE_3D, vt.gl_name);
+    if (vt.gl_dirty) {
+        vt.gl_dirty = false;
+        for (vt.volumes, 0..) |v, level| {
+            if (tf.compressed) {
+                gl.glCompressedTexImage3D(GL_TEXTURE_3D, @intCast(level), tf.internal, @intCast(v.width), @intCast(v.height), @intCast(v.depth), 0, @intCast(v.data.len), v.data.ptr);
+            } else {
+                gl.glTexImage3D(GL_TEXTURE_3D, @intCast(level), @intCast(tf.internal), @intCast(v.width), @intCast(v.height), @intCast(v.depth), 0, tf.format, tf.ty, v.data.ptr);
+            }
+        }
+        gl.glTexParameteri(GL_TEXTURE_3D, 0x813D, @intCast(vt.volumes.len - 1)); // MAX_LEVEL
     }
     return true;
 }
@@ -675,7 +889,7 @@ fn addressMode(v: u32) host.GLint {
     };
 }
 
-fn applySampler(dev: *const Device, unit: usize, levels: usize) void {
+fn applySampler(dev: *const Device, unit: usize, target: host.GLenum, levels: usize) void {
     const gl = &host.gl;
     const ss = &dev.sampler_states[unit];
     const mag_linear = ss[5] >= 2;
@@ -686,10 +900,13 @@ fn applySampler(dev: *const Device, unit: usize, levels: usize) void {
         1 => if (min_linear) 0x2701 else 0x2700, // *_MIPMAP_NEAREST
         else => if (min_linear) 0x2703 else 0x2702, // *_MIPMAP_LINEAR
     };
-    gl.glTexParameteri(GL_TEXTURE_2D, 0x2800, if (mag_linear) 0x2601 else 0x2600);
-    gl.glTexParameteri(GL_TEXTURE_2D, 0x2801, min);
-    gl.glTexParameteri(GL_TEXTURE_2D, 0x2802, addressMode(ss[1]));
-    gl.glTexParameteri(GL_TEXTURE_2D, 0x2803, addressMode(ss[2]));
+    gl.glTexParameteri(target, 0x2800, if (mag_linear) 0x2601 else 0x2600);
+    gl.glTexParameteri(target, 0x2801, min);
+    gl.glTexParameteri(target, 0x2802, addressMode(ss[1]));
+    gl.glTexParameteri(target, 0x2803, addressMode(ss[2]));
+    if (target == GL_TEXTURE_3D or target == GL_TEXTURE_CUBE_MAP) {
+        gl.glTexParameteri(target, GL_TEXTURE_WRAP_R, addressMode(ss[3]));
+    }
 }
 
 const DeleteJob = struct { name: host.GLuint };
@@ -861,6 +1078,10 @@ fn drawJob(raw: ?*anyopaque) void {
     if (prog.loc_ps_c >= 0 and prog.ps_const_count != 0) gl.glUniform4fv(prog.loc_ps_c, prog.ps_const_count, @ptrCast(&dev.ps_consts));
     if (prog.loc_half >= 0) gl.glUniform2f(prog.loc_half, 1.0 / @as(f32, @floatFromInt(@max(1, dev.viewport.Width))), -1.0 / @as(f32, @floatFromInt(@max(1, dev.viewport.Height))));
     if (prog.fixed_key != null) setFixedUniforms(dev, prog);
+    const clip_mask: u32 = if (if (prog.fixed_key) |fk| fk.pretransformed else false) 0 else (dev.render_states[152] & 0xFF);
+    for (0..8) |ci| setEnabled(0x3000 + @as(host.GLenum, @intCast(ci)), (clip_mask & (@as(u32, 1) << @intCast(ci))) != 0);
+    if (prog.loc_clip >= 0 and clip_mask != 0) gl.glUniform4fv(prog.loc_clip, 8, @ptrCast(&dev.clip_planes));
+    if (prog.loc_clip_mask >= 0) gl.glUniform1i(prog.loc_clip_mask, @intCast(clip_mask));
 
     profLap(&mark, .uniforms);
     gl.glBindBuffer(0x8892, 0); // ARRAY_BUFFER: client memory
@@ -910,20 +1131,56 @@ fn drawJob(raw: ?*anyopaque) void {
     for (prog.samplers, 0..) |kind, unit| {
         if (kind == .none) continue;
         gl.glActiveTexture(0x84C0 + @as(host.GLenum, @intCast(unit)));
-        if (kind != .tex2d) {
-            warnOnce(8, "cube and volume samplers are not implemented; they sample as empty");
-            gl.glBindTexture(GL_TEXTURE_2D, 0);
-            continue;
-        }
-        const tex = dev.bound_textures[unit] orelse {
-            gl.glBindTexture(GL_TEXTURE_2D, 0);
+        const target: host.GLenum = switch (kind) {
+            .tex2d => GL_TEXTURE_2D,
+            .cube => GL_TEXTURE_CUBE_MAP,
+            .volume => GL_TEXTURE_3D,
+            .none => continue,
+        };
+        const bound = dev.bound_textures[unit] orelse {
+            gl.glBindTexture(target, 0);
             continue;
         };
-        if (!bindTexture(tex)) {
-            gl.glBindTexture(GL_TEXTURE_2D, 0);
-            continue;
+        const tkind = d3d.textureKind(bound);
+        switch (kind) {
+            .tex2d => {
+                if (tkind != d3d.D3DRTYPE_TEXTURE) {
+                    gl.glBindTexture(target, 0);
+                    continue;
+                }
+                const tex: *d3d.WinsTexture9 = @ptrCast(@alignCast(bound));
+                if (!bindTexture(tex)) {
+                    gl.glBindTexture(target, 0);
+                    continue;
+                }
+                applySampler(dev, unit, target, tex.surfaces.len);
+            },
+            .cube => {
+                if (tkind != d3d.D3DRTYPE_CUBETEXTURE) {
+                    gl.glBindTexture(target, 0);
+                    continue;
+                }
+                const ct: *d3d.WinsCubeTexture9 = @ptrCast(@alignCast(bound));
+                if (!bindCubeTexture(ct)) {
+                    gl.glBindTexture(target, 0);
+                    continue;
+                }
+                applySampler(dev, unit, target, ct.levels);
+            },
+            .volume => {
+                if (tkind != d3d.D3DRTYPE_VOLUMETEXTURE) {
+                    gl.glBindTexture(target, 0);
+                    continue;
+                }
+                const vt: *d3d.WinsVolumeTexture9 = @ptrCast(@alignCast(bound));
+                if (!bindVolumeTexture(vt)) {
+                    gl.glBindTexture(target, 0);
+                    continue;
+                }
+                applySampler(dev, unit, target, vt.volumes.len);
+            },
+            .none => {},
         }
-        applySampler(dev, unit, tex.surfaces.len);
     }
 
     profLap(&mark, .textures);
@@ -960,11 +1217,14 @@ fn drawJob(raw: ?*anyopaque) void {
 /// Everything the generated fixed-function GLSL depends on.
 pub const FixedKey = struct {
     pretransformed: bool,
+    has_normal: bool,
+    lighting: bool,
     has_color0: bool,
     has_color1: bool,
     tex_coords: u8, // texcoord sets present in the vertex
     specular: bool,
     stages: [8][7]u8, // colorop, colorarg1, colorarg2, alphaop, alphaarg1, alphaarg2, texcoordindex | result<<4
+    sampler_kinds: [8]u8,
     stage_count: u8,
     textured: u8, // stages with a bound texture
 };
@@ -979,10 +1239,25 @@ const TSS_TEXCOORDINDEX = 11;
 const TSS_RESULTARG = 28;
 
 fn fixedKey(dev: *const Device, elements: []const d3d.D3DVERTEXELEMENT9) FixedKey {
-    var k: FixedKey = .{ .pretransformed = false, .has_color0 = false, .has_color1 = false, .tex_coords = 0, .specular = dev.render_states[29] != 0, .stages = std.mem.zeroes([8][7]u8), .stage_count = 0, .textured = 0 };
+    var k: FixedKey = .{
+        .pretransformed = false,
+        .has_normal = false,
+        .lighting = false,
+        .has_color0 = false,
+        .has_color1 = false,
+        .tex_coords = 0,
+        .specular = dev.render_states[29] != 0,
+        .stages = std.mem.zeroes([8][7]u8),
+        .sampler_kinds = [_]u8{0} ** 8,
+        .stage_count = 0,
+        .textured = 0,
+    };
     for (elements) |e| {
         if (e.Stream == 0xFF) break;
         switch (e.Usage) {
+            3 => if (e.UsageIndex == 0) {
+                k.has_normal = true;
+            },
             9 => k.pretransformed = true,
             10 => if (e.UsageIndex == 0) {
                 k.has_color0 = true;
@@ -995,12 +1270,16 @@ fn fixedKey(dev: *const Device, elements: []const d3d.D3DVERTEXELEMENT9) FixedKe
             else => {},
         }
     }
+    k.lighting = !k.pretransformed and dev.render_states[137] != 0;
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         const t = dev.tex_stage_states[i];
         if (t[TSS_COLOROP] == 1 or t[TSS_COLOROP] == 0) break;
         k.stages[i] = .{ @intCast(t[TSS_COLOROP] & 0xFF), @intCast(t[TSS_COLORARG1] & 0xFF), @intCast(t[TSS_COLORARG2] & 0xFF), @intCast(t[TSS_ALPHAOP] & 0xFF), @intCast(t[TSS_ALPHAARG1] & 0xFF), @intCast(t[TSS_ALPHAARG2] & 0xFF), @intCast((t[TSS_TEXCOORDINDEX] & 7) | ((t[TSS_RESULTARG] & 0xF) << 4)) };
-        if (dev.bound_textures[i] != null) k.textured |= @as(u8, 1) << @intCast(i);
+        if (dev.bound_textures[i]) |bt| {
+            k.textured |= @as(u8, 1) << @intCast(i);
+            k.sampler_kinds[i] = @intCast(d3d.textureKind(bt) & 0xFF);
+        }
         k.stage_count += 1;
     }
     return k;
@@ -1062,31 +1341,194 @@ fn buildFixed(k: FixedKey) Program {
             b.appendSlice(alloc, t) catch {};
         }
     }.f;
-    w(&vsb, "#version 120\nattribute vec4 a_pos;\nattribute vec4 a_col0;\nattribute vec4 a_col1;\n", .{});
+    w(&vsb, "#version 130\nattribute vec4 a_pos;\n", .{});
+    if (k.has_normal) vsb.appendSlice(alloc, "attribute vec3 a_norm;\n") catch {};
+    vsb.appendSlice(alloc, "attribute vec4 a_col0;\nattribute vec4 a_col1;\n") catch {};
     for (0..8) |i| w(&vsb, "attribute vec4 a_tc{d};\nvarying vec4 v_tc{d};\n", .{ i, i });
-    w(&vsb, "uniform mat4 wvp;\nuniform vec4 vp;\nuniform vec2 wins_half_pixel;\nvarying vec4 v_col0;\nvarying vec4 v_col1;\nvoid main() {{\n", .{});
+    vsb.appendSlice(alloc,
+        \\uniform mat4 wvp;
+        \\uniform mat4 wins_world;
+        \\uniform vec4 vp;
+        \\uniform vec2 wins_half_pixel;
+        \\uniform vec4 wins_clip[8];
+        \\uniform int wins_clip_mask;
+        \\varying vec4 v_col0;
+        \\varying vec4 v_col1;
+        \\
+    ) catch {};
+    if (k.lighting) {
+        vsb.appendSlice(alloc,
+            \\uniform mat4 wins_wv;
+            \\uniform mat4 wins_norm_mat;
+            \\uniform vec4 wins_global_amb;
+            \\uniform vec4 wins_mat_diff;
+            \\uniform vec4 wins_mat_amb;
+            \\uniform vec4 wins_mat_spec;
+            \\uniform vec4 wins_mat_emis;
+            \\uniform vec4 wins_mat_power;
+            \\uniform ivec4 wins_mat_src;
+            \\uniform ivec4 wins_light_flags;
+            \\uniform int wins_light_count;
+            \\uniform vec4 wins_light_pos[8];
+            \\uniform vec4 wins_light_dir[8];
+            \\uniform vec4 wins_light_diff[8];
+            \\uniform vec4 wins_light_amb[8];
+            \\uniform vec4 wins_light_spec[8];
+            \\uniform vec4 wins_light_atten[8];
+            \\uniform vec4 wins_light_spot[8];
+            \\
+        ) catch {};
+        w(&vsb,
+            \\vec4 wins_pick_mat(vec4 mv, int src, vec4 c0, vec4 c1) {{
+            \\    if (wins_light_flags.w != 0) {{
+            \\        if (src == 1 && {s}) return c0;
+            \\        if (src == 2 && {s}) return c1;
+            \\    }}
+            \\    return mv;
+            \\}}
+            \\
+        , .{ if (k.has_color0) "true" else "false", if (k.has_color1) "true" else "false" });
+    }
+    vsb.appendSlice(alloc, "void main() {\n") catch {};
     if (k.pretransformed) {
         // D3DFVF_XYZRHW: screen pixels; w holds 1/w.
         w(&vsb, "    float ww = a_pos.w != 0.0 ? 1.0 / a_pos.w : 1.0;\n    vec3 ndc = vec3((a_pos.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (a_pos.y - vp.y) / vp.w * 2.0, a_pos.z);\n    gl_Position = vec4(ndc * ww, ww);\n", .{});
     } else {
-        w(&vsb, "    gl_Position = wvp * vec4(a_pos.xyz, 1.0);\n", .{});
+        vsb.appendSlice(alloc,
+            \\    vec4 wins_pos = vec4(a_pos.xyz, 1.0);
+            \\    gl_Position = wvp * wins_pos;
+            \\    if (wins_clip_mask != 0) {
+            \\        vec4 wins_wp = wins_world * wins_pos;
+            \\        gl_ClipDistance[0] = dot(wins_wp, wins_clip[0]);
+            \\        gl_ClipDistance[1] = dot(wins_wp, wins_clip[1]);
+            \\        gl_ClipDistance[2] = dot(wins_wp, wins_clip[2]);
+            \\        gl_ClipDistance[3] = dot(wins_wp, wins_clip[3]);
+            \\        gl_ClipDistance[4] = dot(wins_wp, wins_clip[4]);
+            \\        gl_ClipDistance[5] = dot(wins_wp, wins_clip[5]);
+            \\        gl_ClipDistance[6] = dot(wins_wp, wins_clip[6]);
+            \\        gl_ClipDistance[7] = dot(wins_wp, wins_clip[7]);
+            \\    }
+            \\
+        ) catch {};
     }
     w(&vsb, "    gl_Position.xy += wins_half_pixel * gl_Position.w;\n", .{});
-    w(&vsb, "    v_col0 = {s};\n    v_col1 = {s};\n", .{ if (k.has_color0) "a_col0" else "vec4(1.0)", if (k.has_color1) "a_col1" else "vec4(0.0)" });
+    if (!k.lighting) {
+        w(&vsb, "    v_col0 = {s};\n    v_col1 = {s};\n", .{ if (k.has_color0) "a_col0" else "vec4(1.0)", if (k.has_color1) "a_col1" else "vec4(0.0)" });
+    } else {
+        w(&vsb, "    vec4 c0 = {s};\n    vec4 c1 = {s};\n", .{ if (k.has_color0) "a_col0" else "vec4(1.0)", if (k.has_color1) "a_col1" else "vec4(0.0)" });
+        w(&vsb, "    vec3 n_raw = {s};\n", .{ if (k.has_normal) "mat3(wins_norm_mat) * a_norm" else "vec3(0.0)" });
+        vsb.appendSlice(alloc,
+            \\    vec4 m_diff = wins_pick_mat(wins_mat_diff, wins_mat_src.x, c0, c1);
+            \\    vec4 m_spec = wins_pick_mat(wins_mat_spec, wins_mat_src.y, c0, c1);
+            \\    vec4 m_amb  = wins_pick_mat(wins_mat_amb,  wins_mat_src.z, c0, c1);
+            \\    vec4 m_emis = wins_pick_mat(wins_mat_emis, wins_mat_src.w, c0, c1);
+            \\    vec3 v_eye = (wins_wv * wins_pos).xyz;
+            \\    vec3 n_eye = n_raw;
+            \\    if (wins_light_flags.z != 0) {
+            \\        float n2 = dot(n_eye, n_eye);
+            \\        if (n2 > 0.0) n_eye *= inversesqrt(n2);
+            \\    }
+            \\    vec3 view_dir = vec3(0.0, 0.0, -1.0);
+            \\    if (wins_light_flags.y != 0) {
+            \\        float v2 = dot(v_eye, v_eye);
+            \\        if (v2 > 0.0) view_dir = -v_eye * inversesqrt(v2);
+            \\    }
+            \\    vec3 amb_acc = wins_global_amb.rgb;
+            \\    vec3 diff_acc = vec3(0.0);
+            \\    vec3 spec_acc = vec3(0.0);
+            \\    for (int li = 0; li < 8; li++) {
+            \\        if (li >= wins_light_count) break;
+            \\        int ltype = int(wins_light_pos[li].w + 0.5);
+            \\        vec3 ldir = vec3(0.0);
+            \\        float atten = 1.0;
+            \\        float spot = 1.0;
+            \\        if (ltype == 3) {
+            \\            vec3 dvec = -wins_light_dir[li].xyz;
+            \\            float d2 = dot(dvec, dvec);
+            \\            if (d2 <= 0.0) continue;
+            \\            ldir = dvec * inversesqrt(d2);
+            \\        } else {
+            \\            vec3 to_l = wins_light_pos[li].xyz - v_eye;
+            \\            float d2 = dot(to_l, to_l);
+            \\            float dist = sqrt(d2);
+            \\            if (dist > wins_light_dir[li].w) continue;
+            \\            ldir = dist > 0.0 ? (to_l / dist) : vec3(0.0, 0.0, -1.0);
+            \\            vec3 a = wins_light_atten[li].xyz;
+            \\            float denom = a.x + a.y * dist + a.z * d2;
+            \\            atten = denom > 0.0 ? (1.0 / denom) : 0.0;
+            \\            if (ltype == 2) {
+            \\                vec3 sdir = wins_light_dir[li].xyz;
+            \\                float s2 = dot(sdir, sdir);
+            \\                if (s2 > 0.0) sdir *= inversesqrt(s2);
+            \\                float rho = dot(-ldir, sdir);
+            \\                float c_theta = wins_light_spot[li].x;
+            \\                float c_phi = wins_light_spot[li].y;
+            \\                if (rho <= c_phi) {
+            \\                    spot = 0.0;
+            \\                } else if (rho < c_theta) {
+            \\                    float span = max(c_theta - c_phi, 1e-6);
+            \\                    float t = clamp((rho - c_phi) / span, 0.0, 1.0);
+            \\                    spot = t > 0.0 ? pow(t, wins_light_spot[li].z) : 0.0;
+            \\                }
+            \\            }
+            \\        }
+            \\        float factor = atten * spot;
+            \\        if (factor <= 0.0) continue;
+            \\        amb_acc += wins_light_amb[li].rgb * factor;
+            \\        float ndotl = dot(n_eye, ldir);
+            \\        if (ndotl > 0.0) {
+            \\            diff_acc += wins_light_diff[li].rgb * ndotl * factor;
+            \\            if (wins_light_flags.x != 0) {
+            \\                vec3 hv = ldir + view_dir;
+            \\                float h2 = dot(hv, hv);
+            \\                if (h2 > 0.0) {
+            \\                    float ndoth = max(dot(n_eye, hv * inversesqrt(h2)), 0.0);
+            \\                    float sp = wins_mat_power.x > 0.0 ? (ndoth > 0.0 ? pow(ndoth, wins_mat_power.x) : 0.0) : 1.0;
+            \\                    spec_acc += wins_light_spec[li].rgb * sp * factor;
+            \\                }
+            \\            }
+            \\        }
+            \\    }
+            \\    vec3 lit_diff = m_emis.rgb + m_amb.rgb * amb_acc + m_diff.rgb * diff_acc;
+            \\    vec3 lit_spec = wins_light_flags.x != 0 ? (m_spec.rgb * spec_acc) : vec3(0.0);
+            \\    v_col0 = vec4(clamp(lit_diff, 0.0, 1.0), clamp(m_diff.a, 0.0, 1.0));
+            \\    v_col1 = vec4(clamp(lit_spec, 0.0, 1.0), clamp(m_spec.a, 0.0, 1.0));
+            \\
+        ) catch {};
+    }
     for (0..8) |i| {
         if (k.tex_coords & (@as(u8, 1) << @intCast(i)) != 0) w(&vsb, "    v_tc{d} = a_tc{d};\n", .{ i, i }) else w(&vsb, "    v_tc{d} = vec4(0.0, 0.0, 0.0, 1.0);\n", .{i});
     }
     w(&vsb, "}}\n", .{});
 
-    w(&psb, "#version 120\nuniform vec4 tfactor;\nvarying vec4 v_col0;\nvarying vec4 v_col1;\n", .{});
-    for (0..8) |i| w(&psb, "varying vec4 v_tc{d};\nuniform sampler2D s{d};\n", .{ i, i });
+    w(&psb, "#version 130\nuniform vec4 tfactor;\nvarying vec4 v_col0;\nvarying vec4 v_col1;\n", .{});
+    for (0..8) |i| {
+        const stype: []const u8 = switch (k.sampler_kinds[i]) {
+            d3d.D3DRTYPE_CUBETEXTURE => "samplerCube",
+            d3d.D3DRTYPE_VOLUMETEXTURE => "sampler3D",
+            else => "sampler2D",
+        };
+        w(&psb, "varying vec4 v_tc{d};\nuniform {s} s{d};\n", .{ i, stype, i });
+    }
     w(&psb, "void main() {{\n    vec4 diffuse = v_col0;\n    vec4 specular = v_col1;\n    vec4 current = diffuse;\n    vec4 temp = vec4(0.0);\n    vec4 t = vec4(1.0);\n", .{});
     for (0..k.stage_count) |i| {
         const st = k.stages[i];
         const tci = st[6] & 7;
         if (k.textured & (@as(u8, 1) << @intCast(i)) != 0) {
-            w(&psb, "    t = texture2D(s{d}, v_tc{d}.xy);\n", .{ i, tci });
-            p.samplers[i] = .tex2d;
+            switch (k.sampler_kinds[i]) {
+                d3d.D3DRTYPE_CUBETEXTURE => {
+                    w(&psb, "    t = textureCube(s{d}, v_tc{d}.xyz);\n", .{ i, tci });
+                    p.samplers[i] = .cube;
+                },
+                d3d.D3DRTYPE_VOLUMETEXTURE => {
+                    w(&psb, "    t = texture3D(s{d}, v_tc{d}.xyz);\n", .{ i, tci });
+                    p.samplers[i] = .volume;
+                },
+                else => {
+                    w(&psb, "    t = texture2D(s{d}, v_tc{d}.xy);\n", .{ i, tci });
+                    p.samplers[i] = .tex2d;
+                },
+            }
         } else w(&psb, "    t = vec4(1.0);\n", .{});
         const dst: []const u8 = if ((st[6] >> 4) == 5) "temp" else "current";
         // colour
@@ -1131,6 +1573,7 @@ fn buildFixed(k: FixedKey) Program {
     gl.glAttachShader(prog, gv);
     gl.glAttachShader(prog, gp);
     gl.glBindAttribLocation(prog, 0, "a_pos");
+    if (k.has_normal) gl.glBindAttribLocation(prog, 1, "a_norm");
     gl.glBindAttribLocation(prog, 2, "a_col0");
     gl.glBindAttribLocation(prog, 3, "a_col1");
     var name_buf: [16]u8 = undefined;
@@ -1156,6 +1599,7 @@ fn buildFixed(k: FixedKey) Program {
     }
     var inputs: std.ArrayList(shader.Input) = .empty;
     inputs.append(alloc, .{ .reg = 0, .usage = if (k.pretransformed) 9 else 0, .index = 0 }) catch {};
+    if (k.has_normal) inputs.append(alloc, .{ .reg = 1, .usage = 3, .index = 0 }) catch {};
     if (k.has_color0) inputs.append(alloc, .{ .reg = 2, .usage = 10, .index = 0 }) catch {};
     if (k.has_color1) inputs.append(alloc, .{ .reg = 3, .usage = 10, .index = 1 }) catch {};
     for (0..8) |i| {
@@ -1164,15 +1608,35 @@ fn buildFixed(k: FixedKey) Program {
     p.inputs = inputs.toOwnedSlice(alloc) catch &.{};
     p.prog = prog;
     p.loc_wvp = gl.glGetUniformLocation(prog, "wvp");
+    p.loc_world = gl.glGetUniformLocation(prog, "wins_world");
+    p.loc_wv = gl.glGetUniformLocation(prog, "wins_wv");
+    p.loc_norm_mat = gl.glGetUniformLocation(prog, "wins_norm_mat");
     p.loc_vp = gl.glGetUniformLocation(prog, "vp");
     p.loc_tfactor = gl.glGetUniformLocation(prog, "tfactor");
     p.loc_half = gl.glGetUniformLocation(prog, "wins_half_pixel");
+    p.loc_clip = gl.glGetUniformLocation(prog, "wins_clip");
+    p.loc_clip_mask = gl.glGetUniformLocation(prog, "wins_clip_mask");
+    p.loc_light_count = gl.glGetUniformLocation(prog, "wins_light_count");
+    p.loc_global_amb = gl.glGetUniformLocation(prog, "wins_global_amb");
+    p.loc_mat_diff = gl.glGetUniformLocation(prog, "wins_mat_diff");
+    p.loc_mat_amb = gl.glGetUniformLocation(prog, "wins_mat_amb");
+    p.loc_mat_spec = gl.glGetUniformLocation(prog, "wins_mat_spec");
+    p.loc_mat_emis = gl.glGetUniformLocation(prog, "wins_mat_emis");
+    p.loc_mat_power = gl.glGetUniformLocation(prog, "wins_mat_power");
+    p.loc_mat_src = gl.glGetUniformLocation(prog, "wins_mat_src");
+    p.loc_light_flags = gl.glGetUniformLocation(prog, "wins_light_flags");
+    p.loc_light_pos = gl.glGetUniformLocation(prog, "wins_light_pos");
+    p.loc_light_dir = gl.glGetUniformLocation(prog, "wins_light_dir");
+    p.loc_light_diff = gl.glGetUniformLocation(prog, "wins_light_diff");
+    p.loc_light_amb = gl.glGetUniformLocation(prog, "wins_light_amb");
+    p.loc_light_spec = gl.glGetUniformLocation(prog, "wins_light_spec");
+    p.loc_light_atten = gl.glGetUniformLocation(prog, "wins_light_atten");
+    p.loc_light_spot = gl.glGetUniformLocation(prog, "wins_light_spot");
     return p;
 }
 
 fn fixedProgramFor(dev: *const Device, elements: []const d3d.D3DVERTEXELEMENT9) ?*const Program {
     const k = fixedKey(dev, elements);
-    if (!k.pretransformed and dev.render_states[137] != 0) warnOnce(11, "fixed-function lighting is not implemented; lit vertices use their own colour");
     for (g_programs.items) |*p| {
         if (p.fixed_key) |pk| {
             if (std.meta.eql(pk, k)) return if (p.prog != 0) p else null;
@@ -1195,11 +1659,73 @@ fn matMul(a: [16]f32, b: [16]f32) [16]f32 {
     return r;
 }
 
+fn normalMatrixMat4(wv: [16]f32) [16]f32 {
+    const a00 = wv[0];
+    const a01 = wv[1];
+    const a02 = wv[2];
+    const a10 = wv[4];
+    const a11 = wv[5];
+    const a12 = wv[6];
+    const a20 = wv[8];
+    const a21 = wv[9];
+    const a22 = wv[10];
+    const c00 = a11 * a22 - a12 * a21;
+    const c01 = a12 * a20 - a10 * a22;
+    const c02 = a10 * a21 - a11 * a20;
+    const c10 = a02 * a21 - a01 * a22;
+    const c11 = a00 * a22 - a02 * a20;
+    const c12 = a01 * a20 - a00 * a21;
+    const c20 = a01 * a12 - a02 * a11;
+    const c21 = a02 * a10 - a00 * a12;
+    const c22 = a00 * a11 - a01 * a10;
+    const det = a00 * c00 + a01 * c01 + a02 * c02;
+    if (@abs(det) < 1e-12) {
+        return .{ a00, a01, a02, 0, a10, a11, a12, 0, a20, a21, a22, 0, 0, 0, 0, 1 };
+    }
+    const inv = 1.0 / det;
+    return .{
+        c00 * inv, c01 * inv, c02 * inv, 0,
+        c10 * inv, c11 * inv, c12 * inv, 0,
+        c20 * inv, c21 * inv, c22 * inv, 0,
+        0,         0,         0,         1,
+    };
+}
+
+fn transformPoint(v: d3d.D3DVECTOR, m: [16]f32) [3]f32 {
+    return .{
+        v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12],
+        v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13],
+        v.x * m[2] + v.y * m[6] + v.z * m[10] + m[14],
+    };
+}
+
+fn transformVec(v: d3d.D3DVECTOR, m: [16]f32) [3]f32 {
+    return .{
+        v.x * m[0] + v.y * m[4] + v.z * m[8],
+        v.x * m[1] + v.y * m[5] + v.z * m[9],
+        v.x * m[2] + v.y * m[6] + v.z * m[10],
+    };
+}
+
+fn argbVec4(c: u32) [4]f32 {
+    return .{
+        @as(f32, @floatFromInt((c >> 16) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((c >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(c & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(c >> 24)) / 255.0,
+    };
+}
+
+fn colorValueVec4(c: d3d.D3DCOLORVALUE) [4]f32 {
+    return .{ c.r, c.g, c.b, c.a };
+}
+
 fn setFixedUniforms(dev: *const Device, prog: *const Program) void {
     const gl = &host.gl;
+    const W: [16]f32 = @bitCast(dev.transform_states[d3d.d3dTransformStateIndex(256).?]);
+    const V: [16]f32 = @bitCast(dev.transform_states[d3d.d3dTransformStateIndex(2).?]);
+    if (prog.loc_world >= 0) glUniformMatrix4fv(prog.loc_world, &W);
     if (prog.loc_wvp >= 0) {
-        const W: [16]f32 = @bitCast(dev.transform_states[d3d.d3dTransformStateIndex(256).?]);
-        const V: [16]f32 = @bitCast(dev.transform_states[d3d.d3dTransformStateIndex(2).?]);
         const P: [16]f32 = @bitCast(dev.transform_states[d3d.d3dTransformStateIndex(3).?]);
         // Row vectors: v * W * V * P; OpenGL reads the row-major array as its transpose.
         const m = matMul(matMul(W, V), P);
@@ -1207,11 +1733,98 @@ fn setFixedUniforms(dev: *const Device, prog: *const Program) void {
     }
     if (prog.loc_vp >= 0) gl.glUniform4fv(prog.loc_vp, 1, &[4]f32{ @floatFromInt(dev.viewport.X), @floatFromInt(dev.viewport.Y), @floatFromInt(@max(1, dev.viewport.Width)), @floatFromInt(@max(1, dev.viewport.Height)) });
     if (prog.loc_tfactor >= 0) {
-        const c = dev.render_states[60];
-        gl.glUniform4fv(prog.loc_tfactor, 1, &[4]f32{
-            @as(f32, @floatFromInt((c >> 16) & 0xFF)) / 255.0, @as(f32, @floatFromInt((c >> 8) & 0xFF)) / 255.0,
-            @as(f32, @floatFromInt(c & 0xFF)) / 255.0,         @as(f32, @floatFromInt(c >> 24)) / 255.0,
-        });
+        const tf = argbVec4(dev.render_states[60]);
+        gl.glUniform4fv(prog.loc_tfactor, 1, &tf);
+    }
+    if (prog.loc_light_count >= 0) {
+        const rs = &dev.render_states;
+        const wv = matMul(W, V);
+        if (prog.loc_wv >= 0) glUniformMatrix4fv(prog.loc_wv, &wv);
+        if (prog.loc_norm_mat >= 0) {
+            const nm = normalMatrixMat4(wv);
+            glUniformMatrix4fv(prog.loc_norm_mat, &nm);
+        }
+        if (prog.loc_global_amb >= 0) {
+            const ga = argbVec4(rs[139]);
+            gl.glUniform4fv(prog.loc_global_amb, 1, &ga);
+        }
+        if (prog.loc_mat_diff >= 0) {
+            const v = colorValueVec4(dev.material.Diffuse);
+            gl.glUniform4fv(prog.loc_mat_diff, 1, &v);
+        }
+        if (prog.loc_mat_amb >= 0) {
+            const v = colorValueVec4(dev.material.Ambient);
+            gl.glUniform4fv(prog.loc_mat_amb, 1, &v);
+        }
+        if (prog.loc_mat_spec >= 0) {
+            const v = colorValueVec4(dev.material.Specular);
+            gl.glUniform4fv(prog.loc_mat_spec, 1, &v);
+        }
+        if (prog.loc_mat_emis >= 0) {
+            const v = colorValueVec4(dev.material.Emissive);
+            gl.glUniform4fv(prog.loc_mat_emis, 1, &v);
+        }
+        if (prog.loc_mat_power >= 0) {
+            const v = [4]f32{ dev.material.Power, 0, 0, 0 };
+            gl.glUniform4fv(prog.loc_mat_power, 1, &v);
+        }
+        if (prog.loc_mat_src >= 0) {
+            const srcs = [4]i32{ @bitCast(rs[145]), @bitCast(rs[146]), @bitCast(rs[147]), @bitCast(rs[148]) };
+            gl.glUniform4iv(prog.loc_mat_src, 1, &srcs);
+        }
+        if (prog.loc_light_flags >= 0) {
+            const flags = [4]i32{ @intFromBool(rs[29] != 0), @intFromBool(rs[142] != 0), @intFromBool(rs[143] != 0), @intFromBool(rs[141] != 0) };
+            gl.glUniform4iv(prog.loc_light_flags, 1, &flags);
+        }
+
+        // Collect up to 8 active lights sorted by D3D9 light index.
+        var indices: [8]u32 = [_]u32{std.math.maxInt(u32)} ** 8;
+        var count: usize = 0;
+        var it = dev.lights.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.enabled) continue;
+            const idx = entry.key_ptr.*;
+            var pos_i: usize = count;
+            if (count == 8) {
+                if (idx >= indices[7]) continue;
+                pos_i = 7;
+            } else {
+                count += 1;
+            }
+            while (pos_i > 0 and idx < indices[pos_i - 1]) : (pos_i -= 1) {
+                indices[pos_i] = indices[pos_i - 1];
+            }
+            indices[pos_i] = idx;
+        }
+        var l_pos: [8][4]f32 = std.mem.zeroes([8][4]f32);
+        var l_dir: [8][4]f32 = std.mem.zeroes([8][4]f32);
+        var l_diff: [8][4]f32 = std.mem.zeroes([8][4]f32);
+        var l_amb: [8][4]f32 = std.mem.zeroes([8][4]f32);
+        var l_spec: [8][4]f32 = std.mem.zeroes([8][4]f32);
+        var l_atten: [8][4]f32 = std.mem.zeroes([8][4]f32);
+        var l_spot: [8][4]f32 = std.mem.zeroes([8][4]f32);
+        for (0..count) |li| {
+            const ls = dev.lights.get(indices[li]).?.light;
+            const ep = transformPoint(ls.Position, V);
+            const ed = transformVec(ls.Direction, V);
+            l_pos[li] = .{ ep[0], ep[1], ep[2], @floatFromInt(ls.Type) };
+            l_dir[li] = .{ ed[0], ed[1], ed[2], ls.Range };
+            l_diff[li] = colorValueVec4(ls.Diffuse);
+            l_amb[li] = colorValueVec4(ls.Ambient);
+            l_spec[li] = colorValueVec4(ls.Specular);
+            l_atten[li] = .{ ls.Attenuation0, ls.Attenuation1, ls.Attenuation2, 0 };
+            l_spot[li] = .{ @cos(ls.Theta * 0.5), @cos(ls.Phi * 0.5), ls.Falloff, 0 };
+        }
+        gl.glUniform1i(prog.loc_light_count, @intCast(count));
+        if (count > 0) {
+            if (prog.loc_light_pos >= 0) gl.glUniform4fv(prog.loc_light_pos, @intCast(count), @ptrCast(&l_pos));
+            if (prog.loc_light_dir >= 0) gl.glUniform4fv(prog.loc_light_dir, @intCast(count), @ptrCast(&l_dir));
+            if (prog.loc_light_diff >= 0) gl.glUniform4fv(prog.loc_light_diff, @intCast(count), @ptrCast(&l_diff));
+            if (prog.loc_light_amb >= 0) gl.glUniform4fv(prog.loc_light_amb, @intCast(count), @ptrCast(&l_amb));
+            if (prog.loc_light_spec >= 0) gl.glUniform4fv(prog.loc_light_spec, @intCast(count), @ptrCast(&l_spec));
+            if (prog.loc_light_atten >= 0) gl.glUniform4fv(prog.loc_light_atten, @intCast(count), @ptrCast(&l_atten));
+            if (prog.loc_light_spot >= 0) gl.glUniform4fv(prog.loc_light_spot, @intCast(count), @ptrCast(&l_spot));
+        }
     }
 }
 

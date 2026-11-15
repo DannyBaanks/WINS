@@ -1,17 +1,19 @@
-//! DirectInput 8 keyboard and mouse fed by the host window.
+//! DirectInput 8 keyboard, mouse and controller input fed by the host window
+//! and XInput/SDL2 gamepads.
 //!
 //! Producer: the render thread of wins_gl.zig turns X11 events of the game
 //! window into calls to `keyEvent`, `mouseMove`, `mouseButton`, `mouseWheel`
 //! and `focus`. Consumers: the guest's IDirectInputDevice8 objects, which read
 //! the immediate state (GetDeviceState) or a per-device event buffer
-//! (GetDeviceData), as DirectInput does.
+//! (GetDeviceData), as DirectInput does. Attached SDL2/XInput controllers are
+//! also exposed as joystick devices.
 //!
-//! Only GUID_SysKeyboard and GUID_SysMouse exist; joysticks are not
-//! enumerated (XInput serves the gamepad). Methods outside the
-//! keyboard/mouse contract answer E_NOTIMPL and say so once.
+//! Only system keyboard/mouse and attached gamepads exist; force-feedback and
+//! action mapping are not implemented and answer E_NOTIMPL once.
 
 const std = @import("std");
 const linux = std.os.linux;
+const xinput = @import("wins_xinput.zig");
 
 const W: std.builtin.CallingConvention = .winapi;
 
@@ -25,10 +27,11 @@ const DIERR_INVALIDPARAM: i32 = @bitCast(@as(u32, 0x80070057));
 const DIERR_NOTACQUIRED: i32 = @bitCast(@as(u32, 0x8007000C));
 const DIERR_DEVICENOTREG: i32 = @bitCast(@as(u32, 0x80040154));
 const DIERR_NOTFOUND: i32 = @bitCast(@as(u32, 0x80070002));
+const DIERR_OBJECTNOTFOUND: i32 = @bitCast(@as(u32, 0x80070002));
 const DIERR_NOTBUFFERED: i32 = @bitCast(@as(u32, 0x80040207));
 const DIERR_OUTOFMEMORY: i32 = @bitCast(@as(u32, 0x8007000E));
 
-pub const Kind = enum(u8) { keyboard, mouse };
+pub const Kind = enum(u8) { keyboard, mouse, joystick };
 
 // ---- shared input state (written by the render thread) ------------------------
 
@@ -74,7 +77,14 @@ fn push(kind: Kind, ofs: u32, data: u32) void {
     defer unlock();
     for (g_devices) |maybe| {
         const d = maybe orelse continue;
-        if (d.kind != kind or !d.acquired or d.buffer.len == 0) continue;
+        if (d.kind != kind or !d.acquired) continue;
+        // Latch press edges until GetDeviceState observes them so fast taps
+        // (press+release between two poll frames or inside one X11 batch) aren't lost.
+        if (kind == .keyboard and data != 0 and ofs < 256) d.latched_keys[ofs] = true;
+        if (kind == .mouse and data != 0 and ofs >= 12 and ofs < 17) {
+            d.latched_buttons |= @as(u32, 1) << @intCast(ofs - 12);
+        }
+        if (d.buffer.len == 0) continue;
         if (d.count == d.buffer.len) {
             d.overflow = true;
             continue;
@@ -125,6 +135,13 @@ pub fn focus(has: bool) void {
     if (has) return;
     for (0..256) |k| keyEvent(@intCast(k), false);
     for (0..5) |b| mouseButton(@intCast(b), false);
+    lock();
+    defer unlock();
+    for (g_devices) |maybe| {
+        const d = maybe orelse continue;
+        @memset(&d.latched_keys, false);
+        d.latched_buttons = 0;
+    }
 }
 
 pub fn focused() bool {
@@ -168,6 +185,27 @@ const GUID_SysKeyboard = GUID{ .d1 = 0x6F1D2B61, .d2 = 0xD5A0, .d3 = 0x11CF, .d4
 const IID_IUnknown = GUID{ .d1 = 0, .d2 = 0, .d3 = 0, .d4 = .{ 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
 const IID_IDirectInputDevice8A = GUID{ .d1 = 0x54D41080, .d2 = 0xDC15, .d3 = 0x4833, .d4 = .{ 0xA4, 0x1B, 0x74, 0x8F, 0x73, 0xA3, 0x81, 0x79 } };
 const IID_IDirectInputDevice8W = GUID{ .d1 = 0x54D41081, .d2 = 0xDC15, .d3 = 0x4833, .d4 = .{ 0xA4, 0x1B, 0x74, 0x8F, 0x73, 0xA3, 0x81, 0x79 } };
+
+const GUID_XAxis = GUID{ .d1 = 0xA36D02E0, .d2 = 0xC9F3, .d3 = 0x11CF, .d4 = .{ 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+const GUID_YAxis = GUID{ .d1 = 0xA36D02E1, .d2 = 0xC9F3, .d3 = 0x11CF, .d4 = .{ 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+const GUID_ZAxis = GUID{ .d1 = 0xA36D02E2, .d2 = 0xC9F3, .d3 = 0x11CF, .d4 = .{ 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+const GUID_RxAxis = GUID{ .d1 = 0xA36D02F4, .d2 = 0xC9F3, .d3 = 0x11CF, .d4 = .{ 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+const GUID_RyAxis = GUID{ .d1 = 0xA36D02F5, .d2 = 0xC9F3, .d3 = 0x11CF, .d4 = .{ 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+const GUID_Button = GUID{ .d1 = 0xA36D02F0, .d2 = 0xC9F3, .d3 = 0x11CF, .d4 = .{ 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+const GUID_Key = GUID{ .d1 = 0x55728220, .d2 = 0xD33C, .d3 = 0x11CF, .d4 = .{ 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+const GUID_POV = GUID{ .d1 = 0xA36D02F2, .d2 = 0xC9F3, .d3 = 0x11CF, .d4 = .{ 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+
+pub fn joystickGuid(slot: u8) GUID {
+    return .{ .d1 = 0x57494E53, .d2 = 0x5849, .d3 = 0x0000, .d4 = .{ 0, 0, 0, 0, 0, 0, 0, slot } };
+}
+
+fn matchJoystickGuid(g: *align(1) const GUID) ?u8 {
+    for (0..4) |i| {
+        const jg = joystickGuid(@intCast(i));
+        if (guidEql(g, &jg)) return @intCast(i);
+    }
+    return null;
+}
 
 fn guidEql(a: *align(1) const GUID, b: *const GUID) bool {
     return std.mem.eql(u8, std.mem.asBytes(a), std.mem.asBytes(b));
@@ -213,10 +251,15 @@ pub const Device = struct {
     ref_count: u32,
     kind: Kind,
     wide: bool,
+    joy_index: u8 = 0,
     acquired: bool = false,
     data_size: u32 = 0,
     absolute: bool = false,
     coop_flags: u32 = 0,
+    range_min: i32 = -32768,
+    range_max: i32 = 32767,
+    deadzone: u32 = 0,
+    saturation: u32 = 10000,
     /// Totals already handed out by GetDeviceState (mouse deltas are per device).
     seen_x: i32 = 0,
     seen_y: i32 = 0,
@@ -225,6 +268,8 @@ pub const Device = struct {
     head: usize = 0,
     count: usize = 0,
     overflow: bool = false,
+    latched_keys: [256]bool = [_]bool{false} ** 256,
+    latched_buttons: u32 = 0,
 };
 
 var g_said: u32 = 0;
@@ -274,34 +319,127 @@ fn dev_Release(this: *anyopaque) callconv(W) u32 {
 /// force-feedback fields.
 fn dev_GetCapabilities(this: *anyopaque, caps: ?[*]u32) callconv(W) i32 {
     sayOnce(0, "GetCapabilities", @returnAddress());
+    const d = self(this);
     const c = caps orelse return E_POINTER;
     const size = c[0];
     if (size != 24 and size != 44) return DIERR_INVALIDPARAM;
     @memset(std.mem.sliceAsBytes(c[1 .. size / 4]), 0);
     c[1] = 0x1 | 0x4; // DIDC_ATTACHED | DIDC_EMULATED
-    if (self(this).kind == .keyboard) {
-        c[2] = 0x13 | (4 << 8); // DI8DEVTYPE_KEYBOARD, DI8DEVTYPEKEYBOARD_PCENH
-        c[4] = 128;
-    } else {
-        c[2] = 0x12 | (2 << 8); // DI8DEVTYPE_MOUSE, DI8DEVTYPEMOUSE_TRADITIONAL
-        c[3] = 3;
-        c[4] = 5;
+    switch (d.kind) {
+        .keyboard => {
+            c[2] = 0x13 | (4 << 8); // DI8DEVTYPE_KEYBOARD, DI8DEVTYPEKEYBOARD_PCENH
+            c[4] = 128;
+        },
+        .mouse => {
+            c[2] = 0x12 | (2 << 8); // DI8DEVTYPE_MOUSE, DI8DEVTYPEMOUSE_TRADITIONAL
+            c[3] = 3;
+            c[4] = 5;
+        },
+        .joystick => {
+            c[2] = 0x15 | (2 << 8); // DI8DEVTYPE_GAMEPAD, DI8DEVTYPEGAMEPAD_STANDARD
+            c[3] = 5; // X, Y, Z(triggers), Rx, Ry
+            c[4] = 12;
+            c[5] = 1; // 1 POV (D-pad)
+        },
+    }
+    return DI_OK;
+}
+
+const EnumObjectCb = *const fn (*const u8, ?*anyopaque) callconv(W) i32;
+
+fn pushObj(wide: bool, cb_fn: EnumObjectCb, ref: ?*anyopaque, guid: *const GUID, ofs: u32, obj_type: u32, flags: u32, name: []const u8) bool {
+    const char_size: usize = if (wide) 2 else 1;
+    var buf: [576]u8 align(4) = [_]u8{0} ** 576;
+    const obj_size: u32 = if (wide) 576 else 316;
+    std.mem.writeInt(u32, buf[0..4], obj_size, .little);
+    @memcpy(buf[4..20], std.mem.asBytes(guid));
+    std.mem.writeInt(u32, buf[20..24], ofs, .little);
+    std.mem.writeInt(u32, buf[24..28], obj_type, .little);
+    std.mem.writeInt(u32, buf[28..32], flags, .little);
+    fillName(buf[32 .. 32 + 260 * char_size], wide, name);
+    return cb_fn(&buf[0], ref) != 0; // DIENUM_STOP == 0
+}
+
+fn enumDeviceObjects(d: *const Device, cb: ?*anyopaque, ref: ?*anyopaque, flags: u32) i32 {
+    const raw_cb = cb orelse return E_POINTER;
+    const cb_fn: EnumObjectCb = @ptrCast(@alignCast(raw_cb));
+    const want_all = flags == 0;
+    const want_axis = want_all or (flags & 3) != 0; // DIDFT_AXIS (RELAXIS | ABSAXIS)
+    const want_btn = want_all or (flags & 0xC) != 0; // DIDFT_BUTTON
+    const want_pov = want_all or (flags & 0x10) != 0; // DIDFT_POV
+
+    switch (d.kind) {
+        .mouse => {
+            if (want_axis) {
+                const axes = [_]struct { g: *const GUID, o: u32, t: u32, n: []const u8 }{
+                    .{ .g = &GUID_XAxis, .o = 0, .t = 0x0001, .n = "X-axis" },
+                    .{ .g = &GUID_YAxis, .o = 4, .t = 0x0101, .n = "Y-axis" },
+                    .{ .g = &GUID_ZAxis, .o = 8, .t = 0x0201, .n = "Wheel" },
+                };
+                for (axes) |a| {
+                    if (!pushObj(d.wide, cb_fn, ref, a.g, a.o, a.t, 0, a.n)) return DI_OK;
+                }
+            }
+            if (want_btn) {
+                const btns = [_][]const u8{ "Button 0", "Button 1", "Button 2", "Button 3", "Button 4" };
+                for (btns, 0..) |bn, i| {
+                    const obj_type: u32 = (@as(u32, @intCast(3 + i)) << 8) | 0x04;
+                    if (!pushObj(d.wide, cb_fn, ref, &GUID_Button, @intCast(12 + i), obj_type, 0, bn)) return DI_OK;
+                }
+            }
+        },
+        .keyboard => {
+            if (!want_btn) return DI_OK;
+            var k: u32 = 1;
+            while (k <= 0xDD) : (k += 1) {
+                if (k > 0x58 and k < 0x9C) continue;
+                var nbuf: [16]u8 = undefined;
+                const kn = std.fmt.bufPrint(&nbuf, "Key {d}", .{k}) catch "Key";
+                const obj_type: u32 = (k << 8) | 0x04;
+                if (!pushObj(d.wide, cb_fn, ref, &GUID_Key, k, obj_type, 0, kn)) return DI_OK;
+            }
+        },
+        .joystick => {
+            if (want_axis) {
+                const axes = [_]struct { g: *const GUID, o: u32, inst: u32, n: []const u8 }{
+                    .{ .g = &GUID_XAxis, .o = 0, .inst = 0, .n = "X Axis" },
+                    .{ .g = &GUID_YAxis, .o = 4, .inst = 1, .n = "Y Axis" },
+                    .{ .g = &GUID_ZAxis, .o = 8, .inst = 2, .n = "Z Axis" },
+                    .{ .g = &GUID_RxAxis, .o = 12, .inst = 3, .n = "X Rotation" },
+                    .{ .g = &GUID_RyAxis, .o = 16, .inst = 4, .n = "Y Rotation" },
+                };
+                for (axes) |a| {
+                    const obj_type: u32 = (a.inst << 8) | 0x02; // DIDFT_ABSAXIS
+                    if (!pushObj(d.wide, cb_fn, ref, a.g, a.o, obj_type, 0x0100, a.n)) return DI_OK;
+                }
+            }
+            if (want_pov) {
+                if (!pushObj(d.wide, cb_fn, ref, &GUID_POV, 32, (0 << 8) | 0x10, 0, "Hat Switch")) return DI_OK;
+            }
+            if (want_btn) {
+                for (0..12) |i| {
+                    var nbuf: [16]u8 = undefined;
+                    const bn = std.fmt.bufPrint(&nbuf, "Button {d}", .{i}) catch "Button";
+                    const obj_type: u32 = (@as(u32, @intCast(i)) << 8) | 0x04; // DIDFT_PSHBUTTON
+                    if (!pushObj(d.wide, cb_fn, ref, &GUID_Button, @intCast(48 + i), obj_type, 0, bn)) return DI_OK;
+                }
+            }
+        },
     }
     return DI_OK;
 }
 
 fn dev_EnumObjects(this: *anyopaque, cb: ?*anyopaque, ref: ?*anyopaque, flags: u32) callconv(W) i32 {
-    _ = this;
-    _ = cb;
-    _ = ref;
-    _ = flags;
-    sayOnce(1, "EnumObjects is not implemented yet", @returnAddress());
-    return E_NOTIMPL;
+    sayOnce(1, "EnumObjects", @returnAddress());
+    return enumDeviceObjects(self(this), cb, ref, flags);
 }
 
 /// Predefined properties are passed as small integers (MAKEDIPROP).
 const DIPROP_BUFFERSIZE: usize = 1;
 const DIPROP_AXISMODE: usize = 2;
+const DIPROP_RANGE: usize = 4;
+const DIPROP_DEADZONE: usize = 5;
+const DIPROP_SATURATION: usize = 6;
 
 fn dev_GetProperty(this: *anyopaque, prop: usize, ph: ?[*]u32) callconv(W) i32 {
     const d = self(this);
@@ -309,6 +447,12 @@ fn dev_GetProperty(this: *anyopaque, prop: usize, ph: ?[*]u32) callconv(W) i32 {
     switch (prop) {
         DIPROP_BUFFERSIZE => h[4] = @intCast(d.buffer.len),
         DIPROP_AXISMODE => h[4] = @intFromBool(d.absolute),
+        DIPROP_RANGE => {
+            h[4] = @bitCast(d.range_min);
+            h[5] = @bitCast(d.range_max);
+        },
+        DIPROP_DEADZONE => h[4] = d.deadzone,
+        DIPROP_SATURATION => h[4] = d.saturation,
         else => {
             sayOnce(2, "GetProperty for an unsupported property", @returnAddress());
             return DIERR_NOTFOUND;
@@ -334,6 +478,21 @@ fn dev_SetProperty(this: *anyopaque, prop: usize, ph: ?[*]const u32) callconv(W)
             if (old.len != 0) std.heap.page_allocator.free(old);
         },
         DIPROP_AXISMODE => d.absolute = h[4] == 1,
+        DIPROP_RANGE => {
+            const rmin: i32 = @bitCast(h[4]);
+            const rmax: i32 = @bitCast(h[5]);
+            if (rmin > rmax) return DIERR_INVALIDPARAM;
+            d.range_min = rmin;
+            d.range_max = rmax;
+        },
+        DIPROP_DEADZONE => {
+            if (h[4] > 10000) return DIERR_INVALIDPARAM;
+            d.deadzone = h[4];
+        },
+        DIPROP_SATURATION => {
+            if (h[4] > 10000) return DIERR_INVALIDPARAM;
+            d.saturation = h[4];
+        },
         else => {
             sayOnce(3, "SetProperty for an unsupported property (ignored)", @returnAddress());
         },
@@ -350,6 +509,8 @@ fn dev_Acquire(this: *anyopaque) callconv(W) i32 {
     d.acquired = true;
     d.head = 0;
     d.count = 0;
+    @memset(&d.latched_keys, false);
+    d.latched_buttons = 0;
     unlock();
     d.seen_x = g_mouse_x.load(.monotonic);
     d.seen_y = g_mouse_y.load(.monotonic);
@@ -359,7 +520,7 @@ fn dev_Acquire(this: *anyopaque) callconv(W) i32 {
 
 fn dev_Unacquire(this: *anyopaque) callconv(W) i32 {
     const d = self(this);
-    sayOnce(12 + @as(u5, @intCast(@intFromEnum(d.kind))), "Unacquire", @returnAddress());
+    sayOnce(13 + @as(u5, @intCast(@intFromEnum(d.kind))), "Unacquire", @returnAddress());
     if (!d.acquired) return DI_NOEFFECT;
     lock();
     d.acquired = false;
@@ -367,15 +528,62 @@ fn dev_Unacquire(this: *anyopaque) callconv(W) i32 {
     return DI_OK;
 }
 
+fn scaleJoyAxis(d: *const Device, raw_v: i16) i32 {
+    var norm: f64 = if (raw_v < 0)
+        @as(f64, @floatFromInt(raw_v)) / 32768.0
+    else
+        @as(f64, @floatFromInt(raw_v)) / 32767.0;
+    const dz = @as(f64, @floatFromInt(d.deadzone)) / 10000.0;
+    const sat = @as(f64, @floatFromInt(d.saturation)) / 10000.0;
+    const mag = @abs(norm);
+    if (mag <= dz) {
+        norm = 0;
+    } else if (mag >= sat or sat <= dz) {
+        norm = std.math.sign(norm);
+    } else {
+        norm = std.math.sign(norm) * (mag - dz) / (sat - dz);
+    }
+    const rmin: f64 = @floatFromInt(d.range_min);
+    const rmax: f64 = @floatFromInt(d.range_max);
+    const mid = (rmin + rmax) * 0.5;
+    const half = (rmax - rmin) * 0.5;
+    return @intFromFloat(std.math.clamp(mid + norm * half, rmin, rmax));
+}
+
+fn povFromDpad(buttons: u16) u32 {
+    const up = (buttons & 0x0001) != 0;
+    const down = (buttons & 0x0002) != 0;
+    const left = (buttons & 0x0004) != 0;
+    const right = (buttons & 0x0008) != 0;
+    if (up and right) return 4500;
+    if (down and right) return 13500;
+    if (down and left) return 22500;
+    if (up and left) return 31500;
+    if (up) return 0;
+    if (right) return 9000;
+    if (down) return 18000;
+    if (left) return 27000;
+    return 0xFFFFFFFF;
+}
+
 fn dev_GetDeviceState(this: *anyopaque, cb: u32, data: ?[*]u8) callconv(W) i32 {
     const d = self(this);
     const out = data orelse return E_POINTER;
-    sayOnce(14 + @as(u5, @intCast(@intFromEnum(d.kind))), "GetDeviceState", @returnAddress());
+    sayOnce(16 + @as(u5, @intCast(@intFromEnum(d.kind))), "GetDeviceState", @returnAddress());
     if (!d.acquired) return DIERR_NOTACQUIRED;
     if (cb != d.data_size) return DIERR_INVALIDPARAM;
     switch (d.kind) {
-        .keyboard => for (0..256) |k| {
-            out[k] = g_keys[k].load(.monotonic);
+        .keyboard => {
+            lock();
+            defer unlock();
+            for (0..256) |k| {
+                if (g_keys[k].load(.monotonic) != 0 or d.latched_keys[k]) {
+                    out[k] = 0x80;
+                    d.latched_keys[k] = false;
+                } else {
+                    out[k] = 0;
+                }
+            }
         },
         .mouse => {
             const x = g_mouse_x.load(.monotonic);
@@ -386,8 +594,47 @@ fn dev_GetDeviceState(this: *anyopaque, cb: u32, data: ?[*]u8) callconv(W) i32 {
             d.seen_y = y;
             d.seen_z = z;
             @memcpy(out[0..12], std.mem.sliceAsBytes(&v));
-            const buttons = g_buttons.load(.monotonic);
+            lock();
+            const buttons = g_buttons.load(.monotonic) | d.latched_buttons;
+            d.latched_buttons = 0;
+            unlock();
             for (0..cb - 12) |i| out[12 + i] = if (i < 5 and (buttons >> @intCast(i)) & 1 != 0) 0x80 else 0;
+        },
+        .joystick => {
+            @memset(out[0..cb], 0);
+            for (0..4) |p| std.mem.writeInt(u32, out[32 + p * 4 ..][0..4], 0xFFFFFFFF, .little);
+            const ci = xinput.queryController(d.joy_index);
+            if (!ci.connected) return DI_OK;
+            const gp = ci.state.Gamepad;
+            const invY: i16 = if (gp.sThumbLY == std.math.minInt(i16)) std.math.maxInt(i16) else -gp.sThumbLY;
+            const invRY: i16 = if (gp.sThumbRY == std.math.minInt(i16)) std.math.maxInt(i16) else -gp.sThumbRY;
+            const trig_diff: i32 = (@as(i32, gp.bLeftTrigger) - @as(i32, gp.bRightTrigger)) * 128;
+            const lZ_raw: i16 = @intCast(std.math.clamp(trig_diff, -32768, 32767));
+            const axes = [5]i32{
+                scaleJoyAxis(d, gp.sThumbLX),
+                scaleJoyAxis(d, invY),
+                scaleJoyAxis(d, lZ_raw),
+                scaleJoyAxis(d, gp.sThumbRX),
+                scaleJoyAxis(d, invRY),
+            };
+            for (axes, 0..) |a, idx| std.mem.writeInt(i32, out[idx * 4 ..][0..4], a, .little);
+            std.mem.writeInt(u32, out[32..36], povFromDpad(gp.wButtons), .little);
+            // XInput face/shoulder/system buttons mapped to DIJOYSTATE::rgbButtons[0..9]
+            const di_masks = [_]u16{
+                0x1000, // 0: A
+                0x2000, // 1: B
+                0x4000, // 2: X
+                0x8000, // 3: Y
+                0x0100, // 4: LB
+                0x0200, // 5: RB
+                0x0020, // 6: Back
+                0x0010, // 7: Start
+                0x0040, // 8: LS
+                0x0080, // 9: RS
+            };
+            for (di_masks, 0..) |m, bi| {
+                out[48 + bi] = if ((gp.wButtons & m) != 0) 0x80 else 0;
+            }
         },
     }
     return DI_OK;
@@ -396,7 +643,7 @@ fn dev_GetDeviceState(this: *anyopaque, cb: u32, data: ?[*]u8) callconv(W) i32 {
 fn dev_GetDeviceData(this: *anyopaque, cb: u32, rgdod: ?[*]ObjectData, inout: ?*u32, flags: u32) callconv(W) i32 {
     const d = self(this);
     const n_ptr = inout orelse return E_POINTER;
-    sayOnce(16 + @as(u5, @intCast(@intFromEnum(d.kind))), "GetDeviceData", @returnAddress());
+    sayOnce(19 + @as(u5, @intCast(@intFromEnum(d.kind))), "GetDeviceData", @returnAddress());
     if (!d.acquired) return DIERR_NOTACQUIRED;
     if (cb != @sizeOf(ObjectData)) return DIERR_INVALIDPARAM;
     if (d.buffer.len == 0) return DIERR_NOTBUFFERED;
@@ -419,8 +666,9 @@ fn dev_GetDeviceData(this: *anyopaque, cb: u32, rgdod: ?[*]ObjectData, inout: ?*
 }
 
 /// DIDATAFORMAT: dwSize, dwObjSize, dwFlags, dwDataSize, dwNumObjs, rgodf.
-/// The standard formats (c_dfDIKeyboard 256, c_dfDIMouse 16, c_dfDIMouse2 20)
-/// are recognised by their data size; their object layout is the standard one.
+/// The standard formats (c_dfDIKeyboard 256, c_dfDIMouse 16, c_dfDIMouse2 20,
+/// c_dfDIJoystick 80, c_dfDIJoystick2 272) are recognised by their data size;
+/// their object layout is the standard one.
 fn dev_SetDataFormat(this: *anyopaque, fmt: ?[*]const u32) callconv(W) i32 {
     const d = self(this);
     const f = fmt orelse return E_POINTER;
@@ -429,6 +677,7 @@ fn dev_SetDataFormat(this: *anyopaque, fmt: ?[*]const u32) callconv(W) i32 {
     const ok = switch (d.kind) {
         .keyboard => size == 256,
         .mouse => size == 16 or size == 20,
+        .joystick => size == 80 or size == 272,
     };
     std.debug.print("[WINS:DInput] {s}: SetDataFormat(data size {d}, flags 0x{x}, {d} objects){s}\n", .{ @tagName(d.kind), size, f[2], f[4], if (ok) "" else " -- not a standard format, refused" });
     if (!ok) return DIERR_INVALIDPARAM;
@@ -460,12 +709,73 @@ fn dev_GetObjectInfo(this: *anyopaque, info: ?*anyopaque, obj: u32, how: u32) ca
 }
 
 fn fillName(dst: []u8, wide: bool, name: []const u8) void {
+    const cap = if (wide) dst.len / 2 else dst.len;
+    if (cap == 0) return;
+    const n = @min(name.len, cap - 1);
     if (wide) {
-        for (name, 0..) |ch, i| {
+        for (name[0..n], 0..) |ch, i| {
             dst[i * 2] = ch;
             dst[i * 2 + 1] = 0;
         }
-    } else @memcpy(dst[0..name.len], name);
+    } else @memcpy(dst[0..n], name[0..n]);
+}
+
+fn deviceName(kind: Kind, joy_index: u8, name_buf: *[64]u8) struct { name: []const u8, prod: GUID } {
+    switch (kind) {
+        .keyboard => return .{ .name = "Keyboard", .prod = GUID_SysKeyboard },
+        .mouse => return .{ .name = "Mouse", .prod = GUID_SysMouse },
+        .joystick => {
+            const ci = xinput.queryController(joy_index);
+            const ig = joystickGuid(joy_index);
+            const prod: GUID = if (ci.vendor != 0 or ci.product != 0)
+                .{ .d1 = (@as(u32, ci.product) << 16) | ci.vendor, .d2 = 0, .d3 = 0, .d4 = .{ 0, 0, 'P', 'I', 'D', 'V', 'I', 'D' } }
+            else
+                ig;
+            if (ci.connected and ci.name_len > 0) {
+                const n = @min(@as(usize, ci.name_len), name_buf.len);
+                @memcpy(name_buf[0..n], ci.name[0..n]);
+                return .{ .name = name_buf[0..n], .prod = prod };
+            }
+            return .{ .name = "XInput Controller", .prod = prod };
+        },
+    }
+}
+
+fn fillDeviceInstance(kind: Kind, joy_index: u8, wide: bool, p: [*]u8, size: u32) i32 {
+    const char_size: usize = if (wide) 2 else 1;
+    const full: u32 = @intCast(4 + 16 + 16 + 4 + 520 * char_size + 16 + 4);
+    if (size != full and size != full - 20) return DIERR_INVALIDPARAM;
+    std.mem.writeInt(u32, p[0..4], size, .little);
+    @memset(p[4..size], 0);
+    const joy_guid = joystickGuid(joy_index);
+    const inst_guid: *const GUID = switch (kind) {
+        .keyboard => &GUID_SysKeyboard,
+        .mouse => &GUID_SysMouse,
+        .joystick => &joy_guid,
+    };
+    var name_buf: [64]u8 = undefined;
+    const info = deviceName(kind, joy_index, &name_buf);
+    const dev_type: u32 = switch (kind) {
+        .keyboard => 0x13 | (4 << 8),
+        .mouse => 0x12 | (2 << 8),
+        .joystick => 0x15 | (2 << 8),
+    };
+    @memcpy(p[4..20], std.mem.asBytes(inst_guid));
+    @memcpy(p[20..36], std.mem.asBytes(&info.prod));
+    std.mem.writeInt(u32, p[36..40], dev_type, .little);
+    fillName(p[40 .. 40 + 260 * char_size], wide, info.name);
+    fillName(p[40 + 260 * char_size .. 40 + 520 * char_size], wide, info.name);
+    if (size == full) {
+        const u = 40 + 520 * char_size + 16;
+        const usage: u16 = switch (kind) {
+            .keyboard => 6,
+            .mouse => 2,
+            .joystick => 5,
+        };
+        std.mem.writeInt(u16, p[u..][0..2], 1, .little); // HID usage page: generic desktop
+        std.mem.writeInt(u16, p[u + 2 ..][0..2], usage, .little);
+    }
+    return DI_OK;
 }
 
 /// DIDEVICEINSTANCE{A,W}: dwSize, guidInstance, guidProduct, dwDevType,
@@ -474,24 +784,7 @@ fn dev_GetDeviceInfo(this: *anyopaque, raw: ?[*]u8) callconv(W) i32 {
     const d = self(this);
     const p = raw orelse return E_POINTER;
     const size = std.mem.readInt(u32, p[0..4], .little);
-    const char_size: usize = if (d.wide) 2 else 1;
-    const full: u32 = @intCast(4 + 16 + 16 + 4 + 520 * char_size + 16 + 4);
-    if (size != full and size != full - 20) return DIERR_INVALIDPARAM;
-    @memset(p[4..size], 0);
-    const guid = if (d.kind == .keyboard) &GUID_SysKeyboard else &GUID_SysMouse;
-    @memcpy(p[4..20], std.mem.asBytes(guid));
-    @memcpy(p[20..36], std.mem.asBytes(guid));
-    const dev_type: u32 = if (d.kind == .keyboard) 0x13 | (4 << 8) else 0x12 | (2 << 8);
-    std.mem.writeInt(u32, p[36..40], dev_type, .little);
-    const name = if (d.kind == .keyboard) "Keyboard" else "Mouse";
-    fillName(p[40 .. 40 + 260 * char_size], d.wide, name);
-    fillName(p[40 + 260 * char_size .. 40 + 520 * char_size], d.wide, name);
-    if (size == full) {
-        const u = 40 + 520 * char_size + 16;
-        std.mem.writeInt(u16, p[u..][0..2], 1, .little); // HID usage page: generic desktop
-        std.mem.writeInt(u16, p[u + 2 ..][0..2], if (d.kind == .keyboard) 6 else 2, .little);
-    }
-    return DI_OK;
+    return fillDeviceInstance(d.kind, d.joy_index, d.wide, p, size);
 }
 
 fn dev_RunControlPanel(this: *anyopaque, hwnd: usize, flags: u32) callconv(W) i32 {
@@ -513,7 +806,7 @@ fn noFx5(this: *anyopaque, a: usize, b: usize, c: usize, e: usize) callconv(W) i
     _ = b;
     _ = c;
     _ = e;
-    sayOnce(6, "a force-feedback/effect-file method (keyboard and mouse have none)", @returnAddress());
+    sayOnce(6, "a force-feedback/effect-file method (no force feedback)", @returnAddress());
     return DIERR_DEVICENOTREG;
 }
 fn noFx4(this: *anyopaque, a: usize, b: usize, c: usize) callconv(W) i32 {
@@ -538,8 +831,10 @@ fn noFx2(this: *anyopaque, a: usize) callconv(W) i32 {
     return E_NOTIMPL;
 }
 fn dev_Poll(this: *anyopaque) callconv(W) i32 {
-    if (!self(this).acquired) return DIERR_NOTACQUIRED;
-    return DI_NOEFFECT; // keyboard and mouse are interrupt-driven
+    const d = self(this);
+    if (!d.acquired) return DIERR_NOTACQUIRED;
+    if (d.kind == .joystick) _ = xinput.queryController(d.joy_index);
+    return DI_OK;
 }
 
 const g_vtbl: Vtbl = .{
@@ -577,22 +872,133 @@ const g_vtbl: Vtbl = .{
     .GetImageInfo = @ptrCast(&noFx2),
 };
 
-/// IDirectInput8::CreateDevice for the system keyboard and mouse.
+const EnumDeviceCb = *const fn (*const u8, ?*anyopaque) callconv(W) i32;
+
+const DIEDFL_FORCEFEEDBACK: u32 = 0x00000100;
+const DI8DEVCLASS_ALL: u32 = 0;
+const DI8DEVCLASS_POINTER: u32 = 2;
+const DI8DEVCLASS_KEYBOARD: u32 = 3;
+const DI8DEVCLASS_GAMECTRL: u32 = 4;
+const DI_NOTATTACHED: i32 = 1;
+
+fn pushEnumDevice(kind: Kind, joy_index: u8, wide: bool, cb_fn: EnumDeviceCb, ref: ?*anyopaque) bool {
+    var buf: [1100]u8 align(4) = undefined;
+    const full: u32 = if (wide) 1100 else 580;
+    _ = fillDeviceInstance(kind, joy_index, wide, &buf, full);
+    return cb_fn(&buf[0], ref) != 0;
+}
+
+/// IDirectInput8::EnumDevices
+pub fn enumDevices(dev_type: u32, wide: bool, cb: ?*anyopaque, ref: ?*anyopaque, flags: u32) i32 {
+    const raw_cb = cb orelse return DIERR_INVALIDPARAM;
+    const cb_fn: EnumDeviceCb = @ptrCast(@alignCast(raw_cb));
+    if ((flags & DIEDFL_FORCEFEEDBACK) != 0) return DI_OK;
+    const base_type = dev_type & 0xFF;
+    const want_mouse = dev_type == DI8DEVCLASS_ALL or dev_type == DI8DEVCLASS_POINTER or base_type == 0x12;
+    const want_kb = dev_type == DI8DEVCLASS_ALL or dev_type == DI8DEVCLASS_KEYBOARD or base_type == 0x13;
+    const want_joy = dev_type == DI8DEVCLASS_ALL or dev_type == DI8DEVCLASS_GAMECTRL or (base_type >= 0x14 and base_type <= 0x1C);
+    if (want_mouse) {
+        if (!pushEnumDevice(.mouse, 0, wide, cb_fn, ref)) return DI_OK;
+    }
+    if (want_kb) {
+        if (!pushEnumDevice(.keyboard, 0, wide, cb_fn, ref)) return DI_OK;
+    }
+    if (want_joy) {
+        for (0..4) |slot| {
+            const idx: u8 = @intCast(slot);
+            if (!xinput.queryController(idx).connected) continue;
+            if (!pushEnumDevice(.joystick, idx, wide, cb_fn, ref)) return DI_OK;
+        }
+    }
+    return DI_OK;
+}
+
+/// IDirectInput8::GetDeviceStatus
+pub fn getDeviceStatus(guid: ?*align(1) const GUID) i32 {
+    const g = guid orelse return E_POINTER;
+    if (guidEql(g, &GUID_SysKeyboard) or guidEql(g, &GUID_SysMouse)) return DI_OK;
+    if (matchJoystickGuid(g)) |slot| {
+        return if (xinput.queryController(slot).connected) DI_OK else DI_NOTATTACHED;
+    }
+    return DI_NOTATTACHED;
+}
+
+fn readGuestName(name_ptr: ?*const anyopaque, wide: bool, out: *[260]u8) ?[]const u8 {
+    const ptr = name_ptr orelse return null;
+    if (wide) {
+        const wp: [*:0]const u16 = @ptrCast(@alignCast(ptr));
+        var n: usize = 0;
+        while (n < out.len and wp[n] != 0) : (n += 1) {
+            out[n] = @truncate(wp[n]);
+        }
+        return out[0..n];
+    } else {
+        const ap: [*:0]const u8 = @ptrCast(ptr);
+        const s = std.mem.sliceTo(ap, 0);
+        const n = @min(s.len, out.len);
+        @memcpy(out[0..n], s[0..n]);
+        return out[0..n];
+    }
+}
+
+/// IDirectInput8::FindDevice
+pub fn findDevice(rguid_class: ?*align(1) const GUID, name_ptr: ?*const anyopaque, wide: bool, out_guid: ?*align(1) GUID) i32 {
+    const dst = out_guid orelse return E_POINTER;
+    var tmp: [260]u8 = undefined;
+    const name = readGuestName(name_ptr, wide, &tmp) orelse return DIERR_INVALIDPARAM;
+    if (rguid_class) |g| {
+        if (guidEql(g, &GUID_SysKeyboard) and std.ascii.eqlIgnoreCase(name, "Keyboard")) {
+            dst.* = GUID_SysKeyboard;
+            return DI_OK;
+        }
+        if (guidEql(g, &GUID_SysMouse) and std.ascii.eqlIgnoreCase(name, "Mouse")) {
+            dst.* = GUID_SysMouse;
+            return DI_OK;
+        }
+    }
+    for (0..4) |slot| {
+        const idx: u8 = @intCast(slot);
+        const ci = xinput.queryController(idx);
+        if (!ci.connected) continue;
+        const jg = joystickGuid(idx);
+        if (rguid_class) |g| {
+            const zero = std.mem.zeroes(GUID);
+            if (!guidEql(g, &zero) and !guidEql(g, &jg)) continue;
+        }
+        const cname = if (ci.name_len > 0) ci.name[0..ci.name_len] else "XInput Controller";
+        if (std.ascii.eqlIgnoreCase(name, cname) or std.ascii.eqlIgnoreCase(name, "XInput Controller")) {
+            dst.* = jg;
+            return DI_OK;
+        }
+    }
+    return DIERR_DEVICENOTREG;
+}
+
+/// IDirectInput8::CreateDevice for the system keyboard, mouse, and attached gamepads.
 pub fn createDevice(guid: ?*align(1) const GUID, wide: bool, out: *?*anyopaque) i32 {
     out.* = null;
     const g = guid orelse return E_POINTER;
-    const kind: Kind = if (guidEql(g, &GUID_SysKeyboard)) .keyboard else if (guidEql(g, &GUID_SysMouse)) .mouse else {
-        std.debug.print("[WINS:DInput] CreateDevice({x:0>8}-...): only the system keyboard and mouse exist\n", .{g.d1});
+    var joy_index: u8 = 0;
+    const kind: Kind = if (guidEql(g, &GUID_SysKeyboard))
+        .keyboard
+    else if (guidEql(g, &GUID_SysMouse))
+        .mouse
+    else if (matchJoystickGuid(g)) |slot| blk: {
+        if (!xinput.queryController(slot).connected) return DIERR_DEVICENOTREG;
+        joy_index = slot;
+        break :blk .joystick;
+    } else {
+        std.debug.print("[WINS:DInput] CreateDevice({x:0>8}-...): unknown device GUID\n", .{g.d1});
         return DIERR_DEVICENOTREG;
     };
     const d = std.heap.page_allocator.create(Device) catch return DIERR_OUTOFMEMORY;
-    d.* = .{ .vtbl = &g_vtbl, .ref_count = 1, .kind = kind, .wide = wide };
+    d.* = .{ .vtbl = &g_vtbl, .ref_count = 1, .kind = kind, .wide = wide, .joy_index = joy_index };
     lock();
     defer unlock();
     for (&g_devices) |*slot| {
         if (slot.* == null) {
             slot.* = d;
-            std.debug.print("[WINS:DInput] CreateDevice({s}) -> 0x{x}\n", .{ @tagName(kind), @intFromPtr(d) });
+            std.debug.print("[WINS:DInput] CreateDevice({s}#{d}) -> 0x{x}\n", .{ @tagName(kind), joy_index, @intFromPtr(d) });
             out.* = d;
             return DI_OK;
         }
@@ -603,14 +1009,20 @@ pub fn createDevice(guid: ?*align(1) const GUID, wide: bool, out: *?*anyopaque) 
 
 pub fn isSystemDeviceGuid(guid: ?*align(1) const GUID) bool {
     const g = guid orelse return false;
-    return guidEql(g, &GUID_SysKeyboard) or guidEql(g, &GUID_SysMouse);
+    return guidEql(g, &GUID_SysKeyboard) or guidEql(g, &GUID_SysMouse) or matchJoystickGuid(g) != null;
 }
 
 // ---- tests --------------------------------------------------------------------
 
 fn testCreate(kind: Kind) !*Device {
     var out: ?*anyopaque = null;
-    try std.testing.expectEqual(DI_OK, createDevice(if (kind == .keyboard) &GUID_SysKeyboard else &GUID_SysMouse, false, &out));
+    const jg = joystickGuid(0);
+    const g: *const GUID = switch (kind) {
+        .keyboard => &GUID_SysKeyboard,
+        .mouse => &GUID_SysMouse,
+        .joystick => &jg,
+    };
+    try std.testing.expectEqual(DI_OK, createDevice(g, false, &out));
     return @ptrCast(@alignCast(out.?));
 }
 
@@ -669,4 +1081,128 @@ test "X11 keycodes map to DirectInput scan codes" {
     try std.testing.expectEqual(@as(u8, 0xC8), dikFromX11(111)); // Up
     try std.testing.expectEqual(@as(u8, 0x9C), dikFromX11(104)); // KP Enter
     try std.testing.expectEqual(@as(u8, 0), dikFromX11(3));
+}
+
+test "joystick: EnumDevices, CreateDevice, EnumObjects, properties, and DIJOYSTATE2 readout" {
+    xinput.setTestController(0, true, .{
+        .wButtons = 0x1005, // A (0x1000) + UP (0x0001) + LEFT (0x0004)
+        .bLeftTrigger = 200,
+        .bRightTrigger = 0,
+        .sThumbLX = 16384,
+        .sThumbLY = -32768,
+        .sThumbRX = 3000,
+        .sThumbRY = 0,
+    });
+    defer xinput.clearTestController(0);
+
+    try std.testing.expectEqual(DIERR_INVALIDPARAM, enumDevices(DI8DEVCLASS_ALL, false, null, null, 0));
+
+    const Ctx = struct { count: u32 = 0, saw_pad: bool = false, saw_mouse: bool = false };
+    var ctx = Ctx{};
+    const cb = struct {
+        fn f(raw: *const u8, ref: ?*anyopaque) callconv(W) i32 {
+            const c: *Ctx = @ptrCast(@alignCast(ref.?));
+            const p: [*]const u8 = @ptrCast(raw);
+            c.count += 1;
+            const d1 = std.mem.readInt(u32, p[4..8], .little);
+            if (d1 == 0x57494E53) c.saw_pad = true;
+            if (d1 == 0x6F1D2B60) c.saw_mouse = true;
+            return 1;
+        }
+    }.f;
+    try std.testing.expectEqual(DI_OK, enumDevices(DI8DEVCLASS_ALL, false, @constCast(@ptrCast(&cb)), &ctx, 0));
+    try std.testing.expect(ctx.count >= 3);
+    try std.testing.expect(ctx.saw_pad);
+    try std.testing.expect(ctx.saw_mouse);
+
+    const d = try testCreate(.joystick);
+    defer _ = dev_Release(d);
+
+    var info_w: [1100]u8 align(4) = [_]u8{0} ** 1100;
+    std.mem.writeInt(u32, info_w[0..4], 1100, .little);
+    d.wide = true;
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceInfo(d, &info_w));
+    d.wide = false;
+    try std.testing.expectEqual(@as(u8, 'X'), info_w[40]);
+
+    var obj_count: u32 = 0;
+    const obj_cb = struct {
+        fn f(raw: *const u8, ref: ?*anyopaque) callconv(W) i32 {
+            _ = raw;
+            const c: *u32 = @ptrCast(@alignCast(ref.?));
+            c.* += 1;
+            return 1;
+        }
+    }.f;
+    try std.testing.expectEqual(DI_OK, dev_EnumObjects(d, @constCast(@ptrCast(&obj_cb)), &obj_count, 0));
+    try std.testing.expectEqual(@as(u32, 18), obj_count); // 5 axes + 1 POV + 12 buttons
+
+    const fmt = [_]u32{ 24, 16, 1, 272, 0, 0 };
+    try std.testing.expectEqual(DI_OK, dev_SetDataFormat(d, &fmt));
+    const range_prop = [_]u32{ 24, 16, 0, 1, @bitCast(@as(i32, -1000)), @bitCast(@as(i32, 1000)) };
+    try std.testing.expectEqual(DI_OK, dev_SetProperty(d, DIPROP_RANGE, &range_prop));
+    const dz_prop = [_]u32{ 20, 16, 0, 1, 2000 };
+    try std.testing.expectEqual(DI_OK, dev_SetProperty(d, DIPROP_DEADZONE, &dz_prop));
+    try std.testing.expectEqual(DI_OK, dev_Acquire(d));
+    try std.testing.expectEqual(DI_OK, dev_Poll(d));
+
+    var st: [272]u8 align(4) = undefined;
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(d, 272, &st));
+    const ly = std.mem.readInt(i32, st[4..8], .little);
+    const rx = std.mem.readInt(i32, st[12..16], .little);
+    const pov = std.mem.readInt(u32, st[32..36], .little);
+    try std.testing.expectEqual(@as(i32, 1000), ly); // -32768 inverted -> +1000
+    try std.testing.expectEqual(@as(i32, 0), rx); // 3000/32767 < 0.20 deadzone -> 0
+    try std.testing.expectEqual(@as(u32, 31500), pov); // up + left -> 315 deg
+    try std.testing.expectEqual(@as(u8, 0x80), st[48]); // button A
+
+    var found_guid: GUID = undefined;
+    try std.testing.expectEqual(DI_OK, findDevice(null, "XInput Test Gamepad", false, &found_guid));
+    try std.testing.expect(guidEql(&found_guid, &joystickGuid(0)));
+    try std.testing.expectEqual(DI_OK, getDeviceStatus(&found_guid));
+}
+
+test "fast tap latching: key and mouse button taps between GetDeviceState calls are observed once" {
+    const kb = try testCreate(.keyboard);
+    defer _ = dev_Release(kb);
+    const kb_fmt = [_]u32{ 24, 16, 2, 256, 256, 0 };
+    try std.testing.expectEqual(DI_OK, dev_SetDataFormat(kb, &kb_fmt));
+    try std.testing.expectEqual(DI_OK, dev_Acquire(kb));
+
+    // Unbuffered keyboard: Tab (DIK 0x0F) pressed and released before GetDeviceState runs.
+    keyEvent(0x0F, true);
+    keyEvent(0x0F, false);
+    var kstate: [256]u8 = undefined;
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(kb, 256, &kstate));
+    try std.testing.expectEqual(@as(u8, 0x80), kstate[0x0F]);
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(kb, 256, &kstate));
+    try std.testing.expectEqual(@as(u8, 0), kstate[0x0F]);
+
+    // Shift (0x2A) held across one poll still releases cleanly on key-up without re-latching.
+    keyEvent(0x2A, true);
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(kb, 256, &kstate));
+    try std.testing.expectEqual(@as(u8, 0x80), kstate[0x2A]);
+    keyEvent(0x2A, false);
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(kb, 256, &kstate));
+    try std.testing.expectEqual(@as(u8, 0), kstate[0x2A]);
+
+    // Focus loss clears unconsumed latches.
+    keyEvent(0x0F, true);
+    keyEvent(0x0F, false);
+    focus(false);
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(kb, 256, &kstate));
+    try std.testing.expectEqual(@as(u8, 0), kstate[0x0F]);
+
+    const m = try testCreate(.mouse);
+    defer _ = dev_Release(m);
+    const m_fmt = [_]u32{ 24, 16, 2, 20, 11, 0 };
+    try std.testing.expectEqual(DI_OK, dev_SetDataFormat(m, &m_fmt));
+    try std.testing.expectEqual(DI_OK, dev_Acquire(m));
+    mouseButton(0, true);
+    mouseButton(0, false);
+    var mstate: [20]u8 = undefined;
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(m, 20, &mstate));
+    try std.testing.expectEqual(@as(u8, 0x80), mstate[12]);
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(m, 20, &mstate));
+    try std.testing.expectEqual(@as(u8, 0), mstate[12]);
 }

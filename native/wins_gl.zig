@@ -30,6 +30,7 @@ const Xlib = struct {
     XCreateColormap: *const fn (?*anyopaque, c_ulong, ?*anyopaque, c_int) callconv(.c) c_ulong,
     XCreateWindow: *const fn (?*anyopaque, c_ulong, c_int, c_int, c_uint, c_uint, c_uint, c_int, c_uint, ?*anyopaque, c_ulong, *XSetWindowAttributes) callconv(.c) c_ulong,
     XMapWindow: *const fn (?*anyopaque, c_ulong) callconv(.c) c_int,
+    XResizeWindow: *const fn (?*anyopaque, c_ulong, c_uint, c_uint) callconv(.c) c_int,
     XStoreName: *const fn (?*anyopaque, c_ulong, [*:0]const u8) callconv(.c) c_int,
     XFlush: *const fn (?*anyopaque) callconv(.c) c_int,
     XSync: *const fn (?*anyopaque, c_int) callconv(.c) c_int,
@@ -198,6 +199,8 @@ pub const Gl = struct {
     glTexParameteri: *const fn (GLenum, GLenum, GLint) callconv(.c) void,
     glTexImage2D: *const fn (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
     glCompressedTexImage2D: *const fn (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, ?*const anyopaque) callconv(.c) void,
+    glTexImage3D: *const fn (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
+    glCompressedTexImage3D: *const fn (GLenum, GLint, GLenum, GLsizei, GLsizei, GLsizei, GLint, GLsizei, ?*const anyopaque) callconv(.c) void,
 
     glCreateShader: *const fn (GLenum) callconv(.c) GLuint,
     glShaderSource: *const fn (GLuint, GLsizei, *const [*:0]const u8, ?*const GLint) callconv(.c) void,
@@ -483,6 +486,19 @@ pub fn start(w: u32, h: u32, title: []const u8) bool {
 pub fn swap() void {
     glx.glXSwapBuffers(g_display, g_window);
     pumpInput();
+}
+
+/// Render thread only: resize the host window and tracked bounds.
+pub fn resize(w: u32, h: u32) void {
+    const rw = @max(w, 1);
+    const rh = @max(h, 1);
+    width = rw;
+    height = rh;
+    g_have_last = false;
+    if (g_display != null and g_window != 0) {
+        _ = xlib.XResizeWindow(g_display, g_window, rw, rh);
+        _ = xlib.XFlush(g_display);
+    }
 }
 
 var g_last_x: c_int = 0;
