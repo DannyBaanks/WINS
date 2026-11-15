@@ -1,0 +1,13 @@
+{
+  "apps": {
+    "example-app": {
+      "linux_package": {
+        "url": "https://vendor.example/example-app-linux-x64.zip",
+        "kind": "zip"
+      },
+      "binaries": {
+        "example-device-agent": "resources/bin/example-device-agent"
+      }
+    }
+  }
+}

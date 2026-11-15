@@ -188,13 +188,18 @@ class BinaryTriage:
             res = subprocess.run([sz, "l", self.file_path], capture_output=True, text=True, timeout=8)
             output = res.stdout
             if "app.asar" in output or "app-64.7z" in output or "app-32.7z" in output:
+                companions = self._detect_companion_exes(output)
+                details = {
+                    "framework": "Electron (Chromium + Node.js Web Architecture)",
+                    "envelope_compression": "NSIS + Embedded 7z payload",
+                    "contains_asar": True,
+                }
+                if companions:
+                    details["companion_pe_helpers"] = companions
+                    details["requires_companion_heal"] = True
                 return {
                     "runtime": "electron",
-                    "details": {
-                        "framework": "Electron (Chromium + Node.js Web Architecture)",
-                        "envelope_compression": "NSIS + Embedded 7z payload",
-                        "contains_asar": True,
-                    },
+                    "details": details,
                     "feasibility": "EXCELLENT (100% native Linux re-hosting; 0 Wine emulation required)",
                     "recipe": "recipe_electron",
                 }
@@ -219,6 +224,16 @@ class BinaryTriage:
         except Exception:
             pass
         return None
+
+    def _detect_companion_exes(self, listing: str, limit: int = 20) -> list:
+        """Finds Windows companion executables shipped beside the Electron payload.
+
+        These are spawned by the application under an extension-less name on
+        Linux and must be healed (native ELF re-binding, else micro-Wine shim).
+        """
+        found = re.findall(r'([A-Za-z0-9._-]+\.exe)', listing)
+        unique = sorted({f for f in found if not f.lower().startswith(("unins", "nsis"))})
+        return unique[:limit]
 
     def _detect_runtime(self, data: bytes) -> Dict[str, Any]:
         # 1. Electron / Web

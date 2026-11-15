@@ -22,6 +22,8 @@ from core.recipes.transpiler import TranspilerRecipe
 from core.tester import CleanroomTester
 from core.transpiler.harvester import BinaryHarvester
 from core.transpiler.fallout_pipeline import detect_fallout_nv, FalloutPipeline
+from core.healers.companion_binaries import CompanionBinaryHealer
+from core.port_context import PortContext
 
 RECIPES = [
     ElectronRecipe(),
@@ -74,6 +76,11 @@ def cmd_transmute(args):
     options = {
         "bin_dir": args.bin_dir,
         "electron_version": args.electron_version,
+        "app_id": args.app_id,
+        "arch": args.arch,
+        "allow_wine_fallback": not args.no_wine_fallback,
+        "skills_dir": args.skills_dir,
+        "workspace": args.workspace,
     }
 
     print(f"[WINS] Selected Recipe: {matched_recipe.name} ({matched_recipe.description})")
@@ -213,6 +220,56 @@ def cmd_fallout(args):
     print(f"  D3D9 Shaders:    {stats['shaders']['total_compiled_shaders']} compiled bytecode shaders across {stats['shaders']['packages_count']} packages")
     print("")
 
+def cmd_heal_bin(args):
+    """Heals Windows-only companion executables of an (already transmuted) app."""
+    healer = CompanionBinaryHealer(arch=args.arch)
+    report = healer.heal(
+        args.target,
+        app_id=args.app_id,
+        allow_wine_fallback=not args.no_wine_fallback,
+        dry_run=args.dry_run,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    print(f"\n[WINS COMPANION HEAL] {report['target']}")
+    print(f"  Bin dir:      {report['bin_dir']}")
+    print(f"  PE helpers:   {report['scanned']}")
+    print(f"  Native ELF:   {len(report['healed_native'])}")
+    print(f"  Micro-Wine:   {len(report['wine_shimmed'])}")
+    print(f"  Already ELF:  {len(report['already_native'])}\n")
+    for item in report["healed_native"]:
+        print(f"  - [native] {item['name']} <- {item['source']}")
+    for item in report["wine_shimmed"]:
+        print(f"  - [shim]   {item['name']} -> {item['path']}")
+    for err in report["errors"]:
+        print(f"  - [error]  {err}")
+    print("")
+
+def cmd_port_context(args):
+    """Generates the agent-facing host corpus of a transmuted (ported) app."""
+    context = PortContext(
+        app_id=args.app_id,
+        app_title=args.title,
+        install_dir=args.install_dir,
+        skills_dir=args.skills_dir,
+        workspace=args.workspace,
+        slug=args.slug,
+    )
+    report = context.install(print_preamble=not args.json)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    print(f"\n[WINS PORT CONTEXT] {report['app_id']}")
+    print(f"  Skill:         {report['skill'] or '(not installed)'}")
+    print(f"  Workspace doc: {report['workspace_doc'] or '(not installed)'}")
+    print(f"\n  Preamble for the agent chat:\n")
+    for line in report["preamble"].split(". "):
+        print(f"    - {line.strip()}")
+    print("")
+
 def cmd_list(args):
     print("\nAvailable WINS Transmutation Recipes:")
     for r in RECIPES:
@@ -235,6 +292,11 @@ def main():
     p_trans.add_argument("--dest", "--out", dest="dest", help="Destination directory (default: ~/.local/share/<app>-desktop)")
     p_trans.add_argument("--bin-dir", default="~/.local/bin", help="Launcher bin directory")
     p_trans.add_argument("--electron-version", default="35.1.4", help="Target Electron runtime version")
+    p_trans.add_argument("--app-id", default=None, help="Application id used to resolve native Linux companion builds")
+    p_trans.add_argument("--arch", default="x64", help="Target architecture for native builds (default: x64)")
+    p_trans.add_argument("--no-wine-fallback", action="store_true", help="Do not generate micro-Wine shims for PE companions")
+    p_trans.add_argument("--skills-dir", default=None, help="Skill directory for the generated host corpus SKILL.md")
+    p_trans.add_argument("--workspace", default=None, help="Workspace directory for the generated host corpus")
     p_trans.set_defaults(func=cmd_transmute)
 
     # test
@@ -283,6 +345,33 @@ def main():
     # list
     p_list = subparsers.add_parser("list", help="List available transmutation recipes")
     p_list.set_defaults(func=cmd_list)
+
+    # heal-bin
+    p_heal = subparsers.add_parser(
+        "heal-bin",
+        help="Heal Windows-only companion executables of an installed app (native ELF first, micro-Wine shim otherwise)",
+    )
+    p_heal.add_argument("target", help="App install dir, resources dir or bin dir containing the companion .exe files")
+    p_heal.add_argument("--app-id", default=None, help="Application id used to resolve native Linux builds (manifest lookup)")
+    p_heal.add_argument("--arch", default="x64", help="Target architecture for native builds (default: x64)")
+    p_heal.add_argument("--no-wine-fallback", action="store_true", help="Fail instead of generating a micro-Wine shim")
+    p_heal.add_argument("--dry-run", action="store_true", help="Report what would be done without writing")
+    p_heal.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_heal.set_defaults(func=cmd_heal_bin)
+
+    # port-context
+    p_ctx = subparsers.add_parser(
+        "port-context",
+        help="Generate the agent-facing host corpus (AGENTS/skill + command corpus) of a ported app",
+    )
+    p_ctx.add_argument("--app-id", required=True, help="Application id (e.g. manus)")
+    p_ctx.add_argument("--title", default=None, help="Human readable application title")
+    p_ctx.add_argument("--install-dir", default=None, help="Ported application install directory")
+    p_ctx.add_argument("--skills-dir", default=None, help="Skill directory to install the SKILL.md into")
+    p_ctx.add_argument("--workspace", default=None, help="Workspace directory to drop AGENTS.md / WINS-PORT.md into")
+    p_ctx.add_argument("--slug", default="wins-port-context", help="Skill slug (default: wins-port-context)")
+    p_ctx.add_argument("--json", action="store_true", help="Output machine-readable JSON for agents")
+    p_ctx.set_defaults(func=cmd_port_context)
 
     if len(sys.argv) == 1:
         print(BANNER)

@@ -217,6 +217,32 @@ Example `probe` output:
 | **PyInstaller** | Recipe is a stub (`transmute` returns failure) |
 | **JVM / Launch4j** | Planned |
 
+### 4. Heal Companion Binaries of an Installed App
+
+Runtime-wrapped apps usually ship **Windows-only helper executables** next to
+their payload (`resources/bin/*.exe`: device agents, sidecars, utility hosts).
+On Linux the application spawns them **without the `.exe` extension**, so a
+naive transmutation leaves the app with a broken connector.
+
+```bash
+wins heal-bin ~/.local/share/manus-desktop --app-id manus
+```
+
+`heal-bin` is native-first:
+1. **Native re-binding** — a Linux ELF build of the helper is fetched (vendor
+   Linux package or `~/.cache/wins/companions/`) and installed under the
+   extension-less host name.
+2. **Micro-Wine shim** — when no native build exists, WINS generates a
+   hardened launcher that re-hosts the PE under an isolated Wine prefix
+   (local-API fd relay, deterministic pipe handshake, no `~/.wine` pollution).
+
+Unlike a hand-written wrapper, the shim is tracked by the toolchain, can be
+re-applied at any time and is covered by the test suite.
+
+```bash
+wins heal-bin <app-dir> --dry-run --json   # report only, machine readable
+```
+
 ---
 
 ## Agentic interoperability

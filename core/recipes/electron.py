@@ -142,6 +142,14 @@ class ElectronRecipe(BaseRecipe):
             # Wire host MCP tools (bun, uv, uvx)
             self._wire_mcp_shims(dest_resources)
 
+            # 8b. Heal companion PE executables shipped in resources/bin
+            # (native ELF re-binding first, hardened micro-Wine shim otherwise)
+            companion_report = self._heal_companion_binaries(dest_resources, app_id, options)
+
+            # 8c. Generate the agent-facing host corpus (the agent must know it
+            # drives a private Linux port, not a Windows machine)
+            self._install_port_context(dest_dir, app_id, app_title, options)
+
             # 9. Register Launcher and Desktop Entry
             bin_dir = os.path.expanduser(options.get("bin_dir", "~/.local/bin"))
             os.makedirs(bin_dir, exist_ok=True)
@@ -285,6 +293,48 @@ exec "$APP_DIR/{app_id}" --no-sandbox "$APP_DIR/resources/app" "$@"
             subprocess.run(["unzip", "-q", zip_to_extract, "-d", target_dist])
             return target_dist
         return None
+
+    def _heal_companion_binaries(self, resources_dir: str, app_id: str, options: Dict[str, Any]):
+        """Heals the Windows-only companion executables shipped beside the app.
+
+        Native ELF re-binding is attempted first (vendor Linux package / local
+        cache). When no native build exists, a hardened micro-Wine launcher is
+        generated so the helper keeps working instead of being hand-patched
+        outside the toolchain.
+        """
+        from ..healers.companion_binaries import CompanionBinaryHealer
+
+        healer = CompanionBinaryHealer(arch=options.get("arch", "x64"))
+        report = healer.heal(
+            resources_dir,
+            app_id=options.get("app_id") or app_id,
+            allow_wine_fallback=options.get("allow_wine_fallback", True),
+        )
+        if report["scanned"]:
+            print(f"[WINS:Electron] [✓] Companion binaries audited: {report['scanned']} PE helper(s) | "
+                  f"native: {len(report['healed_native'])} | micro-Wine shim: {len(report['wine_shimmed'])}")
+        for err in report["errors"]:
+            print(f"[WINS:Electron:WARN] Companion healing issue: {err}", file=sys.stderr)
+        return report
+
+    def _install_port_context(self, dest_dir: str, app_id: str, app_title: str, options: Dict[str, Any]):
+        """Installs the host corpus the agent needs (real OS, port topology, commands)."""
+        from ..port_context import PortContext
+
+        context = PortContext(
+            app_id=app_id,
+            app_title=app_title,
+            install_dir=dest_dir,
+            skills_dir=options.get("skills_dir"),
+            workspace=options.get("workspace"),
+            slug=options.get("port_context_slug", "wins-port-context"),
+        )
+        report = context.install()
+        installed = [p for p in (report["skill"], report["workspace_doc"], report["install_doc"]) if p]
+        if installed:
+            print(f"[WINS:Electron] [✓] Port context installed: {', '.join(installed)}")
+        print("[WINS:Electron] Agent preamble: " + report["preamble"])
+        return report
 
     def _wire_mcp_shims(self, resources_dir: str):
         bun_dir = os.path.join(resources_dir, "bun")
