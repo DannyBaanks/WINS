@@ -371,3 +371,28 @@ Tests: `zig test native/wins_d3d9.zig` 30/30 (incluye 3 del traductor y el de sc
   pipeline fijo, FVF, cube/volume, UDEC3/DEC3N) se reportan una vez y se saltan.
 - Sin entrada (teclado/ratón X11 → mensajes de la ventana) todavía: siguiente paso natural.
 - DirectSound sigue en silencio.
+
+## Continuación Claude Code (2026-11-14 noche) — entrada, New Game, vídeo Bink
+
+Commits: 2e0612f (DirectInput8 real + Bink sin handle falso), 38e7b8f (caps del oráculo, Bink real,
+mensajes de teclado, pipeline fijo D3D9), e576703 (logs de audio Bink).
+
+- **Entrada:** teclado/ratón DirectInput8 reales alimentados por eventos X11 de la ventana GL
+  (`native/wins_dinput.zig`). Verificado en vivo: los clics de Danny manejan el menú.
+- **New Game se caía en 0xb57aa9:** NULL de la fábrica de shaders del motor (0xb55560). El motor
+  elige su tier con `PS20Caps.NumInstructionSlots`/`NumTemps` (D3DCAPS9 +0x118/+0x110) y WINS los
+  daba a 0. `GetDeviceCaps` devuelve ahora el D3DCAPS9 de wined3d para este adaptador
+  (`~/.cache/wins-oracle/replay/replay_wine.tsv`). Con eso Danny pasó del menú y la carga.
+- **Bink:** `native/wins_bink.zig` lee el contenedor y decodifica con libavcodec i386 del sistema
+  (binkvideo/binkaudio) en hilos nativos. FNVIntro.bik (1280x720, 8692 cuadros) se ve
+  (captura sha256 de la PNG reducida: ver commit; Strip con Lucky 38). Audio: pendiente de confirmar.
+- **D3D9:** valores por defecto de render states (antes todo 0), SetFVF/GetFVF,
+  Draw(Indexed)PrimitiveUP, GLSL generado para pipeline fijo (pretransformado o W*V*P, etapas de
+  textura). Iluminación fija NO implementada (se avisa).
+- **USER32:** WM_KEYDOWN/UP/SYSKEY*, TranslateMessage→WM_CHAR, GetKeyState/GetAsyncKeyState.
+  No probado aún en un campo de texto del juego.
+- Informe de fallos: vuelca memoria tras cada registro (process_vm_readv).
+
+Pendiente: lo que pida el 3D tras el vídeo (render targets que no sean el back buffer, iluminación
+fija, cube/volume), texto en el juego (nombre del personaje). Loader instalado: build e576703
+(respaldo `winrun32.prev-2e0612f`). Error transitorio de Steam S:0000065432: relanzar.
