@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# WINS Steam compatibility tool launcher: Fallout: New Vegas (AppID 22380).
+#
+# Runs FalloutNV.exe under the WINS i386 loader inside bubblewrap: no Proton, no Wine.
+# The installed game is read-only to this script; WINS gets its own profile (saves,
+# ini files) under ~/.local/share/wins/falloutnv/profile. Versioned in the WINS
+# repository (launch/falloutnv); `launch/falloutnv/install.sh` installs it.
+#
+# Overrides: WINS_STEAM_ROOT (default ~/.local/share/Steam), WINS_KEEP_RUN_DIR=1
+# keeps the temporary game workspace, WINS_GPU=integrated renders on the integrated
+# GPU instead of the NVIDIA one.
+set -euo pipefail
+umask 077
+
+APP_ID=22380
+HOST_HOME="${HOME:?HOME is not set}"
+STEAM_ROOT="${WINS_STEAM_ROOT:-$HOST_HOME/.local/share/Steam}"
+STEAM_EXE="$STEAM_ROOT/steamrt64/steam"
+GAME_ROOT="$STEAM_ROOT/steamapps/common/Fallout New Vegas"
+TOOL_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+PROFILE_ROOT="$HOST_HOME/.local/share/wins/falloutnv/profile"
+STATE_ROOT="$HOST_HOME/.local/state/wins/falloutnv"
+KEEP_RUN_DIR=${WINS_KEEP_RUN_DIR:-0}
+USER_ID="$(id -u)"
+GROUP_ID="$(id -g)"
+
+fail() {
+    printf '[WINS Steam] %s\n' "$*" >&2
+    exit 1
+}
+
+if [[ -n "${SteamAppId:-}" && "$SteamAppId" != "$APP_ID" ]]; then
+    fail "SteamAppId mismatch: expected $APP_ID, got $SteamAppId."
+fi
+[[ "${STEAM_COMPAT_APP_ID:-}" == "$APP_ID" ]] ||
+    fail "Steam did not provide STEAM_COMPAT_APP_ID=$APP_ID; launch this tool from Fallout NV in Steam."
+# Steam supplies the compatibility AppID to its tool as STEAM_COMPAT_APP_ID.
+# Pass that same value to WINS, whose Steam bridge expects SteamAppId.
+export SteamAppId="$STEAM_COMPAT_APP_ID"
+[[ -x "$STEAM_EXE" && -d "$STEAM_ROOT/linux32" ]] ||
+    fail "Steam client files are not at the expected installation path: $STEAM_ROOT"
+[[ -f "$GAME_ROOT/FalloutNV.exe" && -d "$GAME_ROOT/Data" ]] ||
+    fail "Fallout: New Vegas is not installed at: $GAME_ROOT"
+command -v bwrap >/dev/null 2>&1 || fail "bubblewrap (bwrap) is required."
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to identify Steam's live IPC process."
+
+# Steam has more than one process named "steam" on this host. Select the one
+# that has the real shared-memory IPC object; never synthesize SteamAppId.
+STEAM_PID="${WINS_STEAM_PID:-}"
+if [[ -z "$STEAM_PID" ]]; then
+    STEAM_PID="$(python3 - <<'PY'
+import glob
+import os
+import sys
+
+matches = []
+for proc in glob.glob("/proc/[0-9]*"):
+    pid = os.path.basename(proc)
+    try:
+        with open(os.path.join(proc, "comm"), encoding="utf-8") as f:
+            if f.read().strip() != "steam":
+                continue
+        with open(os.path.join(proc, "maps"), encoding="utf-8", errors="replace") as f:
+            if any("ValveIPCSharedObj-Steam" in line for line in f):
+                matches.append(pid)
+    except OSError:
+        continue
+
+if len(matches) != 1:
+    sys.stderr.write(
+        "[WINS Steam] Could not identify exactly one live Steam IPC process "
+        f"(matches={len(matches)}).\n"
+    )
+    sys.exit(1)
+print(matches[0])
+PY
+)" || fail "Steam's live IPC process could not be identified."
+fi
+[[ "$STEAM_PID" =~ ^[0-9]+$ ]] || fail "Invalid Steam process id."
+[[ -r "/proc/$STEAM_PID/comm" ]] || fail "Steam process $STEAM_PID is not visible."
+[[ "$(cat "/proc/$STEAM_PID/comm")" == "steam" ]] ||
+    fail "Process $STEAM_PID is not the Steam client."
+STEAM_EXE="$(readlink -f "/proc/$STEAM_PID/exe")" ||
+    fail "Could not resolve the Steam client executable."
+[[ "$STEAM_EXE" == "$STEAM_ROOT/steamrt64/steam" ]] ||
+    fail "Steam executable path changed: $STEAM_EXE"
+
+mkdir -p "$PROFILE_ROOT/Documents/My Games/FalloutNV" \
+         "$PROFILE_ROOT/AppData/Roaming" \
+         "$PROFILE_ROOT/AppData/Local" \
+         "$PROFILE_ROOT/.config" \
+         "$PROFILE_ROOT/.cache" \
+         "$PROFILE_ROOT/tmp"
+mkdir -p "$STATE_ROOT/logs"
+
+RUN_ROOT="$(mktemp -d "/tmp/wins-fnv-${USER_ID}.XXXXXXXX")" ||
+    fail "Could not create the temporary game workspace."
+chmod 700 "$RUN_ROOT"
+cleanup() {
+    if [[ "$KEEP_RUN_DIR" == "1" ]]; then
+        printf '[WINS Steam] Kept temporary game workspace: %s\n' "$RUN_ROOT" >&2
+    elif [[ "$RUN_ROOT" == "/tmp/wins-fnv-${USER_ID}."* && -d "$RUN_ROOT" && ! -L "$RUN_ROOT" ]]; then
+        rm -rf --one-file-system -- "$RUN_ROOT"
+    fi
+}
+trap cleanup EXIT
+
+mkdir -p "$RUN_ROOT/game/Data" "$RUN_ROOT/game/FalloutNV" \
+         "$RUN_ROOT/game/home" "$RUN_ROOT/game/tmp" "$RUN_ROOT/run"
+while IFS= read -r -d '' entry; do
+    name="${entry##*/}"
+    case "$name" in
+        Data|FalloutNV|"My Games"|Redists|ExitData.mhd|FalloutNV.exe.pre-4gb*)
+            continue
+            ;;
+    esac
+    cp -a -- "$entry" "$RUN_ROOT/game/"
+done < <(find "$GAME_ROOT" -mindepth 1 -maxdepth 1 -print0)
+ln -s '/tmp/wins-workspace/home/Documents/My Games' "$RUN_ROOT/game/My Games"
+
+BWRAP_ARGS=(
+    --unshare-user
+    --uid "$USER_ID"
+    --gid "$GROUP_ID"
+    --ro-bind / /
+    --tmpfs /home
+    --dir "$HOST_HOME"
+    --dir "$HOST_HOME/.local"
+    --dir "$HOST_HOME/.local/share"
+    --dir "$STEAM_ROOT"
+    --dir "$STEAM_ROOT/linux32"
+    --dir "$STEAM_ROOT/steamrt64"
+    --ro-bind "$STEAM_ROOT/linux32" "$STEAM_ROOT/linux32"
+    --ro-bind "$STEAM_ROOT/steamrt64" "$STEAM_ROOT/steamrt64"
+    --tmpfs /tmp
+    --dir /tmp/.X11-unix
+    --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix
+    --dev /dev
+    --dir /dev/dri
+    --proc /proc
+    --bind /dev/shm /dev/shm
+    --dir /tmp/wins-workspace
+    --bind "$RUN_ROOT" /tmp/wins-workspace
+    --bind "$PROFILE_ROOT" /tmp/wins-workspace/home
+    --ro-bind "$GAME_ROOT/Data" /tmp/wins-workspace/game/Data
+    --dir /tmp/wins-tool
+    --ro-bind "$TOOL_DIR" /tmp/wins-tool
+    --chdir /tmp/wins-workspace/game
+    --setenv HOME /tmp/wins-workspace/home
+    --setenv USERPROFILE /tmp/wins-workspace/home
+    --setenv APPDATA /tmp/wins-workspace/home/AppData/Roaming
+    --setenv LOCALAPPDATA /tmp/wins-workspace/home/AppData/Local
+    --setenv XDG_CONFIG_HOME /tmp/wins-workspace/home/.config
+    --setenv XDG_CACHE_HOME /tmp/wins-workspace/home/.cache
+    --setenv XDG_DATA_HOME /tmp/wins-workspace/home/.local/share
+    --setenv TMPDIR /tmp/wins-workspace/tmp
+    --setenv TEMP /tmp/wins-workspace/tmp
+    --setenv TMP /tmp/wins-workspace/tmp
+    --setenv WINS_STEAM_PID "$STEAM_PID"
+    --setenv WINS_STEAM_EXE "$STEAM_EXE"
+)
+if [[ -d /dev/dri ]]; then
+    BWRAP_ARGS+=(--dev-bind-try /dev/dri /dev/dri)
+fi
+# The NVIDIA driver talks to its own device nodes, not /dev/dri: without them
+# the loader can only render on the integrated GPU.
+for nv in /dev/nvidiactl /dev/nvidia0 /dev/nvidia-modeset /dev/nvidia-uvm /dev/nvidia-uvm-tools; do
+    [[ -e "$nv" ]] && BWRAP_ARGS+=(--dev-bind-try "$nv" "$nv")
+done
+if [[ -n "${XAUTHORITY:-}" && -f "$XAUTHORITY" ]]; then
+    cp -- "$XAUTHORITY" "$RUN_ROOT/Xauthority"
+    chmod 600 "$RUN_ROOT/Xauthority"
+    BWRAP_ARGS+=(--setenv XAUTHORITY /tmp/wins-workspace/Xauthority)
+elif [[ -f "$HOST_HOME/.Xauthority" ]]; then
+    cp -- "$HOST_HOME/.Xauthority" "$RUN_ROOT/Xauthority"
+    chmod 600 "$RUN_ROOT/Xauthority"
+    BWRAP_ARGS+=(--setenv XAUTHORITY /tmp/wins-workspace/Xauthority)
+else
+    BWRAP_ARGS+=(--unsetenv XAUTHORITY)
+fi
+BWRAP_ARGS+=(--unsetenv DBUS_SESSION_BUS_ADDRESS)
+
+LOG="$STATE_ROOT/logs/$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+printf '[WINS Steam] AppID %s, live Steam PID %s\n' "$APP_ID" "$STEAM_PID" >&2
+printf '[WINS Steam] Loader output: %s\n' "$LOG" >&2
+set +e
+bwrap "${BWRAP_ARGS[@]}" -- /tmp/wins-tool/dist/winrun32 --run /tmp/wins-workspace/game/FalloutNV.exe 2>&1 | tee "$LOG"
+status=${PIPESTATUS[0]}
+set -e
+exit "$status"

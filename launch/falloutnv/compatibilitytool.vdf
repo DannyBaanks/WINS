@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "wins_falloutnv"
+    {
+      "install_path" "."
+      "display_name" "WINS (Fallout: New Vegas)"
+      "from_oslist" "windows"
+      "to_oslist" "linux"
+    }
+  }
+}

@@ -195,24 +195,7 @@ exec "$APP_DIR/{app_id}" --no-sandbox "$APP_DIR/resources/app" "$@"
             if self._find_asar(payload_dir):
                 return True
 
-        # Fallback to Wine silent extract
-        if shutil.which("wine"):
-            wine_target = "C:\\wins_tmp"
-            wine_env = os.environ.copy()
-            wine_env["WINEDEBUG"] = "-all"
-            subprocess.run(["wine", target_exe, "/S", f"/D={wine_target}"], env=wine_env, capture_output=True)
-            user_wine = os.path.expanduser("~/.wine/drive_c/wins_tmp")
-            if os.path.isdir(user_wine):
-                for item in os.listdir(user_wine):
-                    s = os.path.join(user_wine, item)
-                    d = os.path.join(payload_dir, item)
-                    if os.path.isdir(s):
-                        shutil.copytree(s, d)
-                    else:
-                        shutil.copy2(s, d)
-                shutil.rmtree(user_wine, ignore_errors=True)
-                return True
-
+        # Unsupported installers fail closed; never execute them for extraction.
         return False
 
     def _find_asar(self, start_dir: str) -> Optional[str]:

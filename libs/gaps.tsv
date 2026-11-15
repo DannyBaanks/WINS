@@ -1,0 +1,86 @@
+library	dll	symbol	programs
+(no WINS library)	comdlg32.dll	ChooseColorW	1
+(no WINS library)	comdlg32.dll	PrintDlgW	1
+(no WINS library)	dwmapi.dll	DwmGetColorizationColor	1
+(no WINS library)	dwmapi.dll	DwmSetWindowAttribute	1
+(no WINS library)	imm32.dll	ImmEscapeW	1
+(no WINS library)	imm32.dll	ImmNotifyIME	1
+(no WINS library)	imm32.dll	ImmSetCandidateWindow	1
+(no WINS library)	imm32.dll	ImmSetCompositionFontW	1
+(no WINS library)	imm32.dll	ImmSetCompositionWindow	1
+(no WINS library)	msimg32.dll	AlphaBlend	1
+(no WINS library)	uxtheme.dll	BeginBufferedAnimation	1
+(no WINS library)	uxtheme.dll	BufferedPaintRenderAnimation	1
+(no WINS library)	uxtheme.dll	BufferedPaintStopAllAnimations	1
+(no WINS library)	uxtheme.dll	CloseThemeData	1
+(no WINS library)	uxtheme.dll	DrawThemeBackground	1
+(no WINS library)	uxtheme.dll	DrawThemeParentBackground	1
+(no WINS library)	uxtheme.dll	DrawThemeTextEx	1
+(no WINS library)	uxtheme.dll	EnableThemeDialogTexture	1
+(no WINS library)	uxtheme.dll	EndBufferedAnimation	1
+(no WINS library)	uxtheme.dll	GetThemeBackgroundContentRect	1
+(no WINS library)	uxtheme.dll	GetThemeColor	1
+(no WINS library)	uxtheme.dll	GetThemeFont	1
+(no WINS library)	uxtheme.dll	GetThemePartSize	1
+(no WINS library)	uxtheme.dll	GetThemeTransitionDuration	1
+(no WINS library)	uxtheme.dll	OpenThemeData	1
+(no WINS library)	uxtheme.dll	SetWindowTheme	1
+(no WINS library)	wininet.dll	InternetCrackUrlW	1
+wins-comctl32	comctl32.dll	#17	1
+wins-comctl32	comctl32.dll	#345	1
+wins-comctl32	comctl32.dll	#381	1
+wins-comctl32	comctl32.dll	#410	1
+wins-comctl32	comctl32.dll	#411	1
+wins-comctl32	comctl32.dll	#412	1
+wins-comctl32	comctl32.dll	#413	1
+wins-comctl32	comctl32.dll	ImageList_AddMasked	1
+wins-comctl32	comctl32.dll	ImageList_BeginDrag	1
+wins-comctl32	comctl32.dll	ImageList_Create	1
+wins-comctl32	comctl32.dll	ImageList_Destroy	1
+wins-comctl32	comctl32.dll	ImageList_DragEnter	1
+wins-comctl32	comctl32.dll	ImageList_DragMove	1
+wins-comctl32	comctl32.dll	ImageList_DragShowNolock	1
+wins-comctl32	comctl32.dll	ImageList_Draw	1
+wins-comctl32	comctl32.dll	ImageList_EndDrag	1
+wins-comctl32	comctl32.dll	ImageList_GetIcon	1
+wins-comctl32	comctl32.dll	ImageList_GetIconSize	1
+wins-comctl32	comctl32.dll	ImageList_GetImageInfo	1
+wins-comctl32	comctl32.dll	ImageList_Remove	1
+wins-comctl32	comctl32.dll	ImageList_ReplaceIcon	1
+wins-comctl32	comctl32.dll	ImageList_SetIconSize	1
+wins-comctl32	comctl32.dll	_TrackMouseEvent	1
+wins-crypto	bcrypt.dll	BCryptCloseAlgorithmProvider	1
+wins-crypto	bcrypt.dll	BCryptCreateHash	1
+wins-crypto	bcrypt.dll	BCryptDestroyHash	1
+wins-crypto	bcrypt.dll	BCryptFinishHash	1
+wins-crypto	bcrypt.dll	BCryptGetProperty	1
+wins-crypto	bcrypt.dll	BCryptHashData	1
+wins-crypto	bcrypt.dll	BCryptOpenAlgorithmProvider	1
+wins-crypto	crypt32.dll	CertEnumCertificatesInStore	1
+wins-crypto	crypt32.dll	CertFindCertificateInStore	2
+wins-crypto	crypt32.dll	CertFindExtension	1
+wins-crypto	crypt32.dll	CertFreeCertificateChain	1
+wins-crypto	crypt32.dll	CertFreeCertificateChainEngine	1
+wins-crypto	crypt32.dll	CertGetCertificateChain	1
+wins-crypto	crypt32.dll	CertGetCertificateContextProperty	2
+wins-crypto	crypt32.dll	CertGetNameStringA	1
+wins-crypto	crypt32.dll	CertGetNameStringW	2
+wins-crypto	crypt32.dll	CertNameToStrW	2
+wins-crypto	crypt32.dll	CryptDecodeObjectEx	1
+wins-crypto	crypt32.dll	CryptImportPublicKeyInfoEx2	1
+wins-crypto	crypt32.dll	CryptMsgGetParam	2
+wins-crypto	crypt32.dll	CryptQueryObject	2
+wins-crypto	crypt32.dll	CryptStringToBinaryA	1
+wins-crypto	crypt32.dll	CryptStringToBinaryW	1
+wins-crypto	crypt32.dll	PFXImportCertStore	1
+wins-crypto	ncrypt.dll	BCryptCloseAlgorithmProvider	1
+wins-crypto	ncrypt.dll	BCryptCreateHash	1
+wins-crypto	ncrypt.dll	BCryptDestroyHash	1
+wins-crypto	ncrypt.dll	BCryptDestroyKey	1
+wins-crypto	ncrypt.dll	BCryptFinishHash	1
+wins-crypto	ncrypt.dll	BCryptGenRandom	1
+wins-crypto	ncrypt.dll	BCryptHashData	1
+wins-crypto	ncrypt.dll	BCryptOpenAlgorithmProvider	1
+wins-crypto	ncrypt.dll	BCryptVerifySignature	1
+wins-dbghelp	dbghelp.dll	ImageNtHeader	1
+wins-msvcrt	msvcrt.dll	_beginthreadex	1

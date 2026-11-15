@@ -2,6 +2,12 @@
 # STRICT POLICY: Never track proprietary binaries, assets, or runtimes
 
 # Binaries & packages
+bin/wins-fuzz
+bin/winrun32
+native/winrun
+native/winrun_gui
+native/wins_fuzzer
+*.o
 *.exe
 *.dll
 *.so
@@ -32,3 +38,12 @@ node_modules/
 
 # Logs
 *.log
+
+# Measurement-only instrumentation. Local scratch builds used to observe a
+# target's call flow with REA. NEVER published: the repo must not carry stubs or
+# bypass logic that someone could replicate. `tools/build_probe.sh` regenerates
+# them from the public sources.
+native/probe/
+
+# Output of native/testdata/profile_probe.c, which writes probe.ini where it runs
+probe.ini

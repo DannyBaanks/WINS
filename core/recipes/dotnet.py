@@ -136,44 +136,7 @@ exec dotnet "$APP_DIR/{os.path.basename(main_dll)}" "$@"
             if res.returncode == 0 and any(f.endswith(".dll") for f in os.listdir(payload_dir)):
                 return True
 
-        # 3. Cleanroom Ephemeral Wine Extraction
-        if shutil.which("wine"):
-            print("[WINS:DotNet] Deploying cleanroom unpacker...")
-            temp_name = f"wins_unpack_{os.getpid()}"
-            wine_target = f"C:\\{temp_name}"
-            user_wine = os.path.expanduser(f"~/.wine/drive_c/{temp_name}")
-            shutil.rmtree(user_wine, ignore_errors=True)
-
-            base_exe = os.path.basename(target_exe)
-            subprocess.run(["killall", "-9", base_exe, "ShareX.exe"], capture_output=True)
-
-            cmd = ["wine", target_exe, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", f"/DIR={wine_target}"]
-            env = os.environ.copy()
-            env["WINEDEBUG"] = "-all"
-            try:
-                subprocess.run(cmd, env=env, timeout=25, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
-
-            subprocess.run(["killall", "-9", base_exe, "ShareX.exe"], capture_output=True)
-
-            if os.path.isdir(user_wine):
-                for item in os.listdir(user_wine):
-                    if item.endswith(".tmp") or item.startswith("is-"):
-                        continue
-                    s = os.path.join(user_wine, item)
-                    d = os.path.join(payload_dir, item)
-                    if os.path.isdir(s):
-                        shutil.copytree(s, d)
-                    elif os.path.isfile(s):
-                        shutil.copy2(s, d)
-                shutil.rmtree(user_wine, ignore_errors=True)
-                if any(f.endswith(".dll") for f in os.listdir(payload_dir)):
-                    return True
-                # Ensure no rogue child processes remain
-                subprocess.run(["pkill", "-9", "-f", os.path.basename(target_exe)], capture_output=True)
-                return True
-
+        # Unsupported installers fail closed; never execute them for extraction.
         return False
 
     def _locate_net_entrypoint(self, payload_dir: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
