@@ -85,7 +85,10 @@ const IID_IUnknown = Guid{ .data1 = 0x00000000, .data2 = 0x0000, .data3 = 0x0000
 const IID_IDirectSound = Guid{ .data1 = 0x279AFA83, .data2 = 0x4981, .data3 = 0x11CE, .data4 = .{ 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 } };
 const IID_IDirectSound8 = Guid{ .data1 = 0xC50A7E93, .data2 = 0xF395, .data3 = 0x4834, .data4 = .{ 0x9E, 0xF6, 0x7F, 0xA9, 0x9D, 0xE5, 0x09, 0x66 } };
 const IID_IDirectSoundBuffer = Guid{ .data1 = 0x279AFA85, .data2 = 0x4981, .data3 = 0x11CE, .data4 = .{ 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 } };
-const IID_IDirectSoundBuffer8 = Guid{ .data1 = 0x6825A449, .data2 = 0x7524, .data3 = 0x4D82, .data4 = .{ 0x92, 0x00, 0x61, 0x43, 0x4A, 0x00, 0x2F, 0xA0 } };
+// {6825A449-7524-4D82-920F-50E36AB3AB1E} (dsound.h). The tail used to be
+// mistyped, so a correct QueryInterface for IDirectSoundBuffer8 was refused
+// and FalloutNV dereferenced the NULL it got back (0xaecc16).
+const IID_IDirectSoundBuffer8 = Guid{ .data1 = 0x6825A449, .data2 = 0x7524, .data3 = 0x4D82, .data4 = .{ 0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB, 0x1E } };
 
 fn accepts(self_iid: *const Guid, iid: ?*const Guid) bool {
     const g = iid orelse return false;
@@ -919,16 +922,15 @@ fn devGetCaps(p: *anyopaque, caps: ?*DSCAPS) callconv(W) HRESULT {
     if (declared < 8) return E_INVALIDARG;
     const raw: [*]u8 = @ptrCast(c);
     @memset(raw[8..declared], 0);
-    c.dwFlags = DSCAPS_PRIMARYSTEREO | DSCAPS_PRIMARY16BIT | DSCAPS_SECONDARYSTEREO | DSCAPS_SECONDARY16BIT;
-    c.dwMinSecondarySampleRate = 8000;
-    c.dwMaxSecondarySampleRate = 192000;
+    // What Proton's dsound answers on this machine (oracle probe dscaps.exe,
+    // 2026-11-14): software mixing only, no hardware 3D voices.
+    c.dwFlags = 0xF5F;
+    c.dwMinSecondarySampleRate = 100;
+    c.dwMaxSecondarySampleRate = 200000;
     c.dwPrimaryBuffers = 1;
-    c.dwMaxHwMixingAllBuffers = 32;
-    c.dwMaxHwMixingStaticBuffers = 32;
-    c.dwMaxHwMixingStreamingBuffers = 32;
-    c.dwFreeHwMixingAllBuffers = 32;
-    c.dwFreeHwMixingStaticBuffers = 32;
-    c.dwFreeHwMixingStreamingBuffers = 32;
+    c.dwMaxHwMixingAllBuffers = 1;
+    c.dwMaxHwMixingStaticBuffers = 1;
+    c.dwMaxHwMixingStreamingBuffers = 1;
     return S_OK;
 }
 
