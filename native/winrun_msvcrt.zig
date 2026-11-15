@@ -3132,11 +3132,12 @@ fn XInputEnable(enable: u32) callconv(C) void {
     _ = enable;
 }
 
-/// winmm's mmio* (RIFF chunk I/O over a real fd). The RIFF parser itself is not
-/// modelled: mmioOpen/mmioRead/mmioSeek/mmioClose do real file I/O, and the
-/// chunk-navigation calls (Ascend/Descend/GetInfo/SetInfo) report failure rather
-/// than inventing a chunk, because a wrong chunk position corrupts the caller's
-/// parse of the file it opened.
+/// winmm's mmio*: unbuffered RIFF file I/O. A file is read either through the
+/// caller's own I/O procedure (MMIOINFO.pIOProc -- FalloutNV reads its .wav
+/// effects out of the .bsa archives this way, IOProc 0xaf0400) or, without one,
+/// from a real fd. Descend/Ascend walk the RIFF chunks as winmm does. There is
+/// no internal buffer, so MMIO_ALLOCBUF is accepted and mmioAdvance answers
+/// MMIOERR_UNBUFFERED. Writing is not modelled: a write open fails.
 pub fn lookupWinmm(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "mmioClose")) return @intFromPtr(&mmioClose);
     if (std.mem.eql(u8, name, "mmioDescend")) return @intFromPtr(&mmioDescend);
@@ -3150,102 +3151,226 @@ pub fn lookupWinmm(name: []const u8) ?usize {
     return null;
 }
 
-// Minimal open/free-tracking set: the guest gets a real fd-backed handle, so a
-// successful mmioOpen means the file really opened, and mmioRead really reads it.
-const MMIO_IO = extern struct {
-    fd: i32,
-    used: bool,
+const MMIOM_READ: u32 = 0;
+const MMIOM_SEEK: u32 = 2;
+const MMIOM_OPEN: u32 = 3;
+const MMIOM_CLOSE: u32 = 4;
+const MMIOERR_CHUNKNOTFOUND: u32 = 265;
+const MMIOERR_UNBUFFERED: u32 = 266;
+const MMSYSERR_INVALHANDLE: u32 = 5;
+const FOURCC_RIFF: u32 = 0x46464952;
+const FOURCC_LIST: u32 = 0x5453494C;
+
+/// mmsystem.h's MMIOINFO (pack 1; 0x48 bytes on i386).
+const MMIOINFO = extern struct {
+    dwFlags: u32,
+    fccIOProc: u32,
+    pIOProc: ?*const fn (*MMIOINFO, u32, usize, usize) callconv(W) isize,
+    wErrorRet: u32,
+    htask: u32,
+    cchBuffer: i32,
+    pchBuffer: u32,
+    pchNext: u32,
+    pchEndRead: u32,
+    pchEndWrite: u32,
+    lBufOffset: i32,
+    lDiskOffset: i32,
+    adwInfo: [3]u32,
+    dwReserved1: u32,
+    dwReserved2: u32,
+    hmmio: u32,
 };
 
-var g_mmio_table: [16]MMIO_IO = [_]MMIO_IO{ .{ .fd = -1, .used = false } } ** 16;
+const MMCKINFO = extern struct {
+    ckid: u32,
+    cksize: u32,
+    fccType: u32,
+    dwDataOffset: u32,
+    dwFlags: u32,
+};
 
-fn mmioOpenA(szFilename: ?[*:0]const u8, pmioopen: ?*const anyopaque, dwOpenFlags: u32) callconv(C) usize {
-    _ = pmioopen;
-    const path = szFilename orelse return 0;
-    if (dwOpenFlags & 0x0001 != 0) {
-        // MMIO_READ: open read-only, which is the only mode these shims model.
+const MmioFile = struct {
+    used: bool = false,
+    fd: i32 = -1,
+    /// The MMIOINFO the I/O procedure sees; it keeps its own state in adwInfo.
+    info: MMIOINFO = std.mem.zeroes(MMIOINFO),
+};
+
+var g_mmio_table: [32]MmioFile = [_]MmioFile{.{}} ** 32;
+const MMIO_HANDLE_BASE: usize = 0x00310000;
+
+fn mmioFile(hmmio: usize) ?*MmioFile {
+    if (hmmio <= MMIO_HANDLE_BASE or hmmio - MMIO_HANDLE_BASE > g_mmio_table.len) return null;
+    const f = &g_mmio_table[hmmio - MMIO_HANDLE_BASE - 1];
+    return if (f.used) f else null;
+}
+
+fn mmioOpenA(szFilename: ?[*:0]const u8, pmioopen: ?*MMIOINFO, dwOpenFlags: u32) callconv(W) usize {
+    var slot: ?*MmioFile = null;
+    var index: usize = 0;
+    for (&g_mmio_table, 0..) |*e, i| {
+        if (!e.used) {
+            slot = e;
+            index = i;
+            break;
+        }
+    }
+    const f = slot orelse return 0;
+    f.* = .{};
+    if (pmioopen) |src| f.info = src.*;
+    f.info.dwFlags = dwOpenFlags;
+    f.info.hmmio = @intCast(MMIO_HANDLE_BASE + index + 1);
+    f.info.lDiskOffset = 0;
+    if (f.info.pIOProc) |proc| {
+        const rc = proc(&f.info, MMIOM_OPEN, @intFromPtr(szFilename), 0);
+        if (rc != 0) {
+            if (pmioopen) |src| src.wErrorRet = @truncate(@as(usize, @bitCast(rc)));
+            return 0;
+        }
+    } else {
+        const path = szFilename orelse return 0;
+        // MMIO_READ is 0; MMIO_WRITE (1) and MMIO_READWRITE (2) are not modelled.
+        if (dwOpenFlags & 3 != 0) return 0;
         const fd = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
         if (linux.errno(fd) != .SUCCESS) return 0;
-        for (&g_mmio_table) |*e| {
-            if (!e.used) {
-                e.used = true;
-                e.fd = @intCast(fd);
-                return @as(usize, 0x31000) + @intFromPtr(e);
-            }
-        }
-        _ = linux.close(@intCast(fd));
-        return 0;
+        f.fd = @intCast(fd);
     }
-    return 0;
+    f.used = true;
+    if (pmioopen) |src| src.wErrorRet = 0;
+    return f.info.hmmio;
 }
 
-fn mmioClose(hmmio: usize, wFlags: u32) callconv(C) u32 {
-    _ = wFlags;
-    const idx: usize = (hmmio - 0x31000) / @sizeOf(MMIO_IO);
-    if (idx >= g_mmio_table.len) return 0xFFFFFFFF;
-    g_mmio_table[idx].used = false;
-    _ = linux.close(@intCast(g_mmio_table[idx].fd));
-    return 0;
+fn mmioClose(hmmio: usize, wFlags: u32) callconv(W) u32 {
+    const f = mmioFile(hmmio) orelse return MMSYSERR_INVALHANDLE;
+    var rc: u32 = 0;
+    if (f.info.pIOProc) |proc| {
+        rc = @truncate(@as(usize, @bitCast(proc(&f.info, MMIOM_CLOSE, wFlags, 0))));
+    } else {
+        _ = linux.close(f.fd);
+    }
+    f.used = false;
+    return rc;
 }
 
-fn mmioRead(hmmio: usize, pch: ?[*]u8, cch: u32) callconv(C) i32 {
-    const idx: usize = (hmmio - 0x31000) / @sizeOf(MMIO_IO);
-    if (idx >= g_mmio_table.len) return -1;
+fn mmioRead(hmmio: usize, pch: ?[*]u8, cch: i32) callconv(W) i32 {
+    const f = mmioFile(hmmio) orelse return -1;
     const buf = pch orelse return 0;
-    const fd: i32 = g_mmio_table[idx].fd;
-    if (@import("builtin").cpu.arch == .x86) {
-        const r = linux.syscall3(.read, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(buf), cch);
-        if (linux.errno(r) != .SUCCESS) return -1;
-        return @intCast(r);
+    if (cch <= 0) return 0;
+    if (f.info.pIOProc) |proc| return @intCast(proc(&f.info, MMIOM_READ, @intFromPtr(buf), @intCast(cch)));
+    var total: usize = 0;
+    const want: usize = @intCast(cch);
+    while (total < want) {
+        const r = linux.read(f.fd, buf + total, want - total);
+        if (linux.errno(r) != .SUCCESS) return if (total > 0) @intCast(total) else -1;
+        if (r == 0) break;
+        total += r;
     }
-    const r = linux.read(fd, buf[0..cch]);
+    f.info.lDiskOffset += @intCast(total);
+    return @intCast(total);
+}
+
+fn mmioSeek(hmmio: usize, lOffset: i32, iOrigin: i32) callconv(W) i32 {
+    const f = mmioFile(hmmio) orelse return -1;
+    if (f.info.pIOProc) |proc| {
+        return @intCast(proc(&f.info, MMIOM_SEEK, @as(usize, @bitCast(@as(isize, lOffset))), @as(usize, @bitCast(@as(isize, iOrigin)))));
+    }
+    if (iOrigin < 0 or iOrigin > 2) return -1;
+    const r = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, f.fd))), @as(usize, @bitCast(@as(isize, lOffset))), @as(usize, @intCast(iOrigin)));
     if (linux.errno(r) != .SUCCESS) return -1;
+    f.info.lDiskOffset = @intCast(r);
     return @intCast(r);
 }
 
-fn mmioSeek(hmmio: usize, lOffset: i32, iOrigin: i32) callconv(C) i32 {
-    const idx: usize = (hmmio - 0x31000) / @sizeOf(MMIO_IO);
-    if (idx >= g_mmio_table.len) return -1;
-    const fd: i32 = g_mmio_table[idx].fd;
-    const whence: u32 = if (iOrigin == 0) 0 else if (iOrigin == 1) 1 else 2;
-    if (@import("builtin").cpu.arch == .x86) {
-        const r = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, fd))), @as(usize, @bitCast(@as(isize, lOffset))), whence);
-        if (linux.errno(r) != .SUCCESS) return -1;
-        return @intCast(r);
+/// Find a chunk (optionally a given one, optionally inside `parent`) and leave
+/// the file at the start of its data, as winmm's mmioDescend.
+fn mmioDescend(hmmio: usize, lpck: ?*MMCKINFO, parent: ?*const MMCKINFO, wFlags: u32) callconv(W) u32 {
+    if (mmioFile(hmmio) == null) return MMSYSERR_INVALHANDLE;
+    const ck = lpck orelse return 11; // MMSYSERR_INVALPARAM
+    const cur = mmioSeek(hmmio, 0, 1);
+    if (cur < 0) return MMIOERR_CHUNKNOTFOUND;
+    var pos: u32 = @intCast(cur);
+    var max_pos: u32 = 0xFFFFFFFF;
+    if (parent) |p| {
+        const end = p.dwDataOffset +% p.cksize;
+        if (pos < p.dwDataOffset or pos >= end) {
+            pos = p.dwDataOffset;
+            _ = mmioSeek(hmmio, @bitCast(pos), 0);
+        }
+        max_pos = end;
     }
-    return -1;
+    const start = pos;
+    var want_id: u32 = 0;
+    var want_type: u32 = 0;
+    if (wFlags & 0x10 != 0) want_id = ck.ckid; // MMIO_FINDCHUNK
+    if (wFlags & 0x20 != 0) { // MMIO_FINDRIFF
+        want_id = FOURCC_RIFF;
+        want_type = ck.fccType;
+    }
+    if (wFlags & 0x40 != 0) { // MMIO_FINDLIST
+        want_id = FOURCC_LIST;
+        want_type = ck.fccType;
+    }
+    while (true) {
+        var head: [3]u32 = .{ 0, 0, 0 };
+        const got: i32 = if (pos < max_pos) mmioRead(hmmio, @ptrCast(&head), 12) else 0;
+        if (got < 8) {
+            _ = mmioSeek(hmmio, @bitCast(start), 0);
+            return MMIOERR_CHUNKNOTFOUND;
+        }
+        const is_form = head[0] == FOURCC_RIFF or head[0] == FOURCC_LIST;
+        const type_ok = want_type == 0 or (is_form and got >= 12 and head[2] == want_type);
+        if ((want_id == 0 or want_id == head[0]) and type_ok) {
+            ck.ckid = head[0];
+            ck.cksize = head[1];
+            ck.dwDataOffset = pos + 8;
+            ck.dwFlags = 0;
+            if (is_form) {
+                ck.fccType = head[2];
+                _ = mmioSeek(hmmio, @bitCast(ck.dwDataOffset + 4), 0);
+            } else {
+                ck.fccType = 0;
+                _ = mmioSeek(hmmio, @bitCast(ck.dwDataOffset), 0);
+            }
+            return 0;
+        }
+        pos = pos + 8 + ((head[1] +% 1) & ~@as(u32, 1));
+        if (mmioSeek(hmmio, @bitCast(pos), 0) < 0) {
+            _ = mmioSeek(hmmio, @bitCast(start), 0);
+            return MMIOERR_CHUNKNOTFOUND;
+        }
+    }
 }
 
-// The four chunk-navigation calls are not modelled: inventing a chunk would
-// corrupt the caller's view of the file.
-fn mmioAscend(hmmio: usize, pmmioinfo: ?*anyopaque, wFlags: u32) callconv(C) u32 {
-    _ = hmmio; _ = pmmioinfo; _ = wFlags;
-    std.debug.print("[WINS:winmm] mmioAscend: RIFF chunk navigation is not modelled.\n", .{});
-    return 0xFFFFFFFF;
+/// Leave a chunk: seek past its (word-aligned) data.
+fn mmioAscend(hmmio: usize, lpck: ?*const MMCKINFO, wFlags: u32) callconv(W) u32 {
+    _ = wFlags;
+    if (mmioFile(hmmio) == null) return MMSYSERR_INVALHANDLE;
+    const ck = lpck orelse return 11;
+    const end = ck.dwDataOffset +% ((ck.cksize +% 1) & ~@as(u32, 1));
+    if (mmioSeek(hmmio, @bitCast(end), 0) < 0) return 263; // MMIOERR_CANNOTSEEK
+    return 0;
 }
 
-fn mmioDescend(hmmio: usize, pmmioinfo: ?*anyopaque, pmmcki: ?*const anyopaque, wFlags: u32) callconv(C) u32 {
-    _ = hmmio; _ = pmmioinfo; _ = pmmcki; _ = wFlags;
-    std.debug.print("[WINS:winmm] mmioDescend: RIFF chunk navigation is not modelled.\n", .{});
-    return 0xFFFFFFFF;
+fn mmioGetInfo(hmmio: usize, pmmioinfo: ?*MMIOINFO, wFlags: u32) callconv(W) u32 {
+    _ = wFlags;
+    const f = mmioFile(hmmio) orelse return MMSYSERR_INVALHANDLE;
+    if (pmmioinfo) |out| out.* = f.info;
+    return 0;
 }
 
-fn mmioGetInfo(hmmio: usize, pmmioinfo: ?*anyopaque, wFlags: u32) callconv(C) u32 {
-    _ = hmmio; _ = pmmioinfo; _ = wFlags;
-    std.debug.print("[WINS:winmm] mmioGetInfo: not modelled.\n", .{});
-    return 0xFFFFFFFF;
+fn mmioAdvance(hmmio: usize, pmmioinfo: ?*const MMIOINFO, wFlags: u32) callconv(W) u32 {
+    _ = pmmioinfo;
+    _ = wFlags;
+    if (mmioFile(hmmio) == null) return MMSYSERR_INVALHANDLE;
+    return MMIOERR_UNBUFFERED;
 }
 
-fn mmioAdvance(hmmio: usize, pmmioinfo: ?*const anyopaque, wFlags: u32) callconv(C) u32 {
-    _ = hmmio; _ = pmmioinfo; _ = wFlags;
-    std.debug.print("[WINS:winmm] mmioAdvance: buffered I/O is not modelled.\n", .{});
-    return 0xFFFFFFFF;
-}
-
-fn mmioSetInfo(hmmio: usize, pmmioinfo: ?*const anyopaque, wFlags: u32) callconv(C) u32 {
-    _ = hmmio; _ = pmmioinfo; _ = wFlags;
-    std.debug.print("[WINS:winmm] mmioSetInfo: not modelled.\n", .{});
-    return 0xFFFFFFFF;
+fn mmioSetInfo(hmmio: usize, pmmioinfo: ?*const MMIOINFO, wFlags: u32) callconv(W) u32 {
+    _ = pmmioinfo;
+    _ = wFlags;
+    // No internal buffer, so there are no buffer pointers to take back.
+    if (mmioFile(hmmio) == null) return MMSYSERR_INVALHANDLE;
+    return 0;
 }
 
 pub fn lookup(name: []const u8) ?usize {

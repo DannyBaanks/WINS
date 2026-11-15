@@ -504,7 +504,9 @@ fn logRefused(what: []const u8, g: *const Guid) void {
     std.debug.print("[WINS:DSound] {s} QueryInterface({x:0>8}-{x:0>4}-{x:0>4}-...) refused (E_NOINTERFACE)\n", .{ what, g.data1, g.data2, g.data3 });
 }
 
-var created_logged: u32 = 0;
+/// Buffer creation flags whose first Play was already reported.
+var played_flags: [16]u32 = undefined;
+var played_flag_count: usize = 0;
 
 fn bufAddRef(p: *anyopaque) callconv(W) u32 {
     traceFirst(1, "bufAddRef", @returnAddress());
@@ -680,6 +682,11 @@ fn bufPlay(p: *anyopaque, reserved1: u32, priority: u32, flags: u32) callconv(W)
     _ = reserved1;
     _ = priority;
     const self: *Buffer = @ptrCast(@alignCast(p));
+    if (std.mem.indexOfScalar(u32, played_flags[0..played_flag_count], self.flags) == null and played_flag_count < played_flags.len) {
+        played_flags[played_flag_count] = self.flags;
+        played_flag_count += 1;
+        std.debug.print("[WINS:DSound] first Play of a flags 0x{x} buffer: {d} bytes, tag {d}, {d} Hz {d} ch {d} bit, volume {d}, play flags 0x{x}\n", .{ self.flags, self.buf_len, self.wfx.wFormatTag, self.wfx.nSamplesPerSec, self.wfx.nChannels, self.wfx.wBitsPerSample, self.volume, flags });
+    }
     if (self.buf_len == 0) return DSERR_UNSUPPORTED;
     if (!self.playing) {
         self.start_cursor = bufCursor(self);
@@ -916,6 +923,28 @@ fn devRelease(p: *anyopaque) callconv(W) u32 {
     return self.refs;
 }
 
+/// Distinct (flags, format) combinations already reported by CreateSoundBuffer.
+var seen_formats: [48][5]u32 = undefined;
+var seen_format_count: usize = 0;
+
+fn logFormatOnce(d: *const DSBUFFERDESC) void {
+    const f = d.lpwfxFormat;
+    const key = [5]u32{
+        d.dwFlags,
+        if (f) |x| x.wFormatTag else 0,
+        if (f) |x| x.nSamplesPerSec else 0,
+        if (f) |x| x.nChannels else 0,
+        if (f) |x| x.wBitsPerSample else 0,
+    };
+    for (seen_formats[0..seen_format_count]) |k| {
+        if (std.mem.eql(u32, &k, &key)) return;
+    }
+    if (seen_format_count == seen_formats.len) return;
+    seen_formats[seen_format_count] = key;
+    seen_format_count += 1;
+    std.debug.print("[WINS:DSound] CreateSoundBuffer(flags 0x{x}, {d} bytes, tag {d}, {d} Hz {d} ch {d} bit, block {d})\n", .{ key[0], d.dwBufferBytes, key[1], key[2], key[3], key[4], if (f) |x| x.nBlockAlign else 0 });
+}
+
 fn devCreateSoundBuffer(p: *anyopaque, desc: ?*DSBUFFERDESC, out: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) HRESULT {
     traceFirst(26, "devCreateSoundBuffer", @returnAddress());
     _ = p;
@@ -928,11 +957,7 @@ fn devCreateSoundBuffer(p: *anyopaque, desc: ?*DSBUFFERDESC, out: ?*?*anyopaque,
         std.debug.print("[WINS:DSound] CreateSoundBuffer: all {d} buffers are in use; refused\n", .{POOL_MAX});
         return E_OUTOFMEMORY;
     };
-    if (created_logged < 12) {
-        created_logged += 1;
-        const f = d.lpwfxFormat;
-        std.debug.print("[WINS:DSound] CreateSoundBuffer(flags 0x{x}, {d} bytes, {d} Hz {d} ch {d} bit)\n", .{ d.dwFlags, d.dwBufferBytes, if (f) |x| x.nSamplesPerSec else 0, if (f) |x| x.nChannels else 0, if (f) |x| x.wBitsPerSample else 0 });
-    }
+    logFormatOnce(d);
     const hr = bufAlloc(slot, d);
     init3D(slot);
     if (hr != S_OK) {
