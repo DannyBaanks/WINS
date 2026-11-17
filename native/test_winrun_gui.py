@@ -210,7 +210,7 @@ class WinrunGuiTests(unittest.TestCase):
         fuzzer_bin = Path('/tmp/wins_fuzzer')
         if not fuzzer_bin.is_file():
             subprocess.run(['zig', 'build-exe', str(ROOT / 'native' / 'wins_fuzzer.zig'),
-                            '-O', 'Debug', '-lc', '-lX11', '-fPIC', f'-femit-bin={fuzzer_bin}'],
+                            '-O', 'ReleaseSafe', '-lc', '-lX11', '-fPIC', f'-femit-bin={fuzzer_bin}'],
                            check=True, capture_output=True)
         res = subprocess.run([str(fuzzer_bin), str(ROOT / 'corpus'), '--json'],
                              capture_output=True, text=True, check=True)
@@ -229,7 +229,7 @@ class WinrunGuiTests(unittest.TestCase):
         fuzzer_bin = Path('/tmp/wins_fuzzer')
         if not fuzzer_bin.is_file():
             subprocess.run(['zig', 'build-exe', str(ROOT / 'native' / 'wins_fuzzer.zig'),
-                            '-O', 'Debug', '-lc', '-lX11', '-fPIC', f'-femit-bin={fuzzer_bin}'],
+                            '-O', 'ReleaseSafe', '-lc', '-lX11', '-fPIC', f'-femit-bin={fuzzer_bin}'],
                            check=True, capture_output=True)
         res = subprocess.run([str(fuzzer_bin), str(ROOT / 'corpus'), '--json'],
                              capture_output=True, text=True, check=True)
@@ -239,6 +239,39 @@ class WinrunGuiTests(unittest.TestCase):
         self.assertEqual(npp_entry['missing'], 0, f"Missing imports in notepad++: {npp_entry}")
         self.assertEqual(npp_entry['resolved'], 624)
         self.assertEqual(npp_entry['readiness_pct'], 100.0)
+
+    def test_notepad_corpus_check_and_xvfb_window(self):
+        """notepad++.exe must pass --check (624 imports) and map its 1024x700 window in private Xvfb."""
+        npp = ROOT / 'corpus' / 'notepad++.exe'
+        if not npp.is_file():
+            self.skipTest('corpus/notepad++.exe not present')
+        digest = hashlib.sha256(npp.read_bytes()).hexdigest()
+        argv_check = BOX + ['--ro-bind', str(npp), '/probe.exe',
+                            '--ro-bind', str(self.loader), '/loader',
+                            '--', '/loader', '--sha256', digest, '--check', '/probe.exe']
+        res_check = subprocess.run(argv_check, capture_output=True, text=True, timeout=15)
+        self.assertEqual(res_check.returncode, 0, res_check.stderr)
+        self.assertIn('READY', res_check.stderr)
+        self.assertIn('imports=624', res_check.stderr)
+
+        if not shutil.which('xwininfo'):
+            self.skipTest('xwininfo not present')
+        script = (
+            'Xvfb :91 -screen 0 1280x900x24 -nolisten tcp -noreset -extension GLX -extension DRI3 >/dev/null 2>&1 & '
+            'srv=$!; trap "kill $srv 2>/dev/null || true" EXIT; '
+            'i=0; while [ ! -S /tmp/.X11-unix/X91 ]; do i=$((i+1)); [ $i -lt 50 ] || exit 97; sleep 0.05; done; '
+            'DISPLAY=:91 /loader --sha256 "$1" /probe.exe >/dev/null 2>&1 & '
+            'app=$!; sleep 1.0; '
+            'DISPLAY=:91 xwininfo -root -tree; '
+            'kill -9 $app 2>/dev/null || true'
+        )
+        argv_run = BOX + ['--ro-bind', str(npp), '/probe.exe',
+                          '--ro-bind', str(self.loader), '/loader',
+                          '--', '/bin/sh', '-c', script, 'npp-x11', digest]
+        res_run = subprocess.run(argv_run, capture_output=True, text=True, timeout=30)
+        self.assertEqual(res_run.returncode, 0, res_run.stderr)
+        self.assertIn('Notepad++', res_run.stdout)
+        self.assertIn('1024x700', res_run.stdout)
 
 
 

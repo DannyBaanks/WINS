@@ -80,15 +80,14 @@ const DispatcherContext = extern struct {
 };
 
 const linux = std.os.linux;
+const builtin = @import("builtin");
 
-// The C runtime is cdecl, not stdcall: the CALLER pops the arguments. The
-// Win32 DLL modules (kernel32, user32, ...) are stdcall instead. On i386 this
-// distinction is fatal -- a stdcall shim bound into a cdecl slot leaves the
-// guest's stack misaligned by the argument count and the next `ret` lands on
-// garbage. On x86_64 both conventions lower to the same ABI, which is why the
-// 64-bit loader never showed this.
+// On i386, the C runtime is cdecl (.c: caller cleans stack) whereas Win32 DLLs
+// are stdcall (.winapi: callee cleans stack). On x86_64 Linux, however, `.c`
+// means the System V AMD64 ABI (rdi, rsi, rdx, rcx, r8, r9) while Windows PE32+
+// CRT exports still expect the Microsoft x64 ABI (.winapi: rcx, rdx, r8, r9).
 const W: std.builtin.CallingConvention = .winapi;
-const C: std.builtin.CallingConvention = .c;
+const C: std.builtin.CallingConvention = if (builtin.cpu.arch == .x86_64) .winapi else .c;
 
 // ---------------------------------------------------------------------------
 // 1. Data Exports & Global CRT State
@@ -2064,7 +2063,7 @@ fn ldexp(x: f64, exp: i32) callconv(C) f64 {
 // 10. Formatting & Scanning
 // ---------------------------------------------------------------------------
 
-fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) i32 {
+pub fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) i32 {
     const f = fmt orelse return -1;
     var arg_idx: usize = 0;
     var out_pos: usize = 0;
@@ -3673,4 +3672,12 @@ pub fn lookup(name: []const u8) ?usize {
     }
 
     return null;
+}
+
+test "CRT calling convention matches target guest ABI" {
+    if (builtin.cpu.arch == .x86_64) {
+        try std.testing.expectEqual(std.builtin.CallingConvention.winapi, C);
+    } else if (builtin.cpu.arch == .x86) {
+        try std.testing.expectEqual(std.builtin.CallingConvention.c, C);
+    }
 }

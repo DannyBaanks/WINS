@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "wins_cuphead"
+    {
+      "install_path" "."
+      "display_name" "WINS (Cuphead)"
+      "from_oslist" "windows"
+      "to_oslist" "linux"
+    }
+  }
+}

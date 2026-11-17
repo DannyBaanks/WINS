@@ -184,8 +184,10 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             };
         }
 
-        fn lookup(lib: []const u8, name: []const u8) ?usize {
+        /// pub: winrun64 / winload64 (multi-image x64 loader) reuses this GUI shim table.
+        pub fn lookup(lib: []const u8, name: []const u8) ?usize {
             if (std.ascii.eqlIgnoreCase(lib, "kernel32.dll")) {
+                @import("winrun_kernel32.zig").last_error_hook = &SetLastError;
                 for (exports()) |e| if (std.mem.eql(u8, name, e.name)) return e.addr;
                 return @import("winrun_kernel32.zig").lookup(name);
             }
@@ -200,6 +202,9 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             }
             if (std.ascii.eqlIgnoreCase(lib, "user32.dll")) {
                 if (comptime gui) {
+                    // RawInput + key-state live in winrun_directx (real, unit-tested);
+                    // winrun_gui_support only has fixed-zero placeholders for them.
+                    if (@import("winrun_directx.zig").lookupUser32Input(name)) |func| return @intFromPtr(func);
                     if (@import("winrun_gui_support.zig").lookup(name)) |addr| return addr;
                 }
                 return @import("winrun_extra_dlls.zig").lookupUser32Console(name);
@@ -231,9 +236,43 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             if (std.ascii.eqlIgnoreCase(lib, "ncrypt.dll") or std.ascii.eqlIgnoreCase(lib, "bcrypt.dll")) {
                 return @import("winrun_extra_dlls.zig").lookupNcrypt(name);
             }
+            if (std.ascii.eqlIgnoreCase(lib, "msimg32.dll")) {
+                if (comptime gui) {
+                    if (std.mem.eql(u8, name, "AlphaBlend")) {
+                        return @import("winrun_gui_support.zig").lookupGdi32("GdiAlphaBlend");
+                    }
+                }
+                return null;
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "comctl32.dll")) {
+                if (comptime gui) {
+                    if (@import("winrun_gui_support.zig").lookupComctl32(name)) |addr| return addr;
+                }
+                const extra = @import("winrun_extra_dlls.zig");
+                return extra.lookupComctl32(name) orelse extra.lookupMisc(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "comdlg32.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupComdlg32(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "uxtheme.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupUxtheme(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "dwmapi.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupDwmapi(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "dbghelp.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupDbghelp(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "wininet.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupWininet(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "imm32.dll")) {
+                if (@import("winrun_extra_dlls.zig").lookupImm32(name)) |addr| return addr;
+                if (gui) if (@import("winrun_directx.zig").lookupDirectX(name)) |func| return @intFromPtr(func);
+                return null;
+            }
             if (std.ascii.eqlIgnoreCase(lib, "sensapi.dll") or
                 std.ascii.eqlIgnoreCase(lib, "secur32.dll") or
-                std.ascii.eqlIgnoreCase(lib, "comctl32.dll") or
                 std.ascii.eqlIgnoreCase(lib, "wintrust.dll") or
                 std.ascii.eqlIgnoreCase(lib, "iphlpapi.dll") or
                 std.ascii.eqlIgnoreCase(lib, "dnsapi.dll") or
@@ -241,7 +280,16 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             {
                 return @import("winrun_extra_dlls.zig").lookupMisc(name);
             }
-            if (std.ascii.eqlIgnoreCase(lib, "d3d11.dll") or
+            if (std.ascii.eqlIgnoreCase(lib, "psapi.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupPsapi(name);
+            }
+            if (std.ascii.eqlIgnoreCase(lib, "mswsock.dll")) {
+                return @import("winrun_extra_dlls.zig").lookupMswsock(name);
+            }
+            if (gui and std.ascii.eqlIgnoreCase(lib, "opengl32.dll")) {
+                return @import("wins_gl_win64.zig").lookupOpengl32(name);
+            }
+            if (gui and (std.ascii.eqlIgnoreCase(lib, "d3d11.dll") or
                 std.ascii.eqlIgnoreCase(lib, "dxgi.dll") or
                 std.ascii.eqlIgnoreCase(lib, "d3dcompiler_47.dll") or
                 std.ascii.eqlIgnoreCase(lib, "d3dcompiler.dll") or
@@ -250,13 +298,11 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
                 std.ascii.eqlIgnoreCase(lib, "xinput1_4.dll") or
                 std.ascii.eqlIgnoreCase(lib, "xinput1_3.dll") or
                 std.ascii.eqlIgnoreCase(lib, "xinput9_1_0.dll") or
-                std.ascii.eqlIgnoreCase(lib, "opengl32.dll") or
                 std.ascii.eqlIgnoreCase(lib, "hid.dll") or
                 std.ascii.eqlIgnoreCase(lib, "winmm.dll") or
-                std.ascii.eqlIgnoreCase(lib, "imm32.dll") or
                 std.ascii.eqlIgnoreCase(lib, "version.dll") or
                 std.ascii.eqlIgnoreCase(lib, "setupapi.dll") or
-                std.ascii.eqlIgnoreCase(lib, "unityplayer.dll"))
+                std.ascii.eqlIgnoreCase(lib, "unityplayer.dll")))
             {
                 if (@import("winrun_directx.zig").lookupDirectX(name)) |func| {
                     return @intFromPtr(func);
@@ -486,6 +532,7 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             // the Linux signal terminates the process rather than dispatching SEH.
             if (dirs[3].size != 0) {
                 if (@as(u64, dirs[3].rva) + dirs[3].size > size_of_image or dirs[3].size % 12 != 0) die(.bad_image, "exception directory malformed", .{});
+                @import("winrun_kernel32.zig").setExceptionTable(base, map_len, dirs[3].rva, dirs[3].size);
                 var p: usize = dirs[3].rva;
                 while (p < dirs[3].rva + dirs[3].size) : (p += 12) {
                     var ui = need(u32, img, p + 8, "unwind info rva");

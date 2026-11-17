@@ -31,6 +31,7 @@ pub const W: std.builtin.CallingConvention = .winapi;
 
 pub const WAIT_OBJECT_0: u32 = 0;
 pub const WAIT_TIMEOUT: u32 = 258;
+pub const WAIT_IO_COMPLETION: u32 = 0xC0;
 pub const WAIT_FAILED: u32 = 0xFFFFFFFF;
 pub const INFINITE: u32 = 0xFFFFFFFF;
 pub const STILL_ACTIVE: u32 = 259;
@@ -42,7 +43,10 @@ const MAX_OBJECTS = 4096;
 pub const MAXIMUM_WAIT_OBJECTS = 64;
 
 pub const StartFn = *const fn (?*anyopaque) callconv(W) u32;
+pub const ApcFn = *const fn (usize) callconv(W) void;
 pub const Kind = enum { event, semaphore, mutex, thread };
+
+const Apc = struct { next: ?*Apc = null, callback: ApcFn, data: usize };
 
 pub const Object = struct {
     kind: Kind,
@@ -63,16 +67,31 @@ pub const Object = struct {
     // thread
     tid: u32 = 0,
     tid_ready: bool = false,
+    running: bool = false,
     exit_code: u32 = STILL_ACTIVE,
     finished: bool = false,
     suspend_count: i32 = 0,
+    priority: i32 = 0,
+    sig_paused: u32 = 0,
+    ctx_gregs: [18]u64 = [_]u64{0} ** 18,
     start: ?StartFn = null,
     param: ?*anyopaque = null,
     stack_size: usize = 0,
+    apc_head: ?*Apc = null,
+    apc_tail: ?*Apc = null,
 };
 
 var g_mu: c.pthread_mutex_t = .{};
-var g_cv: c.pthread_cond_t = .{};
+/// Wait/wake word for every object state change (replaces a pthread condition
+/// variable). A waker bumps it and FUTEX_WAKEs everyone; that never blocks. A
+/// pthread_cond_broadcast, by contrast, waits for earlier waiters to leave the
+/// condvar, and a waiter stopped by SuspendThread (Mono's GC does that) never
+/// does: the broadcaster then hangs holding g_mu and the whole process stops.
+var g_epoch: u32 = 0;
+/// g_mu nesting of this thread. SuspendThread's signal is deferred while it is
+/// non-zero, so a suspended thread can never be holding g_mu.
+threadlocal var t_lock_depth: u32 = 0;
+threadlocal var t_pause_pending: bool = false;
 var g_objs: [MAX_OBJECTS]?*Object = [_]?*Object{null} ** MAX_OBJECTS;
 
 /// Called on a new thread before the guest's start routine runs, to build its
@@ -82,13 +101,23 @@ pub var g_thread_init: ?*const fn (*Object) void = null;
 threadlocal var g_current: ?*Object = null;
 
 fn lock() void {
+    // Count first: a suspend signal that lands while we wait for or hold g_mu is deferred.
+    @atomicStore(u32, &t_lock_depth, t_lock_depth + 1, .seq_cst);
     _ = c.pthread_mutex_lock(&g_mu);
 }
 fn unlock() void {
     _ = c.pthread_mutex_unlock(&g_mu);
+    @atomicStore(u32, &t_lock_depth, t_lock_depth - 1, .seq_cst);
+    if (t_lock_depth == 0 and @atomicLoad(bool, &t_pause_pending, .seq_cst)) {
+        @atomicStore(bool, &t_pause_pending, false, .seq_cst);
+        // Take the deferred suspension now, outside g_mu, with a real signal context.
+        _ = linux.tgkill(linux.getpid(), @intCast(linux.gettid()), linux.SIG.URG);
+    }
 }
+/// Every waiter re-checks its object after this; it never blocks the caller.
 fn wake() void {
-    _ = c.pthread_cond_broadcast(&g_cv);
+    _ = @atomicRmw(u32, &g_epoch, .Add, 1, .seq_cst);
+    _ = linux.futex_3arg(&g_epoch, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
 }
 
 threadlocal var t_tid: u32 = 0;
@@ -156,6 +185,11 @@ fn release(o: *Object) void {
     if (o.refs > 0) o.refs -= 1;
     if (o.refs == 0) {
         g_objs[o.slot] = null;
+        var apc = o.apc_head;
+        while (apc) |node| {
+            apc = node.next;
+            std.heap.c_allocator.destroy(node);
+        }
         std.heap.c_allocator.destroy(o);
     }
 }
@@ -333,14 +367,30 @@ const Deadline = struct {
     }
 };
 
-/// Blocks on the shared condition variable; returns true when the deadline passed.
+/// Called with g_mu held: releases it, sleeps until the next wake() (or the
+/// deadline), re-takes it. Returns true when the deadline passed. Spurious
+/// returns are fine: every caller loops and re-checks its condition.
 fn waitCond(d: *const Deadline) bool {
-    if (d.infinite) {
-        _ = c.pthread_cond_wait(&g_cv, &g_mu);
-        return false;
+    // Read under g_mu: a wake() for a change made after this read bumps the word,
+    // so FUTEX_WAIT below returns at once instead of missing it.
+    const seen = @atomicLoad(u32, &g_epoch, .seq_cst);
+    var rel: linux.timespec = undefined;
+    if (!d.infinite) {
+        var now: linux.timespec = undefined;
+        _ = linux.clock_gettime(.REALTIME, &now);
+        var sec: i64 = @as(i64, d.abs.sec) - @as(i64, now.sec);
+        var nsec: i64 = @as(i64, d.abs.nsec) - @as(i64, now.nsec);
+        if (nsec < 0) {
+            nsec += 1_000_000_000;
+            sec -= 1;
+        }
+        if (sec < 0) return true;
+        rel = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
     }
-    const rc = c.pthread_cond_timedwait(&g_cv, &g_mu, &d.abs);
-    return rc == .TIMEDOUT;
+    unlock();
+    const rc = linux.futex_4arg(&g_epoch, .{ .cmd = .WAIT, .private = true }, seen, if (d.infinite) null else &rel);
+    lock();
+    return !d.infinite and linux.errno(rc) == .TIMEDOUT;
 }
 
 /// WaitForSingleObject on one of our handles; null when `h` is not ours.
@@ -363,6 +413,126 @@ pub fn waitOne(h: usize, ms: u32) ?u32 {
                 return WAIT_OBJECT_0;
             }
             return WAIT_TIMEOUT;
+        }
+    }
+}
+
+/// Queue a user-mode APC for a live thread object. Only the target's own
+/// alertable wait removes and runs this callback.
+pub fn queueUserApc(callback: ?*anyopaque, h: usize, data: usize) bool {
+    const raw = callback orelse return false;
+    const apc = std.heap.c_allocator.create(Apc) catch return false;
+    apc.* = .{ .callback = @ptrCast(@alignCast(raw)), .data = data };
+    lock();
+    const o = if (h == ~@as(usize, 1)) registerCurrentLocked() else find(h);
+    if (o == null or o.?.kind != .thread or o.?.finished) {
+        unlock();
+        std.heap.c_allocator.destroy(apc);
+        return false;
+    }
+    const thread = o.?;
+    if (thread.apc_tail) |tail| tail.next = apc else thread.apc_head = apc;
+    thread.apc_tail = apc;
+    wake();
+    unlock();
+    return true;
+}
+
+/// g_mu is held. Call guest APCs with g_mu released, draining callbacks added
+/// by callbacks as well. Only callbacks belonging to the current thread run.
+fn runApcsLocked() bool {
+    var ran = false;
+    const current = registerCurrentLocked() orelse return false;
+    while (current.apc_head) |apc| {
+        current.apc_head = apc.next;
+        if (current.apc_head == null) current.apc_tail = null;
+        unlock();
+        apc.callback(apc.data);
+        std.heap.c_allocator.destroy(apc);
+        lock();
+        ran = true;
+    }
+    return ran;
+}
+
+/// Alertable wait for one object. APC completion takes precedence over object
+/// completion and timeout.
+pub fn waitOneEx(h: usize, ms: u32, alertable: bool) ?u32 {
+    lock();
+    defer unlock();
+    const o = find(h) orelse return null;
+    const tid = tidNow();
+    const d = Deadline.init(ms);
+    while (true) {
+        if (alertable and runApcsLocked()) return WAIT_IO_COMPLETION;
+        if (signaledFor(o, tid)) {
+            consume(o, tid);
+            return WAIT_OBJECT_0;
+        }
+        if (ms == 0) return WAIT_TIMEOUT;
+        if (waitCond(&d)) {
+            if (alertable and runApcsLocked()) return WAIT_IO_COMPLETION;
+            if (signaledFor(o, tid)) {
+                consume(o, tid);
+                return WAIT_OBJECT_0;
+            }
+            return WAIT_TIMEOUT;
+        }
+    }
+}
+
+pub fn waitManyEx(handles: []const usize, wait_all: bool, ms: u32, alertable: bool) ?u32 {
+    if (handles.len == 0 or handles.len > MAXIMUM_WAIT_OBJECTS) return WAIT_FAILED;
+    lock();
+    defer unlock();
+    var objs: [MAXIMUM_WAIT_OBJECTS]*Object = undefined;
+    for (handles, 0..) |h, i| objs[i] = find(h) orelse return null;
+    const tid = tidNow();
+    const d = Deadline.init(ms);
+    while (true) {
+        if (alertable and runApcsLocked()) return WAIT_IO_COMPLETION;
+        if (waitManyReady(objs[0..handles.len], wait_all, tid)) |result| return result;
+        if (ms == 0) return WAIT_TIMEOUT;
+        if (waitCond(&d)) {
+            if (alertable and runApcsLocked()) return WAIT_IO_COMPLETION;
+            if (waitManyReady(objs[0..handles.len], wait_all, tid)) |result| return result;
+            return WAIT_TIMEOUT;
+        }
+    }
+}
+
+fn waitManyReady(objs: []*Object, wait_all: bool, tid: u32) ?u32 {
+    if (wait_all) {
+        for (objs) |o| if (!signaledFor(o, tid)) return null;
+        for (objs) |o| consume(o, tid);
+        return WAIT_OBJECT_0;
+    }
+    for (objs, 0..) |o, i| if (signaledFor(o, tid)) {
+        consume(o, tid);
+        return WAIT_OBJECT_0 + @as(u32, @intCast(i));
+    };
+    return null;
+}
+
+/// Alertable SleepEx wakes on queued APC delivery. Non-alertable sleep ignores
+/// the APC queue and returns zero once the interval elapses.
+pub fn sleepEx(ms: u32, alertable: bool) u32 {
+    if (!alertable) {
+        if (ms == INFINITE) {
+            while (true) sleepMs(60_000);
+        }
+        sleepMs(ms);
+        return 0;
+    }
+    lock();
+    defer unlock();
+    const d = Deadline.init(ms);
+    while (true) {
+        if (runApcsLocked()) return WAIT_IO_COMPLETION;
+        if (ms == 0) return 0;
+        if (waitCond(&d)) {
+            if (runApcsLocked()) return WAIT_IO_COMPLETION;
+            return 0;
         }
     }
 }
@@ -435,10 +605,136 @@ pub fn currentThread() ?*Object {
     return g_current;
 }
 
+/// Win32 thread priority state. Priority classes are advisory in this runtime;
+/// GetThreadPriority returns exactly the last accepted value.
+pub fn setThreadPriority(h: usize, priority: i32) bool {
+    if (priority < -15 or priority > 15) return false;
+    lock(); defer unlock();
+    const o = if (h == ~@as(usize, 1)) registerCurrentLocked() else find(h);
+    const thread = o orelse return false;
+    if (thread.kind != .thread) return false;
+    thread.priority = priority;
+    return true;
+}
+
+pub fn getThreadPriority(h: usize) ?i32 {
+    lock(); defer unlock();
+    const o = if (h == ~@as(usize, 1)) registerCurrentLocked() else find(h);
+    const thread = o orelse return null;
+    if (thread.kind != .thread) return null;
+    return thread.priority;
+}
+
+/// Returns the host tid for a validated WINS thread handle, including the
+/// current-thread pseudo handle. No lookup result means the handle is invalid.
+pub fn threadTid(h: usize) ?u32 {
+    if (h == ~@as(usize, 1)) return tidNow();
+    lock(); defer unlock();
+    const o = find(h) orelse return null;
+    if (o.kind != .thread or !o.tid_ready) return null;
+    return o.tid;
+}
+
+var g_sig_init = std.atomic.Value(u32).init(0);
+
+fn onSuspendSignal(_: linux.SIG, _: *const linux.siginfo_t, ctx_raw: ?*anyopaque) callconv(.c) void {
+    const o = g_current orelse return;
+    if (@atomicLoad(u32, &t_lock_depth, .seq_cst) != 0) {
+        // Inside WINS with (or about to take) g_mu: pausing here would freeze
+        // every other thread. unlock() re-raises this signal once g_mu is free.
+        @atomicStore(bool, &t_pause_pending, true, .seq_cst);
+        return;
+    }
+    // A deferred pause can arrive after the suspender already gave up and resumed us.
+    if (@atomicLoad(i32, &o.suspend_count, .seq_cst) <= 0) return;
+    if (ctx_raw) |raw| {
+        const g: [*]const u64 = @ptrFromInt(@intFromPtr(raw) + 40); // ucontext.uc_mcontext.gregs
+        for (0..18) |i| o.ctx_gregs[i] = g[i];
+    }
+    @atomicStore(u32, &o.sig_paused, 1, .seq_cst);
+    // ResumeThread may have run between the check above and the store: it cleared
+    // sig_paused before we set it, so nobody would ever wake us. Re-check.
+    if (@atomicLoad(i32, &o.suspend_count, .seq_cst) <= 0) {
+        @atomicStore(u32, &o.sig_paused, 0, .seq_cst);
+        return;
+    }
+    _ = linux.syscall3(.futex, @intFromPtr(&o.sig_paused), 1, 1);
+    while (@atomicLoad(u32, &o.sig_paused, .acquire) == 1) {
+        _ = linux.syscall4(.futex, @intFromPtr(&o.sig_paused), 0, 1, 0);
+    }
+}
+
+fn ensureSuspendHandler() void {
+    if (g_sig_init.load(.acquire) == 2) return;
+    if (g_sig_init.cmpxchgStrong(0, 1, .acq_rel, .monotonic) == null) {
+        var sa: linux.Sigaction = .{
+            .handler = .{ .sigaction = onSuspendSignal },
+            .mask = linux.sigemptyset(),
+            .flags = linux.SA.SIGINFO | linux.SA.RESTART,
+        };
+        _ = linux.sigaction(linux.SIG.URG, &sa, null);
+        g_sig_init.store(2, .release);
+    } else {
+        while (g_sig_init.load(.acquire) != 2) std.atomic.spinLoopHint();
+    }
+}
+
+fn registerCurrentLocked() ?*Object {
+    if (g_current) |o| return o;
+    const tid = tidNow();
+    for (g_objs) |maybe| {
+        if (maybe) |o| {
+            if (o.kind == .thread and o.tid == tid and !o.finished) {
+                g_current = o;
+                return o;
+            }
+        }
+    }
+    const o = alloc(.thread, null) orelse return null;
+    o.refs = 2; // stays alive in table while thread lives + handle
+    o.tid = tid;
+    o.tid_ready = true;
+    o.running = true;
+    g_current = o;
+    return o;
+}
+
+pub fn dupCurrentThread() usize {
+    ensureSuspendHandler();
+    lock();
+    defer unlock();
+    const o = registerCurrentLocked() orelse return 0;
+    o.refs += 1;
+    return handleOf(o);
+}
+
+pub fn dupHandle(h: usize) usize {
+    lock();
+    defer unlock();
+    const o = find(h) orelse return 0;
+    o.refs += 1;
+    return handleOf(o);
+}
+
+pub fn openThreadByTid(tid: u32) usize {
+    ensureSuspendHandler();
+    lock();
+    defer unlock();
+    for (g_objs) |maybe| {
+        if (maybe) |o| {
+            if (o.kind == .thread and o.tid == tid and !o.finished) {
+                o.refs += 1;
+                return handleOf(o);
+            }
+        }
+    }
+    return 0;
+}
+
 fn finish(o: *Object, code: u32) void {
     lock();
     o.exit_code = code;
-    o.finished = true;
+    @atomicStore(bool, &o.finished, true, .release);
     wake();
     release(o); // the reference the running thread held
     unlock();
@@ -447,15 +743,15 @@ fn finish(o: *Object, code: u32) void {
 fn trampoline(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
     const o: *Object = @ptrCast(@alignCast(arg.?));
     g_current = o;
+    ensureSuspendHandler();
+    if (g_thread_init) |init_fn| init_fn(o);
     lock();
     o.tid = tidNow();
     o.tid_ready = true;
     wake();
-    unlock();
-    if (g_thread_init) |init| init(o);
     // CREATE_SUSPENDED: wait for ResumeThread.
-    lock();
-    while (o.suspend_count > 0) _ = c.pthread_cond_wait(&g_cv, &g_mu);
+    while (o.suspend_count > 0) _ = waitCond(&Deadline.init(INFINITE));
+    o.running = true;
     unlock();
     const code = o.start.?(o.param);
     finish(o, code);
@@ -465,6 +761,8 @@ fn trampoline(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
 /// CreateThread. Returns the handle (0 on failure) and, through `tid_out`, the id
 /// the new thread will report from GetCurrentThreadId.
 pub fn createThread(stack_size: usize, start: StartFn, param: ?*anyopaque, flags: u32, tid_out: ?*u32) usize {
+    ensureSuspendHandler();
+    const alloc_stack = @max(stack_size, 4 * 1024 * 1024);
     lock();
     const o = alloc(.thread, null) orelse {
         unlock();
@@ -473,15 +771,15 @@ pub fn createThread(stack_size: usize, start: StartFn, param: ?*anyopaque, flags
     o.refs = 2; // the handle and the running thread
     o.start = start;
     o.param = param;
-    o.stack_size = stack_size;
+    o.stack_size = alloc_stack;
     o.suspend_count = if (flags & CREATE_SUSPENDED != 0) 1 else 0;
     const h = handleOf(o);
     unlock();
 
     var attr: c.pthread_attr_t = undefined;
     _ = c.pthread_attr_init(&attr);
-    // Windows' default reserve is 1 MiB; the guest's own request wins when larger.
-    _ = c.pthread_attr_setstacksize(&attr, @max(stack_size, 1 << 20));
+    // Reserve at least 4 MiB per guest worker thread so Mono/Unity stacks never clip TEB.StackLimit.
+    _ = c.pthread_attr_setstacksize(&attr, alloc_stack);
     var th: c.pthread_t = undefined;
     const rc = c.pthread_create(&th, &attr, trampoline, o);
     _ = c.pthread_attr_destroy(&attr);
@@ -496,7 +794,7 @@ pub fn createThread(stack_size: usize, start: StartFn, param: ?*anyopaque, flags
     // The id is only known once the thread runs; wait for it so that the value
     // CreateThread returns equals what the thread itself reads.
     lock();
-    while (!o.tid_ready) _ = c.pthread_cond_wait(&g_cv, &g_mu);
+    while (!o.tid_ready) _ = waitCond(&Deadline.init(INFINITE));
     if (tid_out) |t| t.* = o.tid;
     unlock();
     return h;
@@ -506,24 +804,90 @@ pub fn createThread(stack_size: usize, start: StartFn, param: ?*anyopaque, flags
 pub fn resumeThread(h: usize) u32 {
     lock();
     defer unlock();
-    const o = find(h) orelse return WAIT_FAILED;
-    if (o.kind != .thread) return WAIT_FAILED;
-    const prev: u32 = @intCast(o.suspend_count);
-    if (o.suspend_count > 0) o.suspend_count -= 1;
-    if (o.suspend_count == 0) wake();
+    const o = if (h == ~@as(usize, 1)) registerCurrentLocked() else find(h);
+    if (o == null or o.?.kind != .thread) return WAIT_FAILED;
+    const obj = o.?;
+    const prev: u32 = @intCast(obj.suspend_count);
+    if (obj.suspend_count > 0) @atomicStore(i32, &obj.suspend_count, obj.suspend_count - 1, .seq_cst);
+    if (obj.suspend_count == 0) {
+        @atomicStore(u32, &obj.sig_paused, 0, .release);
+        _ = linux.syscall3(.futex, @intFromPtr(&obj.sig_paused), 1, 1);
+        wake();
+    }
     return prev;
 }
 
-/// SuspendThread: only keeps the count. A thread that is already running keeps
-/// running (NOT_DEMONSTRATED: stopping an arbitrary Linux thread safely).
+/// SuspendThread: pauses a live thread via SIGURG and captures its registers/RSP.
 pub fn suspendThread(h: usize) u32 {
+    ensureSuspendHandler();
     lock();
-    defer unlock();
-    const o = find(h) orelse return WAIT_FAILED;
-    if (o.kind != .thread) return WAIT_FAILED;
+    const o = (if (h == ~@as(usize, 1)) registerCurrentLocked() else find(h)) orelse {
+        unlock();
+        return WAIT_FAILED;
+    };
+    if (o.kind != .thread) {
+        unlock();
+        return WAIT_FAILED;
+    }
     const prev: u32 = @intCast(o.suspend_count);
-    o.suspend_count += 1;
+    @atomicStore(i32, &o.suspend_count, o.suspend_count + 1, .seq_cst);
+    const my_tid = tidNow();
+    const should_pause = (prev == 0 and o.running and !o.finished and o.tid != 0 and o.tid != my_tid);
+    const target_tid = o.tid;
+    if (should_pause) {
+        o.refs += 1;
+        @atomicStore(u32, &o.sig_paused, 0, .release);
+    }
+    unlock();
+
+    if (should_pause) {
+        _ = linux.tgkill(@intCast(linux.getpid()), @intCast(target_tid), linux.SIG.URG);
+        var tries: u32 = 0;
+        while (@atomicLoad(u32, &o.sig_paused, .acquire) == 0 and !@atomicLoad(bool, &o.finished, .acquire) and tries < 20) : (tries += 1) {
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+            _ = linux.syscall4(.futex, @intFromPtr(&o.sig_paused), 0, 0, @intFromPtr(&ts));
+        }
+        lock();
+        release(o);
+        unlock();
+    }
     return prev;
+}
+
+/// GetThreadContext: fills a Win64 CONTEXT struct (1232 bytes) from the thread's
+/// captured signal state (when suspended) or current frame (when querying self).
+pub fn getThreadContext(h: usize, lp_ctx: ?*anyopaque) bool {
+    const out_ptr: [*]u8 = @ptrCast(lp_ctx orelse return false);
+    lock();
+    const o = (if (h == ~@as(usize, 1)) registerCurrentLocked() else find(h)) orelse {
+        unlock();
+        return false;
+    };
+    if (o.kind != .thread) {
+        unlock();
+        return false;
+    }
+    const is_self = (o.tid == tidNow());
+    const gregs = o.ctx_gregs;
+    const paused = (@atomicLoad(u32, &o.sig_paused, .acquire) == 1);
+    unlock();
+
+    const existing_flags = std.mem.readInt(u32, out_ptr[0x30..][0..4], .little);
+    std.mem.writeInt(u32, out_ptr[0x30..][0..4], existing_flags | 0x10000F, .little);
+    if (is_self and !paused) {
+        const sp = @frameAddress();
+        std.mem.writeInt(u64, out_ptr[0x78 + 4 * 8 ..][0..8], sp, .little); // Rsp
+        std.mem.writeInt(u64, out_ptr[0x78 + 5 * 8 ..][0..8], sp, .little); // Rbp
+        std.mem.writeInt(u64, out_ptr[0xf8..][0..8], @returnAddress(), .little); // Rip
+        return true;
+    }
+    std.mem.writeInt(u32, out_ptr[0x44..][0..4], @truncate(gregs[17]), .little); // EFlags
+    const map_from_greg = [16]usize{ 13, 14, 12, 11, 15, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7 };
+    for (0..16) |wreg| {
+        std.mem.writeInt(u64, out_ptr[0x78 + wreg * 8 ..][0..8], gregs[map_from_greg[wreg]], .little);
+    }
+    std.mem.writeInt(u64, out_ptr[0xf8..][0..8], gregs[16], .little); // Rip
+    return true;
 }
 
 pub fn getExitCode(h: usize, out: *u32) ?bool {
@@ -688,6 +1052,15 @@ test "handles that are not ours are not ours" {
     try testing.expectEqual(@as(?u32, null), waitOne(0x2003, 0));
     try testing.expect(!closeHandle(0x4001));
     try testing.expect(!setEvent(0x2001));
+}
+
+test "thread priority validates handles and preserves the configured value" {
+    const pseudo = ~@as(usize, 1);
+    try testing.expect(setThreadPriority(pseudo, 3));
+    try testing.expectEqual(@as(?i32, 3), getThreadPriority(pseudo));
+    try testing.expect(!setThreadPriority(0x1234, 2));
+    try testing.expectEqual(@as(?i32, null), getThreadPriority(0x1234));
+    try testing.expect(!setThreadPriority(pseudo, 16));
 }
 
 test "semaphore counts, and ReleaseSemaphore refuses to exceed the maximum" {
@@ -915,4 +1288,192 @@ test "wait-all on a thread handle and an event" {
     try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitMany(&hs, true, 5000));
     try testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &counter, .seq_cst));
     try testing.expect(closeHandle(th) and closeHandle(ev));
+}
+
+const SuspendProbe = struct { go: usize, counter: u32 = 0, stop: u32 = 0, other: usize = 0 };
+
+fn waitGoThenCount(p: ?*anyopaque) callconv(W) u32 {
+    const sp: *SuspendProbe = @ptrCast(@alignCast(p.?));
+    _ = waitOne(sp.go, INFINITE);
+    _ = @atomicRmw(u32, &sp.counter, .Add, 1, .seq_cst);
+    return 0;
+}
+
+test "SetEvent does not block while a waiter is suspended (Mono GC suspend pattern)" {
+    // Mono's GC suspends threads that may be blocked in a wait, then signals
+    // objects and resumes them. With a pthread condvar the broadcast waited for
+    // the suspended waiter and the process hung holding the global lock.
+    var sp: SuspendProbe = .{ .go = createEvent(false, false, null) };
+    const th = createThread(0, &waitGoThenCount, &sp, 0, null);
+    try testing.expect(th != 0);
+    sleepMs(80); // the thread is now inside waitOne
+    try testing.expectEqual(@as(u32, 0), suspendThread(th));
+    var t0: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &t0);
+    try testing.expect(setEvent(sp.go)); // must return at once
+    const other = createEvent(true, false, null);
+    try testing.expect(setEvent(other)); // any other wake() as well
+    var t1: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &t1);
+    try testing.expect(t1.sec - t0.sec < 1);
+    sleepMs(100);
+    try testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &sp.counter, .seq_cst)); // still suspended
+    try testing.expectEqual(@as(u32, 1), resumeThread(th));
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(th, 5000));
+    try testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &sp.counter, .seq_cst));
+    try testing.expect(closeHandle(th));
+    try testing.expect(closeHandle(other));
+    try testing.expect(closeHandle(sp.go));
+}
+
+fn churnLock(p: ?*anyopaque) callconv(W) u32 {
+    const sp: *SuspendProbe = @ptrCast(@alignCast(p.?));
+    while (@atomicLoad(u32, &sp.stop, .seq_cst) == 0) {
+        _ = setEvent(sp.other);
+        _ = resetEvent(sp.other);
+        _ = waitOne(sp.other, 0);
+        _ = @atomicRmw(u32, &sp.counter, .Add, 1, .seq_cst);
+    }
+    return 0;
+}
+
+test "suspending a thread that keeps taking the global lock never freezes the others" {
+    var sp: SuspendProbe = .{ .go = 0, .other = createEvent(true, false, null) };
+    const th = createThread(0, &churnLock, &sp, 0, null);
+    try testing.expect(th != 0);
+    sleepMs(10); // give the worker a scheduling turn before the rapid suspend loop
+    const ev = createEvent(false, false, null);
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        _ = suspendThread(th);
+        // With the thread paused, the lock must be free for everyone else.
+        try testing.expect(setEvent(ev));
+        try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(ev, 2000));
+        _ = resumeThread(th);
+    }
+    @atomicStore(u32, &sp.stop, 1, .seq_cst);
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(th, 5000));
+    try testing.expect(@atomicLoad(u32, &sp.counter, .seq_cst) > 0);
+    try testing.expect(closeHandle(th));
+    try testing.expect(closeHandle(ev));
+    try testing.expect(closeHandle(sp.other));
+}
+
+const ApcTestState = struct {
+    ready: u32 = 0,
+    ran: u32 = 0,
+    callback_tid: u32 = 0,
+    worker_tid: u32 = 0,
+    ran_after_nonalert: u32 = 99,
+    wait_result: u32 = WAIT_FAILED,
+    event: usize,
+    event2: usize = 0,
+    alertable: bool,
+};
+
+fn apcTestCallback(raw: usize) callconv(W) void {
+    const state: *ApcTestState = @ptrFromInt(raw);
+    state.callback_tid = tidNow();
+    _ = @atomicRmw(u32, &state.ran, .Add, 1, .seq_cst);
+}
+
+fn apcWaitWorker(raw: ?*anyopaque) callconv(W) u32 {
+    const state: *ApcTestState = @ptrCast(@alignCast(raw.?));
+    state.worker_tid = tidNow();
+    @atomicStore(u32, &state.ready, 1, .seq_cst);
+    state.wait_result = waitOneEx(state.event, if (state.alertable) 5000 else 50, state.alertable) orelse WAIT_FAILED;
+    if (!state.alertable) {
+        state.ran_after_nonalert = @atomicLoad(u32, &state.ran, .seq_cst);
+        state.wait_result = waitOneEx(state.event, 5000, true) orelse WAIT_FAILED;
+    }
+    return 0;
+}
+
+fn apcWaitManyWorker(raw: ?*anyopaque) callconv(W) u32 {
+    const state: *ApcTestState = @ptrCast(@alignCast(raw.?));
+    state.worker_tid = tidNow();
+    @atomicStore(u32, &state.ready, 1, .seq_cst);
+    const handles = [_]usize{ state.event, state.event2 };
+    state.wait_result = waitManyEx(&handles, false, 5000, true) orelse WAIT_FAILED;
+    return 0;
+}
+
+test "APC queued to a thread in an alertable wait runs there and returns WAIT_IO_COMPLETION" {
+    const event = createEvent(false, false, null);
+    var state = ApcTestState{ .event = event, .alertable = true };
+    const th = createThread(0, &apcWaitWorker, &state, 0, null);
+    try testing.expect(th != 0);
+    while (@atomicLoad(u32, &state.ready, .seq_cst) == 0) std.atomic.spinLoopHint();
+    sleepMs(10); // let the target enter its alertable wait before delivery
+    const target_tid = state.worker_tid;
+    try testing.expect(target_tid != 0);
+    try testing.expect(queueUserApc(@constCast(@ptrCast(&apcTestCallback)), th, @intFromPtr(&state)));
+    try testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &state.ran, .seq_cst));
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(th, 5000));
+    try testing.expectEqual(WAIT_IO_COMPLETION, state.wait_result);
+    try testing.expectEqual(@as(u32, 1), state.ran);
+    try testing.expectEqual(target_tid, state.callback_tid);
+    try testing.expect(closeHandle(th) and closeHandle(event));
+}
+
+test "APC queued during a non-alertable wait waits for the next alertable wait" {
+    const event = createEvent(false, false, null);
+    var state = ApcTestState{ .event = event, .alertable = false };
+    const th = createThread(0, &apcWaitWorker, &state, 0, null);
+    try testing.expect(th != 0);
+    while (@atomicLoad(u32, &state.ready, .seq_cst) == 0) std.atomic.spinLoopHint();
+    sleepMs(10); // ensure this APC arrives while the target is blocked non-alertably
+    try testing.expect(queueUserApc(@constCast(@ptrCast(&apcTestCallback)), th, @intFromPtr(&state)));
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(th, 5000));
+    try testing.expectEqual(WAIT_IO_COMPLETION, state.wait_result);
+    try testing.expectEqual(@as(u32, 1), state.ran);
+    try testing.expectEqual(state.worker_tid, state.callback_tid);
+    try testing.expect(closeHandle(th) and closeHandle(event));
+}
+
+test "WaitForMultipleObjectsEx alertable wakes for and dispatches an APC" {
+    const event1 = createEvent(false, false, null);
+    const event2 = createEvent(false, false, null);
+    var state = ApcTestState{ .event = event1, .event2 = event2, .alertable = true };
+    const th = createThread(0, &apcWaitManyWorker, &state, 0, null);
+    try testing.expect(th != 0);
+    while (@atomicLoad(u32, &state.ready, .seq_cst) == 0) std.atomic.spinLoopHint();
+    sleepMs(10);
+    try testing.expect(queueUserApc(@constCast(@ptrCast(&apcTestCallback)), th, @intFromPtr(&state)));
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(th, 5000));
+    try testing.expectEqual(WAIT_IO_COMPLETION, state.wait_result);
+    try testing.expectEqual(@as(u32, 1), state.ran);
+    try testing.expectEqual(state.worker_tid, state.callback_tid);
+    try testing.expect(closeHandle(th) and closeHandle(event1) and closeHandle(event2));
+}
+
+const SleepQueue = struct { target: usize, state: *ApcTestState };
+fn queueSleepApc(raw: ?*anyopaque) callconv(W) u32 {
+    const q: *SleepQueue = @ptrCast(@alignCast(raw.?));
+    sleepMs(20);
+    _ = queueUserApc(@constCast(@ptrCast(&apcTestCallback)), q.target, @intFromPtr(q.state));
+    return 0;
+}
+
+test "SleepEx alertable returns WAIT_IO_COMPLETION early on a queued APC" {
+    const current = dupCurrentThread();
+    var state = ApcTestState{ .event = 0, .alertable = true };
+    var q = SleepQueue{ .target = current, .state = &state };
+    const th = createThread(0, &queueSleepApc, &q, 0, null);
+    try testing.expect(th != 0);
+    try testing.expectEqual(WAIT_IO_COMPLETION, sleepEx(5000, true));
+    try testing.expectEqual(@as(u32, 1), state.ran);
+    try testing.expectEqual(tidNow(), state.callback_tid);
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(th, 5000));
+    try testing.expect(closeHandle(th) and closeHandle(current));
+}
+
+test "QueueUserAPC rejects a thread that has already finished" {
+    var counter: u32 = 0;
+    const th = createThread(0, &incAndReturn42, &counter, 0, null);
+    try testing.expect(th != 0);
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(th, 5000));
+    try testing.expect(!queueUserApc(@constCast(@ptrCast(&apcTestCallback)), th, 0));
+    try testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &counter, .seq_cst));
+    try testing.expect(closeHandle(th));
 }

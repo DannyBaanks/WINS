@@ -101,6 +101,35 @@ fn accepts(self_iid: *const Guid, iid: ?*const Guid) bool {
     return g.eql(self_iid) or g.eql(&IID_IUnknown);
 }
 
+// The single output device this file emulates (the host sound server behind it).
+// A fixed GUID so the same device keeps its identity across enumerations and
+// creations. Plus the DirectSound default-device IDs programs legitimately pass
+// (dsound.h: DEF00000-9C6D-47E7-A1B8-999B2A0F2025 and ...DEF00003...).
+const WINS_DEVICE_GUID: Guid = .{ .data1 = 0x5A3C2B7E, .data2 = 0x1A0E, .data3 = 0x4F33, .data4 = .{ 0x9D, 0x2B, 0x71, 0x4C, 0xA8, 0xE5, 0x16, 0xD0 } };
+const DSDEVID_DefaultPlayback: Guid = .{ .data1 = 0xDEF00000, .data2 = 0x9C6D, .data3 = 0x47E7, .data4 = .{ 0xA1, 0xB8, 0x99, 0x9B, 0x2A, 0x0F, 0x20, 0x25 } };
+const DSDEVID_DefaultVoicePlayback: Guid = .{ .data1 = 0xDEF00003, .data2 = 0x9C6D, .data3 = 0x47E7, .data4 = .{ 0xA1, 0xB8, 0x99, 0x9B, 0x2A, 0x0F, 0x20, 0x25 } };
+
+/// NULL means "the default device"; the direct sound default IDs and the one
+/// WINS device are the acceptable GUIDs. Anything else is honestly "no driver".
+fn guidAccepted(guid: ?*const Guid) bool {
+    const g = guid orelse return true;
+    return g.eql(&WINS_DEVICE_GUID) or g.eql(&DSDEVID_DefaultPlayback) or g.eql(&DSDEVID_DefaultVoicePlayback);
+}
+
+/// comptime ASCII -> [len:0]u16 (for the enumeration strings).
+fn toWide(comptime s: []const u8) [s.len:0]u16 {
+    var out: [s.len:0]u16 = undefined;
+    for (s, 0..) |c, i| out[i] = c;
+    out[s.len] = 0;
+    return out;
+}
+const wide_primary_name = toWide("Primary Sound Driver");
+const wide_device_name = toWide("WINS DirectSound");
+const wide_device_module = toWide("{0.0.1.00000000}.{WINS DirectSound}");
+const narrow_primary_name: [*:0]const u8 = "Primary Sound Driver";
+const narrow_device_name: [*:0]const u8 = "WINS DirectSound";
+const narrow_device_module: [*:0]const u8 = "{0.0.1.00000000}.{WINS DirectSound}";
+
 pub const WAVEFORMATEX = extern struct {
     wFormatTag: u16 = 1, // WAVE_FORMAT_PCM
     nChannels: u16 = 2,
@@ -1366,13 +1395,13 @@ fn makeDevice(out: ?*?*anyopaque, outer: ?*anyopaque) HRESULT {
 
 fn DirectSoundCreate(guid: ?*const Guid, out: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) HRESULT {
     traceFirst(35, "DirectSoundCreate", @returnAddress());
-    _ = guid;
+    if (!guidAccepted(guid)) return DSERR_NODRIVER;
     return makeDevice(out, outer);
 }
 
 fn DirectSoundCreate8(guid: ?*const Guid, out: ?*?*anyopaque, outer: ?*anyopaque) callconv(W) HRESULT {
     traceFirst(36, "DirectSoundCreate8", @returnAddress());
-    _ = guid;
+    if (!guidAccepted(guid)) return DSERR_NODRIVER;
     return makeDevice(out, outer);
 }
 
@@ -1417,24 +1446,27 @@ fn DirectSoundFullDuplexCreate(
 const EnumerateProc = *const fn (?*const Guid, ?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(W) i32;
 const EnumerateProcW = *const fn (?*const Guid, ?[*:0]const u16, ?[*:0]const u16, ?*anyopaque) callconv(W) i32;
 
-const wide_device_name: [16:0]u16 = .{
-    'W', 'I', 'N', 'S', ' ', 'D', 'i', 'r', 'e', 'c', 't', 'S', 'o', 'u', 'n', 'd',
-};
-
 fn DirectSoundEnumerateA(cb: ?EnumerateProc, ctx: ?*anyopaque) callconv(W) HRESULT {
     traceFirst(39, "DirectSoundEnumerateA", @returnAddress());
     const f = cb orelse return E_INVALIDARG;
-    // One device, no GUID (the default device), then the terminating null entry.
-    _ = f(null, "WINS DirectSound", null, ctx);
-    _ = f(null, null, null, ctx);
+    // Windows order: the primary-driver entry (NULL GUID = the default device,
+    // the reserved name, an empty module string), then each real device with
+    // its own GUID. The callback returns FALSE (0) to stop; honour it.
+    if (f(null, narrow_primary_name, "", ctx) == 0) return S_OK;
+    if (f(&WINS_DEVICE_GUID, narrow_device_name, narrow_device_module, ctx) == 0) return S_OK;
     return S_OK;
 }
+
+const wide_empty_module = toWide("");
 
 fn DirectSoundEnumerateW(cb: ?EnumerateProcW, ctx: ?*anyopaque) callconv(W) HRESULT {
     traceFirst(40, "DirectSoundEnumerateW", @returnAddress());
     const f = cb orelse return E_INVALIDARG;
-    _ = f(null, &wide_device_name, null, ctx);
-    _ = f(null, null, null, ctx);
+    // Windows order: the primary-driver entry (NULL GUID = the default device,
+    // the reserved name, an empty module string), then each real device with
+    // its own GUID. The callback returns FALSE (0) to stop; honour it.
+    if (f(null, &wide_primary_name, &wide_empty_module, ctx) == 0) return S_OK;
+    if (f(&WINS_DEVICE_GUID, &wide_device_name, &wide_device_module, ctx) == 0) return S_OK;
     return S_OK;
 }
 
@@ -1453,10 +1485,10 @@ fn DirectSoundCaptureEnumerateW(cb: ?EnumerateProcW, ctx: ?*anyopaque) callconv(
 }
 
 fn GetDeviceID(guid_src: ?*const Guid, guid_out: ?*Guid) callconv(W) HRESULT {
-    _ = guid_src;
+    if (!guidAccepted(guid_src)) return DSERR_NODRIVER;
     const o = guid_out orelse return E_INVALIDARG;
-    o.* = .{ .data1 = 0, .data2 = 0, .data3 = 0, .data4 = [_]u8{0} ** 8 };
-    return DSERR_NODRIVER;
+    o.* = WINS_DEVICE_GUID;
+    return S_OK;
 }
 
 fn DllCanUnloadNow() callconv(W) HRESULT {
@@ -1561,8 +1593,8 @@ fn notifyTickerMain() void {
 }
 
 fn startMixer() void {
-    if (g_mixer_started.swap(true, .acq_rel)) return;
     if (!audio.outputEnabled()) return;
+    if (g_mixer_started.swap(true, .acq_rel)) return;
     const t = std.Thread.spawn(.{}, mixerMain, .{}) catch {
         std.debug.print("[WINS:DSound] could not start the mixer thread; sound stays silent\n", .{});
         return;
@@ -2011,4 +2043,195 @@ test "spatial sound cone attenuation and Doppler pitch shift" {
     _ = lSetDoppler(&pri.i3d, 0.0, 0);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), dopplerRatio(b, pri), 0.0001);
 }
+// ---------------------------------------------------------------------------
+// Enumeration protocol: what the callback actually sees. FMOD's DirectSound
+// driver count counts the entries that carry a real device GUID, so the second
+// entry must exist, carry one, and pass a non-empty module string; the primary
+// entry is (NULL, "Primary Sound Driver", "", ctx); FALSE stops the iteration.
+// Everything the shim passes as a description/module is a stable const global,
+// so the collectors keep the spans they are handed.
+// ---------------------------------------------------------------------------
+const EnumEntryW = struct { guid: ?Guid, desc: []const u16, module: []const u16 };
+const EnumEntryA = struct { guid: ?Guid, desc: []const u8, module: []const u8 };
+var enum_w_entries: [8]EnumEntryW = undefined;
+var enum_w_count: usize = 0;
+var enum_w_stop: bool = false;
+var enum_a_entries: [8]EnumEntryA = undefined;
+var enum_a_count: usize = 0;
+var enum_a_stop: bool = false;
 
+fn wideEq(s: []const u16, comptime ascii: []const u8) bool {
+    if (s.len != ascii.len) return false;
+    for (s, 0..) |c, i| if (c != ascii[i]) return false;
+    return true;
+}
+
+fn narrowEq(s: []const u8, comptime ascii: []const u8) bool {
+    return std.mem.eql(u8, s, ascii);
+}
+
+fn enumCollectorW(guid: ?*const Guid, desc: ?[*:0]const u16, module: ?[*:0]const u16, ctx: ?*anyopaque) callconv(W) i32 {
+    _ = ctx;
+    if (enum_w_count < enum_w_entries.len) {
+        enum_w_entries[enum_w_count] = .{
+            .guid = if (guid) |g| g.* else null,
+            .desc = std.mem.span(desc orelse unreachable),
+            .module = std.mem.span(module orelse unreachable),
+        };
+    }
+    enum_w_count += 1;
+    return if (enum_w_stop) 0 else 1;
+}
+
+fn enumCollectorA(guid: ?*const Guid, desc: ?[*:0]const u8, module: ?[*:0]const u8, ctx: ?*anyopaque) callconv(W) i32 {
+    _ = ctx;
+    if (enum_a_count < enum_a_entries.len) {
+        enum_a_entries[enum_a_count] = .{
+            .guid = if (guid) |g| g.* else null,
+            .desc = std.mem.span(desc orelse unreachable),
+            .module = std.mem.span(module orelse unreachable),
+        };
+    }
+    enum_a_count += 1;
+    return if (enum_a_stop) 0 else 1;
+}
+
+test "DirectSoundEnumerateW: primary entry, then the WINS device GUID" {
+    enum_w_count = 0;
+    enum_w_stop = false;
+    try std.testing.expectEqual(S_OK, DirectSoundEnumerateW(enumCollectorW, null));
+    try std.testing.expectEqual(@as(usize, 2), enum_w_count);
+    // Entry 1: NULL GUID, the reserved name, an empty (but non-NULL) module.
+    try std.testing.expect(enum_w_entries[0].guid == null);
+    try std.testing.expect(wideEq(enum_w_entries[0].desc, "Primary Sound Driver"));
+    try std.testing.expectEqual(@as(usize, 0), enum_w_entries[0].module.len);
+    // Entry 2: the WINS device GUID, a description, a non-empty module string.
+    try std.testing.expect(enum_w_entries[1].guid != null and enum_w_entries[1].guid.?.eql(&WINS_DEVICE_GUID));
+    try std.testing.expect(wideEq(enum_w_entries[1].desc, "WINS DirectSound"));
+    try std.testing.expect(enum_w_entries[1].module.len > 0);
+}
+
+test "DirectSoundEnumerateW: a FALSE return stops after the primary entry" {
+    enum_w_count = 0;
+    enum_w_stop = true;
+    defer enum_w_stop = false;
+    try std.testing.expectEqual(S_OK, DirectSoundEnumerateW(enumCollectorW, null));
+    try std.testing.expectEqual(@as(usize, 1), enum_w_count);
+}
+
+test "DirectSoundEnumerateA: primary entry, then the WINS device GUID" {
+    enum_a_count = 0;
+    enum_a_stop = false;
+    try std.testing.expectEqual(S_OK, DirectSoundEnumerateA(enumCollectorA, null));
+    try std.testing.expectEqual(@as(usize, 2), enum_a_count);
+    try std.testing.expect(enum_a_entries[0].guid == null);
+    try std.testing.expect(narrowEq(enum_a_entries[0].desc, "Primary Sound Driver"));
+    try std.testing.expectEqual(@as(usize, 0), enum_a_entries[0].module.len);
+    try std.testing.expect(enum_a_entries[1].guid != null and enum_a_entries[1].guid.?.eql(&WINS_DEVICE_GUID));
+    try std.testing.expect(narrowEq(enum_a_entries[1].desc, "WINS DirectSound"));
+    try std.testing.expect(enum_a_entries[1].module.len > 0);
+}
+
+test "DirectSoundEnumerateA: a FALSE return stops after the primary entry" {
+    enum_a_count = 0;
+    enum_a_stop = true;
+    defer enum_a_stop = false;
+    try std.testing.expectEqual(S_OK, DirectSoundEnumerateA(enumCollectorA, null));
+    try std.testing.expectEqual(@as(usize, 1), enum_a_count);
+}
+
+test "device creation accepts the enumerated GUID and the default IDs, refuses others" {
+    var out: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, DirectSoundCreate8(&WINS_DEVICE_GUID, &out, null));
+    const o1: *Device = @ptrCast(@alignCast(out));
+    _ = device.vtbl.Release(o1);
+
+    out = null;
+    try std.testing.expectEqual(S_OK, DirectSoundCreate8(&DSDEVID_DefaultPlayback, &out, null));
+    const o2: *Device = @ptrCast(@alignCast(out));
+    _ = device.vtbl.Release(o2);
+
+    out = null;
+    try std.testing.expectEqual(S_OK, DirectSoundCreate8(&DSDEVID_DefaultVoicePlayback, &out, null));
+    const o3: *Device = @ptrCast(@alignCast(out));
+    _ = device.vtbl.Release(o3);
+
+    out = null;
+    try std.testing.expectEqual(S_OK, DirectSoundCreate(&WINS_DEVICE_GUID, &out, null));
+    const o4: *Device = @ptrCast(@alignCast(out));
+    _ = device.vtbl.Release(o4);
+
+    out = null;
+    const bogus = Guid{ .data1 = 0xDEADBEEF, .data2 = 0x1234, .data3 = 0x5678, .data4 = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    try std.testing.expectEqual(DSERR_NODRIVER, DirectSoundCreate8(&bogus, &out, null));
+    try std.testing.expectEqual(DSERR_NODRIVER, DirectSoundCreate(&bogus, &out, null));
+    try std.testing.expect(out == null);
+}
+
+test "GetDeviceID answers the WINS GUID for accepted devices" {
+    var id: Guid = undefined;
+    try std.testing.expectEqual(S_OK, GetDeviceID(null, &id));
+    try std.testing.expect(id.eql(&WINS_DEVICE_GUID));
+    try std.testing.expectEqual(S_OK, GetDeviceID(&DSDEVID_DefaultPlayback, &id));
+    try std.testing.expect(id.eql(&WINS_DEVICE_GUID));
+    const bogus = Guid{ .data1 = 0xDEADBEEF, .data2 = 0x1234, .data3 = 0x5678, .data4 = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    try std.testing.expectEqual(DSERR_NODRIVER, GetDeviceID(&bogus, &id));
+}
+
+fn sleepMs(ms: i64) void {
+    var ts = linux.timespec{ .sec = @intCast(@divTrunc(ms, 1000)), .nsec = @intCast(@mod(ms, 1000) * 1_000_000) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+test "the play cursor advances with wall-clock time, not with mixer writes" {
+    // FMOD's DirectSound thread waits for the cursor to move; a cursor that
+    // only advanced when the sound server accepted a write would stall it.
+    // Nothing here calls Lock/Unlock, Play again or the mixer: only the clock.
+    var ds_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, DirectSoundCreate8(&WINS_DEVICE_GUID, &ds_raw, null));
+    const ds: *Device = @ptrCast(@alignCast(ds_raw.?));
+    defer _ = ds.vtbl.Release(ds);
+
+    var wfx = WAVEFORMATEX{
+        .wFormatTag = 1,
+        .nChannels = 2,
+        .nSamplesPerSec = 48000,
+        .nAvgBytesPerSec = 192000,
+        .nBlockAlign = 4,
+        .wBitsPerSample = 16,
+    };
+    const buf_len: u32 = 19200; // 100 ms
+    var sdesc = DSBUFFERDESC{
+        .dwSize = @sizeOf(DSBUFFERDESC),
+        .dwFlags = DSBCAPS_GLOBALFOCUS,
+        .dwBufferBytes = buf_len,
+        .dwReserved = 0,
+        .lpwfxFormat = &wfx,
+    };
+    var b_raw: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, ds.vtbl.CreateSoundBuffer(ds, &sdesc, &b_raw, null));
+    const b: *Buffer = @ptrCast(@alignCast(b_raw.?));
+    defer _ = b.vtbl.Release(b);
+
+    try std.testing.expectEqual(S_OK, b.vtbl.Play(b, 0, 0, DSBPLAY_LOOPING));
+    const t0 = nowMs();
+    var p0: u32 = 0;
+    try std.testing.expectEqual(S_OK, b.vtbl.GetCurrentPosition(b, &p0, null));
+
+    sleepMs(200); // the clock, and nothing else, runs
+
+    var p1: u32 = 0;
+    try std.testing.expectEqual(S_OK, b.vtbl.GetCurrentPosition(b, &p1, null));
+    const t1 = nowMs();
+    const elapsed: u64 = @as(u64, @intCast(@max(t1 - t0, 0) * 192000)) / 1000; // bytes at 192000 B/s
+    const advanced: u64 = (@as(u64, p1) + buf_len - @as(u64, p0)) % buf_len;
+    // Circular distance between the clock-derived and the observed advance
+    // (the cursor wraps through the 100 ms ring during a 200 ms sleep).
+    const em: i64 = @intCast(elapsed % buf_len);
+    const ad: i64 = @intCast(advanced);
+    const d: i64 = @mod(ad - em, 19200);
+    const dist: i64 = @min(d, 19200 - d);
+    try std.testing.expect(dist < 192000 / 40); // within 25 ms of drift
+    // The mixer was never started here: it must not be a prerequisite.
+    try std.testing.expect(!g_mixer_started.load(.acquire));
+}
