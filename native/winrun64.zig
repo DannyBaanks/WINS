@@ -33,6 +33,7 @@ const winrun = @import("winrun_impl.zig").GuiImpl(.none);
 const threads = @import("winrun_threads.zig");
 const seh64 = @import("winrun_seh64.zig");
 const k32 = @import("winrun_kernel32.zig");
+const steam64 = @import("winrun_steam64.zig");
 
 const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
 
@@ -187,6 +188,7 @@ fn moduleKey(buf: []u8, raw: []const u8) []const u8 {
 }
 
 fn handleFor(key: []const u8) usize {
+    if (steam64.isSteamClientDll(key)) return steam64.getModuleHandle(key);
     const ld = g_ld orelse return 0;
     if (ld.find(key)) |k| return ld.images.items[k].base;
     for (system_dlls, 0..) |d, k| if (std.mem.eql(u8, d, key)) {
@@ -361,6 +363,15 @@ fn LoadLibraryExA(name: ?[*:0]const u8, file: usize, flags: u32) callconv(W) usi
 }
 
 fn GetModuleFileNameW(h: usize, buf: ?[*]u16, n: u32) callconv(W) u32 {
+    if (h == steam64.module_handle) {
+        var path_buf: [2048]u8 = undefined;
+        const path = steam64.fileName(h, &path_buf) orelse return 0;
+        if (buf == null or n == 0) return @intCast(path.len + 1);
+        const count = @min(path.len, n - 1);
+        for (path[0..count], 0..) |ch, i| buf.?[i] = ch;
+        buf.?[count] = 0;
+        return @intCast(count);
+    }
     const ld = g_ld orelse return 0;
     const host_path: []const u8 = if (h == 0) ld.images.items[0].full_path else blk: {
         for (ld.images.items) |im| if (im.base == h) break :blk im.full_path;
@@ -636,11 +647,53 @@ fn winQueueUserAPC(callback: ?*anyopaque, h_thread: usize, data: usize) callconv
 }
 
 fn winSignalObjectAndWait(h_signal: usize, h_wait: usize, ms: u32, alertable: i32) callconv(W) u32 {
-    // The real operation signals first, then enters the requested wait. These
-    // handles are WINS synchronization objects; unsupported handles fail.
-    if (!threads.setEvent(h_signal) and !threads.releaseSemaphore(h_signal, 1, null) and !threads.releaseMutex(h_signal))
-        return threads.WAIT_FAILED;
-    return threads.waitOneEx(h_wait, ms, alertable != 0) orelse threads.WAIT_FAILED;
+    return threads.signalAndWait(h_signal, h_wait, ms, alertable != 0) orelse threads.WAIT_FAILED;
+}
+
+fn wideName(name: ?[*:0]const u16, tmp: *[48]u8) ?[]const u8 {
+    return if (name) |w| wideToUtf8Tmp(w, tmp) else null;
+}
+fn openNamed(kind: threads.Kind, name: ?[]const u8) usize {
+    const h = if (name) |n| threads.openNamed(kind, n) else 0;
+    if (h == 0) setLastError(2);
+    return h;
+}
+fn winOpenEventA(access: u32, inherit: i32, name: ?[*:0]const u8) callconv(W) usize { _ = access; _ = inherit; return openNamed(.event, if (name) |p| std.mem.span(p) else null); }
+fn winOpenEventW(access: u32, inherit: i32, name: ?[*:0]const u16) callconv(W) usize { _ = access; _ = inherit; var b: [48]u8 = undefined; return openNamed(.event, wideName(name, &b)); }
+fn winOpenSemaphoreA(access: u32, inherit: i32, name: ?[*:0]const u8) callconv(W) usize { _ = access; _ = inherit; return openNamed(.semaphore, if (name) |p| std.mem.span(p) else null); }
+fn winOpenSemaphoreW(access: u32, inherit: i32, name: ?[*:0]const u16) callconv(W) usize { _ = access; _ = inherit; var b: [48]u8 = undefined; return openNamed(.semaphore, wideName(name, &b)); }
+fn winOpenMutexA(access: u32, inherit: i32, name: ?[*:0]const u8) callconv(W) usize { _ = access; _ = inherit; return openNamed(.mutex, if (name) |p| std.mem.span(p) else null); }
+fn winOpenMutexW(access: u32, inherit: i32, name: ?[*:0]const u16) callconv(W) usize { _ = access; _ = inherit; var b: [48]u8 = undefined; return openNamed(.mutex, wideName(name, &b)); }
+fn winCreateWaitableTimerA(attrs: ?*anyopaque, manual: i32, name: ?[*:0]const u8) callconv(W) usize { _ = attrs; const h = threads.createTimer(manual != 0, if (name) |p| std.mem.span(p) else null); if (h == 0) setLastError(8); return h; }
+fn winCreateWaitableTimerW(attrs: ?*anyopaque, manual: i32, name: ?[*:0]const u16) callconv(W) usize { _ = attrs; var b: [48]u8 = undefined; const h = threads.createTimer(manual != 0, wideName(name, &b)); if (h == 0) setLastError(8); return h; }
+fn winCreateWaitableTimerExW(attrs: ?*anyopaque, name: ?[*:0]const u16, flags: u32, access: u32) callconv(W) usize { _ = attrs; _ = access; var b: [48]u8 = undefined; const h = threads.createTimer(flags & 1 != 0, wideName(name, &b)); if (h == 0) setLastError(8); return h; }
+fn winCreateWaitableTimerExA(attrs: ?*anyopaque, name: ?[*:0]const u8, flags: u32, access: u32) callconv(W) usize { _ = attrs; _ = access; const h = threads.createTimer(flags & 1 != 0, if (name) |p| std.mem.span(p) else null); if (h == 0) setLastError(8); return h; }
+fn winSetWaitableTimer(h: usize, due: ?*const i64, period: i32, callback: ?*anyopaque, arg: ?*anyopaque, wake_resume: i32) callconv(W) i32 { _ = wake_resume; const d = due orelse { setLastError(87); return 0; }; const ok = threads.setTimer(h, d.*, period, callback, @intFromPtr(arg)); if (!ok) setLastError(6); return @intFromBool(ok); }
+fn winSetWaitableTimerEx(h: usize, due: ?*const i64, period: i32, callback: ?*anyopaque, arg: ?*anyopaque, wake: ?*anyopaque, tolerable: u32) callconv(W) i32 { _ = wake; _ = tolerable; return winSetWaitableTimer(h, due, period, callback, arg, 0); }
+fn winCancelWaitableTimer(h: usize) callconv(W) i32 { const ok = threads.cancelTimer(h); if (!ok) setLastError(6); return @intFromBool(ok); }
+
+const INVALID_HANDLE_VALUE = ~@as(usize, 0);
+fn winCreateIoCompletionPort(file: usize, existing: usize, key: usize, concurrent: u32) callconv(W) usize {
+    _ = key; _ = concurrent;
+    if (file != INVALID_HANDLE_VALUE) { setLastError(50); return 0; }
+    if (existing != 0) { setLastError(87); return 0; }
+    const h = threads.createCompletionPort(); if (h == 0) setLastError(8); return h;
+}
+fn winPostQueuedCompletionStatus(port: usize, bytes: u32, key: usize, overlapped: ?*anyopaque) callconv(W) i32 { const ok = threads.postCompletion(port, bytes, key, overlapped); if (!ok) setLastError(6); return @intFromBool(ok); }
+fn winGetQueuedCompletionStatus(port: usize, bytes: ?*u32, key: ?*usize, overlapped: ?*?*anyopaque, ms: u32) callconv(W) i32 {
+    if (!threads.isCompletionPort(port)) { setLastError(6); return 0; }
+    const packet = threads.getCompletion(port, ms) orelse { if (bytes) |p| p.* = 0; if (key) |p| p.* = 0; if (overlapped) |p| p.* = null; setLastError(258); return 0; };
+    if (bytes) |p| p.* = packet.bytes; if (key) |p| p.* = packet.key; if (overlapped) |p| p.* = packet.overlapped; return 1;
+}
+const OverlappedEntry = extern struct { key: usize, overlapped: ?*anyopaque, internal: usize, bytes: u32, pad: u32 = 0 };
+fn winGetQueuedCompletionStatusEx(port: usize, entries: ?[*]OverlappedEntry, count: u32, removed: ?*u32, ms: u32, alertable: i32) callconv(W) i32 {
+    _ = alertable; const out = entries orelse { setLastError(87); return 0; }; const nout = removed orelse { setLastError(87); return 0; };
+    if (!threads.isCompletionPort(port)) { setLastError(6); return 0; }
+    if (count == 0) { setLastError(87); return 0; }
+    const first = threads.getCompletion(port, ms) orelse { nout.* = 0; setLastError(258); return 0; };
+    out[0] = .{ .key = first.key, .overlapped = first.overlapped, .internal = 0, .bytes = first.bytes };
+    var n: u32 = 1; while (n < count) : (n += 1) { const p = threads.getCompletion(port, 0) orelse break; out[n] = .{ .key = p.key, .overlapped = p.overlapped, .internal = 0, .bytes = p.bytes }; }
+    nout.* = n; return 1;
 }
 
 fn winMsgWaitForMultipleObjectsEx(count: u32, handles: ?[*]const usize, ms: u32, wake_mask: u32, flags: u32) callconv(W) u32 {
@@ -712,6 +765,10 @@ fn FreeLibrary(h: usize) callconv(W) i32 {
     return 1; // images stay mapped for the process lifetime
 }
 fn GetProcAddress(h: usize, name: ?[*:0]const u8) callconv(W) usize {
+    if (h == steam64.module_handle) {
+        const symbol = name orelse return 0;
+        return steam64.getProcAddress(h, std.mem.span(symbol));
+    }
     const ld = g_ld orelse return 0;
     var symbuf: [16]u8 = undefined;
     const sym: []const u8 = if (@intFromPtr(name) < 0x10000)
@@ -968,9 +1025,65 @@ fn VirtualUnlock(addr: ?*anyopaque, size: usize) callconv(W) i32 {
     return 1;
 }
 
+const steam_active_process_key: usize = 0x7FFD_5354_5049_4400;
+const steam_process_handle: usize = 0x7FFD_5354_5052_0001;
+var steam_process_handle_pid: u32 = 0;
+
+fn OpenProcess(access: u32, inherit: u32, pid: u32) callconv(W) usize {
+    if (steam64.isSteamPidAlive(pid)) {
+        steam_process_handle_pid = pid;
+        return steam_process_handle;
+    }
+    const fallback = winrun.lookup("kernel32.dll", "OpenProcess") orelse return 0;
+    const call: *const fn (u32, u32, u32) callconv(W) usize = @ptrFromInt(fallback);
+    return call(access, inherit, pid);
+}
+
+fn GetExitCodeProcess(process: usize, code: ?*u32) callconv(W) u32 {
+    if (process == steam_process_handle) {
+        if (code == null) return 0;
+        code.?.* = if (steam64.isSteamPidAlive(steam_process_handle_pid)) 259 else 0;
+        return 1;
+    }
+    const fallback = winrun.lookup("kernel32.dll", "GetExitCodeProcess") orelse return 0;
+    const call: *const fn (usize, ?*u32) callconv(W) u32 = @ptrFromInt(fallback);
+    return call(process, code);
+}
+
+fn RegOpenKeyExA(hKey: usize, subKey: ?[*:0]const u8, options: u32, desired: u32, result: ?*usize) callconv(W) i32 {
+    if (@as(u32, @truncate(hKey)) == 0x80000001) {
+        if (subKey) |p| {
+            if (std.ascii.eqlIgnoreCase(std.mem.span(p), "Software\\Valve\\Steam\\ActiveProcess")) {
+                if (result) |out| out.* = steam_active_process_key;
+                return 0;
+            }
+        }
+    }
+    const fallback = @import("winrun_extra_dlls.zig").lookupAdvapi32("RegOpenKeyExA") orelse return 127;
+    const call: *const fn (usize, ?[*:0]const u8, u32, u32, ?*usize) callconv(W) i32 = @ptrFromInt(fallback);
+    return call(hKey, subKey, options, desired, result);
+}
+
+fn RegQueryValueExA(hKey: usize, name: ?[*:0]const u8, reserved: ?*u32, valueType: ?*u32, data: ?[*]u8, size: ?*u32) callconv(W) i32 {
+    if (hKey == steam_active_process_key and name != null and std.ascii.eqlIgnoreCase(std.mem.span(name.?), "pid")) {
+        return steam64.querySteamPidValue(steam64.steamClientPid(), valueType, data, size);
+    }
+    const fallback = @import("winrun_extra_dlls.zig").lookupAdvapi32("RegQueryValueExA") orelse return 127;
+    const call: *const fn (usize, ?[*:0]const u8, ?*u32, ?*u32, ?[*]u8, ?*u32) callconv(W) i32 = @ptrFromInt(fallback);
+    return call(hKey, name, reserved, valueType, data, size);
+}
+
 fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
     var b: [272]u8 = undefined;
     const key = moduleKey(&b, lib);
+    if (std.mem.eql(u8, key, "advapi32.dll")) {
+        if (std.mem.eql(u8, sym, "RegOpenKeyExA")) return @intFromPtr(&RegOpenKeyExA);
+        if (std.mem.eql(u8, sym, "RegQueryValueExA")) return @intFromPtr(&RegQueryValueExA);
+    }
+    if (std.mem.eql(u8, key, "kernel32.dll") or std.mem.eql(u8, key, "kernelbase.dll")) {
+        if (std.mem.eql(u8, sym, "OpenProcess")) return @intFromPtr(&OpenProcess);
+        if (std.mem.eql(u8, sym, "GetExitCodeProcess")) return @intFromPtr(&GetExitCodeProcess);
+    }
     if (@import("wins_audio64.zig").lookupOverride(key, sym)) |a| return a;
     if (@import("winload64_sync.zig").lookup(key, sym)) |a| return a;
     if (std.mem.eql(u8, key, "ucrtbase.dll") or std.mem.eql(u8, key, "msvcrt.dll") or std.ascii.startsWithIgnoreCase(lib, "vcruntime140")) {
@@ -1020,6 +1133,14 @@ fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
         .{ "WaitForMultipleObjects", &winWaitForMultipleObjects }, .{ "WaitForMultipleObjectsEx", &winWaitForMultipleObjectsEx },
         .{ "SleepEx", &winSleepEx }, .{ "QueueUserAPC", &winQueueUserAPC },
         .{ "SignalObjectAndWait", &winSignalObjectAndWait },
+        .{ "OpenEventA", &winOpenEventA }, .{ "OpenEventW", &winOpenEventW },
+        .{ "OpenSemaphoreA", &winOpenSemaphoreA }, .{ "OpenSemaphoreW", &winOpenSemaphoreW },
+        .{ "OpenMutexA", &winOpenMutexA }, .{ "OpenMutexW", &winOpenMutexW },
+        .{ "CreateWaitableTimerA", &winCreateWaitableTimerA }, .{ "CreateWaitableTimerW", &winCreateWaitableTimerW },
+        .{ "CreateWaitableTimerExA", &winCreateWaitableTimerExA }, .{ "CreateWaitableTimerExW", &winCreateWaitableTimerExW },
+        .{ "SetWaitableTimer", &winSetWaitableTimer }, .{ "SetWaitableTimerEx", &winSetWaitableTimerEx }, .{ "CancelWaitableTimer", &winCancelWaitableTimer },
+        .{ "CreateIoCompletionPort", &winCreateIoCompletionPort }, .{ "GetQueuedCompletionStatus", &winGetQueuedCompletionStatus },
+        .{ "GetQueuedCompletionStatusEx", &winGetQueuedCompletionStatusEx }, .{ "PostQueuedCompletionStatus", &winPostQueuedCompletionStatus },
     };
     inline for (table) |e| if (std.mem.eql(u8, sym, e[0])) return @intFromPtr(e[1]);
     return null;
@@ -1601,6 +1722,7 @@ pub fn main(init: std.process.Init) !void {
         die(.usage, "execution requires the boxed launcher; use winload64_box.py", .{});
 
     g_ld = &ld;
+    steam64.setIo(ld.io);
     if (winrun.lookup("kernel32.dll", "SetLastError")) |f| @import("winload64_sync.zig").set_last_error = @ptrFromInt(f);
     const root_idx = ld.map(root.?);
     for (preloads.items) |pl| {

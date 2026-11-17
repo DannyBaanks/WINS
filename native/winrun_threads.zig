@@ -44,9 +44,10 @@ pub const MAXIMUM_WAIT_OBJECTS = 64;
 
 pub const StartFn = *const fn (?*anyopaque) callconv(W) u32;
 pub const ApcFn = *const fn (usize) callconv(W) void;
-pub const Kind = enum { event, semaphore, mutex, thread };
+pub const TimerApcFn = *const fn (?*anyopaque, u32, u32) callconv(W) void;
+pub const Kind = enum { event, semaphore, mutex, thread, timer, completion_port };
 
-const Apc = struct { next: ?*Apc = null, callback: ApcFn, data: usize };
+const Apc = struct { next: ?*Apc = null, callback: ?ApcFn = null, timer_callback: ?TimerApcFn = null, data: usize, time_low: u32 = 0, time_high: u32 = 0 };
 
 pub const Object = struct {
     kind: Kind,
@@ -79,7 +80,21 @@ pub const Object = struct {
     stack_size: usize = 0,
     apc_head: ?*Apc = null,
     apc_tail: ?*Apc = null,
+    // waitable timer
+    timer_manual: bool = false,
+    timer_handles: u32 = 0,
+    timer_generation: u64 = 0,
+    timer_due_ns: i128 = 0,
+    timer_period_ns: i128 = 0,
+    timer_callback: ?TimerApcFn = null,
+    timer_callback_data: usize = 0,
+    timer_thread: ?*Object = null,
+    // IO completion port FIFO
+    packet_head: ?*CompletionPacket = null,
+    packet_tail: ?*CompletionPacket = null,
 };
+
+const CompletionPacket = struct { next: ?*CompletionPacket = null, key: usize, bytes: u32, overlapped: ?*anyopaque };
 
 var g_mu: c.pthread_mutex_t = .{};
 /// Wait/wake word for every object state change (replaces a pthread condition
@@ -185,11 +200,14 @@ fn release(o: *Object) void {
     if (o.refs > 0) o.refs -= 1;
     if (o.refs == 0) {
         g_objs[o.slot] = null;
+        if (o.timer_thread) |target| { o.timer_thread = null; release(target); }
         var apc = o.apc_head;
         while (apc) |node| {
             apc = node.next;
             std.heap.c_allocator.destroy(node);
         }
+        var packet = o.packet_head;
+        while (packet) |node| { packet = node.next; std.heap.c_allocator.destroy(node); }
         std.heap.c_allocator.destroy(o);
     }
 }
@@ -293,6 +311,131 @@ pub fn createMutex(initial_owner: bool, name: ?[]const u8) usize {
     return handleOf(o);
 }
 
+pub fn openNamed(kind: Kind, name: []const u8) usize {
+    if (name.len == 0 or name.len > 48) return 0;
+    lock(); defer unlock();
+    for (g_objs) |maybe| if (maybe) |o| {
+        if (o.kind == kind and o.name_len == name.len and std.mem.eql(u8, o.name[0..o.name_len], name)) { o.refs += 1; return handleOf(o); }
+    };
+    return 0;
+}
+
+pub fn createTimer(manual: bool, name: ?[]const u8) usize {
+    lock(); defer unlock();
+    const existed = if (name) |n| n.len > 0 and hasNamed(.timer, n) else false;
+    const o = alloc(.timer, name) orelse return 0;
+    if (!existed) o.timer_manual = manual;
+    o.timer_handles += 1;
+    return handleOf(o);
+}
+
+const TimerTask = struct { handle: usize, generation: u64 };
+fn timerThread(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const task: *TimerTask = @ptrCast(@alignCast(arg.?)); defer std.heap.c_allocator.destroy(task);
+    while (true) {
+        lock();
+        const o = find(task.handle);
+        if (o == null or o.?.kind != .timer or o.?.timer_generation != task.generation) { if (o) |obj| release(obj); unlock(); return null; }
+        const obj = o.?;
+        const due = obj.timer_due_ns;
+        const period = obj.timer_period_ns;
+        var now_ts: linux.timespec = undefined; _ = linux.clock_gettime(.MONOTONIC, &now_ts);
+        const now: i128 = @as(i128, now_ts.sec) * 1_000_000_000 + now_ts.nsec;
+        if (now < due) {
+            const remain: i128 = due - now;
+            const ms: u32 = @intCast(@min(@as(i128, std.math.maxInt(u32) - 1), @divTrunc(remain + 999_999, 1_000_000)));
+            _ = waitCond(&Deadline.init(ms));
+            unlock();
+            continue;
+        }
+        if (find(task.handle)) |cur| {
+            if (cur.kind == .timer and cur.timer_generation == task.generation) {
+                cur.signaled = true;
+                if (cur.timer_callback) |cb| if (cur.timer_thread) |target| {
+                    const apc = std.heap.c_allocator.create(Apc) catch null;
+                    if (apc) |a| {
+                        var real: linux.timespec = undefined; _ = linux.clock_gettime(.REALTIME, &real);
+                        const ft: u64 = @intCast((@as(i128, real.sec) + 11_644_473_600) * 10_000_000 + @divTrunc(real.nsec, 100));
+                        a.* = .{ .timer_callback = cb, .data = cur.timer_callback_data, .time_low = @truncate(ft), .time_high = @truncate(ft >> 32) };
+                        if (target.apc_tail) |tail| tail.next = a else target.apc_head = a; target.apc_tail = a;
+                    }
+                };
+                wake();
+                if (period > 0) { cur.timer_due_ns += period; unlock(); continue; }
+                if (cur.timer_thread) |target| { cur.timer_thread = null; release(target); }
+                cur.timer_callback = null;
+            }
+            release(cur);
+        }
+        unlock(); return null;
+    }
+}
+
+pub fn setTimer(h: usize, due_100ns: i64, period_ms: i32, callback: ?*anyopaque, data: usize) bool {
+    lock();
+    const o = find(h) orelse { unlock(); return false; };
+    if (o.kind != .timer or due_100ns == 0 or period_ms < 0) { unlock(); return false; }
+    o.timer_generation +%= 1; const generation = o.timer_generation; wake();
+    if (o.timer_thread) |old| { release(old); o.timer_thread = null; }
+    const tid = registerCurrentLocked();
+    if (callback != null and tid != null) { tid.?.refs += 1; o.timer_thread = tid; }
+    o.timer_callback = if (callback) |p| @ptrCast(@alignCast(p)) else null;
+    o.timer_callback_data = data;
+    o.signaled = false;
+    var now_ts: linux.timespec = undefined; _ = linux.clock_gettime(.MONOTONIC, &now_ts);
+    const now: i128 = @as(i128, now_ts.sec) * 1_000_000_000 + now_ts.nsec;
+    const delta: i128 = if (due_100ns < 0) -@as(i128, due_100ns) * 100 else blk: {
+        var real: linux.timespec = undefined; _ = linux.clock_gettime(.REALTIME, &real);
+        const ft_now = (@as(i128, real.sec) + 11_644_473_600) * 10_000_000 + @divTrunc(real.nsec, 100);
+        break :blk @max(@as(i128, 0), @as(i128, due_100ns) - ft_now) * 100;
+    };
+    o.timer_due_ns = now + delta; o.timer_period_ns = @as(i128, period_ms) * 1_000_000;
+    o.refs += 1;
+    const task = std.heap.c_allocator.create(TimerTask) catch { release(o); unlock(); return false; };
+    task.* = .{ .handle = h, .generation = generation };
+    unlock();
+    var th: c.pthread_t = undefined;
+    if (c.pthread_create(&th, null, timerThread, task) != .SUCCESS) {
+        std.heap.c_allocator.destroy(task); lock(); if (find(h)) |obj| { if (obj.timer_generation == generation) release(obj); } unlock(); return false;
+    }
+    _ = c.pthread_detach(th); return true;
+}
+
+pub fn cancelTimer(h: usize) bool {
+    lock(); defer unlock(); const o = find(h) orelse return false;
+    if (o.kind != .timer) return false;
+    o.timer_generation +%= 1; o.timer_callback = null; wake();
+    if (o.timer_thread) |target| { release(target); o.timer_thread = null; }
+    o.signaled = false; wake(); return true;
+}
+
+pub fn postCompletion(h: usize, bytes: u32, key: usize, overlapped: ?*anyopaque) bool {
+    const packet = std.heap.c_allocator.create(CompletionPacket) catch return false;
+    packet.* = .{ .key = key, .bytes = bytes, .overlapped = overlapped };
+    lock(); defer unlock(); const o = find(h) orelse { std.heap.c_allocator.destroy(packet); return false; };
+    if (o.kind != .completion_port) { std.heap.c_allocator.destroy(packet); return false; }
+    if (o.packet_tail) |tail| tail.next = packet else o.packet_head = packet;
+    o.packet_tail = packet; wake(); return true;
+}
+
+pub fn createCompletionPort() usize {
+    lock(); defer unlock(); const o = alloc(.completion_port, null) orelse return 0; return handleOf(o);
+}
+
+pub fn isCompletionPort(h: usize) bool {
+    lock(); defer unlock(); const o = find(h) orelse return false; return o.kind == .completion_port;
+}
+
+pub const CompletionResult = struct { bytes: u32, key: usize, overlapped: ?*anyopaque };
+pub fn getCompletion(h: usize, ms: u32) ?CompletionResult {
+    lock(); defer unlock(); const o = find(h) orelse return null; if (o.kind != .completion_port) return null;
+    const d = Deadline.init(ms);
+    while (true) {
+        if (o.packet_head) |p| { o.packet_head = p.next; if (o.packet_head == null) o.packet_tail = null; const out: CompletionResult = .{ .bytes = p.bytes, .key = p.key, .overlapped = p.overlapped }; std.heap.c_allocator.destroy(p); return out; }
+        if (ms == 0 or waitCond(&d)) return null;
+    }
+}
+
 /// ReleaseMutex: only the owner may release.
 pub fn releaseMutex(h: usize) bool {
     lock();
@@ -312,6 +455,15 @@ pub fn closeHandle(h: usize) bool {
     lock();
     defer unlock();
     const o = find(h) orelse return false;
+    if (o.kind == .timer and o.timer_handles > 0) {
+        o.timer_handles -= 1;
+        if (o.timer_handles == 0) {
+            o.timer_generation +%= 1;
+            wake();
+            o.timer_callback = null;
+            if (o.timer_thread) |target| { o.timer_thread = null; release(target); }
+        }
+    }
     release(o);
     return true;
 }
@@ -326,6 +478,8 @@ fn signaledFor(o: *const Object, tid: u32) bool {
         .semaphore => o.count > 0,
         .mutex => o.owner == 0 or o.owner == tid,
         .thread => o.finished,
+        .timer => o.signaled,
+        .completion_port => o.packet_head != null,
     };
 }
 
@@ -340,6 +494,35 @@ fn consume(o: *Object, tid: u32) void {
             o.recursion += 1;
         },
         .thread => {},
+        .timer => if (!o.timer_manual) { o.signaled = false; },
+        .completion_port => {},
+    }
+}
+
+/// Signal one synchronization object and begin the second wait without
+/// releasing g_mu between the two state transitions.
+pub fn signalAndWait(h_signal: usize, h_wait: usize, ms: u32, alertable: bool) ?u32 {
+    lock(); defer unlock();
+    const sig = find(h_signal) orelse return WAIT_FAILED;
+    const target = find(h_wait) orelse return WAIT_FAILED;
+    const tid = tidNow();
+    switch (sig.kind) {
+        .event => sig.signaled = true,
+        .semaphore => { if (sig.count >= sig.max) return WAIT_FAILED; sig.count += 1; },
+        .mutex => { if (sig.owner != tid or sig.recursion == 0) return WAIT_FAILED; sig.recursion -= 1; if (sig.recursion == 0) sig.owner = 0; },
+        else => return WAIT_FAILED,
+    }
+    wake();
+    const d = Deadline.init(ms);
+    while (true) {
+        if (alertable and runApcsLocked()) return WAIT_IO_COMPLETION;
+        if (signaledFor(target, tid)) { consume(target, tid); return WAIT_OBJECT_0; }
+        if (ms == 0) return WAIT_TIMEOUT;
+        if (waitCond(&d)) {
+            if (alertable and runApcsLocked()) return WAIT_IO_COMPLETION;
+            if (signaledFor(target, tid)) { consume(target, tid); return WAIT_OBJECT_0; }
+            return WAIT_TIMEOUT;
+        }
     }
 }
 
@@ -447,7 +630,7 @@ fn runApcsLocked() bool {
         current.apc_head = apc.next;
         if (current.apc_head == null) current.apc_tail = null;
         unlock();
-        apc.callback(apc.data);
+        if (apc.callback) |callback| callback(apc.data) else if (apc.timer_callback) |callback| callback(@ptrFromInt(apc.data), apc.time_low, apc.time_high);
         std.heap.c_allocator.destroy(apc);
         lock();
         ran = true;
@@ -1263,7 +1446,8 @@ test "ExitThread ends only that thread and records its exit code" {
     var code: u32 = 0;
     try testing.expectEqual(@as(?bool, true), getExitCode(th, &code));
     try testing.expectEqual(@as(u32, 7), code);
-    try testing.expect(!exitCurrentThread(0) or true); // main thread: not ours, returns false
+    // Do not call exitCurrentThread from the test runner: earlier tests may
+    // have registered this runner as the current pseudo-thread.
     try testing.expect(closeHandle(th));
 }
 
@@ -1278,6 +1462,71 @@ test "named events are shared between Create calls" {
     try testing.expect(isOurs(b));
     try testing.expect(closeHandle(b));
     try testing.expect(!isOurs(a));
+}
+
+test "openNamed opens only existing objects of the requested kind" {
+    const e = createEvent(true, false, "open-event-test");
+    const s = createSemaphore(0, 2, "open-semaphore-test");
+    const m = createMutex(false, "open-mutex-test");
+    try testing.expectEqual(e, openNamed(.event, "open-event-test"));
+    try testing.expectEqual(@as(usize, 0), openNamed(.mutex, "open-event-test"));
+    try testing.expectEqual(s, openNamed(.semaphore, "open-semaphore-test"));
+    try testing.expectEqual(m, openNamed(.mutex, "open-mutex-test"));
+    try testing.expectEqual(@as(usize, 0), openNamed(.event, "missing-open-test"));
+    try testing.expect(closeHandle(e) and closeHandle(e));
+    try testing.expect(closeHandle(s) and closeHandle(s));
+    try testing.expect(closeHandle(m) and closeHandle(m));
+}
+
+test "waitable timers signal after a relative due time and cancel" {
+    const h = createTimer(false, null);
+    try testing.expect(h != 0);
+    try testing.expect(setTimer(h, -150_000, 0, null, 0)); // 15 ms
+    try testing.expectEqual(@as(?u32, WAIT_TIMEOUT), waitOne(h, 0));
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(h, 1000));
+    try testing.expectEqual(@as(?u32, WAIT_TIMEOUT), waitOne(h, 0)); // auto-reset
+    try testing.expect(setTimer(h, -100_000, 50, null, 0));
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(h, 1000));
+    try testing.expect(cancelTimer(h));
+    try testing.expectEqual(@as(?u32, WAIT_TIMEOUT), waitOne(h, 100));
+    try testing.expect(closeHandle(h));
+}
+
+fn timerApc(p: ?*anyopaque, low: u32, high: u32) callconv(W) void {
+    const out: *u32 = @ptrCast(@alignCast(p.?)); out.* = @intFromBool(low != 0 or high != 0);
+}
+
+test "waitable timer completion routine runs only in an alertable wait" {
+    var called: u32 = 0;
+    const h = createTimer(true, null);
+    try testing.expect(setTimer(h, -100_000, 0, @ptrFromInt(@intFromPtr(&timerApc)), @intFromPtr(&called)));
+    try testing.expectEqual(@as(u32, 0), sleepEx(1000, false));
+    try testing.expectEqual(@as(u32, 0), called);
+    try testing.expectEqual(WAIT_IO_COMPLETION, sleepEx(1000, true));
+    try testing.expectEqual(@as(u32, 1), called);
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(h, 0));
+    try testing.expect(closeHandle(h));
+}
+
+test "completion port preserves FIFO packets and timeout is distinct" {
+    const h = createCompletionPort(); try testing.expect(h != 0);
+    try testing.expect(postCompletion(h, 12, 0xabc, null));
+    try testing.expect(postCompletion(h, 34, 0xdef, @ptrFromInt(0x1234)));
+    const a = getCompletion(h, 0).?; try testing.expectEqual(@as(u32, 12), a.bytes); try testing.expectEqual(@as(usize, 0xabc), a.key);
+    const b = getCompletion(h, 0).?; try testing.expectEqual(@as(u32, 34), b.bytes); try testing.expectEqual(@as(usize, 0xdef), b.key); try testing.expectEqual(@as(usize, 0x1234), @intFromPtr(b.overlapped.?));
+    try testing.expect(getCompletion(h, 0) == null);
+    try testing.expect(!postCompletion(0x2000, 1, 1, null));
+    try testing.expect(closeHandle(h));
+}
+
+test "SignalObjectAndWait atomically signals and waits with error controls" {
+    const s = createEvent(false, false, null);
+    const w = createEvent(false, false, null);
+    try testing.expectEqual(WAIT_TIMEOUT, signalAndWait(s, w, 0, false).?);
+    try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(s, 0));
+    try testing.expectEqual(WAIT_FAILED, signalAndWait(s, 0x2000, 0, false).?);
+    try testing.expect(!releaseMutex(s));
+    try testing.expect(closeHandle(s) and closeHandle(w));
 }
 
 test "wait-all on a thread handle and an event" {
@@ -1408,7 +1657,8 @@ test "APC queued to a thread in an alertable wait runs there and returns WAIT_IO
     const target_tid = state.worker_tid;
     try testing.expect(target_tid != 0);
     try testing.expect(queueUserApc(@constCast(@ptrCast(&apcTestCallback)), th, @intFromPtr(&state)));
-    try testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &state.ran, .seq_cst));
+    // No assertion on `ran` here: the target is in an alertable wait and may run
+    // the APC before this thread looks again (that is the correct behaviour).
     try testing.expectEqual(@as(?u32, WAIT_OBJECT_0), waitOne(th, 5000));
     try testing.expectEqual(WAIT_IO_COMPLETION, state.wait_result);
     try testing.expectEqual(@as(u32, 1), state.ran);
