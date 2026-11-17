@@ -27,12 +27,39 @@ const VFunc = *const fn (usize, usize, usize, usize, usize, usize, usize, usize,
 const Adapter = extern struct {
     vtable: *const [max_slots]VFunc,
     real: usize,
+    kind: InterfaceKind,
+    version: u32,
+};
+
+const InterfaceKind = enum(u8) { client, user, friends, utils, matchmaking, user_stats, apps, remote_storage, unknown };
+const SlotAbi = enum { plain, sret8, float_xmm, float_double_xmm, reverse_warning_hook, reverse_post_result, reverse_check_callback };
+const SlotSpec = struct { slot: usize, abi: SlotAbi };
+
+// ABI-sensitive entries from the SDK vtable order. Other methods use the
+// integer/pointer forwarding thunk. Getter strings are logged at runtime so
+// the selected interface revision is measured rather than assumed.
+const user_abi_slots = [_]SlotSpec{.{ .slot = 2, .abi = .sret8 }}; // ISteamUser::GetSteamID
+const user_stats_abi_slots = [_]SlotSpec{
+    .{ .slot = 4, .abi = .float_xmm }, // SetStat(const char *, float)
+    .{ .slot = 5, .abi = .float_double_xmm }, // UpdateAvgRateStat(const char *, float, double)
+};
+const client_callback_abi_slots = [_]SlotSpec{
+    .{ .slot = 21, .abi = .reverse_warning_hook },
+    .{ .slot = 31, .abi = .reverse_post_result },
+    .{ .slot = 32, .abi = .reverse_post_result },
+    .{ .slot = 33, .abi = .reverse_check_callback },
 };
 
 var g_handle: ?*anyopaque = null;
 var g_create: ?*const fn (?[*:0]const u8, ?*i32) callconv(C) ?*anyopaque = null;
 var g_pipe_fn: ?*const fn () callconv(C) u32 = null;
 var g_user_fn: ?*const fn (u32) callconv(C) u32 = null;
+var g_bget_callback: ?*const fn (u32, *CallbackMsg) callconv(C) bool = null;
+var g_free_last_callback: ?*const fn (u32) callconv(C) void = null;
+var g_get_api_call_result: ?*const fn (u32, u64, [*]u8, u32, i32, *bool) callconv(C) bool = null;
+var g_post_result_win: ?*const fn (u64, ?*anyopaque, u32, i32) callconv(W) void = null;
+var g_check_callback_win: ?*const fn (i32) callconv(W) u32 = null;
+var g_warning_hook_win: ?*const fn (i32, [*:0]const u8) callconv(W) void = null;
 var g_client_real: usize = 0;
 var g_adapters: [adapter_capacity]Adapter = undefined;
 var g_adapter_count: usize = 0;
@@ -40,6 +67,115 @@ var g_ready = false;
 var g_attempted = false;
 var g_io: std.Io = undefined;
 var g_io_ready = false;
+var callback_data_win: [512]u8 = @splat(0);
+
+const CallbackMsg = extern struct { user: i32, callback: i32, param: ?[*]u8, size: i32 };
+
+const CallbackLayout = enum { same, user_stats_received, user_stats_stored, achievement_stored, remote_file_share, remote_read_complete, remote_write_complete, unsupported };
+
+fn callbackLayout(callback: i32) CallbackLayout {
+    return switch (callback) {
+        1101 => .user_stats_received, // UserStatsReceived_t: CGameID, EResult, CSteamID
+        1102 => .user_stats_stored,
+        1103 => .achievement_stored,
+        1307 => .remote_file_share,
+        1331 => .remote_write_complete,
+        1332 => .remote_read_complete,
+        else => .unsupported,
+    };
+}
+
+fn callbackNativeSize(callback: i32) ?usize {
+    return switch (callbackLayout(callback)) {
+        .user_stats_received => 20,
+        .user_stats_stored => 12,
+        .achievement_stored => 148,
+        .remote_file_share => 272,
+        .remote_read_complete => 20,
+        .remote_write_complete => 4,
+        .same, .unsupported => null,
+    };
+}
+
+fn callbackWindowsSize(callback: i32) ?usize {
+    return switch (callbackLayout(callback)) {
+        .user_stats_received => 24,
+        .user_stats_stored => 16,
+        .achievement_stored => 152,
+        .remote_file_share => 280,
+        .remote_read_complete => 24,
+        .remote_write_complete => 4,
+        .same, .unsupported => null,
+    };
+}
+
+fn convertCallbackToWin(callback: i32, input: []const u8, output: []u8) ?usize {
+    switch (callbackLayout(callback)) {
+        .unsupported => return null,
+        .same => {
+            if (input.len > output.len) return null;
+            @memcpy(output[0..input.len], input);
+            return input.len;
+        },
+        .user_stats_received => {
+            // Linux pack(4): gameID@0, result@8, userID@12, size 20.
+            // Windows pack(8): gameID@0, result@8, userID@16, size 24.
+            if (input.len != 20 or output.len < 24) return null;
+            @memcpy(output[0..12], input[0..12]);
+            @memcpy(output[16..24], input[12..20]);
+            return 24;
+        },
+        .user_stats_stored => return paddedCopy(input, output, 12, 16),
+        .achievement_stored => return paddedCopy(input, output, 148, 152),
+        .remote_file_share => {
+            // Result@0, UGCHandle@4/name@12 in Linux; handle@8/name@16 in Windows.
+            if (input.len != 272 or output.len < 280) return null;
+            @memcpy(output[0..4], input[0..4]);
+            @memcpy(output[8..16], input[4..12]);
+            @memcpy(output[16..276], input[12..272]);
+            @memset(output[276..280], 0);
+            return 280;
+        },
+        .remote_read_complete => return paddedCopy(input, output, 20, 24),
+        .remote_write_complete => return paddedCopy(input, output, 4, 4),
+    }
+}
+
+fn convertCallbackFromWin(callback: i32, input: []const u8, output: []u8) ?usize {
+    switch (callbackLayout(callback)) {
+        .unsupported => return null,
+        .same => {
+            if (input.len > output.len) return null;
+            @memcpy(output[0..input.len], input);
+            return input.len;
+        },
+        .user_stats_received => {
+            if (input.len != 24 or output.len < 20) return null;
+            @memcpy(output[0..12], input[0..12]);
+            @memcpy(output[12..20], input[16..24]);
+            return 20;
+        },
+        .user_stats_stored => return paddedCopy(input, output, 16, 12),
+        .achievement_stored => return paddedCopy(input, output, 152, 148),
+        .remote_file_share => {
+            if (input.len != 280 or output.len < 272) return null;
+            @memcpy(output[0..4], input[0..4]);
+            @memcpy(output[4..12], input[8..16]);
+            @memcpy(output[12..272], input[16..276]);
+            return 272;
+        },
+        .remote_read_complete => return paddedCopy(input, output, 24, 20),
+        .remote_write_complete => return paddedCopy(input, output, 4, 4),
+    }
+}
+
+fn paddedCopy(input: []const u8, output: []u8, in_size: usize, out_size: usize) ?usize {
+    if (input.len != in_size or output.len < out_size) return null;
+    const copy_size = @min(in_size, out_size);
+    @memcpy(output[0..copy_size], input[0..copy_size]);
+    if (out_size > copy_size) @memset(output[copy_size..out_size], 0);
+    return out_size;
+}
 
 pub fn setIo(io: std.Io) void {
     g_io = io;
@@ -159,39 +295,82 @@ fn hostClientPath(buf: []u8) ?[:0]const u8 {
     return nativeClientPath(buf, root);
 }
 
-fn adapterFor(real: usize) usize {
+fn versionNumber(version: []const u8) u32 {
+    var i = version.len;
+    while (i > 0 and version[i - 1] >= '0' and version[i - 1] <= '9') : (i -= 1) {}
+    return if (i == version.len) 0 else std.fmt.parseInt(u32, version[i..], 10) catch 0;
+}
+
+fn vtableFor(kind: InterfaceKind) *const [max_slots]VFunc {
+    return switch (kind) {
+        .client => &client_vtable,
+        .user => &user_vtable,
+        .user_stats => &stats_vtable,
+        else => &interface_vtable,
+    };
+}
+
+fn adapterFor(real: usize, kind: InterfaceKind, version: []const u8) usize {
     if (real == 0) return 0;
     for (g_adapters[0..g_adapter_count]) |*adapter| {
-        if (adapter.real == real) return @intFromPtr(adapter);
+        if (adapter.real == real and adapter.kind == kind and adapter.version == versionNumber(version)) return @intFromPtr(adapter);
     }
     if (g_adapter_count == adapter_capacity) return 0;
     const adapter = &g_adapters[g_adapter_count];
-    adapter.* = .{ .vtable = &client_vtable, .real = real };
+    adapter.* = .{ .vtable = vtableFor(kind), .real = real, .kind = kind, .version = versionNumber(version) };
     g_adapter_count += 1;
     return @intFromPtr(adapter);
 }
 
-fn isClientGetter(slot: usize) bool {
-    // Observed ISteamClient slots in the working 32-bit bridge. These methods
-    // return real subinterfaces; wrap each before exposing it to Win64 code.
-    return slot == 5 or slot == 8 or slot == 9 or slot == 13 or slot == 14 or slot == 16;
+fn traceInterface(source: []const u8, version: []const u8) void {
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] {s} requested {s}\n", .{ source, version });
 }
 
 fn dispatch(slot: usize, this: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) usize {
-    // The working 32-bit bridge measured that these initial methods crash on
-    // the raw client's vtable before the client has established its own pipe.
-    // Use the host client's real flat entry points for these two slots.
-    if (slot == 0) return if (g_pipe_fn) |f| f() else 0;
-    if (slot == 2) return if (g_user_fn) |f| f(@truncate(a1)) else 0;
     if (this == 0) return 0;
     const adapter: *const Adapter = @ptrFromInt(this);
     if (adapter.real == 0) return 0;
+    // The working 32-bit bridge measured these client slots failing on the raw
+    // vtable before a pipe exists. Never apply them to sub-interface slots.
+    if (adapter.kind == .client and slot == 0) return if (g_pipe_fn) |f| f() else 0;
+    if (adapter.kind == .client and slot == 2) return if (g_user_fn) |f| f(@truncate(a1)) else 0;
     const real_vtable: [*]const usize = @ptrFromInt((@as(*const usize, @ptrFromInt(adapter.real)).*));
     const address = real_vtable[slot];
     if (address == 0) return 0;
     const method: *const fn (usize, usize, usize, usize, usize, usize, usize, usize, usize) callconv(C) usize = @ptrFromInt(address);
     const result = method(adapter.real, a1, a2, a3, a4, a5, a6, a7, a8);
-    return if (isClientGetter(slot)) adapterFor(result) else result;
+    if (adapter.kind != .client) return result;
+    if (!isClientGetter(slot)) return result;
+    const version_ptr = if (slot == 9) a2 else a3;
+    if (version_ptr == 0) return 0;
+    const version = std.mem.span(@as([*:0]const u8, @ptrFromInt(version_ptr)));
+    traceInterface("ISteamClient getter", version);
+    return wrapGetterResult(adapter.kind, slot, result, version);
+}
+
+fn interfaceKindForVersion(version: []const u8) InterfaceKind {
+    if (std.mem.startsWith(u8, version, "SteamUser")) return .user;
+    if (std.mem.startsWith(u8, version, "SteamFriends")) return .friends;
+    if (std.mem.startsWith(u8, version, "SteamUtils")) return .utils;
+    if (std.mem.startsWith(u8, version, "SteamMatchMaking") or std.mem.startsWith(u8, version, "SteamMatchmaking")) return .matchmaking;
+    if (std.mem.startsWith(u8, version, "STEAMUSERSTATS")) return .user_stats;
+    if (std.mem.startsWith(u8, version, "SteamApps") or std.mem.startsWith(u8, version, "STEAMAPPS")) return .apps;
+    if (std.mem.startsWith(u8, version, "STEAMREMOTESTORAGE")) return .remote_storage;
+    return .unknown;
+}
+
+fn isClientGetter(slot: usize) bool {
+    return switch (slot) {
+        5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        23, 24, 25, 26, 27, 28, 29, 30, 34, 35 => true,
+        else => false,
+    };
+}
+
+fn wrapGetterResult(parent: InterfaceKind, slot: usize, result: usize, version: []const u8) usize {
+    if (parent != .client or result == 0) return result;
+    if (!isClientGetter(slot)) return result;
+    return adapterFor(result, interfaceKindForVersion(version), version);
 }
 
 fn thunk(comptime slot: usize) VFunc {
@@ -205,8 +384,135 @@ fn thunk(comptime slot: usize) VFunc {
 const client_vtable: [max_slots]VFunc = init: {
     var table: [max_slots]VFunc = undefined;
     for (0..max_slots) |i| table[i] = thunk(i);
+    for (client_callback_abi_slots) |s| {
+        table[s.slot] = switch (s.abi) {
+            .reverse_warning_hook => clientSetWarningHookThunk(),
+            .reverse_post_result => clientSetPostResultThunk(s.slot),
+            .reverse_check_callback => clientSetCheckCallbackThunk(),
+            else => unreachable,
+        };
+    }
     break :init table;
 };
+
+const interface_vtable: [max_slots]VFunc = init: {
+    var table: [max_slots]VFunc = undefined;
+    for (0..max_slots) |i| table[i] = thunk(i);
+    break :init table;
+};
+
+const user_vtable: [max_slots]VFunc = init: {
+    var table: [max_slots]VFunc = undefined;
+    for (0..max_slots) |i| table[i] = thunk(i);
+    for (user_abi_slots) |s| if (s.abi == .sret8) { table[s.slot] = userGetSteamIdThunk(); };
+    break :init table;
+};
+
+const stats_vtable: [max_slots]VFunc = init: {
+    var table: [max_slots]VFunc = undefined;
+    for (0..max_slots) |i| table[i] = thunk(i);
+    for (user_stats_abi_slots) |s| {
+        table[s.slot] = if (s.abi == .float_xmm) statsSetFloatThunk() else statsUpdateRateThunk();
+    }
+    break :init table;
+};
+
+fn userGetSteamIdThunk() VFunc {
+    return @ptrCast(&struct {
+        fn call(this: usize, out: ?*u64) callconv(W) usize {
+            if (out == null or this == 0) return 0;
+            const adapter: *const Adapter = @ptrFromInt(this);
+            if (adapter.kind != .user or adapter.real == 0) return 0;
+            const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(adapter.real)).*);
+            const f: *const fn (usize) callconv(C) u64 = @ptrFromInt(vt[2]);
+            out.?.* = f(adapter.real);
+            return @intFromPtr(out.?);
+        }
+    }.call);
+}
+
+fn statsSetFloatThunk() VFunc {
+    return @ptrCast(&struct {
+        fn call(this: usize, name: usize, value: f32) callconv(W) u8 {
+            if (this == 0) return 0;
+            const adapter: *const Adapter = @ptrFromInt(this);
+            if (adapter.kind != .user_stats or adapter.real == 0) return 0;
+            const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(adapter.real)).*);
+            const f: *const fn (usize, usize, f32) callconv(C) u8 = @ptrFromInt(vt[4]);
+            return f(adapter.real, name, value);
+        }
+    }.call);
+}
+
+fn statsUpdateRateThunk() VFunc {
+    return @ptrCast(&struct {
+        fn call(this: usize, name: usize, count: f32, session_seconds: f64) callconv(W) u8 {
+            if (this == 0) return 0;
+            const adapter: *const Adapter = @ptrFromInt(this);
+            if (adapter.kind != .user_stats or adapter.real == 0) return 0;
+            const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(adapter.real)).*);
+            const f: *const fn (usize, usize, f32, f64) callconv(C) u8 = @ptrFromInt(vt[5]);
+            return f(adapter.real, name, count, session_seconds);
+        }
+    }.call);
+}
+
+fn postResultSysv(call: u64, data: ?*anyopaque, size: u32, callback: i32) callconv(C) void {
+    if (g_post_result_win) |f| f(call, data, size, callback);
+}
+
+fn warningHookSysv(severity: i32, message: [*:0]const u8) callconv(C) void {
+    if (g_warning_hook_win) |f| f(severity, message);
+}
+
+fn checkCallbackSysv(callback: i32) callconv(C) u32 {
+    return if (g_check_callback_win) |f| f(callback) else 0;
+}
+
+fn clientSetPostResultThunk(comptime slot: usize) VFunc {
+    return @ptrCast(&struct {
+        fn call(this: usize, callback: usize) callconv(W) usize {
+            if (this == 0) return 0;
+            const adapter: *const Adapter = @ptrFromInt(this);
+            if (adapter.kind != .client or adapter.real == 0) return 0;
+            const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(adapter.real)).*);
+            const f: *const fn (usize, usize) callconv(C) void = @ptrFromInt(vt[slot]);
+            g_post_result_win = if (callback == 0) null else @ptrFromInt(callback);
+            f(adapter.real, if (callback == 0) 0 else @intFromPtr(&postResultSysv));
+            return 0;
+        }
+    }.call);
+}
+
+fn clientSetWarningHookThunk() VFunc {
+    return @ptrCast(&struct {
+        fn call(this: usize, callback: usize) callconv(W) usize {
+            if (this == 0) return 0;
+            const adapter: *const Adapter = @ptrFromInt(this);
+            if (adapter.kind != .client or adapter.real == 0) return 0;
+            const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(adapter.real)).*);
+            const f: *const fn (usize, usize) callconv(C) void = @ptrFromInt(vt[21]);
+            g_warning_hook_win = if (callback == 0) null else @ptrFromInt(callback);
+            f(adapter.real, if (callback == 0) 0 else @intFromPtr(&warningHookSysv));
+            return 0;
+        }
+    }.call);
+}
+
+fn clientSetCheckCallbackThunk() VFunc {
+    return @ptrCast(&struct {
+        fn call(this: usize, callback: usize) callconv(W) usize {
+            if (this == 0) return 0;
+            const adapter: *const Adapter = @ptrFromInt(this);
+            if (adapter.kind != .client or adapter.real == 0) return 0;
+            const vt: [*]const usize = @ptrFromInt(@as(*const usize, @ptrFromInt(adapter.real)).*);
+            const f: *const fn (usize, usize) callconv(C) void = @ptrFromInt(vt[33]);
+            g_check_callback_win = if (callback == 0) null else @ptrFromInt(callback);
+            f(adapter.real, if (callback == 0) 0 else @intFromPtr(&checkCallbackSysv));
+            return 0;
+        }
+    }.call);
+}
 
 fn ensureClient() bool {
     if (g_ready) return true;
@@ -236,18 +542,22 @@ fn ensureClient() bool {
     g_create = @ptrCast(symbol);
     g_pipe_fn = if (dlsym(g_handle, "Steam_CreateSteamPipe")) |p| @ptrCast(p) else null;
     g_user_fn = if (dlsym(g_handle, "Steam_ConnectToGlobalUser")) |p| @ptrCast(p) else null;
+    g_bget_callback = if (dlsym(g_handle, "Steam_BGetCallback")) |p| @ptrCast(p) else null;
+    g_free_last_callback = if (dlsym(g_handle, "Steam_FreeLastCallback")) |p| @ptrCast(p) else null;
+    g_get_api_call_result = if (dlsym(g_handle, "Steam_GetAPICallResult")) |p| @ptrCast(p) else null;
     if (g_pipe_fn == null or g_user_fn == null) {
         std.debug.print("[WINS:SteamBridge64] host steamclient.so is missing real pipe/user entry points.\n", .{});
         return false;
     }
     var rc: i32 = -1;
     const client_name: [:0]const u8 = "SteamClient017";
+    traceInterface("host CreateInterface", client_name);
     const real = g_create.?(client_name.ptr, &rc) orelse {
         std.debug.print("[WINS:SteamBridge64] real client refused SteamClient017 (rc={d}).\n", .{rc});
         return false;
     };
     g_client_real = @intFromPtr(real);
-    if (adapterFor(g_client_real) == 0) {
+    if (adapterFor(g_client_real, .client, "SteamClient017") == 0) {
         std.debug.print("[WINS:SteamBridge64] adapter pool exhausted.\n", .{});
         return false;
     }
@@ -267,18 +577,110 @@ pub fn loadLibrary(raw: []const u8) usize {
 
 pub fn getProcAddress(handle: usize, raw_symbol: []const u8) usize {
     if (handle != module_handle or !ensureClient()) return 0;
-    if (!std.mem.eql(u8, raw_symbol, "CreateInterface")) return 0;
-    return @intFromPtr(&createInterfaceWin);
+    if (std.mem.eql(u8, raw_symbol, "CreateInterface")) return @intFromPtr(&createInterfaceWin);
+    if (std.mem.eql(u8, raw_symbol, "Steam_BGetCallback") and g_bget_callback != null) return @intFromPtr(&steamBGetCallbackWin);
+    if (std.mem.eql(u8, raw_symbol, "Steam_FreeLastCallback") and g_free_last_callback != null) return @intFromPtr(&steamFreeLastCallbackWin);
+    if (std.mem.eql(u8, raw_symbol, "Steam_GetAPICallResult") and g_get_api_call_result != null) return @intFromPtr(&steamGetApiCallResultWin);
+    return 0;
+}
+
+fn steamBGetCallbackWin(pipe: u32, out: ?*CallbackMsg) callconv(W) bool {
+    if (out == null) return false;
+    const host = g_bget_callback orelse return false;
+    const got = host(pipe, out.?);
+    if (!got) return false;
+    const msg = out.?.*;
+    if (callbackLayout(msg.callback) == .unsupported) {
+        std.debug.print("[WINS:SteamABI64] dropped unsupported callback id={d}\n", .{msg.callback});
+        if (g_free_last_callback) |free| free(pipe);
+        return false;
+    }
+    if (msg.param == null or msg.size < 0) {
+        std.debug.print("[WINS:SteamABI64] dropped malformed callback id={d} size={d}\n", .{ msg.callback, msg.size });
+        if (g_free_last_callback) |free| free(pipe);
+        return false;
+    }
+    const converted = convertCallbackToWin(msg.callback, msg.param.?[0..@intCast(msg.size)], &callback_data_win);
+    if (converted) |size| {
+        out.?.param = &callback_data_win;
+        out.?.size = @intCast(size);
+        return true;
+    }
+    std.debug.print("[WINS:SteamABI64] dropped malformed callback id={d} size={d}\n", .{ msg.callback, msg.size });
+    if (g_free_last_callback) |free| free(pipe);
+    return false;
+}
+
+fn steamFreeLastCallbackWin(pipe: u32) callconv(W) void {
+    if (g_free_last_callback) |free| free(pipe);
+}
+
+fn steamGetApiCallResultWin(pipe: u32, call: u64, buffer: ?[*]u8, buffer_size: i32, expected_callback: i32, failed: ?*bool) callconv(W) bool {
+    if (buffer == null or buffer_size < 0 or failed == null) return false;
+    const host = g_get_api_call_result orelse return false;
+    const layout = callbackLayout(expected_callback);
+    if (layout == .unsupported) {
+        std.debug.print("[WINS:SteamABI64] rejected APICallResult callback id={d}\n", .{expected_callback});
+        return false;
+    }
+    if (layout == .same) return host(pipe, call, buffer.?, @intCast(buffer_size), expected_callback, failed.?);
+    const native_size = callbackNativeSize(expected_callback) orelse return false;
+    const windows_size = callbackWindowsSize(expected_callback) orelse return false;
+    if (buffer_size < windows_size) return false;
+    @memset(callback_data_win[0..native_size], 0);
+    var host_failed = false;
+    const ok = host(pipe, call, &callback_data_win, @intCast(native_size), expected_callback, &host_failed);
+    failed.?.* = host_failed;
+    if (!ok) return false;
+    return convertCallbackToWin(expected_callback, callback_data_win[0..native_size], buffer.?[0..@intCast(buffer_size)]) != null;
 }
 
 fn createInterfaceWin(name: ?[*:0]const u8, return_code: ?*i32) callconv(W) ?*anyopaque {
     if (return_code) |rc| rc.* = 1;
-    if (name == null or !ensureClient()) return null;
+    if (name == null) return null;
     const requested = std.mem.span(name.?);
+    traceInterface("CreateInterface", requested);
+    if (!ensureClient()) return null;
     if (!std.mem.eql(u8, requested, "SteamClient017")) return null;
     if (return_code) |rc| rc.* = 0;
-    const wrapped = adapterFor(g_client_real);
+    const wrapped = adapterFor(g_client_real, .client, requested);
     return if (wrapped == 0) null else @ptrFromInt(wrapped);
+}
+
+/// Writes `value` as a REG_SZ registry result (RegQueryValueExA semantics:
+/// size includes the terminating NUL; ERROR_MORE_DATA when the buffer is short).
+pub fn writeRegSz(value: []const u8, value_type: ?*u32, data: ?[*]u8, size: ?*u32) i32 {
+    const need: u32 = @intCast(value.len + 1);
+    if (value_type) |out| out.* = 1; // REG_SZ
+    if (size) |out| {
+        const supplied = out.*;
+        out.* = need;
+        if (data) |dst| {
+            if (supplied < need) return 234; // ERROR_MORE_DATA
+            @memcpy(dst[0..value.len], value);
+            dst[value.len] = 0;
+        }
+    } else if (data != null) {
+        return 87; // ERROR_INVALID_PARAMETER
+    }
+    return 0;
+}
+
+/// HKCU\Software\Valve\Steam\ActiveProcess\SteamClientDll64, as the real Steam
+/// client writes it on Windows. steam_api64 only runs SteamAPI_IsSteamRunning and
+/// loads the client when this value exists. Present only while a live host Steam
+/// client is reachable; otherwise ERROR_FILE_NOT_FOUND, like a PC without Steam.
+pub fn querySteamClientDllValue(value_type: ?*u32, data: ?[*]u8, size: ?*u32) i32 {
+    if (steamClientPid() == 0) {
+        if (size) |out| out.* = 0;
+        return 2; // ERROR_FILE_NOT_FOUND
+    }
+    var path_buf: [2048]u8 = undefined;
+    const path = fileName(module_handle, &path_buf) orelse {
+        if (size) |out| out.* = 0;
+        return 2;
+    };
+    return writeRegSz(path, value_type, data, size);
 }
 
 pub fn fileName(handle: usize, out: []u8) ?[]const u8 {
@@ -348,4 +750,150 @@ test "Steam PID registry values preserve Win32 size and absence semantics" {
     size = 4;
     try std.testing.expectEqual(@as(i32, 2), querySteamPidValue(0, &kind, &bytes, &size));
     try std.testing.expectEqual(@as(u32, 0), size);
+}
+
+test "REG_SZ registry results follow RegQueryValueExA size semantics" {
+    var ty: u32 = 0;
+    var size: u32 = 4;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 234), writeRegSz("Z:\\steam\\steamclient64.dll", &ty, &buf, &size));
+    try std.testing.expectEqual(@as(u32, 27), size);
+    size = buf.len;
+    try std.testing.expectEqual(@as(i32, 0), writeRegSz("Z:\\steam\\steamclient64.dll", &ty, &buf, &size));
+    try std.testing.expectEqual(@as(u32, 1), ty);
+    try std.testing.expectEqualStrings("Z:\\steam\\steamclient64.dll", std.mem.sliceTo(&buf, 0));
+    var only_size: u32 = 0;
+    try std.testing.expectEqual(@as(i32, 0), writeRegSz("abc", null, null, &only_size));
+    try std.testing.expectEqual(@as(u32, 4), only_size);
+}
+
+var abi_test_vtable: [max_slots]usize = @splat(0);
+var abi_test_object: usize = 0;
+var abi_test_float: f32 = 0;
+var abi_test_double: f64 = 0;
+var abi_test_name: usize = 0;
+var abi_test_post: [4]u64 = @splat(0);
+
+fn abiTestSteamId(_: usize) callconv(C) u64 {
+    return 0x1122_3344_5566_7788;
+}
+
+fn abiTestSetFloat(_: usize, name: usize, value: f32) callconv(C) u8 {
+    abi_test_name = name;
+    abi_test_float = value;
+    return 1;
+}
+
+fn abiTestUpdateRate(_: usize, name: usize, count: f32, elapsed: f64) callconv(C) u8 {
+    abi_test_name = name;
+    abi_test_float = count;
+    abi_test_double = elapsed;
+    return 1;
+}
+
+fn abiTestPostWin(call: u64, data: ?*anyopaque, size: u32, callback: i32) callconv(W) void {
+    abi_test_post = .{ call, if (data) |p| @intFromPtr(p) else 0, size, @as(u64, @intCast(@as(u32, @bitCast(callback)))) };
+}
+
+fn abiTestCheckWin(callback: i32) callconv(W) u32 {
+    return @as(u32, @bitCast(callback)) + 5;
+}
+
+fn abiTestWarningWin(severity: i32, message: [*:0]const u8) callconv(W) void {
+    abi_test_post[0] = @as(u64, @intCast(severity));
+    abi_test_post[1] = @intFromPtr(message);
+}
+
+test "SteamID sret thunk writes the SysV 8-byte return and returns out pointer" {
+    abi_test_vtable = @splat(0);
+    abi_test_vtable[2] = @intFromPtr(&abiTestSteamId);
+    abi_test_object = @intFromPtr(&abi_test_vtable);
+    const adapter = Adapter{ .vtable = &user_vtable, .real = @intFromPtr(&abi_test_object), .kind = .user, .version = 23 };
+    var output: u64 = 0;
+    const thunk_fn: *const fn (usize, ?*u64) callconv(W) usize = @ptrCast(userGetSteamIdThunk());
+    const returned = thunk_fn(@intFromPtr(&adapter), &output);
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), output);
+    try std.testing.expectEqual(@intFromPtr(&output), returned);
+}
+
+test "float stats thunk moves Win64 positional XMM argument into SysV xmm0" {
+    abi_test_vtable = @splat(0);
+    abi_test_vtable[4] = @intFromPtr(&abiTestSetFloat);
+    abi_test_object = @intFromPtr(&abi_test_vtable);
+    const adapter = Adapter{ .vtable = &stats_vtable, .real = @intFromPtr(&abi_test_object), .kind = .user_stats, .version = 12 };
+    const thunk_fn: *const fn (usize, usize, f32) callconv(W) u8 = @ptrCast(statsSetFloatThunk());
+    const ok = thunk_fn(@intFromPtr(&adapter), 0xabc, 3.25);
+    try std.testing.expectEqual(@as(u8, 1), ok);
+    try std.testing.expectEqual(@as(usize, 0xabc), abi_test_name);
+    try std.testing.expectEqual(@as(f32, 3.25), abi_test_float);
+}
+
+test "float and double rate thunk repacks positional Win64 XMM arguments for SysV" {
+    abi_test_vtable = @splat(0);
+    abi_test_vtable[5] = @intFromPtr(&abiTestUpdateRate);
+    abi_test_object = @intFromPtr(&abi_test_vtable);
+    const adapter = Adapter{ .vtable = &stats_vtable, .real = @intFromPtr(&abi_test_object), .kind = .user_stats, .version = 12 };
+    const thunk_fn: *const fn (usize, usize, f32, f64) callconv(W) u8 = @ptrCast(statsUpdateRateThunk());
+    const ok = thunk_fn(@intFromPtr(&adapter), 0xdef, 1.75, 9.5);
+    try std.testing.expectEqual(@as(u8, 1), ok);
+    try std.testing.expectEqual(@as(usize, 0xdef), abi_test_name);
+    try std.testing.expectEqual(@as(f32, 1.75), abi_test_float);
+    try std.testing.expectEqual(@as(f64, 9.5), abi_test_double);
+}
+
+test "UserStatsReceived callback layout converts the shifted CSteamID" {
+    var linux_bytes = [_]u8{0} ** 20;
+    linux_bytes[0] = 1;
+    linux_bytes[8] = 2;
+    linux_bytes[12] = 0x88;
+    linux_bytes[19] = 0x11;
+    var windows_bytes = [_]u8{0} ** 24;
+    try std.testing.expectEqual(@as(?usize, 24), convertCallbackToWin(1101, &linux_bytes, &windows_bytes));
+    try std.testing.expectEqual(@as(u8, 0x88), windows_bytes[16]);
+    try std.testing.expectEqual(@as(u8, 0x11), windows_bytes[23]);
+    var roundtrip = [_]u8{0} ** 20;
+    try std.testing.expectEqual(@as(?usize, 20), convertCallbackFromWin(1101, &windows_bytes, &roundtrip));
+    try std.testing.expectEqualSlices(u8, &linux_bytes, &roundtrip);
+}
+
+test "known stats and cloud callback structs receive Windows pack-8 sizes" {
+    var linux_bytes = [_]u8{0x5a} ** 272;
+    var win_bytes = [_]u8{0} ** 512;
+    try std.testing.expectEqual(@as(?usize, 16), convertCallbackToWin(1102, linux_bytes[0..12], &win_bytes));
+    try std.testing.expectEqual(@as(?usize, 152), convertCallbackToWin(1103, linux_bytes[0..148], &win_bytes));
+    try std.testing.expectEqual(@as(?usize, 280), convertCallbackToWin(1307, &linux_bytes, &win_bytes));
+    try std.testing.expectEqual(@as(u8, 0x5a), win_bytes[8]);
+    try std.testing.expectEqual(@as(u8, 0x5a), win_bytes[16]);
+    try std.testing.expectEqual(@as(?usize, 24), convertCallbackToWin(1332, linux_bytes[0..20], &win_bytes));
+    try std.testing.expectEqual(@as(?usize, null), convertCallbackToWin(999999, &linux_bytes, &win_bytes));
+}
+
+test "reverse callbacks translate SysV calls back to Win64 callbacks" {
+    abi_test_post = @splat(0);
+    g_post_result_win = &abiTestPostWin;
+    defer g_post_result_win = null;
+    postResultSysv(0x1234, @ptrFromInt(0x5678), 32, 1101);
+    try std.testing.expectEqual([_]u64{ 0x1234, 0x5678, 32, 1101 }, abi_test_post);
+    g_check_callback_win = &abiTestCheckWin;
+    defer g_check_callback_win = null;
+    try std.testing.expectEqual(@as(u32, 1106), checkCallbackSysv(1101));
+    abi_test_post = @splat(0);
+    g_warning_hook_win = &abiTestWarningWin;
+    defer g_warning_hook_win = null;
+    warningHookSysv(1, "warning" ++ .{0});
+    try std.testing.expectEqual(@as(u64, 1), abi_test_post[0]);
+    try std.testing.expectEqual(@intFromPtr("warning" ++ .{0}), abi_test_post[1]);
+}
+
+test "typed dispatch wraps only client getter methods" {
+    const old_count = g_adapter_count;
+    defer g_adapter_count = old_count;
+    const raw = 0x1234_5678;
+    const user = wrapGetterResult(.client, 5, raw, "SteamUser023");
+    try std.testing.expect(user != raw);
+    const adapter: *const Adapter = @ptrFromInt(user);
+    try std.testing.expectEqual(InterfaceKind.user, adapter.kind);
+    try std.testing.expectEqual(raw, wrapGetterResult(.client, 20, raw, "SteamUtils010"));
+    try std.testing.expectEqual(raw, wrapGetterResult(.user, 5, raw, "SteamUser023"));
+    try std.testing.expectEqual(raw, wrapGetterResult(.client, 4, raw, "SteamUser023"));
 }

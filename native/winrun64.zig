@@ -1068,6 +1068,9 @@ fn RegQueryValueExA(hKey: usize, name: ?[*:0]const u8, reserved: ?*u32, valueTyp
     if (hKey == steam_active_process_key and name != null and std.ascii.eqlIgnoreCase(std.mem.span(name.?), "pid")) {
         return steam64.querySteamPidValue(steam64.steamClientPid(), valueType, data, size);
     }
+    if (hKey == steam_active_process_key and name != null and std.ascii.eqlIgnoreCase(std.mem.span(name.?), "SteamClientDll64")) {
+        return steam64.querySteamClientDllValue(valueType, data, size);
+    }
     const fallback = @import("winrun_extra_dlls.zig").lookupAdvapi32("RegQueryValueExA") orelse return 127;
     const call: *const fn (usize, ?[*:0]const u8, ?*u32, ?*u32, ?[*]u8, ?*u32) callconv(W) i32 = @ptrFromInt(fallback);
     return call(hKey, name, reserved, valueType, data, size);
