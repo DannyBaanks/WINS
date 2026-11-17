@@ -1,4 +1,4 @@
-WINS Steam compatibility tool: Cuphead (AppID 268980)
+WINS Steam compatibility tool: Cuphead (AppID 268910)
 
 This Steam tool starts the installed 64-bit Cuphead.exe with the WINS Win64 PE
 loader. It does not use Proton or Wine. Source: the WINS repository,
@@ -31,7 +31,7 @@ Install for Danny:
      the Steam client version).
   6. Click Play. Steam invokes launch/cuphead/wins with the compatibility
      verb; that entry point launches launch/cuphead/launch-cuphead with
-     STEAM_COMPAT_APP_ID=268980.
+     STEAM_COMPAT_APP_ID=268910.
 
 Approved Win64 game images (SHA-256):
   Cuphead.exe             c5fffd221234ea520b9b5d545d9fff65eba497a0ce1b852334d293770d7ee02d

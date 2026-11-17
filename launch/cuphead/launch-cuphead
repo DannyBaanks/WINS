@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WINS Steam compatibility tool launcher: Cuphead (AppID 268980).
+# WINS Steam compatibility tool launcher: Cuphead (AppID 268910).
 #
 # Runs the installed 64-bit Cuphead.exe under the WINS Win64 loader inside
 # bubblewrap: no Proton and no Wine. The installed game stays read-only. WINS
@@ -15,7 +15,7 @@
 set -euo pipefail
 umask 077
 
-APP_ID=268980
+APP_ID=268910
 HOST_HOME="${HOME:?HOME is not set}"
 STEAM_ROOT="${WINS_STEAM_ROOT:-$HOST_HOME/.local/share/Steam}"
 GAME_ROOT="$STEAM_ROOT/steamapps/common/Cuphead"
