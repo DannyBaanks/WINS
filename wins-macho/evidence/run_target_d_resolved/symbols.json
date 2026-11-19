@@ -1,0 +1,5 @@
+[
+  {"symbol": "dyld_stub_binder", "requested_by": "./fixtures/target_d_boundary", "provider": "/usr/lib/libSystem.B.dylib", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "runtime:trap", "address": "0x1224770"},
+  {"symbol": "_printf", "requested_by": "./fixtures/target_d_boundary", "provider": "/usr/lib/libSystem.B.dylib", "status": "NATIVE_MAPPING", "linux_equiv": "libc:printf", "address": "0x7da08a260100"},
+  {"symbol": "_mach_absolute_time", "requested_by": "./fixtures/target_d_boundary", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "libc:clock_gettime(CLOCK_MONOTONIC)", "address": "0x12275c0"}
+]

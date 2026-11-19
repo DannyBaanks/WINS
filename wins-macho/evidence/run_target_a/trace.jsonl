@@ -1,0 +1,8 @@
+{"ts_ns": 63128272688576, "rel_us": 2949, "event": "START", "detail": "target=./fixtures/target_a_nostdlib run_id=run_target_a"}
+{"ts_ns": 63128273731450, "rel_us": 3992, "event": "IMAGE_MAPPED", "detail": "base=0x746378e24000 slide=127966283710464 segs=5"}
+{"ts_ns": 63128273760314, "rel_us": 4021, "event": "ENTRYPOINT_RESOLVED", "detail": "entryoff=0x490 entry_address=0x746378e24490"}
+{"ts_ns": 63128273850414, "rel_us": 4111, "event": "DYLIB_GRAPH_READY", "detail": "images=1 deps=1"}
+{"ts_ns": 63128273958928, "rel_us": 4220, "event": "FIXUPS_APPLIED", "detail": "images=1"}
+{"ts_ns": 63128273992120, "rel_us": 4253, "event": "IMPORTS_RESOLVED", "detail": "symbols=1"}
+{"ts_ns": 63128274109792, "rel_us": 4371, "event": "TRANSFER_CONTROL", "detail": "rip=0x746378e24490 seccomp_trap=true"}
+{"ts_ns": 63128274136502, "rel_us": 4397, "event": "EXIT", "detail": "return_code=43"}

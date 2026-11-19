@@ -1,0 +1,4 @@
+{"ts_ns": 70324181354118, "rel_us": 5031, "event": "START", "detail": "target=/tmp/brew-probe/tree/2.3.2/bin/tree run_id=run_brew_tree"}
+{"ts_ns": 70324183725938, "rel_us": 7403, "event": "IMAGE_MAPPED", "detail": "base=0x776cdf96a000 slide=131305196396544 segs=5"}
+{"ts_ns": 70324183760453, "rel_us": 7437, "event": "ENTRYPOINT_RESOLVED", "detail": "entryoff=0x5b64 entry_address=0x776cdf96fb64"}
+{"ts_ns": 70324184321531, "rel_us": 7998, "event": "DYLIB_GRAPH_READY", "detail": "images=1 deps=1"}

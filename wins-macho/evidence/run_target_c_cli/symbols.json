@@ -1,0 +1,10 @@
+[
+  {"symbol": "dyld_stub_binder", "requested_by": "./fixtures/target_c_cli", "provider": "/usr/lib/libSystem.B.dylib", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "runtime:trap", "address": "0x1219b50"},
+  {"symbol": "___stack_chk_guard", "requested_by": "./fixtures/target_c_cli", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "data:stack_chk_guard", "address": "0x12e4030"},
+  {"symbol": "___stack_chk_fail", "requested_by": "./fixtures/target_c_cli", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libc:abort", "address": "0x121ae40"},
+  {"symbol": "_clock_gettime", "requested_by": "./fixtures/target_c_cli", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libc:clock_gettime(mapped_clk_id)", "address": "0x121acf0"},
+  {"symbol": "_printf", "requested_by": "./fixtures/target_c_cli", "provider": "/usr/lib/libSystem.B.dylib", "status": "NATIVE_MAPPING", "linux_equiv": "libc:printf", "address": "0x709b70860100"},
+  {"symbol": "_getpid", "requested_by": "./fixtures/target_c_cli", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libc:getpid", "address": "0x121c280"},
+  {"symbol": "_pthread_create", "requested_by": "./fixtures/target_c_cli", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libpthread:pthread_create", "address": "0x121ab60"},
+  {"symbol": "_pthread_join", "requested_by": "./fixtures/target_c_cli", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libpthread:pthread_join", "address": "0x121aaa0"}
+]

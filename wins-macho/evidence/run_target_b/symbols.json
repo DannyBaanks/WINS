@@ -1,0 +1,10 @@
+[
+  {"symbol": "dyld_stub_binder", "requested_by": "./fixtures/target_b_main", "provider": "/usr/lib/libSystem.B.dylib", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "runtime:trap", "address": "0x1219b50"},
+  {"symbol": "_helper_add", "requested_by": "./fixtures/target_b_main", "provider": "./fixtures/libhelper.dylib", "status": "NATIVE_MAPPING", "linux_equiv": "macho:export_trie", "address": "0x7a4f3433a460"},
+  {"symbol": "_getenv", "requested_by": "./fixtures/target_b_main", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libc:getenv", "address": "0x121c500"},
+  {"symbol": "_printf", "requested_by": "./fixtures/target_b_main", "provider": "/usr/lib/libSystem.B.dylib", "status": "NATIVE_MAPPING", "linux_equiv": "libc:printf", "address": "0x7a4f34060100"},
+  {"symbol": "_write", "requested_by": "./fixtures/target_b_main", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libc:write", "address": "0x121c9d0"},
+  {"symbol": "_free", "requested_by": "./fixtures/target_b_main", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libc:free", "address": "0x121c5a0"},
+  {"symbol": "_malloc", "requested_by": "./fixtures/target_b_main", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libc:malloc", "address": "0x121c7c0"},
+  {"symbol": "dyld_stub_binder", "requested_by": "./fixtures/libhelper.dylib", "provider": "/usr/lib/libSystem.B.dylib", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "runtime:trap", "address": "0x1219b50"}
+]

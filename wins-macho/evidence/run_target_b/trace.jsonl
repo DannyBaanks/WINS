@@ -1,0 +1,9 @@
+{"ts_ns": 63135235356673, "rel_us": 3195, "event": "START", "detail": "target=./fixtures/target_b_main run_id=run_target_b"}
+{"ts_ns": 63135236404545, "rel_us": 4243, "event": "IMAGE_MAPPED", "detail": "base=0x7a4f3433e000 slide=134476301852672 segs=5"}
+{"ts_ns": 63135236439862, "rel_us": 4279, "event": "ENTRYPOINT_RESOLVED", "detail": "entryoff=0x620 entry_address=0x7a4f3433e620"}
+{"ts_ns": 63135237159477, "rel_us": 4998, "event": "DYLIB_GRAPH_READY", "detail": "images=2 deps=3"}
+{"ts_ns": 63135237380573, "rel_us": 5219, "event": "FIXUPS_APPLIED", "detail": "images=2"}
+{"ts_ns": 63135237415849, "rel_us": 5255, "event": "IMPORTS_RESOLVED", "detail": "symbols=8"}
+{"ts_ns": 63135237538711, "rel_us": 5377, "event": "TRANSFER_CONTROL", "detail": "rip=0x7a4f3433e620 seccomp_trap=true"}
+{"ts_ns": 63135237573216, "rel_us": 5412, "event": "FIRST_EXTERNAL_CALL", "detail": "symbol=_write"}
+{"ts_ns": 63135237680578, "rel_us": 5519, "event": "EXIT", "detail": "return_code=26"}

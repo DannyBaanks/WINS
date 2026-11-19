@@ -1,0 +1,12 @@
+{
+  "signal": 11,
+  "si_addr": "0x0",
+  "rip": "0x77285f59b258",
+  "rsp": "0x7fffd11c83d8",
+  "rax": "0x0",
+  "rdi": "0x0",
+  "rsi": "0x25",
+  "rdx": "0x7fffd11c8960",
+  "last_event": "SIGNAL",
+  "last_shim": "_strlen"
+}

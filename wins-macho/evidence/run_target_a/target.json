@@ -1,0 +1,6 @@
+{
+  "path_local": "./fixtures/target_a_nostdlib",
+  "sha256": "1af2e11607dc524d5922034ddca80654f29ddd44d002338069faa0b2e9542b90",
+  "size": 12900,
+  "arch": "x86_64"
+}

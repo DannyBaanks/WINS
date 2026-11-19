@@ -1,0 +1,3 @@
+[
+  {"requested": "/usr/lib/libSystem.B.dylib", "resolved": "darwin-shim://libSystem.B.dylib", "kind": "DARWIN_SHIM"}
+]

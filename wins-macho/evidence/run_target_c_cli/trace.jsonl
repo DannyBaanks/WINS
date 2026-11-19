@@ -1,0 +1,9 @@
+{"ts_ns": 63152614435315, "rel_us": 3258, "event": "START", "detail": "target=./fixtures/target_c_cli run_id=run_target_c_cli"}
+{"ts_ns": 63152614750849, "rel_us": 3573, "event": "IMAGE_MAPPED", "detail": "base=0x709b70cc5000 slide=123808619712512 segs=5"}
+{"ts_ns": 63152614777219, "rel_us": 3600, "event": "ENTRYPOINT_RESOLVED", "detail": "entryoff=0x5d0 entry_address=0x709b70cc55d0"}
+{"ts_ns": 63152614863381, "rel_us": 3686, "event": "DYLIB_GRAPH_READY", "detail": "images=1 deps=1"}
+{"ts_ns": 63152615038951, "rel_us": 3862, "event": "FIXUPS_APPLIED", "detail": "images=1"}
+{"ts_ns": 63152615071623, "rel_us": 3894, "event": "IMPORTS_RESOLVED", "detail": "symbols=8"}
+{"ts_ns": 63152615149600, "rel_us": 3972, "event": "TRANSFER_CONTROL", "detail": "rip=0x709b70cc55d0 seccomp_trap=true"}
+{"ts_ns": 63152615176390, "rel_us": 3999, "event": "FIRST_EXTERNAL_CALL", "detail": "symbol=_clock_gettime"}
+{"ts_ns": 63152615410691, "rel_us": 4233, "event": "EXIT", "detail": "return_code=0"}
