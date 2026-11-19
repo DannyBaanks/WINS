@@ -12,8 +12,8 @@ managed .NET program, or a Python bundle, wrapped in a Windows installer. For th
 runs the real program on its native Linux runtime. For genuinely native Win32 code (C++ against `kernel32`, `user32`,
 Direct3D...) WINS does not pretend: it measures how far away a Linux version is, and either builds fuzz-verified Linux
 replacements for the Windows APIs the program calls, one function at a time, or, for 32-bit programs, runs the program
-itself under its own PE loader that answers those APIs natively. Fallout: New Vegas is the worked example of the second
-route.
+itself under its own PE loaders (32-bit and 64-bit) that answer those APIs natively. Fallout: New Vegas (i386) and
+Cuphead (x86-64, Unity) are the worked examples of the second route.
 
 ---
 
@@ -30,11 +30,13 @@ demonstrated and what has **not** — a launcher existing is not the same as the
 | **ShareX 22.3.0** | .NET 10 + Avalonia UI | Installed in `~/.local/share/sharex-desktop` (491 MB), launcher + desktop entry | Runtime correctly identified; Avalonia X11 assemblies present | A successful launch: it ships a Windows-targeted host, so this is not proven |
 | **Notepad++ 8.9.9** | Native Win32 (C++, Scintilla) | Installed via the transpiler path (28 MB); POSIX shims for part of its API surface | Classified, API surface harvested | **The desktop entry is broken** (it points at a deleted temp directory) and a working run is not demonstrated |
 | **Fallout: New Vegas** (Steam build) | Native Win32 (i386 C++; Direct3D 9, DirectSound, DirectInput, DirectShow, Bink) | Runs under the WINS i386 PE loader through a Steam compatibility tool (`launch/falloutnv/`): no Proton, no Wine. The installed game is read-only to it; WINS keeps its own profile and saves | Menu, New Game, character creation, Continue from a save, the Mojave exterior, Pip-Boy UI/controls, console teleporting, underwater/water rendering (`SetClipPlane` implemented), effects, Pip-Boy sounds, voices, music and the intro video, rendered on the host GPU (the NVIDIA one on a hybrid laptop). Observed in hand play-throughs on one machine (`2026-11-15`) | Long sessions, most quests, combat-heavy scenes, surface reflection checks across all water cells, controllers (`wins-xinput` unexercised live), live Bink audio run, mods and script extenders. One machine only: Ubuntu 24.04, hybrid AMD/NVIDIA laptop |
+| **Cuphead** (Steam build) | Native Win64 Unity 2017.4 game (Mono scripting; Direct3D 11, DirectSound via FMOD, XInput via Rewired, Steamworks.NET) | Runs under the WINS x86-64 PE loader (`winrun64`) through a Steam compatibility tool (`launch/cuphead/`): no Proton, no Wine. Direct3D 11 is translated to OpenGL; the game files are mounted read-only and pinned by SHA-256; WINS keeps its own profile and saves | Title screen, main menu, slot select, saves written, the intro cutscene and storybook, Elder Kettle's tutorial dialogue with its text, a level played to the death card, game audio through PipeWire, keyboard input, and `SteamAPI_Init` against the live Steam client (`[WINS:SteamBridge64] connected to the real host SteamClient017`). Observed in a hand play-through on one machine (`2026-11-18`): cutscenes without stutter, dialogue text visible | Achievement/stat round trips, Steam Cloud, the Steam overlay, controllers live, long sessions, most bosses, the DLC. One machine only: Ubuntu 24.04, NVIDIA, GNOME on X11 |
 | WinMerge, Greenshot | Native Win32 / legacy .NET Framework + WinForms | Classified only | Correct triage | Nothing runs: they are routed to the transpiler recipe, which only analyses and harvests (the port is **NOT_DEMONSTRATED**) |
 
 **Honest scope:** WINS reliably ports *runtime-wrapped* software (Electron, NW.js, modern .NET). It does **not** yet
-run arbitrary native Win32 applications: its own loader runs one large native 32-bit game, after the Windows APIs that
-game needs were implemented one by one, and every other native program is a project of its own. `libs/GAPS.md`
+run arbitrary native Win32 applications: its own loaders run one large native 32-bit game and one native 64-bit Unity
+game, after the Windows APIs each game needs were implemented one by one, and every other native program is a project
+of its own. `libs/GAPS.md`
 measures how far each one is. See *How far can it go?* below for a worked example with a real, huge one.
 
 ---
@@ -106,6 +108,7 @@ What each one does **not** do is part of its contract:
 | Loader | Runs | State |
 |---|---|---|
 | `winrun32` | 32-bit (i386) PE32 | Runs Fallout: New Vegas (see the table above). `--check` and `--imports` resolve a program's imports without running it; `--libs` prints the library registry |
+| `winrun64` | x86-64 PE32+ with a window, Direct3D 11 (on OpenGL), DirectSound, XInput, Steam | Runs Cuphead (see the table above). Threads, Win32 sync objects (events, semaphores, waitable timers, IOCP, APCs) and a Win64↔Linux Steamworks bridge (MSVC x64 ↔ SysV ABI: hidden result pointers, XMM float arguments, callback struct packing) to the host's `steamclient.so` |
 | `winrun` | x86-64 console PE32+ | Maps the image, resolves imports and **refuses to run if any is missing**; execution requires the boxed launcher. No program is claimed to run on it here |
 | `winrun_gui` | x86-64 with a window | Same, with the window support. `--check` measures; no program is claimed to run on it here |
 
@@ -124,6 +127,20 @@ launch/falloutnv/install.sh /tmp/wins-build     # then restart Steam and force t
 ```
 
 Your Steam saves are not mounted or touched; WINS keeps its own profile in `~/.local/share/wins/falloutnv/profile`.
+
+Cuphead (Steam build) the same way; `tools/build_all.sh` does not build `winrun64` yet, so it is built explicitly. The
+details (pinned game hashes, what the sandbox exposes) are in [`launch/cuphead/README.txt`](./launch/cuphead/README.txt):
+
+```bash
+mkdir -p /tmp/wins-cuphead-build                # a new, empty directory
+(cd native && zig build-exe winrun64.zig -O ReleaseSafe -lc -lX11 -femit-bin=/tmp/wins-cuphead-build/winrun64)
+launch/cuphead/install.sh /tmp/wins-cuphead-build   # then restart Steam and force the "WINS (Cuphead)" tool
+```
+
+The installed game is mounted read-only and its binaries are checked against pinned SHA-256s (a Steam update that
+changes them is refused). Saves live in `~/.local/share/wins/cuphead/profile`; each run's log, including Unity's own
+`unity.log`, goes to `~/.local/state/wins/cuphead/logs/`. Diagnostics, all off by default: `WINS_D3D11_CAPTURE=<dir>`
+(frame dumps), `WINS_D3D11_DUMP_DIR=<dir>` (translated shaders), `WINS_D3D11_TRACE_PROG=<n>`, `WINS_TRACE=1`.
 
 ---
 
@@ -152,6 +169,7 @@ WINS was pointed at the full installer (5.76 GB). It deposits every file without
   - **fuzzer**: [./core/fuzzer/README.md](./core/fuzzer/README.md) - Ultra-high-throughput Zig differential fuzzing engine (>7,000,000 ops/sec) for proving API equivalence.
 - **libs**: [./libs/README.md](./libs/README.md) - The Windows DLLs WINS stands in for, as versioned libraries (`wins-d3d9`, `wins-dsound`, ...), what has been run through each, and the generated gap report of the DLLs and imports WINS still lacks compared with Windows.
 - **launch**: [./launch/falloutnv/README.txt](./launch/falloutnv/README.txt) - The Steam compatibility tool for Fallout: New Vegas (launcher, installer): the Play button runs the game under the WINS i386 loader.
+  - [./launch/cuphead/README.txt](./launch/cuphead/README.txt) - The Steam compatibility tool for Cuphead: the Play button runs the Win64 game under `winrun64`.
 
 ---
 
@@ -213,6 +231,7 @@ when it is missing.
 * Linux x86_64 (tested on Ubuntu 24.04 LTS), `python3`, `7zz` (or `7z`), `unzip`, `curl`.
 * Electron apps: `bunx` or `npx` (ASAR unpacking). Native tools: Zig 0.16 and `bubblewrap`.
 * Native 32-bit programs (Fallout: New Vegas): the i386 libraries named in `launch/falloutnv/README.txt`.
+* Native 64-bit programs (Cuphead): `libX11`, OpenGL (GLX) and PulseAudio/PipeWire; see `launch/cuphead/README.txt`.
 
 ### Install
 ```bash
@@ -257,7 +276,7 @@ Example `probe` output:
 | **Electron** | Working: ASAR de-layering, platform-check patching, `.node` healing with Linux prebuilds, runtime re-binding. Demonstrated on Notion |
 | **NW.js (RPG Maker MZ games)** | No `wins` recipe yet: Look Outside was packaged as an AppImage separately (its own `GUIA.md` lives next to the AppImage in `~/Documentos/Look Outside Linux/` on the author's machine). Turning that into a recipe is the obvious next step |
 | **.NET (modern) / Avalonia** | Extraction and `runtimeconfig.json` adaptation implemented; a successful launch of ShareX is not demonstrated |
-| **Native Win32 PE** | i386: the WINS PE loader (`winrun32`) runs Fallout: New Vegas. x86-64: `winrun` / `winrun_gui` resolve imports and refuse anything incomplete; no program is claimed to run. Everything else: triage and API harvest (`recipe_transpiler`, analysis only; the port is NOT_DEMONSTRATED) |
+| **Native Win32 PE** | i386: the WINS PE loader (`winrun32`) runs Fallout: New Vegas. x86-64: `winrun64` runs Cuphead; `winrun` / `winrun_gui` resolve imports and refuse anything incomplete, with no program claimed to run on them. Everything else: triage and API harvest (`recipe_transpiler`, analysis only; the port is NOT_DEMONSTRATED) |
 | **PyInstaller** | Recipe is a stub (`transmute` returns failure) |
 | **JVM / Launch4j** | Planned |
 
@@ -301,8 +320,9 @@ fighting a Wine prefix, an agent can decide, port, or report why not — with ev
 
 A PE import inventory, a compiled shim, or a finite fuzz run is not proof that a Windows program was ported or behaves
 equivalently. No `winlux*` replacement has been compared with a real Windows kernel. Games and apps are verified only
-as far as the table above says. Fallout: New Vegas was checked by hand on one machine, not by an automated test; the
-gap report measures import resolution, not behaviour.
+as far as the table above says. Fallout: New Vegas and Cuphead were checked by hand on one machine, not by an automated
+end-to-end test (the loaders' unit and regression tests cover pieces such as staging texture uploads and sync objects);
+the gap report measures import resolution, not behaviour.
 
 ---
 
