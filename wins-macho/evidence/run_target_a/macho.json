@@ -1,0 +1,10 @@
+{
+  "filetype": 2,
+  "ncmds": 16,
+  "sizeofcmds": 1128,
+  "flags": "0x300085",
+  "entryoff": "0x490",
+  "entry_address": "0x746378e24490",
+  "image_base": "0x746378e24000",
+  "slide": 127966283710464
+}

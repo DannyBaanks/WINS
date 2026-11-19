@@ -1,0 +1,10 @@
+[
+  {"symbol": "_objc_msgSend", "requested_by": "./fixtures/target_f_objc", "provider": "flat_namespace", "status": "REIMPLEMENTED", "linux_equiv": "reimplemented:libobjc_msgSend_x86_64", "address": "0x1227780"},
+  {"symbol": "_objc_retain", "requested_by": "./fixtures/target_f_objc", "provider": "flat_namespace", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "reimplemented:objc_retain", "address": "0x1226770"},
+  {"symbol": "dyld_stub_binder", "requested_by": "./fixtures/target_f_objc", "provider": "/usr/lib/libSystem.B.dylib", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "runtime:trap", "address": "0x12250b0"},
+  {"symbol": "__objc_empty_cache", "requested_by": "./fixtures/target_f_objc", "provider": "flat_namespace", "status": "REIMPLEMENTED", "linux_equiv": "data:objc_empty_cache", "address": "0x1318010"},
+  {"symbol": "__objc_empty_cache", "requested_by": "./fixtures/target_f_objc", "provider": "flat_namespace", "status": "REIMPLEMENTED", "linux_equiv": "data:objc_empty_cache", "address": "0x1318010"},
+  {"symbol": "_objc_alloc", "requested_by": "./fixtures/target_f_objc", "provider": "flat_namespace", "status": "REIMPLEMENTED", "linux_equiv": "reimplemented:objc_alloc", "address": "0x1226c10"},
+  {"symbol": "_objc_storeStrong", "requested_by": "./fixtures/target_f_objc", "provider": "flat_namespace", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "reimplemented:objc_storeStrong", "address": "0x1226000"},
+  {"symbol": "_printf", "requested_by": "./fixtures/target_f_objc", "provider": "/usr/lib/libSystem.B.dylib", "status": "NATIVE_MAPPING", "linux_equiv": "libc:printf", "address": "0x73691cc60100"}
+]

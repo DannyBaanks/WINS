@@ -1,0 +1,17 @@
+[
+  {"symbol": "dyld_stub_binder", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "runtime:trap", "address": "0x1224770"},
+  {"symbol": "___stack_chk_guard", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "data:stack_chk_guard", "address": "0x12f2030"},
+  {"symbol": "__NSGetExecutablePath", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "runtime:target_path", "address": "0x1226220"},
+  {"symbol": "_dlopen", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "dyld:shim_dlopen", "address": "0x1225d10"},
+  {"symbol": "_dlsym", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "dyld:shim_dlsym", "address": "0x12256c0"},
+  {"symbol": "___stack_chk_fail", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libc:abort", "address": "0x1227e10"},
+  {"symbol": "_arc4random", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "linux:getrandom", "address": "0x1226bb0"},
+  {"symbol": "_printf", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "NATIVE_MAPPING", "linux_equiv": "libc:printf", "address": "0x737cd2860100"},
+  {"symbol": "_sysctlbyname", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "reimplemented:hw.ncpu/pagesize/memsize", "address": "0x1226530"},
+  {"symbol": "_memset", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "NATIVE_MAPPING", "linux_equiv": "libc:memset", "address": "0x128ab20"},
+  {"symbol": "_mach_absolute_time", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "libc:clock_gettime(CLOCK_MONOTONIC)", "address": "0x12275c0"},
+  {"symbol": "_mach_timebase_info", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "reimplemented:1/1_ns", "address": "0x1227510"},
+  {"symbol": "_stat", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "REIMPLEMENTED", "linux_equiv": "linux:stat->DarwinStat64", "address": "0x1227310"},
+  {"symbol": "_pthread_mutex_lock", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libpthread:pthread_mutex_lock", "address": "0x1227930"},
+  {"symbol": "_pthread_mutex_unlock", "requested_by": "./fixtures/target_e_darwin_apis", "provider": "/usr/lib/libSystem.B.dylib", "status": "THIN_SHIM", "linux_equiv": "libpthread:pthread_mutex_unlock", "address": "0x1227890"}
+]

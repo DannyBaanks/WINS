@@ -1,0 +1,4 @@
+{"ts_ns": 63197604950182, "rel_us": 2828, "event": "START", "detail": "target=./fixtures/target_d_boundary run_id=run_target_d_boundary"}
+{"ts_ns": 63197605268581, "rel_us": 3146, "event": "IMAGE_MAPPED", "detail": "base=0x7873fa6e1000 slide=132435223121920 segs=5"}
+{"ts_ns": 63197605294059, "rel_us": 3172, "event": "ENTRYPOINT_RESOLVED", "detail": "entryoff=0x5d0 entry_address=0x7873fa6e15d0"}
+{"ts_ns": 63197605375693, "rel_us": 3253, "event": "DYLIB_GRAPH_READY", "detail": "images=1 deps=1"}

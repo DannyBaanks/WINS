@@ -1,0 +1,7 @@
+[
+  {"segment": "__PAGEZERO", "requested_vmaddr": "0x0", "actual_address": "0x0", "slide": 0, "fileoff": 0, "filesize": 0, "vmsize": 4294967296, "initprot": 0, "skipped_pagezero": true, "final_prot_applied": true},
+  {"segment": "__TEXT", "requested_vmaddr": "0x100000000", "actual_address": "0x7873fa6e1000", "slide": 132435223121920, "fileoff": 0, "filesize": 1688, "vmsize": 1688, "initprot": 5, "skipped_pagezero": false, "final_prot_applied": false},
+  {"segment": "__DATA_CONST", "requested_vmaddr": "0x100001000", "actual_address": "0x7873fa6e2000", "slide": 132435223121920, "fileoff": 4096, "filesize": 8, "vmsize": 8, "initprot": 3, "skipped_pagezero": false, "final_prot_applied": false},
+  {"segment": "__DATA", "requested_vmaddr": "0x100002000", "actual_address": "0x7873fa6e3000", "slide": 132435223121920, "fileoff": 8192, "filesize": 24, "vmsize": 24, "initprot": 3, "skipped_pagezero": false, "final_prot_applied": false},
+  {"segment": "__LINKEDIT", "requested_vmaddr": "0x100003000", "actual_address": "0x7873fa6e4000", "slide": 132435223121920, "fileoff": 12288, "filesize": 720, "vmsize": 4096, "initprot": 1, "skipped_pagezero": false, "final_prot_applied": false}
+]

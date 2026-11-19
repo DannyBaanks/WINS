@@ -1,0 +1,12 @@
+{
+  "signal": 6,
+  "si_addr": "0x3e80026289d",
+  "rip": "0x7f7228c9ebec",
+  "rsp": "0x7ffc5e610cf0",
+  "rax": "0x0",
+  "rdi": "0x26289d",
+  "rsi": "0x26289d",
+  "rdx": "0x6",
+  "last_event": "SIGNAL",
+  "last_shim": "_objc_msgSend"
+}

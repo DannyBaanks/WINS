@@ -1,0 +1,3 @@
+[
+  {"symbol": "dyld_stub_binder", "requested_by": "./fixtures/target_a_nostdlib", "provider": "/usr/lib/libSystem.B.dylib", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "runtime:trap", "address": "0x1219b50"}
+]
