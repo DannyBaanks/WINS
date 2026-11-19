@@ -178,6 +178,11 @@ cleanup() {
     trap - EXIT INT TERM HUP
     stop_loader
     stop_tee
+    # Keep Unity's own log next to the loader log (its last 8 MiB): it is the
+    # only record of in-game warnings once the workspace is removed.
+    if [[ -n "${LOG:-}" && -f "$RUN_ROOT/unity.log" && ! -L "$RUN_ROOT/unity.log" ]]; then
+        tail -c 8388608 -- "$RUN_ROOT/unity.log" > "${LOG%.log}.unity.log" 2>/dev/null || true
+    fi
     if [[ "$KEEP_RUN_DIR" == "1" ]]; then
         printf '[WINS Steam] Kept temporary game workspace: %s\n' "$RUN_ROOT" >&2
     elif [[ "$RUN_ROOT" == "/tmp/wins-cuphead-${USER_ID}."* && -d "$RUN_ROOT" && ! -L "$RUN_ROOT" ]]; then

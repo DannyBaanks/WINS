@@ -106,6 +106,7 @@ const Gl = struct {
     glPolygonMode: *const fn (GLenum, GLenum) callconv(.c) void,
     glPixelStorei: *const fn (GLenum, GLint) callconv(.c) void,
     glReadPixels: *const fn (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, ?*anyopaque) callconv(.c) void,
+    glGetTexImage: *const fn (GLenum, GLint, GLenum, GLenum, ?*anyopaque) callconv(.c) void,
     glFinish: *const fn () callconv(.c) void,
     glFlush: *const fn () callconv(.c) void,
 
@@ -828,8 +829,156 @@ fn getOrLinkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
 
     const vs_tex = alloc.dupe(shader.TexBinding, tv.tex_bindings) catch &.{};
     const res: LinkedProg = .{ .prog = prog, .ps_tex_bindings = ps_tex, .vs_tex_bindings = vs_tex };
+    dumpProgram(prog, vs, ps, tv.glsl);
     g_progs.put(alloc, key, res) catch {};
     return res;
+}
+
+extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern fn fwrite(ptr: [*]const u8, size: usize, n: usize, f: *anyopaque) usize;
+extern fn fclose(f: *anyopaque) c_int;
+
+fn dumpFile(dir: []const u8, prog: GLuint, suffix: []const u8, data: []const u8) void {
+    var path_buf: [1024]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/p{d:0>4}_{s}", .{ dir, prog, suffix }) catch return;
+    const f = fopen(path.ptr, "wb") orelse return;
+    _ = fwrite(data.ptr, 1, data.len, f);
+    _ = fclose(f);
+}
+
+/// WINS_D3D11_DUMP_DIR=<dir>: write each newly linked program's DXBC and GLSL
+/// (p<prog>_{vs,ps}.{dxbc,glsl}) for offline inspection. Off by default.
+fn dumpProgram(prog: GLuint, vs: *Shader, ps: ?*Shader, vs_glsl: []const u8) void {
+    const dir_z = getenv("WINS_D3D11_DUMP_DIR") orelse return;
+    const dir = std.mem.span(dir_z);
+    dumpFile(dir, prog, "vs.dxbc", vs.bytecode);
+    dumpFile(dir, prog, "vs.glsl", vs_glsl);
+    const p = ps orelse return;
+    dumpFile(dir, prog, "ps.dxbc", p.bytecode);
+    var tv = shader.translateWithVaryings(alloc, vs.bytecode, null) catch return;
+    defer tv.deinit(alloc);
+    var tp = shader.translateWithVaryings(alloc, p.bytecode, tv.outputs) catch return;
+    defer tp.deinit(alloc);
+    dumpFile(dir, prog, "ps.glsl", tp.glsl);
+}
+
+fn cbVec(cb: ?*Buffer, off_regs: u32, reg: u32) [4]f32 {
+    const b = cb orelse return .{ -1, -1, -1, -1 };
+    const sh = b.shadow orelse return .{ -9, -9, -9, -9 };
+    const at = (@as(usize, off_regs) + reg) * 16;
+    if (at + 16 > sh.len) return .{ -7, -7, -7, -7 };
+    var v: [4]f32 = undefined;
+    @memcpy(std.mem.asBytes(&v), sh[at..][0..16]);
+    return v;
+}
+
+/// WINS_D3D11_TRACE_PROG=<gl program ids, comma separated>: for the first 4 draws
+/// of each listed program (and every 500th after) print its textures, depth
+/// state, vertex layout and first vertices, and the constant registers named by
+/// WINS_D3D11_TRACE_REGS="v0:22,v1:6,p0:26" (stage, slot, register). With
+/// WINS_D3D11_DUMP_DIR set, A8 atlases are also read back as PGM. Off by default.
+fn traceProgConstants(s: *const DrawState, prog: GLuint, fw: u32, fh: u32) void {
+    const C = struct { var init = false; var env: ?[*:0]const u8 = null; };
+    if (!C.init) {
+        C.init = true;
+        C.env = getenv("WINS_D3D11_TRACE_PROG");
+    }
+    const want_z = C.env orelse return;
+    var wit = std.mem.tokenizeScalar(u8, std.mem.span(want_z), ',');
+    const slot_idx: usize = blk: {
+        var i: usize = 0;
+        while (wit.next()) |w| : (i += 1) {
+            if (i >= 8) return;
+            if ((std.fmt.parseInt(GLuint, w, 10) catch continue) == prog) break :blk i;
+        }
+        return;
+    };
+    const S = struct { var n: [8]u32 = .{0} ** 8; };
+    S.n[slot_idx] += 1;
+    const n = S.n[slot_idx];
+    if (n > 4 and n % 500 != 0) return;
+    for (0..3) |i| {
+        const v = s.ps_srv[i] orelse continue;
+        const t = v.tex orelse continue;
+        std.debug.print("[WINS:TRACEPROG]   ps_srv{d}: gl={d} {d}x{d} mips={d} tex_fmt={d} view_fmt={d} usage={d}\n", .{ i, t.gl_id, t.width, t.height, t.mip_levels, t.dxgi_fmt, v.dxgi_fmt, t.usage });
+        // A8 atlases: read mip 0 back (red channel holds alpha) as a PGM.
+        if (i == 0 and t.dxgi_fmt == 65 and t.target == 0x0DE1 and (n == 1 or n == 500)) {
+            if (getenv("WINS_D3D11_DUMP_DIR")) |dz| {
+                const px = alloc.alloc(u8, @as(usize, t.width) * t.height) catch continue;
+                defer alloc.free(px);
+                gl.glBindTexture(0x0DE1, t.gl_id);
+                gl.glGetTexImage(0x0DE1, 0, 0x1903, 0x1401, px.ptr);
+                gl.glBindTexture(0x0DE1, 0);
+                var nz: usize = 0;
+                for (px) |b| nz += @intFromBool(b != 0);
+                std.debug.print("[WINS:TRACEPROG]   atlas gl={d}: {d}/{d} nonzero texels\n", .{ t.gl_id, nz, px.len });
+                var hdr_buf: [64]u8 = undefined;
+                const hdr = std.fmt.bufPrint(&hdr_buf, "P5\n{d} {d}\n255\n", .{ t.width, t.height }) catch continue;
+                var name_buf: [64]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "atlas{d}_n{d}.pgm", .{ t.gl_id, n }) catch continue;
+                const all = alloc.alloc(u8, hdr.len + px.len) catch continue;
+                defer alloc.free(all);
+                @memcpy(all[0..hdr.len], hdr);
+                @memcpy(all[hdr.len..], px);
+                dumpFile(std.mem.span(dz), prog, name, all);
+            }
+        }
+    }
+    if (s.depth_stencil) |d| std.debug.print("[WINS:TRACEPROG]   depth en={} write={} func=0x{x}\n", .{ d.depth_enable, d.depth_write, d.depth_func });
+    if (s.input_layout) |il| {
+        for (il.elems[0..il.count]) |el| {
+            std.debug.print("[WINS:TRACEPROG]   attr loc={d} slot={d} off={d} comps={d} gltype=0x{x} norm={} int={}\n", .{ el.location, el.slot, el.offset, el.components, el.gl_type, el.normalized, el.is_int });
+        }
+    }
+    if (s.vb[0]) |vb| if (vb.shadow) |sh| {
+        const stride = s.vb_stride[0];
+        const base = @as(usize, s.vb_offset[0]);
+        std.debug.print("[WINS:TRACEPROG]   vb0 stride={d} off={d} size={d}:", .{ stride, base, sh.len });
+        var k: usize = 0;
+        while (k < stride and base + k + 4 <= sh.len) : (k += 4) {
+            var f: f32 = undefined;
+            @memcpy(std.mem.asBytes(&f), sh[base + k ..][0..4]);
+            std.debug.print(" {d:.3}", .{f});
+        }
+        std.debug.print("\n", .{});
+        // Per-vertex summary for UI-layout buffers: pos.xy, color, uv0, uv1.
+        if (stride == 60) {
+            var nz: usize = 0;
+            var printed: usize = 0;
+            var vi: usize = 0;
+            while (base + (vi + 1) * stride <= sh.len) : (vi += 1) {
+                const at = base + vi * stride;
+                var f: [15]f32 = undefined;
+                @memcpy(std.mem.asBytes(&f), sh[at..][0..60]);
+                const col = std.mem.readInt(u32, sh[at + 24 ..][0..4], .little);
+                if (f[9] != 0 or f[10] != 0) {
+                    nz += 1;
+                    if (printed < 6) {
+                        printed += 1;
+                        std.debug.print("[WINS:TRACEPROG]     v{d}: pos=({d:.1},{d:.1},{d:.1}) col=0x{x:0>8} uv0=({d:.4},{d:.4}) uv1=({d:.4},{d:.4})\n", .{ vi, f[0], f[1], f[2], col, f[7], f[8], f[9], f[10] });
+                    }
+                }
+            }
+            std.debug.print("[WINS:TRACEPROG]     {d}/{d} vertices with nonzero uv1\n", .{ nz, vi });
+        }
+    } else std.debug.print("[WINS:TRACEPROG]   vb0 has no CPU shadow\n", .{});
+    const vp = if (s.num_viewports > 0) s.viewports[0] else std.mem.zeroes(@TypeOf(s.viewports[0]));
+    std.debug.print("[WINS:TRACEPROG] prog={d} n={d} f={d} fb={d}x{d} vp=({d:.1},{d:.1},{d:.1},{d:.1}) stencil={} ref={d}\n", .{
+        prog, n, g_present_count, fw, fh, vp.x, vp.y, vp.w, vp.h,
+        if (s.depth_stencil) |d| d.stencil_enable else false, s.stencil_ref,
+    });
+    const regs_z = getenv("WINS_D3D11_TRACE_REGS") orelse return;
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(regs_z), ',');
+    while (it.next()) |spec| {
+        if (spec.len < 4 or spec[2] != ':') continue;
+        const slot = std.fmt.parseInt(u32, spec[1..2], 10) catch continue;
+        const reg = std.fmt.parseInt(u32, spec[3..], 10) catch continue;
+        const v = if (spec[0] == 'v')
+            cbVec(s.vs_cb[slot], s.vs_cb_off[slot], reg)
+        else
+            cbVec(s.ps_cb[slot], s.ps_cb_off[slot], reg);
+        std.debug.print("    {s} = ({d:.4}, {d:.4}, {d:.4}, {d:.4})\n", .{ spec, v[0], v[1], v[2], v[3] });
+    }
 }
 
 fn attachTextureView(att: GLenum, v: *View) void {
@@ -1449,6 +1598,76 @@ fn readbackTextureToShadow(src: *Texture, mip: u32) void {
     gl.glBindFramebuffer(0x8CA8, 0);
 }
 
+/// Copy the (boxed) region of a staging texture's CPU shadow into subresource
+/// (dmip, dslice) of a GPU texture at (dx, dy, dz). Runs on the GL thread.
+/// Where a staging copy reads from the CPU shadow. `first` is the byte offset of
+/// the region's first row (in block rows for compressed formats), `rows` how many
+/// (block) rows to read, `row_bytes` the bytes per row actually copied, and
+/// `w`/`h` the region size in texels.
+pub const StagingRegion = struct { first: usize, rows: usize, row_bytes: usize, w: u32, h: u32 };
+
+/// Compute the source region of a CPU-staging -> GPU copy. `elem_bytes` is the
+/// bytes per texel (uncompressed) or per 4x4 block (compressed). Returns null when
+/// the region is empty or would read outside the shadow.
+pub fn stagingRegion(src_w: u32, src_h: u32, pitch: usize, shadow_len: usize, compressed: bool, elem_bytes: usize, has_box: bool, bx: [6]u32) ?StagingRegion {
+    if (pitch == 0 or elem_bytes == 0) return null;
+    const sx: u32 = if (has_box) @min(bx[0], src_w) else 0;
+    const sy: u32 = if (has_box) @min(bx[1], src_h) else 0;
+    const ex: u32 = if (has_box) @min(bx[3], src_w) else src_w;
+    const ey: u32 = if (has_box) @min(bx[4], src_h) else src_h;
+    if (ex <= sx or ey <= sy) return null;
+    const w = ex - sx;
+    const h = ey - sy;
+    const r: StagingRegion = if (compressed) .{
+        .first = @as(usize, sy / 4) * pitch + @as(usize, sx / 4) * elem_bytes,
+        .rows = (h + 3) / 4,
+        .row_bytes = @as(usize, (w + 3) / 4) * elem_bytes,
+        .w = w,
+        .h = h,
+    } else .{
+        .first = @as(usize, sy) * pitch + @as(usize, sx) * elem_bytes,
+        .rows = h,
+        .row_bytes = @as(usize, w) * elem_bytes,
+        .w = w,
+        .h = h,
+    };
+    if (!compressed and pitch % elem_bytes != 0) return null;
+    if (r.first + (r.rows - 1) * pitch + r.row_bytes > shadow_len) return null;
+    return r;
+}
+
+fn uploadFromStaging(j: *const CopyJob, shadow: []const u8, dmip: u32, dslice: u32) void {
+    const src = j.src;
+    const dst = j.dst;
+    const gf = dxgiToGlFormat(dst.dxgi_fmt);
+    if (gf.is_depth) return;
+    if (gf.compressed and dst.target == 0x8C1A) return; // compressed array uploads: no observed caller
+    const elem: usize = if (gf.compressed) gf.block_bytes else @max(1, gf.bpp);
+    const pitch: usize = src.row_pitch;
+    const r = stagingRegion(src.width, src.height, pitch, shadow.len, gf.compressed, elem, j.has_box, j.bx) orelse return;
+
+    const face_target: GLenum = if (dst.target == 0x8513) 0x8515 + @as(GLenum, @intCast(dslice % 6)) else dst.target;
+    gl.glBindTexture(dst.target, dst.gl_id);
+    defer gl.glBindTexture(dst.target, 0);
+
+    if (gf.compressed) {
+        const tmp = alloc.alloc(u8, r.row_bytes * r.rows) catch return;
+        defer alloc.free(tmp);
+        for (0..r.rows) |i| @memcpy(tmp[i * r.row_bytes ..][0..r.row_bytes], shadow[r.first + i * pitch ..][0..r.row_bytes]);
+        gl.glCompressedTexSubImage2D(face_target, @intCast(dmip), @intCast(j.dx), @intCast(j.dy), @intCast(r.w), @intCast(r.h), @intCast(gf.internal), @intCast(tmp.len), tmp.ptr);
+        return;
+    }
+
+    gl.glPixelStorei(0x0CF2, @intCast(pitch / elem)); // GL_UNPACK_ROW_LENGTH
+    defer gl.glPixelStorei(0x0CF2, 0);
+    const ptr: *const anyopaque = @ptrCast(shadow[r.first..].ptr);
+    if (dst.target == 0x8C1A) {
+        gl.glTexSubImage3D(0x8C1A, @intCast(dmip), @intCast(j.dx), @intCast(j.dy), @intCast(dslice + j.dz), @intCast(r.w), @intCast(r.h), 1, gf.format, gf.ty, ptr);
+    } else {
+        gl.glTexSubImage2D(face_target, @intCast(dmip), @intCast(j.dx), @intCast(j.dy), @intCast(r.w), @intCast(r.h), gf.format, gf.ty, ptr);
+    }
+}
+
 fn copyTexJob(raw: ?*anyopaque) void {
     const j: *CopyJob = @ptrCast(@alignCast(raw.?));
     const smips = @max(1, j.src.mip_levels);
@@ -1469,6 +1688,16 @@ fn copyTexJob(raw: ?*anyopaque) void {
                 gl.glReadPixels(0, 0, @intCast(j.src.width), @intCast(j.src.height), gf.format, gf.ty, sh.ptr);
                 gl.glBindFramebuffer(0x8CA8, 0);
             }
+        }
+        return;
+    }
+
+    // CPU staging -> GPU upload. Unity fills a STAGING texture through Map and
+    // then copies it into the DEFAULT texture (font atlases, runtime textures).
+    // A staging texture has no GL object, only its CPU shadow (mip 0, slice 0).
+    if (j.src.gl_id == 0 and j.dst.gl_id != 0) {
+        if (j.src.shadow) |shadow| {
+            if (j.src_sub == 0) uploadFromStaging(j, shadow, dmip, dslice);
         }
         return;
     }
@@ -1760,6 +1989,7 @@ fn drawJob(raw: ?*anyopaque) void {
             }
         }
     }
+    traceProgConstants(s, lp.prog, fb_dim.w, fb_dim.h);
     if (g_err_logged < 8) {
         const err = gl.glGetError();
         if (err != 0) {
@@ -1956,4 +2186,42 @@ fn presentJob(raw: ?*anyopaque) void {
 pub fn present(backbuffer: *Texture, hwnd: usize, sync_interval: u32) void {
     var j: PresentJob = .{ .backbuffer = backbuffer, .hwnd = hwnd, .sync_interval = sync_interval };
     run(&presentJob, &j);
+}
+
+test "staging upload covers the whole A8 atlas when no box is given" {
+    // Cuphead's 1024x1024 A8 font atlas: Map staging (pitch 1024), CopySubresourceRegion(box=null).
+    const r = stagingRegion(1024, 1024, 1024, 1024 * 1024, false, 1, false, .{0} ** 6).?;
+    try std.testing.expectEqual(@as(usize, 0), r.first);
+    try std.testing.expectEqual(@as(usize, 1024), r.rows);
+    try std.testing.expectEqual(@as(usize, 1024), r.row_bytes);
+    try std.testing.expectEqual(@as(u32, 1024), r.w);
+}
+
+test "staging upload of a boxed RGBA8 region starts at the box corner" {
+    // 64x32 RGBA8 staging, pitch 256 bytes; box x=[8,24) y=[4,10).
+    const r = stagingRegion(64, 32, 256, 256 * 32, false, 4, true, .{ 8, 4, 0, 24, 10, 1 }).?;
+    try std.testing.expectEqual(@as(usize, 4 * 256 + 8 * 4), r.first);
+    try std.testing.expectEqual(@as(usize, 6), r.rows);
+    try std.testing.expectEqual(@as(usize, 16 * 4), r.row_bytes);
+    try std.testing.expectEqual(@as(u32, 16), r.w);
+    try std.testing.expectEqual(@as(u32, 6), r.h);
+}
+
+test "staging upload of a compressed region counts 4x4 block rows" {
+    // 128x128 BC3 (16-byte blocks): pitch 32 blocks * 16 = 512; box x=[16,48) y=[8,24).
+    const r = stagingRegion(128, 128, 512, 512 * 32, true, 16, true, .{ 16, 8, 0, 48, 24, 1 }).?;
+    try std.testing.expectEqual(@as(usize, 2 * 512 + 4 * 16), r.first);
+    try std.testing.expectEqual(@as(usize, 4), r.rows);
+    try std.testing.expectEqual(@as(usize, 8 * 16), r.row_bytes);
+}
+
+test "staging upload rejects empty boxes and regions past the shadow" {
+    try std.testing.expect(stagingRegion(64, 64, 64, 64 * 64, false, 1, true, .{ 10, 0, 0, 10, 64, 1 }) == null);
+    // Negative control: a shadow one byte short of the last row must be refused.
+    try std.testing.expect(stagingRegion(64, 64, 64, 64 * 64 - 1, false, 1, false, .{0} ** 6) == null);
+    try std.testing.expect(stagingRegion(64, 64, 0, 64 * 64, false, 1, false, .{0} ** 6) == null);
+    // A box larger than the texture is clamped, not read out of bounds.
+    const r = stagingRegion(64, 64, 64, 64 * 64, false, 1, true, .{ 32, 32, 0, 999, 999, 1 }).?;
+    try std.testing.expectEqual(@as(u32, 32), r.w);
+    try std.testing.expectEqual(@as(u32, 32), r.h);
 }

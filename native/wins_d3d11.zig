@@ -26,6 +26,31 @@ fn trace(comptime fmt: []const u8, args: anytype) void {
     if (g_trace_on) std.debug.print("[WINS:D3D11] " ++ fmt ++ "\n", args);
 }
 
+/// WINS_D3D11_TRACE_FMT=<dxgi format>: log every create/update/map/copy that
+/// touches a texture of that format (diagnostic; off by default).
+fn traceFmtOn(fmt_id: u32) bool {
+    const C = struct { var init = false; var want: ?u32 = null; };
+    if (!C.init) {
+        C.init = true;
+        if (comptime @import("builtin").link_libc) {
+            if (std.c.getenv("WINS_D3D11_TRACE_FMT")) |z| C.want = std.fmt.parseInt(u32, std.mem.span(z), 10) catch null;
+        }
+    }
+    return C.want != null and C.want.? == fmt_id;
+}
+
+fn traceFmt(fmt_id: u32, comptime fmt: []const u8, args: anytype) void {
+    if (!traceFmtOn(fmt_id)) return;
+    std.debug.print("[WINS:TEXFMT] " ++ fmt ++ "\n", args);
+}
+
+fn nonzeroBytes(p: ?*const anyopaque, n: usize) usize {
+    const b: [*]const u8 = @ptrCast(p orelse return 0);
+    var c: usize = 0;
+    for (b[0..n]) |x| c += @intFromBool(x != 0);
+    return c;
+}
+
 // ---- Win64 COM Types --------------------------------------------------------
 
 pub const GUID = extern struct {
@@ -645,6 +670,10 @@ fn devCreateTexture2D(_: ?*anyopaque, desc: *const D3D11_TEXTURE2D_DESC, init_da
         }
         has_init = true;
     }
+    traceFmt(desc.Format, "create {d}x{d} mips={d} arr={d} usage={d} cpu=0x{x} bind=0x{x} misc=0x{x} init={} pitch0={d} nz0={d}", .{
+        desc.Width, desc.Height, desc.MipLevels, desc.ArraySize, desc.Usage, desc.CPUAccessFlags, desc.BindFlags, desc.MiscFlags,
+        has_init, pitch_buf[0], if (has_init and traceFmtOn(desc.Format)) nonzeroBytes(ptrs_buf[0], @as(usize, pitch_buf[0]) * desc.Height) else 0,
+    });
     glb.createTexture2D(t, if (has_init) &ptrs_buf else null, if (has_init) &pitch_buf else null);
     const o = newCom(&tex2d_vtbl, .texture2d, @intFromPtr(t), g_device) orelse return E_FAIL;
     o.desc2d = desc.*;
@@ -1181,8 +1210,6 @@ fn ctxDrawIndexedInstanced(_: ?*anyopaque, icount: u32, inst_count: u32, istart:
 }
 
 fn ctxMap(_: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, mapped: *D3D11_MAPPED_SUBRESOURCE) callconv(W) i32 {
-    _ = sub;
-    _ = map_type;
     const o: *ComObj = @ptrCast(@alignCast(res orelse return E_INVALIDARG));
     if (o.kind == .buffer) {
         const b: *glb.Buffer = @ptrFromInt(o.payload);
@@ -1192,6 +1219,7 @@ fn ctxMap(_: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, map
         return S_OK;
     } else if (o.kind == .texture2d) {
         const t: *glb.Texture = @ptrFromInt(o.payload);
+        traceFmt(t.dxgi_fmt, "map gl={d} sub={d} type={d} shadow={}", .{ t.gl_id, sub, map_type, t.shadow != null });
         if (t.shadow) |sh| {
             mapped.pData = sh.ptr;
             mapped.RowPitch = t.row_pitch;
@@ -1238,6 +1266,10 @@ fn ctxUpdateSubresource(_: ?*anyopaque, res: ?*anyopaque, sub: u32, box: ?*const
     } else if (o.kind == .texture2d) {
         const t: *glb.Texture = @ptrFromInt(o.payload);
         const bx = if (box) |b| [6]u32{ b.left, b.top, b.front, b.right, b.bottom, b.back } else [_]u32{0} ** 6;
+        traceFmt(t.dxgi_fmt, "update gl={d} sub={d} box={} [{d},{d})x[{d},{d}) pitch={d} nz={d}", .{
+            t.gl_id, sub, box != null, bx[0], bx[3], bx[1], bx[4], row_pitch,
+            if (traceFmtOn(t.dxgi_fmt)) nonzeroBytes(dptr, @as(usize, row_pitch) * (if (box != null) bx[4] -| bx[1] else t.height)) else 0,
+        });
         glb.updateSubresourceTexture(t, sub, box != null, bx, dptr, row_pitch, depth_pitch);
     }
 }
@@ -1257,6 +1289,7 @@ fn ctxClearDSV(_: ?*anyopaque, dsv: ?*anyopaque, flags: u32, depth: f32, stencil
 fn ctxCopyResource(_: ?*anyopaque, dst: ?*anyopaque, src: ?*anyopaque) callconv(W) void {
     const d = extractResTexture(dst);
     const s = extractResTexture(src);
+    if (d.tex) |dt| traceFmt(dt.dxgi_fmt, "copyResource dst gl={d} <- src gl={d} fmt={d} usage={d}", .{ dt.gl_id, if (s.tex) |st| st.gl_id else 0, if (s.tex) |st| st.dxgi_fmt else 0, if (s.tex) |st| st.usage else 0 });
     glb.copyResource(d.tex, d.buf, s.tex, s.buf);
 }
 
@@ -1264,6 +1297,7 @@ fn ctxCopySubresourceRegion(_: ?*anyopaque, dst: ?*anyopaque, dsub: u32, dx: u32
     const d = extractResTexture(dst);
     const s = extractResTexture(src);
     const bx = if (box) |b| [6]u32{ b.left, b.top, b.front, b.right, b.bottom, b.back } else [_]u32{0} ** 6;
+    if (d.tex) |dt| traceFmt(dt.dxgi_fmt, "copyRegion dst gl={d} sub={d} at ({d},{d}) <- src gl={d} sub={d} fmt={d} usage={d} box={} {any}", .{ dt.gl_id, dsub, dx, dy, if (s.tex) |st| st.gl_id else 0, ssub, if (s.tex) |st| st.dxgi_fmt else 0, if (s.tex) |st| st.usage else 0, box != null, bx });
     glb.copySubresourceRegion(d.tex, dsub, dx, dy, dz, s.tex, ssub, box != null, bx);
 }
 

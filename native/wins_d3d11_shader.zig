@@ -58,6 +58,9 @@ pub const Translated = struct {
 };
 
 pub var last_error: []const u8 = "";
+/// Opcodes already reported as unhandled (bit per opcode; the last word also
+/// absorbs any opcode >= 192).
+var unhandled_seen: [4]u64 = .{ 0, 0, 0, 0 };
 
 fn setErr(msg: []const u8) Error {
     last_error = msg;
@@ -989,8 +992,14 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             .default => try body.appendSlice(a, "    default:\n"),
             .endswitch => try body.appendSlice(a, "    }\n"),
             else => {
-                if (std.c.getenv("WINS_TRACE") != null) {
-                    std.debug.print("[WINS:DXBC] unhandled opcode {d}\n", .{@intFromEnum(op)});
+                // An unhandled opcode is silently dropped from the GLSL, so the
+                // draw renders wrong with no error: report each one once.
+                const code: u16 = @intFromEnum(op);
+                const bit = @as(u64, 1) << @intCast(code & 63);
+                const slot = &unhandled_seen[@min(code >> 6, unhandled_seen.len - 1)];
+                if (slot.* & bit == 0 or std.c.getenv("WINS_TRACE") != null) {
+                    slot.* |= bit;
+                    std.debug.print("[WINS:DXBC] unhandled opcode {d} ({s} shader)\n", .{ code, @tagName(stage) });
                 }
             },
         }

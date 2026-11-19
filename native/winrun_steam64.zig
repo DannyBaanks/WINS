@@ -271,10 +271,14 @@ fn liveValveIpc() bool {
 }
 
 fn hostSteamRoot(buf: []u8) ?[]const u8 {
-    if (getenv("SteamPath")) |steam_path| {
-        const root = std.mem.span(steam_path);
-        if (std.mem.startsWith(u8, root, "/") and root.len != 0) {
-            return std.fmt.bufPrint(buf, "{s}", .{root}) catch null;
+    // Under a Steam launch HOME is the sandboxed game profile, not the user's
+    // home, so the install path Steam itself exports must win over HOME.
+    for ([_][*:0]const u8{ "SteamPath", "STEAM_COMPAT_CLIENT_INSTALL_PATH" }) |name| {
+        if (getenv(name)) |steam_path| {
+            const root = std.mem.span(steam_path);
+            if (std.mem.startsWith(u8, root, "/")) {
+                return std.fmt.bufPrint(buf, "{s}", .{root}) catch null;
+            }
         }
     }
     const home_z = getenv("HOME") orelse return null;
@@ -720,6 +724,25 @@ test "native Steam client path uses the host Steam root" {
         nativeClientPath(&buf, "/home/test/.local/share/Steam/").?,
     );
     try std.testing.expect(nativeClientPath(&buf, "") == null);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "host Steam root prefers Steam's exported install path over a sandboxed HOME" {
+    var buf: [256]u8 = undefined;
+    _ = unsetenv("SteamPath");
+    _ = setenv("HOME", "/tmp/wins-workspace/home", 1);
+    _ = setenv("STEAM_COMPAT_CLIENT_INSTALL_PATH", "/home/test/.local/share/Steam", 1);
+    try std.testing.expectEqualStrings("/home/test/.local/share/Steam", hostSteamRoot(&buf).?);
+    _ = setenv("SteamPath", "/opt/steam", 1);
+    try std.testing.expectEqualStrings("/opt/steam", hostSteamRoot(&buf).?);
+    _ = setenv("SteamPath", "relative/steam", 1);
+    try std.testing.expectEqualStrings("/home/test/.local/share/Steam", hostSteamRoot(&buf).?);
+    // Negative control: with neither Steam variable, HOME is the only source.
+    _ = unsetenv("SteamPath");
+    _ = unsetenv("STEAM_COMPAT_CLIENT_INSTALL_PATH");
+    try std.testing.expectEqualStrings("/tmp/wins-workspace/home/.local/share/Steam", hostSteamRoot(&buf).?);
 }
 
 test "Steam app id parsing is exact and rejects malformed values" {
