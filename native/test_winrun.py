@@ -233,6 +233,30 @@ class WinrunTests(unittest.TestCase):
         self.assertEqual(run_sha.returncode, 0, run_sha.stderr)
         self.assertIn(b'ac5f28922dea8c70eb84d939153c86efdc1bfa9cc1fb15559067dd658e820109', run_sha.stdout)
 
+    def test_sqlite3_corpus_check_and_sql_execution(self):
+        sq = ROOT / 'corpus' / 'sqlite3.exe'
+        if not sq.is_file():
+            self.skipTest('corpus/sqlite3.exe not present')
+        chk = self.winrun(sq, extra=['--check'])
+        self.assertEqual(chk.returncode, 0, chk.stderr)
+        self.assertIn(b'READY', chk.stderr)
+        self.assertIn(b'imports=157', chk.stderr)
+
+        # Arithmetic query tests Windows command-line quoting across spaces.
+        run_expr = self.winrun(sq, app_args=[':memory:', 'SELECT 40 + 2;'])
+        self.assertEqual(run_expr.returncode, 0, run_expr.stderr)
+        self.assertEqual(run_expr.stdout.strip(), b'42')
+
+        # Relational table creation, insert, ordering and aggregation.
+        sql = (
+            "CREATE TABLE items(id INT, name TEXT);"
+            "INSERT INTO items VALUES(1,'alpha'),(2,'beta'),(3,'gamma');"
+            "SELECT count(*), group_concat(name, ',') FROM (SELECT name FROM items ORDER BY id DESC);"
+        )
+        run_tbl = self.winrun(sq, app_args=[':memory:', sql])
+        self.assertEqual(run_tbl.returncode, 0, run_tbl.stderr)
+        self.assertEqual(run_tbl.stdout.strip(), b'3|gamma,beta,alpha')
+
 
 if __name__ == '__main__':
     unittest.main()

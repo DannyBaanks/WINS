@@ -3,6 +3,11 @@
 //! message queueing, Translate/Dispatch, DefWindowProcW and PostQuitMessage.
 const std = @import("std");
 const x11 = @import("x11_window.zig");
+const gdi = @import("winrun_gdi_fb.zig");
+const gl64 = @import("wins_gl_win64.zig");
+const kbd = @import("wins_input64_kbd.zig");
+const dxmod = @import("winrun_directx.zig");
+const threads = @import("winrun_threads.zig");
 const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
 
 const Rect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
@@ -75,10 +80,539 @@ const WM_QUIT: u32 = 0x0012;
 const WM_SHOWWINDOW: u32 = 0x0018;
 const WM_NCDESTROY: u32 = 0x0082;
 
+const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
+const WS_CHILD: u32 = 0x40000000;
+const WS_VISIBLE: u32 = 0x10000000;
+const WM_NCCREATE: u32 = 0x0081;
+const WM_NCCALCSIZE: u32 = 0x0083;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
+const WM_CHAR: u32 = 0x0102;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SYSKEYUP: u32 = 0x0105;
+const WM_SYSCHAR: u32 = 0x0106;
+const WM_INPUT: u32 = 0x00FF;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_GETTEXT: u32 = 0x000D;
+const WM_GETTEXTLENGTH: u32 = 0x000E;
+const WM_SETTEXT: u32 = 0x000C;
+
+const GWLP_WNDPROC: i32 = -4;
+const GWLP_HINSTANCE: i32 = -6;
+const GWLP_HWNDPARENT: i32 = -8;
+const GWL_STYLE: i32 = -16;
+const GWL_EXSTYLE: i32 = -20;
+const GWLP_USERDATA: i32 = -21;
+const GWLP_ID: i32 = -12;
+
+const MAX_WINDOWS = 256;
+const WinObj = struct {
+    in_use: bool = false,
+    hwnd: usize = 0,
+    x11_win: x11.Window = 0,
+    parent: usize = 0,
+    wndproc: ?WndProcFn = null,
+    style: u32 = 0,
+    ex_style: u32 = 0,
+    x: i32 = 0,
+    y: i32 = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    visible: bool = false,
+    needs_paint: bool = false,
+    has_gl: bool = false,
+    hinstance: usize = 0,
+    hmenu: usize = 0,
+    userdata: isize = 0,
+    id: isize = 0,
+    extra: [16]isize = [_]isize{0} ** 16,
+    title: [256]u16 = [_]u16{0} ** 256,
+    title_len: usize = 0,
+    class_name: [64]u16 = [_]u16{0} ** 64,
+    class_len: usize = 0,
+    tab_lparam: usize = 0,
+    tab_item_w: i32 = 80,
+    tab_item_h: i32 = 24,
+    tab_count: u32 = 0,
+    tb_btn_count: u32 = 0,
+    sb_parts_n: usize = 0,
+    sb_parts_right: [8]i32 = [_]i32{0} ** 8,
+    sb_text: [8][64]u16 = [_][64]u16{[_]u16{0} ** 64} ** 8,
+    sb_text_len: [8]usize = [_]usize{0} ** 8,
+};
+
+fn winClassEqAscii(w: *const WinObj, ascii: []const u8) bool {
+    if (w.class_len != ascii.len) return false;
+    for (0..ascii.len) |i| {
+        const c1 = w.class_name[i];
+        const c2 = ascii[i];
+        const l1 = if (c1 >= 'A' and c1 <= 'Z') c1 + 32 else c1;
+        const l2 = if (c2 >= 'A' and c2 <= 'Z') @as(u16, c2) + 32 else @as(u16, c2);
+        if (l1 != l2) return false;
+    }
+    return true;
+}
+
+fn winScreenPos(hwnd: usize) Point {
+    var cur = findWin(hwnd) orelse return .{ .x = 0, .y = 0 };
+    var ox: i32 = cur.x;
+    var oy: i32 = cur.y;
+    var hops: usize = 0;
+    while (hops < 16 and (cur.style & WS_CHILD) != 0 and cur.parent != 0) : (hops += 1) {
+        const p = findWin(cur.parent) orelse break;
+        ox += p.x;
+        oy += p.y;
+        cur = p;
+    }
+    return .{ .x = ox, .y = oy };
+}
+
 var connection: ?x11.Connection = null;
-var active_window: usize = 0;
-var active_wndproc: ?WndProcFn = null;
-var is_visible: i32 = 0;
+var wm_delete_atom: c_ulong = 0;
+var windows: [MAX_WINDOWS]WinObj = [_]WinObj{.{}} ** MAX_WINDOWS;
+var next_synth_hwnd: usize = 0x200010;
+
+const SubclassProcFn = *const fn (usize, u32, usize, usize, usize, usize) callconv(W) usize;
+const MAX_SUBCLASSES = 128;
+const SubclassEntry = struct {
+    in_use: bool = false,
+    hwnd: usize = 0,
+    proc: SubclassProcFn = undefined,
+    id: usize = 0,
+    ref_data: usize = 0,
+};
+var subclasses: [MAX_SUBCLASSES]SubclassEntry = [_]SubclassEntry{.{}} ** MAX_SUBCLASSES;
+var active_subclass_idx: ?usize = null;
+
+var win_surfaces: [MAX_WINDOWS]gdi.Surface = [_]gdi.Surface{.{}} ** MAX_WINDOWS;
+
+const HBRUSH_BASE: usize = 0xB1000000;
+const HPEN_BASE: usize = 0xB2000000;
+const HBITMAP_BASE: usize = 0xB3000000;
+const HDC_BASE: usize = 0xD0000000;
+
+const HRGN_BASE: usize = 0xB4000000;
+
+const GdiBrush = struct { in_use: bool = false, xrgb: u32 = 0xFFFFFF, is_null: bool = false, sticky: bool = false };
+const GdiPen = struct { in_use: bool = false, xrgb: u32 = 0x000000, width: i32 = 1, is_null: bool = false, sticky: bool = false };
+const GdiBitmap = struct {
+    in_use: bool = false,
+    sticky: bool = false,
+    bottom_up: bool = false,
+    bpp: u16 = 32,
+    surface: gdi.Surface = .{},
+    /// Bits handed to the application for non-32bpp DIB sections. Their pixels are
+    /// NOT modelled by the software rasterizer (blits from them draw nothing).
+    raw: []u8 = &.{},
+};
+const GdiRegion = struct { in_use: bool = false, rect: gdi.Clip = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 } };
+const GdiDC = struct {
+    in_use: bool = false,
+    hwnd: usize = 0,
+    is_mem: bool = false,
+    is_screen: bool = false,
+    hbitmap: usize = 0,
+    hbrush: usize = 0,
+    hpen: usize = 0,
+    hfont: usize = 0,
+    bk_xrgb: u32 = 0xFFFFFF,
+    text_xrgb: u32 = 0x000000,
+    bk_mode: i32 = 2, // OPAQUE
+    text_align: u32 = 0,
+    cur_x: i32 = 0,
+    cur_y: i32 = 0,
+    org_x: i32 = 0,
+    org_y: i32 = 0,
+    has_clip: bool = false,
+    clip: gdi.Clip = .{ .left = 0, .top = 0, .right = 4096, .bottom = 4096 },
+    rop2: i32 = 13,
+};
+const SavedDCState = struct { in_use: bool = false, hdc: usize = 0, level: i32 = 0, dc: GdiDC = .{} };
+
+var gdi_brushes: [1024]GdiBrush = [_]GdiBrush{.{}} ** 1024;
+var gdi_pens: [1024]GdiPen = [_]GdiPen{.{}} ** 1024;
+var gdi_bitmaps: [512]GdiBitmap = [_]GdiBitmap{.{}} ** 512;
+var gdi_regions: [512]GdiRegion = [_]GdiRegion{.{}} ** 512;
+var gdi_dcs: [512]GdiDC = [_]GdiDC{.{}} ** 512;
+var saved_dcs: [128]SavedDCState = [_]SavedDCState{.{}} ** 128;
+var stock_objects: [20]usize = [_]usize{0} ** 20;
+var default_bitmap: usize = 0;
+var screen_hdc: usize = 0;
+var fb_dirty: [MAX_WINDOWS]bool = [_]bool{false} ** MAX_WINDOWS;
+
+const WinProp = struct { in_use: bool = false, hwnd: usize = 0, key_hash: u64 = 0, val: usize = 0 };
+var win_props: [128]WinProp = [_]WinProp{.{}} ** 128;
+
+const PAINTSTRUCT = extern struct {
+    hdc: usize,
+    fErase: i32,
+    rcPaint: Rect,
+    fRestore: i32,
+    fIncUpdate: i32,
+    rgbReserved: [32]u8,
+};
+
+fn allocGdiBrush(xrgb: u32, is_null: bool, sticky: bool) usize {
+    for (&gdi_brushes, 0..) |*b, idx| {
+        if (!b.in_use) {
+            b.* = .{ .in_use = true, .xrgb = xrgb, .is_null = is_null, .sticky = sticky };
+            return HBRUSH_BASE + idx;
+        }
+    }
+    return 0;
+}
+
+fn allocGdiPen(xrgb: u32, width: i32, is_null: bool, sticky: bool) usize {
+    for (&gdi_pens, 0..) |*p, idx| {
+        if (!p.in_use) {
+            p.* = .{ .in_use = true, .xrgb = xrgb, .width = width, .is_null = is_null, .sticky = sticky };
+            return HPEN_BASE + idx;
+        }
+    }
+    return 0;
+}
+
+fn brushFromHandle(hbr: usize) ?GdiBrush {
+    if (hbr >= HBRUSH_BASE and hbr < HBRUSH_BASE + gdi_brushes.len) {
+        const b = gdi_brushes[hbr - HBRUSH_BASE];
+        if (b.in_use) return b;
+    }
+    if (hbr >= 1 and hbr <= 31) {
+        return .{ .in_use = true, .xrgb = gdi.colorrefToXrgb(GetSysColor(@intCast(hbr - 1))), .is_null = false };
+    }
+    return null;
+}
+
+fn penFromHandle(hpen: usize) ?GdiPen {
+    if (hpen >= HPEN_BASE and hpen < HPEN_BASE + gdi_pens.len) {
+        const p = gdi_pens[hpen - HPEN_BASE];
+        if (p.in_use) return p;
+    }
+    return null;
+}
+
+fn bitmapFromHandle(hbmp: usize) ?*GdiBitmap {
+    if (hbmp >= HBITMAP_BASE and hbmp < HBITMAP_BASE + gdi_bitmaps.len) {
+        const bm = &gdi_bitmaps[hbmp - HBITMAP_BASE];
+        if (bm.in_use) return bm;
+    }
+    return null;
+}
+
+fn dcFromHandle(hdc: usize) ?*GdiDC {
+    if (hdc >= HDC_BASE and hdc < HDC_BASE + gdi_dcs.len) {
+        const dc = &gdi_dcs[hdc - HDC_BASE];
+        if (dc.in_use) return dc;
+    }
+    return null;
+}
+
+fn allocDC(hwnd: usize, is_mem: bool) usize {
+    for (&gdi_dcs, 0..) |*dc, idx| {
+        if (!dc.in_use) {
+            dc.* = .{ .in_use = true, .hwnd = hwnd, .is_mem = is_mem };
+            return HDC_BASE + idx;
+        }
+    }
+    return 0;
+}
+
+fn findWinSlot(hwnd: usize) ?usize {
+    if (hwnd == 0) return null;
+    for (&windows, 0..) |*w, idx| {
+        if (w.in_use and w.hwnd == hwnd) return idx;
+    }
+    return null;
+}
+
+const DrawTarget = struct {
+    surface: *gdi.Surface,
+    clip: gdi.Clip,
+    ox: i32,
+    oy: i32,
+};
+
+fn winRootAndOffset(hwnd: usize) ?struct { root_idx: usize, ox: i32, oy: i32, clip: gdi.Clip } {
+    const start_idx = findWinSlot(hwnd) orelse return null;
+    var cur_idx = start_idx;
+    var ox: i32 = 0;
+    var oy: i32 = 0;
+    var hops: usize = 0;
+    var clip = gdi.Clip{ .left = 0, .top = 0, .right = windows[start_idx].width, .bottom = windows[start_idx].height };
+    while (hops < 16) : (hops += 1) {
+        const w = &windows[cur_idx];
+        if ((w.style & WS_CHILD) == 0 or w.parent == 0) break;
+        const p_idx = findWinSlot(w.parent) orelse break;
+        ox += w.x;
+        oy += w.y;
+        clip.left += w.x;
+        clip.right += w.x;
+        clip.top += w.y;
+        clip.bottom += w.y;
+        clip.left = @max(clip.left, 0);
+        clip.top = @max(clip.top, 0);
+        clip.right = @min(clip.right, windows[p_idx].width);
+        clip.bottom = @min(clip.bottom, windows[p_idx].height);
+        cur_idx = p_idx;
+    }
+    const root = &windows[cur_idx];
+    if (!win_surfaces[cur_idx].ensure(root.width, root.height, 0x00F0F0F0)) return null;
+    return .{ .root_idx = cur_idx, .ox = ox, .oy = oy, .clip = clip };
+}
+
+fn intersectClip(a: gdi.Clip, b: gdi.Clip) gdi.Clip {
+    return .{
+        .left = @max(a.left, b.left),
+        .top = @max(a.top, b.top),
+        .right = @min(a.right, b.right),
+        .bottom = @min(a.bottom, b.bottom),
+    };
+}
+
+fn dcTarget(dc: *const GdiDC) ?DrawTarget {
+    if (dc.is_mem) {
+        const bm = bitmapFromHandle(dc.hbitmap) orelse return null;
+        if (bm.surface.pixels.len == 0) return null;
+        var clip = gdi.Clip{ .left = 0, .top = 0, .right = @intCast(bm.surface.width), .bottom = @intCast(bm.surface.height) };
+        if (dc.has_clip) clip = intersectClip(clip, dc.clip);
+        return .{ .surface = &bm.surface, .clip = clip, .ox = -dc.org_x, .oy = -dc.org_y };
+    }
+    const wr = winRootAndOffset(dc.hwnd) orelse return null;
+    var clip = wr.clip;
+    if (dc.has_clip) {
+        const shifted = gdi.Clip{
+            .left = dc.clip.left + wr.ox,
+            .top = dc.clip.top + wr.oy,
+            .right = dc.clip.right + wr.ox,
+            .bottom = dc.clip.bottom + wr.oy,
+        };
+        clip = intersectClip(clip, shifted);
+    }
+    return .{ .surface = &win_surfaces[wr.root_idx], .clip = clip, .ox = wr.ox - dc.org_x, .oy = wr.oy - dc.org_y };
+}
+
+fn markFbDirty(hwnd: usize) void {
+    const wr = winRootAndOffset(hwnd) orelse return;
+    fb_dirty[wr.root_idx] = true;
+}
+
+fn flushDirtyBlits() void {
+    const conn = connection orelse return;
+    for (&windows, 0..) |*w, idx| {
+        if (!fb_dirty[idx]) continue;
+        fb_dirty[idx] = false;
+        if (!w.in_use or w.x11_win == 0 or !w.visible or w.has_gl) continue;
+        const surf = &win_surfaces[idx];
+        const ptr = surf.bytesPtr() orelse continue;
+        conn.blitBgrx32(w.x11_win, surf.width, surf.height, ptr);
+    }
+}
+
+/// Marks `hwnd` and every descendant for repaint. All windows of one top-level
+/// share a single software surface, so a parent repaint must be followed by its
+/// children or they would be painted over.
+fn markTreeDirty(hwnd: usize) void {
+    for (&windows) |*w| {
+        if (!w.in_use) continue;
+        var cur: *const WinObj = w;
+        var hops: usize = 0;
+        while (hops < 16) : (hops += 1) {
+            if (cur.hwnd == hwnd) {
+                w.needs_paint = true;
+                break;
+            }
+            if ((cur.style & WS_CHILD) == 0 or cur.parent == 0) break;
+            cur = findWin(cur.parent) orelse break;
+        }
+    }
+}
+
+fn xrgbToColorref(x: u32) u32 {
+    return ((x >> 16) & 0xff) | (x & 0xff00) | ((x & 0xff) << 16);
+}
+
+fn allocBitmap(w_in: i32, h_in: i32, fill: u32) usize {
+    const w = if (w_in <= 0) 1 else w_in;
+    const h = if (h_in <= 0) 1 else h_in;
+    for (&gdi_bitmaps, 0..) |*bm, idx| {
+        if (!bm.in_use) {
+            bm.* = .{ .in_use = true };
+            if (!bm.surface.ensure(w, h, fill)) {
+                bm.* = .{};
+                return 0;
+            }
+            return HBITMAP_BASE + idx;
+        }
+    }
+    return 0;
+}
+
+fn getDefaultBitmap() usize {
+    if (default_bitmap == 0) {
+        default_bitmap = allocBitmap(1, 1, 0);
+        if (bitmapFromHandle(default_bitmap)) |bm| bm.sticky = true;
+    }
+    return default_bitmap;
+}
+
+fn regionFromHandle(h: usize) ?*GdiRegion {
+    if (h >= HRGN_BASE and h < HRGN_BASE + gdi_regions.len) {
+        const r = &gdi_regions[h - HRGN_BASE];
+        if (r.in_use) return r;
+    }
+    return null;
+}
+
+fn allocRegion(rect: gdi.Clip) usize {
+    for (&gdi_regions, 0..) |*r, idx| {
+        if (!r.in_use) {
+            r.* = .{ .in_use = true, .rect = rect };
+            return HRGN_BASE + idx;
+        }
+    }
+    return 0;
+}
+
+fn dcPenColor(dc: *const GdiDC) ?u32 {
+    if (dc.hpen == 0) return 0x000000;
+    const p = penFromHandle(dc.hpen) orelse return 0x000000;
+    if (p.is_null) return null;
+    return p.xrgb;
+}
+
+fn dcBrushColor(dc: *const GdiDC) ?u32 {
+    if (dc.hbrush == 0) return 0xFFFFFF;
+    const b = brushFromHandle(dc.hbrush) orelse return 0xFFFFFF;
+    if (b.is_null) return null;
+    return b.xrgb;
+}
+
+fn applyRop(d: u32, s: u32, rop: u32) u32 {
+    const r: u32 = switch (rop & 0x00FFFFFF) {
+        0x008800C6 => d & s, // SRCAND
+        0x00EE0086 => d | s, // SRCPAINT
+        0x00660046 => d ^ s, // SRCINVERT
+        0x00440328 => s & ~d, // SRCERASE
+        0x00330008 => ~s, // NOTSRCCOPY
+        0x00BB0226 => d | ~s, // MERGEPAINT
+        else => s, // SRCCOPY and unmodelled ROPs copy the source
+    };
+    return r & 0x00FFFFFF;
+}
+
+/// Nearest-neighbour copy between two draw targets (BitBlt / StretchBlt /
+/// StretchDIBits). Coordinates are logical; the targets carry the device offset.
+fn stretchCopy(dst: DrawTarget, dx: i32, dy: i32, dw: i32, dh: i32, src_in: DrawTarget, sx: i32, sy: i32, sw: i32, sh: i32, src_flip: bool, rop: u32) void {
+    if (dw == 0 or dh == 0 or sw == 0 or sh == 0) return;
+    if (dst.surface.pixels.len == 0 or src_in.surface.pixels.len == 0) return;
+    var src = src_in;
+    var tmp: gdi.Surface = .{};
+    defer if (tmp.pixels.len != 0) std.heap.page_allocator.free(tmp.pixels);
+    if (src.surface == dst.surface) {
+        const copy = std.heap.page_allocator.dupe(u32, src.surface.pixels) catch return;
+        tmp = .{ .width = src.surface.width, .height = src.surface.height, .pixels = copy };
+        src.surface = &tmp;
+    }
+    const adw: i32 = @intCast(@abs(dw));
+    const adh: i32 = @intCast(@abs(dh));
+    const asw: i32 = @intCast(@abs(sw));
+    const ash: i32 = @intCast(@abs(sh));
+    const sW: i32 = @intCast(src.surface.width);
+    const sH: i32 = @intCast(src.surface.height);
+    const dW: i32 = @intCast(dst.surface.width);
+    const dH: i32 = @intCast(dst.surface.height);
+    var row: i32 = 0;
+    while (row < adh) : (row += 1) {
+        const py = dst.oy + dy + row;
+        if (py < dst.clip.top or py >= dst.clip.bottom or py < 0 or py >= dH) continue;
+        var qy = src.oy + sy + @divTrunc(row * ash, adh);
+        if (src_flip) qy = sH - 1 - qy;
+        if (qy < 0 or qy >= sH) continue;
+        const drow = @as(usize, @intCast(py)) * dst.surface.width;
+        const srow = @as(usize, @intCast(qy)) * src.surface.width;
+        var col: i32 = 0;
+        while (col < adw) : (col += 1) {
+            const px = dst.ox + dx + col;
+            if (px < dst.clip.left or px >= dst.clip.right or px < 0 or px >= dW) continue;
+            const qx = src.ox + sx + @divTrunc(col * asw, adw);
+            if (qx < 0 or qx >= sW) continue;
+            const di = drow + @as(usize, @intCast(px));
+            dst.surface.pixels[di] = applyRop(dst.surface.pixels[di], src.surface.pixels[srow + @as(usize, @intCast(qx))], rop);
+        }
+    }
+}
+
+fn xorRect(tgt: DrawTarget, l: i32, t: i32, r: i32, b: i32, mask: u32) void {
+    const s = tgt.surface;
+    if (s.pixels.len == 0) return;
+    const x0 = @max(@max(l, tgt.clip.left), 0);
+    const y0 = @max(@max(t, tgt.clip.top), 0);
+    const x1 = @min(@min(r, tgt.clip.right), @as(i32, @intCast(s.width)));
+    const y1 = @min(@min(b, tgt.clip.bottom), @as(i32, @intCast(s.height)));
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        var x = x0;
+        while (x < x1) : (x += 1) {
+            const i = @as(usize, @intCast(y)) * s.width + @as(usize, @intCast(x));
+            s.pixels[i] = (s.pixels[i] ^ mask) & 0x00FFFFFF;
+        }
+    }
+}
+
+fn patBltTarget(dc: *const GdiDC, tgt: DrawTarget, x: i32, y: i32, w: i32, h: i32, rop: u32) void {
+    const l = tgt.ox + @min(x, x + w);
+    const r = tgt.ox + @max(x, x + w);
+    const t = tgt.oy + @min(y, y + h);
+    const b = tgt.oy + @max(y, y + h);
+    switch (rop & 0x00FFFFFF) {
+        0x00000042 => gdi.fillRect(tgt.surface, tgt.clip, l, t, r, b, 0x000000), // BLACKNESS
+        0x00FF0062 => gdi.fillRect(tgt.surface, tgt.clip, l, t, r, b, 0xFFFFFF), // WHITENESS
+        0x00550009 => xorRect(tgt, l, t, r, b, 0x00FFFFFF), // DSTINVERT
+        0x005A0049 => if (dcBrushColor(dc)) |c| xorRect(tgt, l, t, r, b, c), // PATINVERT
+        else => if (dcBrushColor(dc)) |c| gdi.fillRect(tgt.surface, tgt.clip, l, t, r, b, c), // PATCOPY
+    }
+}
+
+fn textWidth(n: usize) i32 {
+    return @intCast(n * 8);
+}
+
+fn drawTextAt(dc: *const GdiDC, tgt: DrawTarget, x_in: i32, y_in: i32, text: []const u16, dx: ?[*]const i32) void {
+    var x = x_in;
+    var y = y_in;
+    const width = textWidth(text.len);
+    const ta = dc.text_align;
+    if ((ta & 24) == 24) {
+        y -= 13; // TA_BASELINE: fixed 8x16 cell, ascent 13
+    } else if ((ta & 8) != 0) {
+        y -= 16; // TA_BOTTOM
+    }
+    if ((ta & 6) == 6) {
+        x -= @divTrunc(width, 2); // TA_CENTER
+    } else if ((ta & 2) != 0) {
+        x -= width; // TA_RIGHT
+    }
+    const bg: ?u32 = if (dc.bk_mode == 2) dc.bk_xrgb else null;
+    if (dx) |advances| {
+        var cx = tgt.ox + x;
+        for (text, 0..) |ch, i| {
+            const adv = advances[i];
+            if (bg) |bcol| gdi.fillRect(tgt.surface, tgt.clip, cx, tgt.oy + y, cx + @max(adv, 0), tgt.oy + y + 16, bcol);
+            if (ch != ' ' and ch != '\t') gdi.drawChar(tgt.surface, tgt.clip, cx, tgt.oy + y, ch, dc.text_xrgb, null);
+            cx += adv;
+        }
+    } else {
+        gdi.drawTextU16(tgt.surface, tgt.clip, tgt.ox + x, tgt.oy + y, text, dc.text_xrgb, bg);
+    }
+}
+
+fn readRectPtr(p: ?*const anyopaque) ?Rect {
+    const ptr = p orelse return null;
+    const r: *const Rect = @ptrCast(@alignCast(ptr));
+    return r.*;
+}
 
 const RegisteredClass = struct {
     name: [64]u16,
@@ -86,11 +620,16 @@ const RegisteredClass = struct {
     wndproc: WndProcFn,
     instance: usize,
     atom: u16,
+    style: u32 = 0,
+    hicon: usize = 0,
+    hcursor: usize = 0,
+    hbr_bg: usize = 0,
+    cb_wnd_extra: i32 = 0,
 };
-var registered_classes: [16]RegisteredClass = undefined;
+var registered_classes: [128]RegisteredClass = undefined;
 var num_registered_classes: usize = 0;
 
-const MAX_QUEUE = 32;
+const MAX_QUEUE = 256;
 var msg_queue: [MAX_QUEUE]MSG = undefined;
 var queue_head: usize = 0;
 var queue_tail: usize = 0;
@@ -114,9 +653,128 @@ fn popMsg() ?MSG {
     return m;
 }
 
+fn getDisplayName() [*:0]const u8 {
+    if (std.c.getenv("DISPLAY")) |d| {
+        if (d[0] != 0) return d;
+    }
+    return ":91";
+}
+
+fn ensureX11() ?x11.Connection {
+    if (connection) |c| return c;
+    const conn = x11.Connection.open(getDisplayName()) catch return null;
+    wm_delete_atom = conn.wmDeleteAtom();
+    connection = conn;
+    return conn;
+}
+
+fn findWin(hwnd: usize) ?*WinObj {
+    if (hwnd == 0) return null;
+    for (&windows) |*w| {
+        if (w.in_use and w.hwnd == hwnd) return w;
+    }
+    return null;
+}
+
+fn findWinByX11(xwin: x11.Window) ?*WinObj {
+    if (xwin == 0) return null;
+    for (&windows) |*w| {
+        if (w.in_use and w.x11_win == xwin) return w;
+    }
+    return null;
+}
+
+fn countTopLevelWindows() usize {
+    var n: usize = 0;
+    for (&windows) |*w| {
+        if (w.in_use and w.x11_win != 0) n += 1;
+    }
+    return n;
+}
+
+fn eqlIgnoreCaseU16(a: []const u16, b: []const u16) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        const la = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
+        const lb = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
+        if (la != lb) return false;
+    }
+    return true;
+}
+
+fn isBuiltinClassName(name: []const u16) bool {
+    const builtins = [_][]const u8{
+        "STATIC",
+        "BUTTON",
+        "EDIT",
+        "LISTBOX",
+        "COMBOBOX",
+        "SCROLLBAR",
+        "MDICLIENT",
+        "ToolbarWindow32",
+        "msctls_statusbar32",
+        "msctls_progress32",
+        "msctls_trackbar32",
+        "msctls_updown32",
+        "SysTabControl32",
+        "SysTreeView32",
+        "SysListView32",
+        "SysHeader32",
+        "SysAnimate32",
+        "SysLink",
+        "ReBarWindow32",
+        "tooltips_class32",
+        "ComboBoxEx32",
+        "RichEdit20W",
+        "RichEdit50W",
+        "#32770",
+        "#32768",
+        "IME",
+    };
+    for (builtins) |b| {
+        if (name.len == b.len) {
+            var ok = true;
+            for (name, b) |cu, cb| {
+                const la = if (cu >= 'A' and cu <= 'Z') cu + 32 else cu;
+                const lb: u16 = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
+                if (la != lb) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) return true;
+        }
+    }
+    return false;
+}
+
+fn copyTitleU16(dst: []u16, src_opt: ?[*:0]const u16) usize {
+    const src = src_opt orelse {
+        dst[0] = 0;
+        return 0;
+    };
+    var i: usize = 0;
+    while (i + 1 < dst.len and src[i] != 0) : (i += 1) {
+        dst[i] = src[i];
+    }
+    dst[i] = 0;
+    return i;
+}
+
+fn encodeTitleUtf8(src: []const u16, out: []u8) usize {
+    var i: usize = 0;
+    for (src) |c| {
+        if (c == 0 or i + 1 >= out.len) break;
+        out[i] = if (c < 128) @truncate(c) else '?';
+        i += 1;
+    }
+    out[i] = 0;
+    return i;
+}
+
 fn registerClassExW(wcex: ?*const WNDCLASSEXW) callconv(W) u16 {
     if (wcex == null) return 0;
-    if (wcex.?.cbSize != @sizeOf(WNDCLASSEXW)) return 0;
+    if (wcex.?.cbSize != @sizeOf(WNDCLASSEXW) and wcex.?.cbSize != @sizeOf(WNDCLASSW)) return 0;
     if (wcex.?.lpszClassName == null or wcex.?.lpfnWndProc == null) return 0;
     if (num_registered_classes >= registered_classes.len) return 0;
     if (@intFromPtr(wcex.?.lpszClassName.?) < 65536) return 0;
@@ -125,8 +783,14 @@ fn registerClassExW(wcex: ?*const WNDCLASSEXW) callconv(W) u16 {
     while (len < 64 and wcex.?.lpszClassName.?[len] != 0) : (len += 1) {}
     if (len == 0 or len >= 64) return 0;
 
-    for (registered_classes[0..num_registered_classes]) |rc| {
-        if (rc.name_len == len and std.mem.eql(u16, rc.name[0..len], wcex.?.lpszClassName.?[0..len])) {
+    for (registered_classes[0..num_registered_classes]) |*rc| {
+        if (eqlIgnoreCaseU16(rc.name[0..rc.name_len], wcex.?.lpszClassName.?[0..len])) {
+            rc.wndproc = wcex.?.lpfnWndProc.?;
+            rc.style = wcex.?.style;
+            rc.hicon = wcex.?.hIcon;
+            rc.hcursor = wcex.?.hCursor;
+            rc.hbr_bg = wcex.?.hbrBackground;
+            rc.cb_wnd_extra = wcex.?.cbWndExtra;
             return rc.atom;
         }
     }
@@ -139,7 +803,17 @@ fn registerClassExW(wcex: ?*const WNDCLASSEXW) callconv(W) u16 {
     reg.wndproc = wcex.?.lpfnWndProc.?;
     reg.instance = wcex.?.hInstance;
     reg.atom = atom;
+    reg.style = wcex.?.style;
+    reg.hicon = wcex.?.hIcon;
+    reg.hcursor = wcex.?.hCursor;
+    reg.hbr_bg = wcex.?.hbrBackground;
+    reg.cb_wnd_extra = wcex.?.cbWndExtra;
     num_registered_classes += 1;
+    if (std.c.getenv("WINS_TRACE") != null) {
+        var u8buf: [64]u8 = undefined;
+        const n = encodeTitleUtf8(reg.name[0..len], &u8buf);
+        std.debug.print("[WINS:USER32] RegisterClassExW \"{s}\" atom=0x{x} proc=0x{x}\n", .{ u8buf[0..n], atom, @intFromPtr(reg.wndproc) });
+    }
     return atom;
 }
 
@@ -162,59 +836,128 @@ fn registerClassW(wc: ?*const WNDCLASSW) callconv(W) u16 {
     return registerClassExW(&wcex);
 }
 
-fn createWindowExW(ex_style: u32, class: ?[*:0]const u16, title: ?[*:0]const u16, style: u32, x: i32, y: i32, width: i32, height: i32, parent: usize, menu: usize, instance: usize, param: usize) callconv(W) usize {
-    if (class == null or width <= 0 or height <= 0 or active_window != 0) return 0;
+fn createWindowExW(ex_style: u32, class: ?[*:0]const u16, title: ?[*:0]const u16, style: u32, raw_x: i32, raw_y: i32, raw_w: i32, raw_h: i32, parent: usize, menu: usize, instance: usize, param: usize) callconv(W) usize {
+    if (class == null) return 0;
 
     var target_wndproc: ?WndProcFn = null;
     const is_atom = @intFromPtr(class.?) < 65536;
+    var cls_buf: [64]u16 = [_]u16{0} ** 64;
+    var cls_len: usize = 0;
 
     if (!is_atom) {
-        const static_name = [_]u16{ 'S', 'T', 'A', 'T', 'I', 'C', 0 };
-        var is_static = true;
-        for (static_name, 0..) |c, i| {
-            if (class.?[i] != c) {
-                is_static = false;
-                break;
-            }
+        while (cls_len < 64 and class.?[cls_len] != 0) : (cls_len += 1) {
+            cls_buf[cls_len] = class.?[cls_len];
         }
-        if (is_static) {
-            target_wndproc = null;
-        } else {
-            var len: usize = 0;
-            while (len < 64 and class.?[len] != 0) : (len += 1) {}
-            var found: ?RegisteredClass = null;
-            for (registered_classes[0..num_registered_classes]) |rc| {
-                if (rc.name_len == len and std.mem.eql(u16, rc.name[0..len], class.?[0..len])) {
-                    found = rc;
-                    break;
-                }
-            }
-            if (found) |f| {
-                target_wndproc = f.wndproc;
-            } else return 0;
-        }
-    } else {
-        const atom_val: u16 = @intCast(@intFromPtr(class.?));
         var found: ?RegisteredClass = null;
         for (registered_classes[0..num_registered_classes]) |rc| {
-            if (rc.atom == atom_val) {
+            if (eqlIgnoreCaseU16(rc.name[0..rc.name_len], cls_buf[0..cls_len])) {
                 found = rc;
                 break;
             }
         }
         if (found) |f| {
             target_wndproc = f.wndproc;
-        } else return 0;
+        } else if (isBuiltinClassName(cls_buf[0..cls_len])) {
+            target_wndproc = &defWindowProcW;
+        } else {
+            if (std.c.getenv("WINS_TRACE") != null) {
+                var u8buf: [64]u8 = undefined;
+                const n = encodeTitleUtf8(cls_buf[0..cls_len], &u8buf);
+                std.debug.print("[WINS:USER32] CreateWindowExW unknown class \"{s}\"\n", .{u8buf[0..n]});
+            }
+            return 0;
+        }
+    } else {
+        const atom_val: u16 = @intCast(@intFromPtr(class.?));
+        if (atom_val == 0x8002) {
+            target_wndproc = &defWindowProcW; // #32770 dialog
+        } else {
+            var found: ?RegisteredClass = null;
+            for (registered_classes[0..num_registered_classes]) |rc| {
+                if (rc.atom == atom_val) {
+                    found = rc;
+                    break;
+                }
+            }
+            if (found) |f| {
+                target_wndproc = f.wndproc;
+                cls_len = f.name_len;
+                @memcpy(cls_buf[0..cls_len], f.name[0..cls_len]);
+            } else {
+                if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:USER32] CreateWindowExW unknown atom=0x{x}\n", .{atom_val});
+                return 0;
+            }
+        }
     }
 
-    const conn = x11.Connection.open(":91") catch return 0;
-    const window = conn.create(@intCast(width), @intCast(height)) catch {
-        conn.close();
+    const is_child = (style & WS_CHILD) != 0;
+    if (!is_child and ensureX11() == null) {
+        if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:USER32] CreateWindowExW failed: ensureX11() == null\n", .{});
         return 0;
+    }
+    const x: i32 = if (raw_x == CW_USEDEFAULT) (if (is_child) @as(i32, 0) else 60) else raw_x;
+    const y: i32 = if (raw_y == CW_USEDEFAULT) (if (is_child) @as(i32, 0) else 60) else raw_y;
+    const width: i32 = if (raw_w == CW_USEDEFAULT) (if (is_child) @as(i32, 0) else 1024) else @max(0, raw_w);
+    const height: i32 = if (raw_h == CW_USEDEFAULT) (if (is_child) @as(i32, 0) else 720) else @max(0, raw_h);
+
+    var slot_opt: ?*WinObj = null;
+    for (&windows) |*w| {
+        if (!w.in_use) {
+            slot_opt = w;
+            break;
+        }
+    }
+    const slot = slot_opt orelse return 0;
+
+    const hwnd = next_synth_hwnd;
+    next_synth_hwnd += 1;
+
+    slot.* = .{
+        .in_use = true,
+        .hwnd = hwnd,
+        .x11_win = 0,
+        .parent = parent,
+        .wndproc = target_wndproc,
+        .style = style,
+        .ex_style = ex_style,
+        .x = x,
+        .y = y,
+        .width = width,
+        .height = height,
+        .visible = (style & WS_VISIBLE) != 0,
+        .needs_paint = (style & WS_VISIBLE) != 0,
+        .hinstance = instance,
+        .hmenu = menu,
+        .id = if (is_child) @intCast(menu) else 0,
     };
-    connection = conn;
-    active_window = window;
-    active_wndproc = target_wndproc;
+    slot.title_len = copyTitleU16(&slot.title, title);
+    slot.class_len = cls_len;
+    @memcpy(slot.class_name[0..cls_len], cls_buf[0..cls_len]);
+    if (winClassEqAscii(slot, "msctls_statusbar32")) {
+        if (slot.height <= 0) slot.height = 24;
+        if (slot.width <= 0) slot.width = 1024;
+    } else if (winClassEqAscii(slot, "ToolbarWindow32")) {
+        if (slot.height <= 0) slot.height = 28;
+        if (slot.width <= 0) slot.width = 1024;
+    }
+
+    ensureX11Window(slot);
+    if (slot.x11_win != 0 and slot.visible) {
+        if (connection) |conn| {
+            conn.map(slot.x11_win);
+            conn.flush();
+        }
+    }
+
+    if (std.c.getenv("WINS_TRACE") != null) {
+        var c8: [64]u8 = undefined;
+        var t8: [256]u8 = undefined;
+        const cn = encodeTitleUtf8(cls_buf[0..cls_len], &c8);
+        const tn = encodeTitleUtf8(slot.title[0..slot.title_len], &t8);
+        std.debug.print("[WINS:USER32] CreateWindowExW class=\"{s}\" title=\"{s}\" style=0x{x} {d}x{d} parent=0x{x} -> hwnd=0x{x}\n", .{
+            c8[0..cn], t8[0..tn], style, width, height, parent, hwnd,
+        });
+    }
 
     if (target_wndproc) |proc| {
         const cs = CREATESTRUCTW{
@@ -231,66 +974,435 @@ fn createWindowExW(ex_style: u32, class: ?[*:0]const u16, title: ?[*:0]const u16
             .lpszClass = class,
             .dwExStyle = ex_style,
         };
-        const res = proc(window, WM_CREATE, 0, @intFromPtr(&cs));
-        if (res == @as(usize, @bitCast(@as(isize, -1)))) {
-            _ = destroyWindow(window);
+        const nc_res = proc(hwnd, WM_NCCREATE, 0, @intFromPtr(&cs));
+        if (nc_res == 0) {
+            _ = destroyWindow(hwnd);
             return 0;
         }
+        const cr_res = proc(hwnd, WM_CREATE, 0, @intFromPtr(&cs));
+        if (cr_res == @as(usize, @bitCast(@as(isize, -1)))) {
+            _ = destroyWindow(hwnd);
+            return 0;
+        }
+        if (slot.in_use) {
+            const lp_size: usize = (@as(usize, @intCast(@max(0, height))) << 16) | @as(usize, @intCast(@max(0, width) & 0xffff));
+            _ = proc(hwnd, WM_SIZE, 0, lp_size);
+        }
     }
-    return window;
+    return hwnd;
 }
 
 fn getClientRect(window: usize, rect: ?*Rect) callconv(W) i32 {
-    if (window == 0 or window != active_window or rect == null) return 0;
-    const geometry = connection.?.geometry(window) catch return 0;
-    rect.?.* = .{ .left = 0, .top = 0, .right = @intCast(geometry.width), .bottom = @intCast(geometry.height) };
+    const r = rect orelse return 0;
+    const w = findWin(window) orelse return 0;
+    if (w.x11_win != 0) {
+        if (connection) |conn| {
+            if (conn.geometry(w.x11_win)) |geom| {
+                w.width = @intCast(geom.width);
+                w.height = @intCast(geom.height);
+            } else |_| {}
+        }
+    }
+    r.* = .{ .left = 0, .top = 0, .right = w.width, .bottom = w.height };
     return 1;
 }
 
 fn destroyWindow(window: usize) callconv(W) i32 {
-    if (window == 0 or window != active_window) return 0;
-    if (active_wndproc) |proc| {
+    const w = findWin(window) orelse return 0;
+    if (w.wndproc) |proc| {
         _ = proc(window, WM_DESTROY, 0, 0);
         _ = proc(window, WM_NCDESTROY, 0, 0);
     }
-    if (connection) |conn| {
-        conn.destroy(window);
-        conn.close();
-        connection = null;
+    if (w.x11_win != 0) {
+        gl64.invalidateWindow(w.x11_win);
+        if (connection) |conn| {
+            conn.destroy(w.x11_win);
+        }
     }
-    active_window = 0;
-    active_wndproc = null;
-    is_visible = 0;
+    w.* = .{};
+    if (countTopLevelWindows() == 0) {
+        if (connection) |conn| {
+            conn.close();
+            connection = null;
+        }
+    }
     return 1;
 }
 
+fn ensureX11Window(w: *WinObj) void {
+    if (!w.in_use or w.x11_win != 0) return;
+    if ((w.style & WS_CHILD) != 0) return;
+    if (w.width <= 0 or w.height <= 0) return;
+    if (ensureX11()) |conn| {
+        const x11_win = conn.createUnmapped(w.x, w.y, @intCast(w.width), @intCast(w.height)) catch 0;
+        if (x11_win != 0) {
+            w.x11_win = x11_win;
+            var tbuf: [256]u8 = undefined;
+            const tn = encodeTitleUtf8(w.title[0..w.title_len], &tbuf);
+            if (tn > 0) conn.setTitle(x11_win, @ptrCast(&tbuf));
+            if (std.c.getenv("WINS_TRACE") != null) {
+                std.debug.print("[WINS:USER32] Created X11 window 0x{x} for hwnd=0x{x} ({d}x{d})\n", .{
+                    x11_win, w.hwnd, w.width, w.height,
+                });
+            }
+        }
+    }
+}
+
 fn showWindow(window: usize, cmd_show: i32) callconv(W) i32 {
-    if (window == 0 or window != active_window) return 0;
-    const was_visible = is_visible;
+    const w = findWin(window) orelse return 0;
+    const was_visible: i32 = if (w.visible) 1 else 0;
     if (cmd_show != 0) {
-        is_visible = 1;
-        if (connection) |conn| conn.map(window);
+        w.visible = true;
+        w.needs_paint = true;
+        w.style |= WS_VISIBLE;
+        var resized = false;
+        if ((w.style & WS_CHILD) == 0 and (w.width <= 0 or w.height <= 0)) {
+            w.width = 1024;
+            w.height = 720;
+            resized = true;
+        }
+        ensureX11Window(w);
+        if (w.x11_win != 0) {
+            if (connection) |conn| {
+                conn.map(w.x11_win);
+                conn.flush();
+            }
+        }
+        markTreeDirty(window);
+        if (resized) {
+            _ = dispatchSubclassFrom(window, WM_SIZE, 0, (@as(usize, @intCast(w.height)) << 16) | @as(usize, @intCast(w.width & 0xffff)), null);
+        }
     } else {
-        is_visible = 0;
-        if (connection) |conn| conn.unmap(window);
+        w.visible = false;
+        w.style &= ~WS_VISIBLE;
+        if (w.x11_win != 0) {
+            if (connection) |conn| {
+                conn.unmap(w.x11_win);
+                conn.flush();
+            }
+        }
     }
     return was_visible;
 }
 
 fn updateWindow(window: usize) callconv(W) i32 {
-    if (window == 0 or window != active_window) return 0;
-    if (active_wndproc) |proc| {
+    const w = findWin(window) orelse return 0;
+    if (w.wndproc) |proc| {
+        w.needs_paint = false;
         _ = proc(window, WM_PAINT, 0, 0);
     }
     return 1;
 }
 
+fn paintCommonControlOverlay(w: *const WinObj, tgt: DrawTarget) void {
+    if (winClassEqAscii(w, "SysTabControl32")) {
+        const th = @max(22, w.tab_item_h) + 2;
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + th, 0x00E3E6EB);
+        gdi.frameRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy + th, tgt.ox + w.width, tgt.oy + w.height, 0x00C6CBD1);
+        const tw = @max(84, w.tab_item_w + 16);
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox + 4, tgt.oy + 2, tgt.ox + 4 + tw, tgt.oy + th + 1, 0x00FFFFFF);
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox + 4, tgt.oy + 2, tgt.ox + 4 + tw, tgt.oy + 5, 0x000078D7);
+        gdi.frameRect(tgt.surface, tgt.clip, tgt.ox + 4, tgt.oy + 2, tgt.ox + 4 + tw, tgt.oy + th + 1, 0x00B8BFC6);
+        const label = if (w.title_len > 0) w.title[0..w.title_len] else &[_]u16{ 'n', 'e', 'w', ' ', '1' };
+        gdi.drawTextU16(tgt.surface, tgt.clip, tgt.ox + 14, tgt.oy + 6, label, 0x00181C20, null);
+    } else if (winClassEqAscii(w, "msctls_statusbar32")) {
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + w.height, 0x00EAECEF);
+        gdi.drawLine(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy, 0x00BFC4CA);
+        var left_x: i32 = 0;
+        const nparts = if (w.sb_parts_n > 0) w.sb_parts_n else 1;
+        for (0..nparts) |pi| {
+            const right_x = if (w.sb_parts_n > 0 and w.sb_parts_right[pi] > left_x) w.sb_parts_right[pi] else w.width;
+            if (pi > 0) {
+                gdi.drawLine(tgt.surface, tgt.clip, tgt.ox + left_x, tgt.oy + 3, tgt.ox + left_x, tgt.oy + w.height - 3, 0x00C4C9D0);
+            }
+            const tlen = w.sb_text_len[pi];
+            if (tlen > 0) {
+                const pclip = intersectClip(tgt.clip, .{
+                    .left = tgt.ox + left_x,
+                    .top = tgt.oy,
+                    .right = tgt.ox + right_x - 4,
+                    .bottom = tgt.oy + w.height,
+                });
+                gdi.drawTextU16(tgt.surface, pclip, tgt.ox + left_x + 8, tgt.oy + @max(1, @divFloor(w.height - 16, 2)), w.sb_text[pi][0..tlen], 0x0024282E, null);
+            }
+            left_x = right_x;
+        }
+    } else if (winClassEqAscii(w, "ToolbarWindow32")) {
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + w.height, 0x00EEF0F3);
+        gdi.drawLine(tgt.surface, tgt.clip, tgt.ox, tgt.oy + w.height - 1, tgt.ox + w.width, tgt.oy + w.height - 1, 0x00CFD4DA);
+        const nb: usize = @min(if (w.tb_btn_count > 0) @as(usize, w.tb_btn_count) else 24, 32);
+        for (0..nb) |bi| {
+            const bx = tgt.ox + 6 + @as(i32, @intCast(bi)) * 24;
+            const by = tgt.oy + 3;
+            if (bx + 20 > tgt.ox + w.width) break;
+            gdi.fillRect(tgt.surface, tgt.clip, bx, by, bx + 20, by + 20, 0x00FAFBFC);
+            gdi.frameRect(tgt.surface, tgt.clip, bx, by, bx + 20, by + 20, 0x00B8C0C8);
+            const col: u32 = switch (bi % 4) {
+                0 => 0x002B6CB0,
+                1 => 0x002F855A,
+                2 => 0x00C05621,
+                else => 0x004A5568,
+            };
+            gdi.fillRect(tgt.surface, tgt.clip, bx + 5, by + 5, bx + 15, by + 15, col);
+        }
+    } else if (winClassEqAscii(w, "ReBarWindow32")) {
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + w.height, 0x00EEF0F3);
+        gdi.drawLine(tgt.surface, tgt.clip, tgt.ox, tgt.oy + w.height - 1, tgt.ox + w.width, tgt.oy + w.height - 1, 0x00CFD4DA);
+    }
+}
+
 fn defWindowProcW(window: usize, msg: u32, wparam: usize, lparam: usize) callconv(W) usize {
-    _ = wparam;
-    _ = lparam;
+    if (msg == WM_NCCREATE) return 1;
+    if (msg == WM_NCCALCSIZE) return 0;
     if (msg == WM_CLOSE) {
         _ = destroyWindow(window);
         return 0;
+    }
+    if (findWin(window)) |w| {
+        if (winClassEqAscii(w, "SysTabControl32")) {
+            switch (msg) {
+                0x1304 => return @max(1, w.tab_count), // TCM_GETITEMCOUNT
+                0x130b, 0x130c => return 0, // TCM_GETCURSEL / TCM_SETCURSEL
+                0x132c => return if (w.tab_count > 0) 1 else 0, // TCM_GETROWCOUNT
+                0x1329 => { // TCM_SETITEMSIZE
+                    const old = (@as(usize, @intCast(@max(0, w.tab_item_h))) << 16) | @as(usize, @intCast(@max(0, w.tab_item_w) & 0xffff));
+                    w.tab_item_w = @intCast(lparam & 0xffff);
+                    w.tab_item_h = @intCast((lparam >> 16) & 0xffff);
+                    return old;
+                },
+                0x130a => { // TCM_GETITEMRECT
+                    if (lparam >= 0x10000) {
+                        const rc: *Rect = @ptrFromInt(lparam);
+                        const idx: i32 = @intCast(wparam & 0xff);
+                        const tw = @max(60, w.tab_item_w);
+                        const th = @max(22, w.tab_item_h);
+                        rc.* = .{ .left = 2 + idx * tw, .top = 2, .right = 2 + (idx + 1) * tw, .bottom = 2 + th };
+                        return 1;
+                    }
+                    return 0;
+                },
+                0x1328 => { // TCM_ADJUSTRECT
+                    if (lparam >= 0x10000) {
+                        const rc: *Rect = @ptrFromInt(lparam);
+                        const th = @max(22, w.tab_item_h) + 4;
+                        if (wparam == 0) {
+                            rc.top += th;
+                            rc.left += 2;
+                            rc.right -= 2;
+                            rc.bottom -= 2;
+                        } else {
+                            rc.top -= th;
+                            rc.left -= 2;
+                            rc.right += 2;
+                            rc.bottom += 2;
+                        }
+                    }
+                    return 0;
+                },
+                0x133e, 0x133d => { // TCM_INSERTITEMW / TCM_SETITEMW
+                    if (lparam >= 0x10000) {
+                        const mask = std.mem.readInt(u32, @as(*const [4]u8, @ptrFromInt(lparam)), .little);
+                        if ((mask & 1) != 0) {
+                            const ptext_addr = std.mem.readInt(usize, @as(*const [8]u8, @ptrFromInt(lparam + 16)), .little);
+                            if (ptext_addr >= 0x10000) {
+                                w.title_len = copyTitleU16(&w.title, @ptrFromInt(ptext_addr));
+                            }
+                        }
+                        if ((mask & 8) != 0) {
+                            w.tab_lparam = std.mem.readInt(usize, @as(*const [8]u8, @ptrFromInt(lparam + 32)), .little);
+                        }
+                    }
+                    if (msg == 0x133e) w.tab_count = @max(1, w.tab_count + 1);
+                    w.needs_paint = true;
+                    return if (msg == 0x133e) 0 else 1;
+                },
+                0x133c => { // TCM_GETITEMW
+                    if (lparam >= 0x10000) {
+                        const mask = std.mem.readInt(u32, @as(*const [4]u8, @ptrFromInt(lparam)), .little);
+                        if ((mask & 8) != 0) {
+                            std.mem.writeInt(usize, @as(*[8]u8, @ptrFromInt(lparam + 32)), w.tab_lparam, .little);
+                        }
+                        if ((mask & 1) != 0) {
+                            const ptext_addr = std.mem.readInt(usize, @as(*const [8]u8, @ptrFromInt(lparam + 16)), .little);
+                            const cch_max = std.mem.readInt(i32, @as(*const [4]u8, @ptrFromInt(lparam + 24)), .little);
+                            if (ptext_addr >= 0x10000 and cch_max > 0) {
+                                const dst: [*]u16 = @ptrFromInt(ptext_addr);
+                                const n = @min(w.title_len, @as(usize, @intCast(cch_max - 1)));
+                                @memcpy(dst[0..n], w.title[0..n]);
+                                dst[n] = 0;
+                            }
+                        }
+                        return 1;
+                    }
+                    return 0;
+                },
+                else => {},
+            }
+        } else if (winClassEqAscii(w, "msctls_statusbar32")) {
+            switch (msg) {
+                0x0005 => { // WM_SIZE
+                    var pw: i32 = @intCast(lparam & 0xffff);
+                    var ph: i32 = @intCast((lparam >> 16) & 0xffff);
+                    if ((pw <= 0 or ph <= 0) and w.parent != 0) {
+                        if (findWin(w.parent)) |p| {
+                            pw = p.width;
+                            ph = p.height;
+                        }
+                    }
+                    if (pw > 0 and ph >= 24) {
+                        w.x = 0;
+                        w.y = ph - 24;
+                        w.width = pw;
+                        w.height = 24;
+                        w.needs_paint = true;
+                    }
+                    return 0;
+                },
+                0x0404 => { // SB_SETPARTS
+                    const n = @min(wparam, 8);
+                    w.sb_parts_n = n;
+                    if (lparam >= 0x10000) {
+                        const edges: [*]const i32 = @ptrFromInt(lparam);
+                        for (0..n) |i| w.sb_parts_right[i] = edges[i];
+                    }
+                    w.needs_paint = true;
+                    return 1;
+                },
+                0x040b => { // SB_SETTEXTW
+                    const part = wparam & 0xff;
+                    if (part < 8 and lparam >= 0x10000) {
+                        w.sb_text_len[part] = copyTitleU16(&w.sb_text[part], @ptrFromInt(lparam));
+                        w.needs_paint = true;
+                    }
+                    return 1;
+                },
+                0x040a => { // SB_GETRECT
+                    if (lparam >= 0x10000) {
+                        const rc: *Rect = @ptrFromInt(lparam);
+                        rc.* = .{ .left = 0, .top = 0, .right = 120, .bottom = @max(22, w.height) };
+                        return 1;
+                    }
+                    return 0;
+                },
+                else => {},
+            }
+        } else if (winClassEqAscii(w, "ToolbarWindow32")) {
+            switch (msg) {
+                0x041d => { // TB_GETITEMRECT
+                    if (lparam >= 0x10000) {
+                        const rc: *Rect = @ptrFromInt(lparam);
+                        const idx: i32 = @intCast(wparam & 0xff);
+                        rc.* = .{ .left = idx * 24, .top = 0, .right = (idx + 1) * 24, .bottom = 26 };
+                        return 1;
+                    }
+                    return 0;
+                },
+                0x043a => return (26 << 16) | 24, // TB_GETBUTTONSIZE
+                0x0444 => { // TB_ADDBUTTONSW
+                    w.tb_btn_count +%= @truncate(wparam);
+                    if (w.height < 26) w.height = 28;
+                    if (w.width < 240) w.width = 1024;
+                    w.needs_paint = true;
+                    return 1;
+                },
+                0x0421 => { // TB_AUTOSIZE
+                    if (w.height < 26) w.height = 28;
+                    if (w.width <= 0) w.width = 1024;
+                    return 0;
+                },
+                else => {},
+            }
+        } else if (winClassEqAscii(w, "ReBarWindow32")) {
+            switch (msg) {
+                0x040a, 0x0401 => { // RB_INSERTBANDW / RB_INSERTBANDA
+                    if (w.hwnd == 0x200022) {
+                        w.tb_btn_count = 1;
+                        w.height = 28;
+                        if (w.width <= 0) w.width = 1024;
+                    }
+                    w.needs_paint = true;
+                    return 1;
+                },
+                0x0410 => return if (wparam == 0) 0 else @bitCast(@as(isize, -1)), // RB_IDTOINDEX
+                0x040c, 0x040d => return if (w.tb_btn_count > 0) 1 else 0, // RB_GETBANDCOUNT / RB_GETROWCOUNT
+                0x040e, 0x041b => return if (w.tb_btn_count > 0) 28 else 0, // RB_GETROWHEIGHT / RB_GETBARHEIGHT
+                0x0409 => { // RB_GETRECT
+                    if (lparam >= 0x10000) {
+                        const rc: *Rect = @ptrFromInt(lparam);
+                        rc.* = .{ .left = 0, .top = 0, .right = @max(200, w.width), .bottom = if (w.tb_btn_count > 0) 28 else 0 };
+                        return 1;
+                    }
+                    return 0;
+                },
+                else => {},
+            }
+        }
+    }
+    if (msg == WM_GETTEXT) {
+        const dst: [*]u16 = if (lparam != 0) @ptrFromInt(lparam) else return 0;
+        const max_c = @min(wparam, 256);
+        if (max_c == 0) return 0;
+        const w = findWin(window) orelse {
+            dst[0] = 0;
+            return 0;
+        };
+        const n = @min(w.title_len, max_c - 1);
+        @memcpy(dst[0..n], w.title[0..n]);
+        dst[n] = 0;
+        return n;
+    }
+    if (msg == WM_GETTEXTLENGTH) {
+        const w = findWin(window) orelse return 0;
+        return w.title_len;
+    }
+    if (msg == WM_PAINT or msg == 0x0318) { // WM_PAINT or WM_PRINTCLIENT
+        if (findWin(window)) |w| {
+            if (w.width > 0 and w.height > 0) {
+                var ps: PAINTSTRUCT = undefined;
+                const use_passed_dc = (wparam != 0 and dcFromHandle(wparam) != null);
+                const hdc = if (use_passed_dc) wparam else BeginPaint(window, &ps);
+                if (hdc != 0) {
+                    if (dcFromHandle(hdc)) |dc| {
+                        if (dcTarget(dc)) |tgt| {
+                            if ((w.style & WS_CHILD) == 0) {
+                                gdi.fillRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + w.height, 0x00F0F0F0);
+                            } else if (winClassEqAscii(w, "SysTabControl32") or winClassEqAscii(w, "msctls_statusbar32") or winClassEqAscii(w, "ToolbarWindow32") or winClassEqAscii(w, "ReBarWindow32")) {
+                                paintCommonControlOverlay(w, tgt);
+                            } else {
+                                gdi.fillRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + w.height, 0x00F5F5F5);
+                                if (w.width >= 4 and w.height >= 4) {
+                                    gdi.frameRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + w.height, 0x00C8C8C8);
+                                    if (w.title_len > 0) {
+                                        gdi.drawTextU16(tgt.surface, tgt.clip, tgt.ox + 6, tgt.oy + @max(0, @divFloor(w.height - 16, 2)), w.title[0..w.title_len], 0x00202020, null);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!use_passed_dc) {
+                        _ = EndPaint(window, &ps);
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    if (msg == 0x0014) { // WM_ERASEBKGND
+        if (findWin(window)) |w| {
+            if (wparam != 0) {
+                if (dcFromHandle(wparam)) |dc| {
+                    if (dcTarget(dc)) |tgt| {
+                        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + w.height, 0x00F0F0F0);
+                    }
+                }
+            }
+        }
+        return 1;
+    }
+    if (msg == WM_SETTEXT and lparam != 0) {
+        _ = SetWindowTextW(window, @ptrFromInt(lparam));
+        return 1;
     }
     return 0;
 }
@@ -312,55 +1424,221 @@ fn postMessageW(window: usize, msg: u32, wparam: usize, lparam: usize) callconv(
     return if (pushMsg(m)) 1 else 0;
 }
 
-fn sendMessageW(window: usize, msg: u32, wparam: usize, lparam: usize) callconv(W) usize {
-    if (window != 0 and window == active_window and active_wndproc != null) {
-        return active_wndproc.?(window, msg, wparam, lparam);
-    }
-    if (window == active_window and msg == WM_CLOSE) {
-        _ = destroyWindow(window);
-        return 0;
+fn callBaseWndProc(window: usize, msg: u32, wparam: usize, lparam: usize) usize {
+    if (findWin(window)) |w| {
+        if (w.wndproc) |proc| return proc(window, msg, wparam, lparam);
+        return defWindowProcW(window, msg, wparam, lparam);
     }
     return 0;
 }
+
+fn dispatchSubclassFrom(window: usize, msg: u32, wparam: usize, lparam: usize, below_idx: ?usize) usize {
+    var i: usize = below_idx orelse subclasses.len;
+    while (i > 0) {
+        i -= 1;
+        const sc = subclasses[i];
+        if (sc.in_use and sc.hwnd == window) {
+            const prev = active_subclass_idx;
+            active_subclass_idx = i;
+            defer active_subclass_idx = prev;
+            return sc.proc(window, msg, wparam, lparam, sc.id, sc.ref_data);
+        }
+    }
+    return callBaseWndProc(window, msg, wparam, lparam);
+}
+
+fn sendMessageW(window: usize, msg: u32, wparam: usize, lparam: usize) callconv(W) usize {
+    return dispatchSubclassFrom(window, msg, wparam, lparam, null);
+}
+
+fn isWindowVisibleTree(w: *const WinObj) bool {
+    if (!w.in_use or !w.visible) return false;
+    var cur: *const WinObj = w;
+    var hops: usize = 0;
+    while (hops < 16 and (cur.style & WS_CHILD) != 0 and cur.parent != 0) : (hops += 1) {
+        const p = findWin(cur.parent) orelse return false;
+        if (!p.in_use or !p.visible) return false;
+        cur = p;
+    }
+    return true;
+}
+
+fn enqueueDirtyPaints() void {
+    // Pass 1: top-level windows
+    for (&windows) |*w| {
+        if (w.in_use and w.needs_paint and (w.style & WS_CHILD) == 0 and isWindowVisibleTree(w)) {
+            w.needs_paint = false;
+            _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_PAINT, .wParam = 0, .lParam = 0, .time = 0, .pt = .{ .x = 0, .y = 0 } });
+        }
+    }
+    // Pass 2: container/tab child windows (e.g. SysTabControl32, ReBarWindow32)
+    for (&windows) |*w| {
+        if (w.in_use and w.needs_paint and (w.style & WS_CHILD) != 0 and (winClassEqAscii(w, "SysTabControl32") or winClassEqAscii(w, "ReBarWindow32")) and isWindowVisibleTree(w)) {
+            w.needs_paint = false;
+            _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_PAINT, .wParam = 0, .lParam = 0, .time = 0, .pt = .{ .x = 0, .y = 0 } });
+        }
+    }
+    // Pass 3: content/leaf child windows (e.g. Scintilla, ToolbarWindow32, msctls_statusbar32)
+    for (&windows) |*w| {
+        if (w.in_use and w.needs_paint and isWindowVisibleTree(w)) {
+            w.needs_paint = false;
+            _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_PAINT, .wParam = 0, .lParam = 0, .time = 0, .pt = .{ .x = 0, .y = 0 } });
+        }
+    }
+}
+
+var g_last_mouse_x: i32 = 0;
+var g_last_mouse_y: i32 = 0;
+
+/// One X11 key event -> Win32: VK in wParam, VK-state table (shared with
+/// GetKeyState/GetAsyncKeyState via winrun_directx.feedKeyState), WM_INPUT
+/// when RawInput keyboard is registered, and WM_KEYDOWN/WM_KEYUP (or the
+/// WM_SYSKEY* variants while Alt is held).
+fn postKeyEvent(w: *WinObj, conn: *const x11.Connection, ke: *const x11.XKeyEvent, down: bool) void {
+    const vk = kbd.handleKeyEvent(conn, ke, down);
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:KBD] keycode={d} vk=0x{x} down={} hwnd=0x{x}\n", .{ ke.keycode, vk, down, w.hwnd });
+    if (vk != 0) dxmod.feedKeyState(vk, down);
+    if (vk != 0 and std.c.getenv("WINS_KBD_NO_RAW") == null) {
+        if (dxmod.getRegisteredRawInputTarget(1, 6)) |hwnd| { // HID usage page 1, usage 6 = keyboard
+            const h = dxmod.pushRawKeyEvent(vk, @intCast(ke.keycode), kbd.isExtendedVk(vk), down);
+            _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = ke.x, .y = ke.y } });
+        }
+    }
+    const alt = kbd.getKeyState(kbd.VK_MENU) < 0 and kbd.getKeyState(kbd.VK_CONTROL) >= 0;
+    const msg: u32 = if (down) (if (alt) WM_SYSKEYDOWN else WM_KEYDOWN) else (if (alt) WM_SYSKEYUP else WM_KEYUP);
+    _ = pushMsg(.{ .hwnd = w.hwnd, .message = msg, .wParam = if (vk != 0) vk else ke.keycode, .lParam = if (down) 1 else 0xC0000001, .time = 0, .pt = .{ .x = ke.x, .y = ke.y } });
+}
+
+/// Post a RawInput mouse packet (if registered) + WM_INPUT, and the classic
+/// WM_LBUTTON*/WM_MOUSEMOVE message.
+fn postMouseButton(w: *WinObj, be: *const x11.XButtonEvent, down: bool) void {
+    const ri_flags: u16 = switch (be.button) {
+        1 => if (down) dxmod.RI_MOUSE_LEFT_BUTTON_DOWN else dxmod.RI_MOUSE_LEFT_BUTTON_UP,
+        2 => if (down) dxmod.RI_MOUSE_MIDDLE_BUTTON_DOWN else dxmod.RI_MOUSE_MIDDLE_BUTTON_UP,
+        3 => if (down) dxmod.RI_MOUSE_RIGHT_BUTTON_DOWN else dxmod.RI_MOUSE_RIGHT_BUTTON_UP,
+        else => 0,
+    };
+    const lp: usize = (@as(usize, @intCast(@max(0, be.y))) << 16) | @as(usize, @intCast(@max(0, be.x) & 0xffff));
+    if (ri_flags != 0) {
+        if (dxmod.getRegisteredRawInputTarget(1, 2)) |hwnd| { // usage page 1, usage 2 = mouse
+            const h = dxmod.pushRawMouseEvent(0, 0, ri_flags, 0);
+            _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = be.x, .y = be.y } });
+        }
+    }
+    if (be.button == 1) {
+        _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_LBUTTONDOWN else WM_LBUTTONUP, .wParam = if (down) 1 else 0, .lParam = lp, .time = 0, .pt = .{ .x = be.x, .y = be.y } });
+    }
+}
+
+fn pumpX11Events(wait_ms: i32) void {
+    enqueueDirtyPaints();
+    flushDirtyBlits();
+    const conn = connection orelse return;
+    if (std.c.getenv("WINS_TRACE") != null) {
+        const n = @atomicRmw(u32, &g_pump_calls, .Add, 1, .monotonic);
+        if (n < 5 or n % 500 == 0) std.debug.print("[WINS:MSG] pumpX11Events #{d} pending={d}\n", .{ n, conn.pending() });
+    }
+    if (conn.pending() == 0 and wait_ms != 0 and queue_count == 0 and !quit_posted) {
+        var pfd = [1]std.posix.pollfd{.{
+            .fd = conn.fd(),
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(&pfd, wait_ms) catch {};
+    }
+    var limit: usize = 0;
+    while (conn.pending() > 0 and limit < 32) : (limit += 1) {
+        var ev: x11.XEvent = undefined;
+        conn.nextEvent(&ev);
+        const any: *const x11.XAnyEvent = @ptrCast(&ev);
+        if (std.c.getenv("WINS_XEV") != null) std.debug.print("[WINS:XEV] type={d} win=0x{x} send={d}\n", .{ ev.type, any.window, any.send_event });
+        const w = findWinByX11(any.window) orelse continue;
+        switch (ev.type) {
+            12 => { // Expose
+                markTreeDirty(w.hwnd);
+                enqueueDirtyPaints();
+            },
+            22 => { // ConfigureNotify
+                const ce: *const x11.XConfigureEvent = @ptrCast(&ev);
+                if (ce.width > 0 and ce.height > 0 and (ce.width != w.width or ce.height != w.height)) {
+                    w.width = ce.width;
+                    w.height = ce.height;
+                    const lp: usize = (@as(usize, @intCast(ce.height)) << 16) | @as(usize, @intCast(ce.width & 0xffff));
+                    _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_SIZE, .wParam = 0, .lParam = lp, .time = 0, .pt = .{ .x = 0, .y = 0 } });
+                }
+            },
+            33 => { // ClientMessage
+                const cm: *const x11.XClientMessageEvent = @ptrCast(&ev);
+                if (@as(c_ulong, @bitCast(cm.data[0])) == wm_delete_atom) {
+                    _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_CLOSE, .wParam = 0, .lParam = 0, .time = 0, .pt = .{ .x = 0, .y = 0 } });
+                }
+            },
+            4 => postMouseButton(w, @ptrCast(&ev), true), // ButtonPress
+            5 => postMouseButton(w, @ptrCast(&ev), false), // ButtonRelease
+            6 => { // MotionNotify -> WM_MOUSEMOVE (+ raw mouse if registered)
+                const me: *const x11.XButtonEvent = @ptrCast(&ev); // same prefix layout as XMotionEvent
+                const lp: usize = (@as(usize, @intCast(@max(0, me.y))) << 16) | @as(usize, @intCast(@max(0, me.x) & 0xffff));
+                _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_MOUSEMOVE, .wParam = 0, .lParam = lp, .time = 0, .pt = .{ .x = me.x, .y = me.y } });
+                if (dxmod.getRegisteredRawInputTarget(1, 2)) |hwnd| {
+                    const rx = me.x - g_last_mouse_x;
+                    const ry = me.y - g_last_mouse_y;
+                    g_last_mouse_x = me.x;
+                    g_last_mouse_y = me.y;
+                    const h = dxmod.pushRawMouseEvent(rx, ry, 0, 0);
+                    _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = me.x, .y = me.y } });
+                }
+            },
+            2 => postKeyEvent(w, &conn, @ptrCast(&ev), true), // KeyPress
+            3 => postKeyEvent(w, &conn, @ptrCast(&ev), false), // KeyRelease
+            else => {},
+        }
+    }
+}
+
+var g_msg_calls: u32 = 0;
+var g_pump_calls: u32 = 0;
 
 fn getMessageW(lp_msg: ?*MSG, window: usize, min_filter: u32, max_filter: u32) callconv(W) i32 {
     _ = window;
     _ = min_filter;
     _ = max_filter;
     if (lp_msg == null) return -1;
-
-    if (popMsg()) |m| {
-        lp_msg.?.* = m;
-        if (m.message == WM_QUIT) return 0;
-        return 1;
+    if (std.c.getenv("WINS_TRACE") != null) {
+        const n = @atomicRmw(u32, &g_msg_calls, .Add, 1, .monotonic);
+        if (n < 5 or n % 1000 == 0) std.debug.print("[WINS:MSG] GetMessageW call #{d}\n", .{n});
     }
 
-    if (quit_posted) {
-        lp_msg.?.* = .{
-            .hwnd = 0,
-            .message = WM_QUIT,
-            .wParam = @bitCast(@as(isize, quit_exit_code)),
-            .lParam = 0,
-            .time = 0,
-            .pt = .{ .x = 0, .y = 0 },
-        };
-        quit_posted = false;
-        return 0;
+    while (true) {
+        if (popMsg()) |m| {
+            lp_msg.?.* = m;
+            if (m.message == WM_QUIT) return 0;
+            return 1;
+        }
+        if (quit_posted) {
+            lp_msg.?.* = .{
+                .hwnd = 0,
+                .message = WM_QUIT,
+                .wParam = @bitCast(@as(isize, quit_exit_code)),
+                .lParam = 0,
+                .time = 0,
+                .pt = .{ .x = 0, .y = 0 },
+            };
+            quit_posted = false;
+            return 0;
+        }
+        if (countTopLevelWindows() == 0) {
+            lp_msg.?.* = .{
+                .hwnd = 0,
+                .message = WM_QUIT,
+                .wParam = 0,
+                .lParam = 0,
+                .time = 0,
+                .pt = .{ .x = 0, .y = 0 },
+            };
+            return 0;
+        }
+        pumpX11Events(100);
     }
-
-    if (active_window == 0 and queue_count == 0) {
-        lp_msg.?.* = .{
-            .hwnd = 0,
-            .message = WM_QUIT,
-            .wParam = 0,
-            .lParam = 0,
-            .time = 0,
-            .pt = .{ .x = 0, .y = 0 },
-        };
-        return 0;
-    }
-
-    return 0;
 }
 
 fn peekMessageW(lp_msg: ?*MSG, window: usize, min_filter: u32, max_filter: u32, remove_msg: u32) callconv(W) i32 {
@@ -368,6 +1646,11 @@ fn peekMessageW(lp_msg: ?*MSG, window: usize, min_filter: u32, max_filter: u32, 
     _ = min_filter;
     _ = max_filter;
     if (lp_msg == null) return 0;
+    if (std.c.getenv("WINS_TRACE") != null) {
+        const n = @atomicRmw(u32, &g_msg_calls, .Add, 1, .monotonic);
+        if (n < 5 or n % 1000 == 0) std.debug.print("[WINS:MSG] PeekMessageW call #{d} rm={d}\n", .{ n, remove_msg });
+    }
+    if (queue_count == 0) pumpX11Events(0);
     if (queue_count > 0) {
         if (remove_msg != 0) {
             lp_msg.?.* = popMsg().?;
@@ -392,21 +1675,49 @@ fn peekMessageW(lp_msg: ?*MSG, window: usize, min_filter: u32, max_filter: u32, 
 }
 
 fn translateMessage(lp_msg: ?*const MSG) callconv(W) i32 {
-    _ = lp_msg;
+    const m = lp_msg orelse return 0;
+    // WM_KEYDOWN/WM_SYSKEYDOWN -> WM_CHAR/WM_SYSCHAR with the character the
+    // key produces (shift/caps aware), as the real TranslateMessage does.
+    if (m.message == WM_KEYDOWN or m.message == WM_SYSKEYDOWN) {
+        if (std.c.getenv("WINS_KBD_NO_CHAR") != null) return 0;
+        const vk = @as(u8, @truncate(m.wParam));
+        const caps = kbd.getKeyState(0x14) & 1 != 0;
+        const ch = kbd.charForVk(vk, kbd.isShiftDown(), caps);
+        if (ch != 0) {
+            const posted = pushMsg(.{
+                .hwnd = m.hwnd,
+                .message = if (m.message == WM_SYSKEYDOWN) WM_SYSCHAR else WM_CHAR,
+                .wParam = ch,
+                .lParam = m.lParam,
+                .time = m.time,
+                .pt = m.pt,
+            });
+            return if (posted) 1 else 0;
+        }
+    }
     return 0;
 }
 
 fn dispatchMessageW(lp_msg: ?*const MSG) callconv(W) usize {
     if (lp_msg == null) return 0;
     const m = lp_msg.?.*;
-    if (m.hwnd != 0 and m.hwnd == active_window and active_wndproc != null) {
-        return active_wndproc.?(m.hwnd, m.message, m.wParam, m.lParam);
-    }
-    return 0;
+    return dispatchSubclassFrom(m.hwnd, m.message, m.wParam, m.lParam, null);
 }
 
 fn MessageBoxW(hwnd: usize, lpText: ?[*:0]const u16, lpCaption: ?[*:0]const u16, uType: u32) callconv(W) i32 {
-    _ = hwnd; _ = lpText; _ = lpCaption; _ = uType;
+    _ = hwnd;
+    _ = uType;
+    if (std.c.getenv("WINS_TRACE") != null) {
+        var c8: [128]u8 = undefined;
+        var t8: [256]u8 = undefined;
+        var cw: [256]u16 = undefined;
+        var tw: [256]u16 = undefined;
+        const cl = copyTitleU16(&cw, lpCaption);
+        const tl = copyTitleU16(&tw, lpText);
+        const cn = encodeTitleUtf8(cw[0..cl], &c8);
+        const tn = encodeTitleUtf8(tw[0..tl], &t8);
+        std.debug.print("[WINS:USER32] MessageBoxW caption=\"{s}\" text=\"{s}\"\n", .{ c8[0..cn], t8[0..tn] });
+    }
     return 1;
 }
 
@@ -416,12 +1727,31 @@ fn MessageBoxA(hwnd: usize, lpText: ?[*:0]const u8, lpCaption: ?[*:0]const u8, u
 }
 
 fn GetDC(hwnd: usize) callconv(W) usize {
-    _ = hwnd;
+    if (hwnd == 0) {
+        if (screen_hdc == 0) {
+            screen_hdc = allocDC(0, true);
+            if (dcFromHandle(screen_hdc)) |dc| {
+                dc.is_screen = true;
+                dc.hbitmap = getDefaultBitmap();
+            }
+        }
+        return screen_hdc;
+    }
+    const hdc = allocDC(hwnd, false);
+    if (hdc != 0) return hdc;
     return 0xDC0001;
 }
 
 fn ReleaseDC(hwnd: usize, hdc: usize) callconv(W) i32 {
-    _ = hwnd; _ = hdc;
+    if (dcFromHandle(hdc)) |dc| {
+        if (dc.is_screen) return 1;
+        const target_hwnd = if (hwnd != 0) hwnd else dc.hwnd;
+        dc.* = .{};
+        if (target_hwnd != 0) {
+            markFbDirty(target_hwnd);
+            flushDirtyBlits();
+        }
+    }
     return 1;
 }
 
@@ -434,23 +1764,88 @@ fn GetSystemMetrics(nIndex: i32) callconv(W) i32 {
 }
 
 fn SetWindowPos(hwnd: usize, hwndInsertAfter: usize, x: i32, y: i32, cx: i32, cy: i32, uFlags: u32) callconv(W) i32 {
-    _ = hwnd; _ = hwndInsertAfter; _ = x; _ = y; _ = cx; _ = cy; _ = uFlags;
-    return 1;
-}
-
-fn GetWindowRect(hwnd: usize, lpRect: ?*Rect) callconv(W) i32 {
-    _ = hwnd;
-    if (lpRect) |r| {
-        r.left = 0;
-        r.top = 0;
-        r.right = 800;
-        r.bottom = 600;
+    _ = hwndInsertAfter;
+    const w = findWin(hwnd) orelse return 0;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+    const SWP_HIDEWINDOW: u32 = 0x0080;
+    if ((uFlags & SWP_NOMOVE) == 0) {
+        w.x = x;
+        w.y = y;
+    }
+    var size_changed = false;
+    if ((uFlags & SWP_NOSIZE) == 0) {
+        const nw = @max(0, cx);
+        var nh = @max(0, cy);
+        if (winClassEqAscii(w, "ReBarWindow32") and w.tb_btn_count > 0 and nh < 28) {
+            nh = 28;
+        }
+        if (nw != w.width or nh != w.height) size_changed = true;
+        w.width = nw;
+        w.height = nh;
+        if (winClassEqAscii(w, "ReBarWindow32") and w.tb_btn_count > 0) {
+            for (&windows) |*cw| {
+                if (cw.in_use and winClassEqAscii(cw, "ToolbarWindow32")) {
+                    cw.x = w.x;
+                    cw.y = w.y;
+                    if (nw > 0) cw.width = nw;
+                    cw.height = nh;
+                    cw.needs_paint = true;
+                }
+            }
+        }
+    }
+    if ((uFlags & SWP_SHOWWINDOW) != 0) {
+        w.visible = true;
+        w.needs_paint = true;
+        w.style |= WS_VISIBLE;
+    } else if ((uFlags & SWP_HIDEWINDOW) != 0) {
+        w.visible = false;
+        w.style &= ~WS_VISIBLE;
+    }
+    ensureX11Window(w);
+    if (w.x11_win != 0) {
+        if (connection) |conn| {
+            if ((uFlags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE)) {
+                conn.moveResize(w.x11_win, w.x, w.y, @intCast(@max(1, w.width)), @intCast(@max(1, w.height)));
+            }
+            if ((uFlags & SWP_SHOWWINDOW) != 0 or w.visible) {
+                conn.map(w.x11_win);
+            } else if ((uFlags & SWP_HIDEWINDOW) != 0) {
+                conn.unmap(w.x11_win);
+            }
+            conn.flush();
+        }
+    }
+    if (size_changed) {
+        if (w.visible) w.needs_paint = true;
+        _ = dispatchSubclassFrom(hwnd, WM_SIZE, 0, (@as(usize, @intCast(@max(0, w.height))) << 16) | @as(usize, @intCast(@max(0, w.width) & 0xffff)), null);
     }
     return 1;
 }
 
+fn GetWindowRect(hwnd: usize, lpRect: ?*Rect) callconv(W) i32 {
+    const r = lpRect orelse return 0;
+    if (findWin(hwnd)) |w| {
+        const sp = winScreenPos(hwnd);
+        r.* = .{ .left = sp.x, .top = sp.y, .right = sp.x + w.width, .bottom = sp.y + w.height };
+        return 1;
+    }
+    r.* = .{ .left = 0, .top = 0, .right = 1024, .bottom = 720 };
+    return 1;
+}
+
 fn SetWindowTextW(hwnd: usize, lpString: ?[*:0]const u16) callconv(W) i32 {
-    _ = hwnd; _ = lpString;
+    const w = findWin(hwnd) orelse return 0;
+    w.title_len = copyTitleU16(&w.title, lpString);
+    if (w.x11_win != 0) {
+        if (connection) |conn| {
+            var tbuf: [256]u8 = undefined;
+            _ = encodeTitleUtf8(w.title[0..w.title_len], &tbuf);
+            conn.setTitle(w.x11_win, @ptrCast(&tbuf));
+        }
+    }
     return 1;
 }
 
@@ -493,7 +1888,10 @@ fn SetDlgItemInt(hDlg: usize, nIDDlgItem: i32, uValue: u32, bSigned: i32) callco
 }
 
 fn DialogBoxParamW(hInstance: usize, lpTemplateName: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*const anyopaque, dwInitParam: usize) callconv(W) isize {
-    _ = hInstance; _ = lpTemplateName; _ = hWndParent; _ = lpDialogFunc; _ = dwInitParam;
+    _ = hInstance; _ = hWndParent; _ = lpDialogFunc; _ = dwInitParam;
+    if (std.c.getenv("WINS_TRACE") != null) {
+        std.debug.print("[WINS:USER32] DialogBoxParamW tmpl=0x{x}\n", .{@intFromPtr(lpTemplateName)});
+    }
     return 1;
 }
 
@@ -513,7 +1911,14 @@ fn LoadImageW(hInst: usize, name: ?*const anyopaque, uType: u32, cx: i32, cy: i3
 }
 
 fn SystemParametersInfoW(uiAction: u32, uiParam: u32, pvParam: ?*anyopaque, fWinIni: u32) callconv(W) i32 {
-    _ = uiAction; _ = uiParam; _ = pvParam; _ = fWinIni;
+    _ = uiParam;
+    _ = fWinIni;
+    if (uiAction == 0x0030) { // SPI_GETWORKAREA
+        if (pvParam) |p| {
+            const rc: *Rect = @ptrCast(@alignCast(p));
+            rc.* = .{ .left = 0, .top = 0, .right = 1024, .bottom = 720 };
+        }
+    }
     return 1;
 }
 
@@ -541,8 +1946,14 @@ fn CallNextHookEx(hhk: usize, nCode: i32, wParam: usize, lParam: usize) callconv
 fn GetDeviceCaps(hdc: usize, nIndex: i32) callconv(W) i32 {
     _ = hdc;
     return switch (nIndex) {
-        88 => 96,
-        90 => 96,
+        2 => 1, // TECHNOLOGY = DT_RASDISPLAY
+        8 => 1280, // HORZRES
+        10 => 900, // VERTRES
+        12 => 32, // BITSPIXEL
+        14 => 1, // PLANES
+        38 => 0x7E99, // RASTERCAPS
+        88 => 96, // LOGPIXELSX
+        90 => 96, // LOGPIXELSY
         else => 0,
     };
 }
@@ -553,68 +1964,259 @@ fn CreateFontW(cHeight: i32, cWidth: i32, cEscapement: i32, cOrientation: i32, c
 }
 
 fn DeleteObject(ho: usize) callconv(W) i32 {
-    _ = ho;
+    if (ho >= HBRUSH_BASE and ho < HBRUSH_BASE + gdi_brushes.len) {
+        const b = &gdi_brushes[ho - HBRUSH_BASE];
+        if (!b.sticky) b.* = .{};
+        return 1;
+    }
+    if (ho >= HPEN_BASE and ho < HPEN_BASE + gdi_pens.len) {
+        const p = &gdi_pens[ho - HPEN_BASE];
+        if (!p.sticky) p.* = .{};
+        return 1;
+    }
+    if (ho >= HBITMAP_BASE and ho < HBITMAP_BASE + gdi_bitmaps.len) {
+        const bm = &gdi_bitmaps[ho - HBITMAP_BASE];
+        if (!bm.sticky) {
+            bm.surface.deinit();
+            if (bm.raw.len > 0) std.heap.page_allocator.free(bm.raw);
+            bm.* = .{};
+        }
+        return 1;
+    }
+    if (ho >= HRGN_BASE and ho < HRGN_BASE + gdi_regions.len) {
+        gdi_regions[ho - HRGN_BASE] = .{};
+        return 1;
+    }
     return 1;
 }
 
 fn CreateDIBSection(hdc: usize, pbmi: ?*const anyopaque, usage: u32, ppvBits: ?*?*anyopaque, hSection: usize, offset: u32) callconv(W) usize {
-    _ = hdc; _ = pbmi; _ = usage; _ = hSection; _ = offset;
+    _ = hdc;
+    _ = usage;
+    _ = hSection;
+    _ = offset;
+    var w: i32 = 64;
+    var h: i32 = 64;
+    var bottom_up = true;
+    if (pbmi) |ptr| {
+        const hdr: *const [10]i32 = @ptrCast(@alignCast(ptr));
+        w = @max(1, @min(4096, hdr[1]));
+        const raw_h = hdr[2];
+        bottom_up = raw_h >= 0;
+        h = @max(1, @min(4096, @as(i32, @intCast(@abs(raw_h)))));
+    }
+    const hbmp = allocBitmap(w, h, 0);
+    if (bitmapFromHandle(hbmp)) |bm| {
+        bm.bottom_up = bottom_up;
+        if (ppvBits) |p| p.* = @ptrCast(bm.surface.pixels.ptr);
+        return hbmp;
+    }
     if (ppvBits) |p| p.* = @ptrFromInt(0x800000);
     return 0xB001;
 }
 
+var gl_dummy_xwin: x11.Window = 0;
+
+pub const GlSurface = struct {
+    display: *anyopaque,
+    window: c_ulong,
+    width: u32,
+    height: u32,
+};
+
+pub fn ensureGlSurfaceForHwnd(hwnd: usize) ?GlSurface {
+    const conn = ensureX11() orelse return null;
+    if (findWin(hwnd)) |w| {
+        w.has_gl = true;
+        if (w.x11_win == 0) {
+            const ww: u32 = @intCast(@max(1, w.width));
+            const hh: u32 = @intCast(@max(1, w.height));
+            w.x11_win = conn.createUnmapped(w.x, w.y, ww, hh) catch 0;
+            if (w.x11_win != 0 and w.visible) conn.map(w.x11_win);
+        }
+        if (w.x11_win != 0) {
+            return .{
+                .display = @ptrCast(conn.display),
+                .window = w.x11_win,
+                .width = @intCast(@max(1, w.width)),
+                .height = @intCast(@max(1, w.height)),
+            };
+        }
+    }
+    if (gl_dummy_xwin == 0) {
+        gl_dummy_xwin = conn.createUnmapped(0, 0, 1, 1) catch 0;
+    }
+    if (gl_dummy_xwin == 0) return null;
+    return .{ .display = @ptrCast(conn.display), .window = gl_dummy_xwin, .width = 1, .height = 1 };
+}
+
+pub fn getWindowClientSize(hwnd: usize) struct { w: u32, h: u32 } {
+    if (findWin(hwnd)) |w| {
+        return .{ .w = @intCast(@max(1, w.width)), .h = @intCast(@max(1, w.height)) };
+    }
+    return .{ .w = 1280, .h = 720 };
+}
+
+pub fn ensureGlSurfaceForDc(hdc: usize) ?GlSurface {
+    if (dcFromHandle(hdc)) |dc| {
+        return ensureGlSurfaceForHwnd(dc.hwnd);
+    }
+    return ensureGlSurfaceForHwnd(0);
+}
+
 fn SwapBuffers(hdc: usize) callconv(W) i32 {
-    _ = hdc;
-    return 1;
+    return gl64.swapBuffers(hdc);
 }
 
 fn ChoosePixelFormat(hdc: usize, ppfd: ?*const anyopaque) callconv(W) i32 {
-    _ = hdc; _ = ppfd;
-    return 1;
+    return gl64.choosePixelFormat(hdc, ppfd);
 }
 
 fn SetPixelFormat(hdc: usize, format: i32, ppfd: ?*const anyopaque) callconv(W) i32 {
-    _ = hdc; _ = format; _ = ppfd;
-    return 1;
+    return gl64.setPixelFormat(hdc, format, ppfd);
+}
+
+fn DescribePixelFormat(hdc: usize, format: i32, nbytes: u32, ppfd: ?[*]u8) callconv(W) i32 {
+    return gl64.describePixelFormat(hdc, format, nbytes, ppfd);
 }
 
 fn BitBlt(hdc: usize, x: i32, y: i32, cx: i32, cy: i32, hdcSrc: usize, x1: i32, y1: i32, rop: u32) callconv(W) i32 {
-    _ = hdc; _ = x; _ = y; _ = cx; _ = cy; _ = hdcSrc; _ = x1; _ = y1; _ = rop;
+    const dc_dst = dcFromHandle(hdc) orelse return 1;
+    const tgt_dst = dcTarget(dc_dst) orelse return 1;
+    if (rop == 0x00000042 or rop == 0x00FF0062 or rop == 0x00550009 or rop == 0x005A0049 or rop == 0x00F00021) {
+        patBltTarget(dc_dst, tgt_dst, x, y, cx, cy, rop);
+        if (!dc_dst.is_mem) markFbDirty(dc_dst.hwnd);
+        return 1;
+    }
+    const dc_src = dcFromHandle(hdcSrc) orelse return 1;
+    const tgt_src = dcTarget(dc_src) orelse return 1;
+    var flip = false;
+    if (dc_src.is_mem) {
+        if (bitmapFromHandle(dc_src.hbitmap)) |bm| flip = bm.bottom_up;
+    }
+    stretchCopy(tgt_dst, x, y, cx, cy, tgt_src, x1, y1, cx, cy, flip, rop);
+    if (!dc_dst.is_mem) markFbDirty(dc_dst.hwnd);
     return 1;
 }
 
 fn SelectObject(hdc: usize, h: usize) callconv(W) usize {
-    _ = hdc;
-    return h;
+    const dc = dcFromHandle(hdc) orelse return h;
+    if (h >= HBRUSH_BASE and h < HBRUSH_BASE + gdi_brushes.len or (h >= 1 and h <= 31)) {
+        const prev = if (dc.hbrush != 0) dc.hbrush else h;
+        dc.hbrush = h;
+        return prev;
+    }
+    if (h >= HPEN_BASE and h < HPEN_BASE + gdi_pens.len) {
+        const prev = if (dc.hpen != 0) dc.hpen else h;
+        dc.hpen = h;
+        return prev;
+    }
+    if (h >= HBITMAP_BASE and h < HBITMAP_BASE + gdi_bitmaps.len) {
+        const prev = if (dc.hbitmap != 0) dc.hbitmap else getDefaultBitmap();
+        dc.hbitmap = h;
+        return prev;
+    }
+    if (h >= HRGN_BASE and h < HRGN_BASE + gdi_regions.len) {
+        if (regionFromHandle(h)) |r| {
+            dc.has_clip = true;
+            dc.clip = r.rect;
+        }
+        return 2; // COMPLEXREGION
+    }
+    const prev_f = if (dc.hfont != 0) dc.hfont else h;
+    dc.hfont = h;
+    return prev_f;
 }
 
 fn CreateCompatibleDC(hdc: usize) callconv(W) usize {
     _ = hdc;
+    const m = allocDC(0, true);
+    if (dcFromHandle(m)) |dc| {
+        dc.hbitmap = getDefaultBitmap();
+        return m;
+    }
     return 0xB002;
 }
 
 fn CreateCompatibleBitmap(hdc: usize, cx: i32, cy: i32) callconv(W) usize {
-    _ = hdc; _ = cx; _ = cy;
-    return 0xB003;
+    _ = hdc;
+    const hbmp = allocBitmap(cx, cy, 0x00FFFFFF);
+    return if (hbmp != 0) hbmp else 0xB003;
 }
 
+const Win32BitmapStruct = extern struct {
+    bmType: i32 = 0,
+    bmWidth: i32 = 16,
+    bmHeight: i32 = 16,
+    bmWidthBytes: i32 = 64,
+    bmPlanes: u16 = 1,
+    bmBitsPixel: u16 = 32,
+    _pad: u32 = 0,
+    bmBits: ?*anyopaque = null,
+};
+
 fn GetObjectA(h: usize, c: i32, pv: ?*anyopaque) callconv(W) i32 {
-    _ = h; _ = c; _ = pv;
-    return 0;
+    return GetObjectW(h, c, pv);
 }
 
 fn GetObjectW(h: usize, c: i32, pv: ?*anyopaque) callconv(W) i32 {
-    _ = h; _ = c; _ = pv;
+    if (bitmapFromHandle(h)) |bm| {
+        if (pv == null) return @sizeOf(Win32BitmapStruct);
+        if (c >= @as(i32, @sizeOf(Win32BitmapStruct))) {
+            const out: *Win32BitmapStruct = @ptrCast(@alignCast(pv.?));
+            const w: i32 = @intCast(@max(1, bm.surface.width));
+            const ht: i32 = @intCast(@max(1, bm.surface.height));
+            out.* = .{
+                .bmType = 0,
+                .bmWidth = w,
+                .bmHeight = ht,
+                .bmWidthBytes = w * 4,
+                .bmPlanes = 1,
+                .bmBitsPixel = 32,
+                .bmBits = if (bm.surface.pixels.len > 0) @ptrCast(bm.surface.pixels.ptr) else null,
+            };
+            return @sizeOf(Win32BitmapStruct);
+        }
+    }
+    if (pv) |p| {
+        if (c > 0) {
+            const bytes: [*]u8 = @ptrCast(p);
+            @memset(bytes[0..@intCast(@min(c, 92))], 0);
+        }
+        return c;
+    }
     return 0;
 }
 
 fn CreateBitmap(nWidth: i32, nHeight: i32, nPlanes: u32, nBitCount: u32, lpBits: ?*const anyopaque) callconv(W) usize {
-    _ = nWidth; _ = nHeight; _ = nPlanes; _ = nBitCount; _ = lpBits;
-    return 0xB004;
+    _ = nPlanes;
+    _ = nBitCount;
+    _ = lpBits;
+    const hbmp = allocBitmap(nWidth, nHeight, 0);
+    return if (hbmp != 0) hbmp else 0xB004;
 }
 
 fn GetStockObject(i: i32) callconv(W) usize {
-    _ = i;
+    if (i >= 0 and i < @as(i32, stock_objects.len)) {
+        const idx: usize = @intCast(i);
+        if (stock_objects[idx] != 0) return stock_objects[idx];
+        const h: usize = switch (i) {
+            0 => allocGdiBrush(0xFFFFFF, false, true), // WHITE_BRUSH
+            1 => allocGdiBrush(0xC0C0C0, false, true), // LTGRAY_BRUSH
+            2 => allocGdiBrush(0x808080, false, true), // GRAY_BRUSH
+            3 => allocGdiBrush(0x404040, false, true), // DKGRAY_BRUSH
+            4 => allocGdiBrush(0x000000, false, true), // BLACK_BRUSH
+            5 => allocGdiBrush(0, true, true), // NULL_BRUSH / HOLLOW_BRUSH
+            6 => allocGdiPen(0xFFFFFF, 1, false, true), // WHITE_PEN
+            7 => allocGdiPen(0x000000, 1, false, true), // BLACK_PEN
+            8 => allocGdiPen(0, 1, true, true), // NULL_PEN
+            18 => allocGdiBrush(0xFFFFFF, false, true), // DC_BRUSH
+            19 => allocGdiPen(0x000000, 1, false, true), // DC_PEN
+            else => 0xF0001 + idx,
+        };
+        stock_objects[idx] = h;
+        return h;
+    }
     return 0xB005;
 }
 
@@ -624,87 +2226,158 @@ fn CreateFontIndirectW(lplf: ?*const anyopaque) callconv(W) usize {
 }
 
 fn CreateSolidBrush(color: u32) callconv(W) usize {
-    _ = color;
-    return 0xB006;
+    const h = allocGdiBrush(gdi.colorrefToXrgb(color), false, false);
+    return if (h != 0) h else 0xB006;
 }
 
 fn CreatePen(iStyle: i32, cWidth: i32, color: u32) callconv(W) usize {
-    _ = iStyle; _ = cWidth; _ = color;
-    return 0xB007;
+    const is_null = (iStyle == 5); // PS_NULL
+    const h = allocGdiPen(gdi.colorrefToXrgb(color), @max(1, cWidth), is_null, false);
+    return if (h != 0) h else 0xB007;
 }
 
 fn CreatePatternBrush(hbm: usize) callconv(W) usize {
     _ = hbm;
-    return 0xB008;
+    const h = allocGdiBrush(0x00E8E8E8, false, false);
+    return if (h != 0) h else 0xB008;
 }
 
 fn CreateHatchBrush(iHatch: i32, color: u32) callconv(W) usize {
-    _ = iHatch; _ = color;
-    return 0xB009;
+    _ = iHatch;
+    const h = allocGdiBrush(gdi.colorrefToXrgb(color), false, false);
+    return if (h != 0) h else 0xB009;
 }
 
 fn ExtCreatePen(iPenStyle: u32, cWidth: u32, plbrush: ?*const anyopaque, cStyle: u32, pstyle: ?*const anyopaque) callconv(W) usize {
-    _ = iPenStyle; _ = cWidth; _ = plbrush; _ = cStyle; _ = pstyle;
-    return 0xB00A;
+    _ = cStyle;
+    _ = pstyle;
+    var color: u32 = 0x000000;
+    if (plbrush) |ptr| {
+        const words: *const [2]u32 = @ptrCast(@alignCast(ptr));
+        color = gdi.colorrefToXrgb(words[1]);
+    }
+    const is_null = (iPenStyle & 0xF) == 5;
+    const h = allocGdiPen(color, @intCast(@max(1, cWidth)), is_null, false);
+    return if (h != 0) h else 0xB00A;
 }
 
 fn DeleteDC(hdc: usize) callconv(W) i32 {
-    _ = hdc;
+    if (dcFromHandle(hdc)) |dc| {
+        if (!dc.is_screen) dc.* = .{};
+    }
     return 1;
 }
 
 fn SaveDC(hdc: usize) callconv(W) i32 {
-    _ = hdc;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    var max_lvl: i32 = 0;
+    for (saved_dcs) |s| {
+        if (s.in_use and s.hdc == hdc and s.level > max_lvl) max_lvl = s.level;
+    }
+    for (&saved_dcs) |*s| {
+        if (!s.in_use) {
+            s.* = .{ .in_use = true, .hdc = hdc, .level = max_lvl + 1, .dc = dc.* };
+            return max_lvl + 1;
+        }
+    }
     return 1;
 }
 
 fn RestoreDC(hdc: usize, nSavedDC: i32) callconv(W) i32 {
-    _ = hdc; _ = nSavedDC;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    var target_idx: ?usize = null;
+    var best_lvl: i32 = -1;
+    for (saved_dcs, 0..) |s, idx| {
+        if (!s.in_use or s.hdc != hdc) continue;
+        if (nSavedDC < 0) {
+            if (s.level > best_lvl) {
+                best_lvl = s.level;
+                target_idx = idx;
+            }
+        } else if (s.level == nSavedDC) {
+            target_idx = idx;
+            break;
+        }
+    }
+    if (target_idx) |idx| {
+        dc.* = saved_dcs[idx].dc;
+        saved_dcs[idx] = .{};
+    }
     return 1;
 }
 
 fn GetROP2(hdc: usize) callconv(W) i32 {
-    _ = hdc;
+    if (dcFromHandle(hdc)) |dc| return dc.rop2;
     return 13;
 }
 
 fn SetROP2(hdc: usize, rop2: i32) callconv(W) i32 {
-    _ = hdc; _ = rop2;
+    if (dcFromHandle(hdc)) |dc| {
+        const prev = dc.rop2;
+        dc.rop2 = rop2;
+        return prev;
+    }
     return 13;
 }
 
 fn SetBkColor(hdc: usize, color: u32) callconv(W) u32 {
-    _ = hdc;
+    if (dcFromHandle(hdc)) |dc| {
+        const prev = xrgbToColorref(dc.bk_xrgb);
+        dc.bk_xrgb = gdi.colorrefToXrgb(color);
+        return prev;
+    }
     return color;
 }
 
 fn SetBkMode(hdc: usize, mode: i32) callconv(W) i32 {
-    _ = hdc;
+    if (dcFromHandle(hdc)) |dc| {
+        const prev = dc.bk_mode;
+        dc.bk_mode = mode;
+        return prev;
+    }
     return mode;
 }
 
 fn SetTextColor(hdc: usize, color: u32) callconv(W) u32 {
-    _ = hdc;
+    if (dcFromHandle(hdc)) |dc| {
+        const prev = xrgbToColorref(dc.text_xrgb);
+        dc.text_xrgb = gdi.colorrefToXrgb(color);
+        return prev;
+    }
     return color;
 }
 
 fn CreateRectRgn(x1: i32, y1: i32, x2: i32, y2: i32) callconv(W) usize {
-    _ = x1; _ = y1; _ = x2; _ = y2;
-    return 0xB00B;
+    const h = allocRegion(.{ .left = x1, .top = y1, .right = x2, .bottom = y2 });
+    return if (h != 0) h else 0xB00B;
 }
 
 fn CreateRectRgnIndirect(lprect: ?*const anyopaque) callconv(W) usize {
-    _ = lprect;
+    if (readRectPtr(lprect)) |r| {
+        const h = allocRegion(.{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom });
+        if (h != 0) return h;
+    }
     return 0xB00C;
 }
 
 fn CombineRgn(hrgnDst: usize, hrgnSrc1: usize, hrgnSrc2: usize, iMode: i32) callconv(W) i32 {
-    _ = hrgnDst; _ = hrgnSrc1; _ = hrgnSrc2; _ = iMode;
+    _ = hrgnSrc2;
+    _ = iMode;
+    if (regionFromHandle(hrgnDst)) |dst| {
+        if (regionFromHandle(hrgnSrc1)) |s1| dst.rect = s1.rect;
+    }
     return 2;
 }
 
 fn SelectClipRgn(hdc: usize, hrgn: usize) callconv(W) i32 {
-    _ = hdc; _ = hrgn;
+    if (dcFromHandle(hdc)) |dc| {
+        if (hrgn == 0) {
+            dc.has_clip = false;
+        } else if (regionFromHandle(hrgn)) |r| {
+            dc.has_clip = true;
+            dc.clip = r.rect;
+        }
+    }
     return 2;
 }
 
@@ -714,7 +2387,15 @@ fn ExcludeClipRect(hdc: usize, left: i32, top: i32, right: i32, bottom: i32) cal
 }
 
 fn IntersectClipRect(hdc: usize, left: i32, top: i32, right: i32, bottom: i32) callconv(W) i32 {
-    _ = hdc; _ = left; _ = top; _ = right; _ = bottom;
+    if (dcFromHandle(hdc)) |dc| {
+        const incoming = gdi.Clip{ .left = left - dc.org_x, .top = top - dc.org_y, .right = right - dc.org_x, .bottom = bottom - dc.org_y };
+        if (dc.has_clip) {
+            dc.clip = intersectClip(dc.clip, incoming);
+        } else {
+            dc.has_clip = true;
+            dc.clip = incoming;
+        }
+    }
     return 2;
 }
 
@@ -724,60 +2405,130 @@ fn GetClipRgn(hdc: usize, hrgn: usize) callconv(W) i32 {
 }
 
 fn MoveToEx(hdc: usize, x: i32, y: i32, lppt: ?*anyopaque) callconv(W) i32 {
-    _ = hdc; _ = x; _ = y; _ = lppt;
+    if (dcFromHandle(hdc)) |dc| {
+        if (lppt) |p| {
+            const pt: *Point = @ptrCast(@alignCast(p));
+            pt.* = .{ .x = dc.cur_x, .y = dc.cur_y };
+        }
+        dc.cur_x = x;
+        dc.cur_y = y;
+    }
     return 1;
 }
 
 fn LineTo(hdc: usize, x: i32, y: i32) callconv(W) i32 {
-    _ = hdc; _ = x; _ = y;
+    if (dcFromHandle(hdc)) |dc| {
+        if (dcTarget(dc)) |tgt| {
+            if (dcPenColor(dc)) |col| {
+                gdi.drawLine(tgt.surface, tgt.clip, tgt.ox + dc.cur_x, tgt.oy + dc.cur_y, tgt.ox + x, tgt.oy + y, col);
+                if (!dc.is_mem) markFbDirty(dc.hwnd);
+            }
+        }
+        dc.cur_x = x;
+        dc.cur_y = y;
+    }
     return 1;
 }
 
 fn Polyline(hdc: usize, apt: ?*const anyopaque, cpt: i32) callconv(W) i32 {
-    _ = hdc; _ = apt; _ = cpt;
+    const pts_ptr = apt orelse return 1;
+    if (cpt < 2) return 1;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    const col = dcPenColor(dc) orelse return 1;
+    const pts: [*]const Point = @ptrCast(@alignCast(pts_ptr));
+    const n: usize = @intCast(@min(cpt, 4096));
+    for (0 .. n - 1) |i| {
+        gdi.drawLine(tgt.surface, tgt.clip, tgt.ox + pts[i].x, tgt.oy + pts[i].y, tgt.ox + pts[i + 1].x, tgt.oy + pts[i + 1].y, col);
+    }
+    if (!dc.is_mem) markFbDirty(dc.hwnd);
     return 1;
 }
 
 fn Polygon(hdc: usize, apt: ?*const anyopaque, cpt: i32) callconv(W) i32 {
-    _ = hdc; _ = apt; _ = cpt;
+    const pts_ptr = apt orelse return 1;
+    if (cpt < 2) return 1;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    const pts: [*]const Point = @ptrCast(@alignCast(pts_ptr));
+    const n: usize = @intCast(@min(cpt, 4096));
+    if (dcBrushColor(dc)) |bcol| {
+        var min_x = pts[0].x;
+        var max_x = pts[0].x;
+        var min_y = pts[0].y;
+        var max_y = pts[0].y;
+        for (pts[0..n]) |pt| {
+            min_x = @min(min_x, pt.x);
+            max_x = @max(max_x, pt.x);
+            min_y = @min(min_y, pt.y);
+            max_y = @max(max_y, pt.y);
+        }
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox + min_x, tgt.oy + min_y, tgt.ox + max_x + 1, tgt.oy + max_y + 1, bcol);
+    }
+    if (dcPenColor(dc)) |pcol| {
+        for (0..n) |i| {
+            const j = (i + 1) % n;
+            gdi.drawLine(tgt.surface, tgt.clip, tgt.ox + pts[i].x, tgt.oy + pts[i].y, tgt.ox + pts[j].x, tgt.oy + pts[j].y, pcol);
+        }
+    }
+    if (!dc.is_mem) markFbDirty(dc.hwnd);
     return 1;
 }
 
 fn Rectangle(hdc: usize, left: i32, top: i32, right: i32, bottom: i32) callconv(W) i32 {
-    _ = hdc; _ = left; _ = top; _ = right; _ = bottom;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    if (dcBrushColor(dc)) |bcol| {
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox + left, tgt.oy + top, tgt.ox + right, tgt.oy + bottom, bcol);
+    }
+    if (dcPenColor(dc)) |pcol| {
+        gdi.frameRect(tgt.surface, tgt.clip, tgt.ox + left, tgt.oy + top, tgt.ox + right, tgt.oy + bottom, pcol);
+    }
+    if (!dc.is_mem) markFbDirty(dc.hwnd);
     return 1;
 }
 
 fn RoundRect(hdc: usize, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(W) i32 {
-    _ = hdc; _ = left; _ = top; _ = right; _ = bottom; _ = width; _ = height;
-    return 1;
+    _ = width; _ = height;
+    return Rectangle(hdc, left, top, right, bottom);
 }
 
 fn Ellipse(hdc: usize, left: i32, top: i32, right: i32, bottom: i32) callconv(W) i32 {
-    _ = hdc; _ = left; _ = top; _ = right; _ = bottom;
-    return 1;
+    return Rectangle(hdc, left, top, right, bottom);
 }
 
 fn PatBlt(hdc: usize, x: i32, y: i32, w: i32, h: i32, rop: u32) callconv(W) i32 {
-    _ = hdc; _ = x; _ = y; _ = w; _ = h; _ = rop;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    patBltTarget(dc, tgt, x, y, w, h, rop);
+    if (!dc.is_mem) markFbDirty(dc.hwnd);
     return 1;
 }
 
 fn StretchBlt(hdcDest: usize, xDest: i32, yDest: i32, wDest: i32, hDest: i32, hdcSrc: usize, xSrc: i32, ySrc: i32, wSrc: i32, hSrc: i32, rop: u32) callconv(W) i32 {
-    _ = hdcDest; _ = xDest; _ = yDest; _ = wDest; _ = hDest; _ = hdcSrc; _ = xSrc; _ = ySrc; _ = wSrc; _ = hSrc; _ = rop;
+    const dc_dst = dcFromHandle(hdcDest) orelse return 1;
+    const tgt_dst = dcTarget(dc_dst) orelse return 1;
+    const dc_src = dcFromHandle(hdcSrc) orelse return 1;
+    const tgt_src = dcTarget(dc_src) orelse return 1;
+    var flip = false;
+    if (dc_src.is_mem) {
+        if (bitmapFromHandle(dc_src.hbitmap)) |bm| flip = bm.bottom_up;
+    }
+    stretchCopy(tgt_dst, xDest, yDest, wDest, hDest, tgt_src, xSrc, ySrc, wSrc, hSrc, flip, rop);
+    if (!dc_dst.is_mem) markFbDirty(dc_dst.hwnd);
     return 1;
 }
 
 fn GdiAlphaBlend(hdcDest: usize, xDest: i32, yDest: i32, wDest: i32, hDest: i32, hdcSrc: usize, xSrc: i32, ySrc: i32, wSrc: i32, hSrc: i32, ftn: usize) callconv(W) i32 {
-    _ = hdcDest; _ = xDest; _ = yDest; _ = wDest; _ = hDest; _ = hdcSrc; _ = xSrc; _ = ySrc; _ = wSrc; _ = hSrc; _ = ftn;
-    return 1;
+    _ = ftn;
+    return StretchBlt(hdcDest, xDest, yDest, wDest, hDest, hdcSrc, xSrc, ySrc, wSrc, hSrc, 0x00CC0020);
 }
 
 fn GetTextExtentPoint32W(hdc: usize, lpString: ?[*:0]const u16, c: i32, lpSize: ?*anyopaque) callconv(W) i32 {
     _ = hdc; _ = lpString;
     if (lpSize) |s| {
         const ptr: *[2]i32 = @ptrCast(@alignCast(s));
-        ptr[0] = c * 8;
+        ptr[0] = @max(0, c) * 8;
         ptr[1] = 16;
     }
     return 1;
@@ -787,7 +2538,7 @@ fn GetTextExtentPoint32A(hdc: usize, lpString: ?[*:0]const u8, c: i32, lpSize: ?
     _ = hdc; _ = lpString;
     if (lpSize) |s| {
         const ptr: *[2]i32 = @ptrCast(@alignCast(s));
-        ptr[0] = c * 8;
+        ptr[0] = @max(0, c) * 8;
         ptr[1] = 16;
     }
     return 1;
@@ -798,51 +2549,107 @@ fn GetTextExtentPointW(hdc: usize, lpString: ?[*:0]const u16, c: i32, lpSize: ?*
 }
 
 fn GetTextExtentExPointA(hdc: usize, lpszStr: ?[*:0]const u8, cchString: i32, nMaxExtent: i32, lpnFit: ?*i32, alpDx: ?*i32, lpSize: ?*anyopaque) callconv(W) i32 {
-    _ = nMaxExtent; _ = alpDx;
-    if (lpnFit) |fit| fit.* = cchString;
-    return GetTextExtentPoint32A(hdc, lpszStr, cchString, lpSize);
+    _ = nMaxExtent;
+    const n: usize = @intCast(@max(0, @min(cchString, 4096)));
+    if (lpnFit) |fit| fit.* = @intCast(n);
+    if (alpDx) |dx_ptr| {
+        const arr: [*]i32 = @ptrCast(dx_ptr);
+        for (0..n) |i| arr[i] = @as(i32, @intCast(i + 1)) * 8;
+    }
+    return GetTextExtentPoint32A(hdc, lpszStr, @intCast(n), lpSize);
 }
 
 fn GetTextExtentExPointW(hdc: usize, lpszStr: ?[*:0]const u16, cchString: i32, nMaxExtent: i32, lpnFit: ?*i32, alpDx: ?*i32, lpSize: ?*anyopaque) callconv(W) i32 {
-    _ = nMaxExtent; _ = alpDx;
-    if (lpnFit) |fit| fit.* = cchString;
-    return GetTextExtentPoint32W(hdc, lpszStr, cchString, lpSize);
+    _ = nMaxExtent;
+    const n: usize = @intCast(@max(0, @min(cchString, 4096)));
+    if (lpnFit) |fit| fit.* = @intCast(n);
+    if (alpDx) |dx_ptr| {
+        const arr: [*]i32 = @ptrCast(dx_ptr);
+        for (0..n) |i| arr[i] = @as(i32, @intCast(i + 1)) * 8;
+    }
+    return GetTextExtentPoint32W(hdc, lpszStr, @intCast(n), lpSize);
 }
 
 fn GetTextMetricsW(hdc: usize, lptm: ?*anyopaque) callconv(W) i32 {
     _ = hdc;
     if (lptm) |tm| {
         const bytes: [*]u8 = @ptrCast(tm);
-        @memset(bytes[0..56], 0);
-        const i32_ptr: *[14]i32 = @ptrCast(@alignCast(tm));
-        i32_ptr[0] = 16;
-        i32_ptr[7] = 8;
+        @memset(bytes[0..60], 0);
+        const i32_ptr: *[7]i32 = @ptrCast(@alignCast(tm));
+        i32_ptr[0] = 16; // tmHeight
+        i32_ptr[1] = 13; // tmAscent
+        i32_ptr[2] = 3; // tmDescent
+        i32_ptr[5] = 8; // tmAveCharWidth
+        i32_ptr[6] = 8; // tmMaxCharWidth
     }
     return 1;
 }
 
 fn ExtTextOutW(hdc: usize, x: i32, y: i32, options: u32, lprect: ?*const anyopaque, lpString: ?[*:0]const u16, c: u32, lpDx: ?*const i32) callconv(W) i32 {
-    _ = hdc; _ = x; _ = y; _ = options; _ = lprect; _ = lpString; _ = c; _ = lpDx;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    var tgt = dcTarget(dc) orelse return 1;
+    if (readRectPtr(lprect)) |rc| {
+        if ((options & 0x0002) != 0) { // ETO_OPAQUE
+            gdi.fillRect(tgt.surface, tgt.clip, tgt.ox + rc.left, tgt.oy + rc.top, tgt.ox + rc.right, tgt.oy + rc.bottom, dc.bk_xrgb);
+        }
+        if ((options & 0x0004) != 0) { // ETO_CLIPPED
+            const rclip = gdi.Clip{ .left = tgt.ox + rc.left, .top = tgt.oy + rc.top, .right = tgt.ox + rc.right, .bottom = tgt.oy + rc.bottom };
+            tgt.clip = intersectClip(tgt.clip, rclip);
+        }
+    }
+    if (lpString) |s_ptr| {
+        const n: usize = @min(c, 4096);
+        if (n > 0) {
+            const slice: [*]const u16 = @ptrCast(s_ptr);
+            const dx_arr: ?[*]const i32 = if (lpDx) |p| @ptrCast(p) else null;
+            drawTextAt(dc, tgt, x, y, slice[0..n], dx_arr);
+        }
+    }
+    if (!dc.is_mem) markFbDirty(dc.hwnd);
     return 1;
 }
 
 fn ExtTextOutA(hdc: usize, x: i32, y: i32, options: u32, lprect: ?*const anyopaque, lpString: ?[*:0]const u8, c: u32, lpDx: ?*const i32) callconv(W) i32 {
-    _ = hdc; _ = x; _ = y; _ = options; _ = lprect; _ = lpString; _ = c; _ = lpDx;
-    return 1;
+    var u16_buf: [512]u16 = undefined;
+    var n: usize = 0;
+    if (lpString) |s_ptr| {
+        const slice: [*]const u8 = @ptrCast(s_ptr);
+        n = @min(c, u16_buf.len);
+        for (0..n) |i| u16_buf[i] = slice[i];
+    }
+    return ExtTextOutW(hdc, x, y, options, lprect, if (n > 0) @ptrCast(&u16_buf) else null, @intCast(n), lpDx);
 }
 
 fn SetTextAlign(hdc: usize, align_flags: u32) callconv(W) u32 {
-    _ = hdc;
+    if (dcFromHandle(hdc)) |dc| {
+        const prev = dc.text_align;
+        dc.text_align = align_flags;
+        return prev;
+    }
     return align_flags;
 }
 
 fn SetWindowOrgEx(hdc: usize, x: i32, y: i32, lppt: ?*anyopaque) callconv(W) i32 {
-    _ = hdc; _ = x; _ = y; _ = lppt;
+    if (dcFromHandle(hdc)) |dc| {
+        if (lppt) |p| {
+            const pt: *Point = @ptrCast(@alignCast(p));
+            pt.* = .{ .x = dc.org_x, .y = dc.org_y };
+        }
+        dc.org_x = x;
+        dc.org_y = y;
+    }
     return 1;
 }
 
 fn OffsetWindowOrgEx(hdc: usize, x: i32, y: i32, lppt: ?*anyopaque) callconv(W) i32 {
-    _ = hdc; _ = x; _ = y; _ = lppt;
+    if (dcFromHandle(hdc)) |dc| {
+        if (lppt) |p| {
+            const pt: *Point = @ptrCast(@alignCast(p));
+            pt.* = .{ .x = dc.org_x, .y = dc.org_y };
+        }
+        dc.org_x += x;
+        dc.org_y += y;
+    }
     return 1;
 }
 
@@ -862,17 +2669,38 @@ fn GetDIBits(hdc: usize, hbm: usize, start: u32, cLines: u32, lpvBits: ?*anyopaq
 }
 
 fn StretchDIBits(hdc: usize, xDest: i32, yDest: i32, DestWidth: i32, DestHeight: i32, xSrc: i32, ySrc: i32, SrcWidth: i32, SrcHeight: i32, lpBits: ?*const anyopaque, lpbmi: ?*const anyopaque, iUsage: u32, rop: u32) callconv(W) i32 {
-    _ = hdc; _ = xDest; _ = yDest; _ = DestWidth; _ = xSrc; _ = ySrc; _ = SrcWidth; _ = SrcHeight; _ = lpBits; _ = lpbmi; _ = iUsage; _ = rop;
+    _ = xSrc; _ = ySrc; _ = SrcWidth; _ = SrcHeight; _ = lpBits; _ = lpbmi; _ = iUsage;
+    if (dcFromHandle(hdc)) |dc| {
+        if (dcTarget(dc)) |tgt| {
+            if (rop == 0x00000042 or rop == 0x00FF0062) {
+                patBltTarget(dc, tgt, xDest, yDest, DestWidth, DestHeight, rop);
+                if (!dc.is_mem) markFbDirty(dc.hwnd);
+            }
+        }
+    }
     return DestHeight;
 }
 
 fn GetPixel(hdc: usize, x: i32, y: i32) callconv(W) u32 {
-    _ = hdc; _ = x; _ = y;
+    if (dcFromHandle(hdc)) |dc| {
+        if (dcTarget(dc)) |tgt| {
+            const px = tgt.ox + x;
+            const py = tgt.oy + y;
+            if (px >= 0 and py >= 0 and px < @as(i32, @intCast(tgt.surface.width)) and py < @as(i32, @intCast(tgt.surface.height))) {
+                return xrgbToColorref(tgt.surface.pixels[@as(usize, @intCast(py)) * tgt.surface.width + @as(usize, @intCast(px))]);
+            }
+        }
+    }
     return 0;
 }
 
 fn SetPixel(hdc: usize, x: i32, y: i32, color: u32) callconv(W) u32 {
-    _ = hdc; _ = x; _ = y;
+    if (dcFromHandle(hdc)) |dc| {
+        if (dcTarget(dc)) |tgt| {
+            gdi.putPixelClipped(tgt.surface, tgt.clip, tgt.ox + x, tgt.oy + y, gdi.colorrefToXrgb(color));
+            if (!dc.is_mem) markFbDirty(dc.hwnd);
+        }
+    }
     return color;
 }
 
@@ -988,11 +2816,16 @@ pub fn lookupGdi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "SwapBuffers")) return @intFromPtr(&SwapBuffers);
     if (std.mem.eql(u8, name, "ChoosePixelFormat")) return @intFromPtr(&ChoosePixelFormat);
     if (std.mem.eql(u8, name, "SetPixelFormat")) return @intFromPtr(&SetPixelFormat);
+    if (std.mem.eql(u8, name, "DescribePixelFormat")) return @intFromPtr(&DescribePixelFormat);
     return null;
 }
 
 fn ClientToScreen(hwnd: usize, lpPoint: ?*anyopaque) callconv(W) i32 {
-    _ = hwnd; _ = lpPoint;
+    const p = lpPoint orelse return 0;
+    const pt: *Point = @ptrCast(@alignCast(p));
+    const sp = winScreenPos(hwnd);
+    pt.x += sp.x;
+    pt.y += sp.y;
     return 1;
 }
 
@@ -1048,17 +2881,18 @@ fn GetFocus() callconv(W) usize {
 }
 
 fn GetKeyState(nVirtKey: i32) callconv(W) i16 {
-    _ = nVirtKey;
-    return 0;
+    return kbd.getKeyState(nVirtKey);
 }
 
 fn GetMessageTime() callconv(W) i32 {
     return 1000;
 }
 
-fn PtInRect(lprc: ?*const anyopaque, pt_x: i32, pt_y: i32) callconv(W) i32 {
-    _ = lprc; _ = pt_x; _ = pt_y;
-    return 1;
+fn PtInRect(lprc: ?*const anyopaque, pt_packed: u64) callconv(W) i32 {
+    const r = readRectPtr(lprc) orelse return 0;
+    const px: i32 = @bitCast(@as(u32, @truncate(pt_packed)));
+    const py: i32 = @bitCast(@as(u32, @truncate(pt_packed >> 32)));
+    return if (px >= r.left and px < r.right and py >= r.top and py < r.bottom) 1 else 0;
 }
 
 fn ReleaseCapture() callconv(W) i32 {
@@ -1119,19 +2953,49 @@ fn MonitorFromWindow(hwnd: usize, dwFlags: u32) callconv(W) usize {
 }
 
 fn GetParent(hwnd: usize) callconv(W) usize {
-    _ = hwnd;
-    return 0;
+    const w = findWin(hwnd) orelse return 0;
+    return w.parent;
 }
 
 fn GetWindowLongPtrW(hwnd: usize, nIndex: i32) callconv(W) isize {
-    _ = hwnd;
-    if (nIndex == -16) return 0x10000000 | 0x00cf0000;
-    return 0;
+    const w = findWin(hwnd) orelse {
+        if (nIndex == GWL_STYLE) return @bitCast(@as(usize, 0x10cf0000));
+        return 0;
+    };
+    return switch (nIndex) {
+        GWLP_WNDPROC => if (w.wndproc) |p| @bitCast(@intFromPtr(p)) else 0,
+        GWLP_HINSTANCE => @bitCast(w.hinstance),
+        GWLP_HWNDPARENT => @bitCast(w.parent),
+        GWL_STYLE => @as(i32, @bitCast(w.style)),
+        GWL_EXSTYLE => @as(i32, @bitCast(w.ex_style)),
+        GWLP_USERDATA => w.userdata,
+        GWLP_ID => w.id,
+        else => if (nIndex >= 0 and @mod(nIndex, @sizeOf(isize)) == 0) blk: {
+            const slot: usize = @intCast(@divTrunc(nIndex, @sizeOf(isize)));
+            break :blk if (slot < w.extra.len) w.extra[slot] else 0;
+        } else 0,
+    };
 }
 
 fn SetWindowLongPtrW(hwnd: usize, nIndex: i32, dwNewLong: isize) callconv(W) isize {
-    _ = hwnd; _ = nIndex;
-    return dwNewLong;
+    const w = findWin(hwnd) orelse return 0;
+    const prev = GetWindowLongPtrW(hwnd, nIndex);
+    switch (nIndex) {
+        GWLP_WNDPROC => w.wndproc = if (dwNewLong != 0) @ptrFromInt(@as(usize, @bitCast(dwNewLong))) else null,
+        GWLP_HINSTANCE => w.hinstance = @bitCast(dwNewLong),
+        GWLP_HWNDPARENT => w.parent = @bitCast(dwNewLong),
+        GWL_STYLE => w.style = @truncate(@as(usize, @bitCast(dwNewLong))),
+        GWL_EXSTYLE => w.ex_style = @truncate(@as(usize, @bitCast(dwNewLong))),
+        GWLP_USERDATA => w.userdata = dwNewLong,
+        GWLP_ID => w.id = dwNewLong,
+        else => {
+            if (nIndex >= 0 and @mod(nIndex, @sizeOf(isize)) == 0) {
+                const slot: usize = @intCast(@divTrunc(nIndex, @sizeOf(isize)));
+                if (slot < w.extra.len) w.extra[slot] = dwNewLong;
+            }
+        },
+    }
+    return prev;
 }
 
 fn GetWindowLongW(hwnd: usize, nIndex: i32) callconv(W) i32 {
@@ -1177,7 +3041,14 @@ fn GetWindowPlacement(hwnd: usize, lpwndpl: ?*WindowPlacement) callconv(W) i32 {
 }
 
 fn SetWindowPlacement(hwnd: usize, lpwndpl: ?*const anyopaque) callconv(W) i32 {
-    _ = hwnd; _ = lpwndpl;
+    if (lpwndpl) |p| {
+        const wp: *const WindowPlacement = @ptrCast(@alignCast(p));
+        const r = wp.rcNormalPosition;
+        const w = if (r.right > r.left) r.right - r.left else 1024;
+        const h = if (r.bottom > r.top) r.bottom - r.top else 720;
+        const show_flag: u32 = if (wp.showCmd != 0) 0x0040 else 0;
+        _ = SetWindowPos(hwnd, 0, r.left, r.top, w, h, 0x0004 | 0x0010 | show_flag);
+    }
     return 1;
 }
 
@@ -1214,7 +3085,11 @@ fn CopyRect(lprcDst: ?*Rect, lprcSrc: ?*const Rect) callconv(W) i32 {
 }
 
 fn ScreenToClient(hwnd: usize, lpPoint: ?*anyopaque) callconv(W) i32 {
-    _ = hwnd; _ = lpPoint;
+    const p = lpPoint orelse return 0;
+    const pt: *Point = @ptrCast(@alignCast(p));
+    const sp = winScreenPos(hwnd);
+    pt.x -= sp.x;
+    pt.y -= sp.y;
     return 1;
 }
 
@@ -1299,8 +3174,7 @@ fn GetKeyNameTextW(lParam: i32, lpString: ?[*]u16, cchSize: i32) callconv(W) i32
 }
 
 fn GetAsyncKeyState(vKey: i32) callconv(W) i16 {
-    _ = vKey;
-    return 0;
+    return kbd.getAsyncKeyState(vKey);
 }
 
 fn GetMessagePos() callconv(W) u32 {
@@ -1316,9 +3190,31 @@ fn DragDetect(hwnd: usize, pt_x: i32, pt_y: i32) callconv(W) i32 {
     return 0;
 }
 
+var g_msg_a_calls: u32 = 0;
+
 fn GetMessageA(lpMsg: ?*anyopaque, hwnd: usize, wMsgFilterMin: u32, wMsgFilterMax: u32) callconv(W) i32 {
-    _ = lpMsg; _ = hwnd; _ = wMsgFilterMin; _ = wMsgFilterMax;
-    return 0;
+    // MSG is layout-identical for A/W on x64; pump the real queue (which reads X11).
+    if (std.c.getenv("WINS_TRACE") != null) {
+        const n = @atomicRmw(u32, &g_msg_a_calls, .Add, 1, .monotonic);
+        if (n < 5 or n % 1000 == 0) std.debug.print("[WINS:MSG] GetMessageA call #{d}\n", .{n});
+    }
+    return getMessageW(@ptrCast(@alignCast(lpMsg)), hwnd, wMsgFilterMin, wMsgFilterMax);
+}
+
+fn PeekMessageA(lpMsg: ?*anyopaque, hwnd: usize, wMsgFilterMin: u32, wMsgFilterMax: u32, wRemoveMsg: u32) callconv(W) i32 {
+    if (std.c.getenv("WINS_TRACE") != null) {
+        const n = @atomicRmw(u32, &g_msg_a_calls, .Add, 1, .monotonic);
+        if (n < 5 or n % 1000 == 0) std.debug.print("[WINS:MSG] PeekMessageA call #{d} rm={d}\n", .{ n, wRemoveMsg });
+    }
+    return peekMessageW(@ptrCast(@alignCast(lpMsg)), hwnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+}
+
+fn DispatchMessageA(lpMsg: ?*const anyopaque) callconv(W) isize {
+    if (std.c.getenv("WINS_TRACE") != null) {
+        const n = @atomicRmw(u32, &g_msg_a_calls, .Add, 1, .monotonic);
+        if (n < 5 or n % 1000 == 0) std.debug.print("[WINS:MSG] DispatchMessageA call #{d}\n", .{n});
+    }
+    return @intCast(dispatchMessageW(@ptrCast(@alignCast(lpMsg))));
 }
 
 fn CopyImage(h: usize, uType: u32, cx: i32, cy: i32, uFlags: u32) callconv(W) usize {
@@ -1338,14 +3234,50 @@ fn wsprintfA(lpOut: ?[*]u8, lpFmt: ?[*:0]const u8) callconv(W) i32 {
     return 0;
 }
 
+const DisplayModeSpec = struct { w: u32, h: u32, hz: u32 };
+const display_modes = [_]DisplayModeSpec{
+    .{ .w = 1280, .h = 720, .hz = 60 },
+    .{ .w = 1920, .h = 1080, .hz = 60 },
+    .{ .w = 800, .h = 600, .hz = 60 },
+};
+
 fn EnumDisplaySettingsA(lpszDeviceName: ?[*:0]const u8, iModeNum: u32, lpDevMode: ?*anyopaque) callconv(W) i32 {
-    _ = lpszDeviceName; _ = iModeNum; _ = lpDevMode;
-    return 0;
+    _ = lpszDeviceName;
+    const raw: [*]u8 = @ptrCast(lpDevMode orelse return 0);
+    const idx: usize = if (iModeNum >= 0xFFFFFFFE) 0 else if (iModeNum < display_modes.len) iModeNum else return 0;
+    const m = display_modes[idx];
+    const sz = std.mem.readInt(u16, raw[36..38], .little);
+    const clear_len: usize = @max(@as(usize, 156), @min(@as(usize, 256), sz));
+    @memset(raw[0..clear_len], 0);
+    @memcpy(raw[0..8], "DISPLAY1");
+    std.mem.writeInt(u16, raw[32..34], 0x0401, .little);
+    std.mem.writeInt(u16, raw[36..38], 156, .little);
+    std.mem.writeInt(u32, raw[40..44], 0x005C0000, .little);
+    std.mem.writeInt(u32, raw[104..108], 32, .little);
+    std.mem.writeInt(u32, raw[108..112], m.w, .little);
+    std.mem.writeInt(u32, raw[112..116], m.h, .little);
+    std.mem.writeInt(u32, raw[120..124], m.hz, .little);
+    return 1;
 }
 
 fn EnumDisplaySettingsW(lpszDeviceName: ?*const u16, iModeNum: u32, lpDevMode: ?*anyopaque) callconv(W) i32 {
-    _ = lpszDeviceName; _ = iModeNum; _ = lpDevMode;
-    return 0;
+    _ = lpszDeviceName;
+    const raw: [*]u8 = @ptrCast(lpDevMode orelse return 0);
+    const idx: usize = if (iModeNum >= 0xFFFFFFFE) 0 else if (iModeNum < display_modes.len) iModeNum else return 0;
+    const m = display_modes[idx];
+    const sz = std.mem.readInt(u16, raw[68..70], .little);
+    const clear_len: usize = @max(@as(usize, 220), @min(@as(usize, 320), sz));
+    @memset(raw[0..clear_len], 0);
+    const dname = "DISPLAY1";
+    for (dname, 0..) |c, i| std.mem.writeInt(u16, raw[i * 2 ..][0..2], c, .little);
+    std.mem.writeInt(u16, raw[64..66], 0x0401, .little);
+    std.mem.writeInt(u16, raw[68..70], 220, .little);
+    std.mem.writeInt(u32, raw[72..76], 0x005C0000, .little);
+    std.mem.writeInt(u32, raw[168..172], 32, .little);
+    std.mem.writeInt(u32, raw[172..176], m.w, .little);
+    std.mem.writeInt(u32, raw[176..180], m.h, .little);
+    std.mem.writeInt(u32, raw[184..188], m.hz, .little);
+    return 1;
 }
 
 fn ChangeDisplaySettingsW(lpDevMode: ?*anyopaque, dwFlags: u32) callconv(W) i32 {
@@ -1353,14 +3285,41 @@ fn ChangeDisplaySettingsW(lpDevMode: ?*anyopaque, dwFlags: u32) callconv(W) i32 
     return 0;
 }
 
+const MonitorRect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+const MonitorEnumProc = *const fn (usize, usize, *const MonitorRect, usize) callconv(W) i32;
+
 fn EnumDisplayMonitors(hdc: usize, lprcClip: ?*const anyopaque, lpfnEnum: ?*anyopaque, dwData: usize) callconv(W) i32 {
-    _ = hdc; _ = lprcClip; _ = lpfnEnum; _ = dwData;
+    _ = lprcClip;
+    if (lpfnEnum) |f| {
+        const cb: MonitorEnumProc = @ptrCast(@alignCast(f));
+        const rc: MonitorRect = .{ .left = 0, .top = 0, .right = 1280, .bottom = 720 };
+        _ = cb(0x10001, hdc, &rc, dwData);
+    }
     return 1;
 }
 
 fn EnumDisplayDevicesA(lpDevice: ?[*:0]const u8, iDevNum: u32, lpDisplayDevice: ?*anyopaque, dwFlags: u32) callconv(W) i32 {
-    _ = lpDevice; _ = iDevNum; _ = lpDisplayDevice; _ = dwFlags;
-    return 0;
+    _ = lpDevice; _ = dwFlags;
+    if (iDevNum != 0) return 0;
+    const raw: [*]u8 = @ptrCast(lpDisplayDevice orelse return 0);
+    @memset(raw[4..424], 0);
+    @memcpy(raw[4..16], "\\\\.\\DISPLAY1");
+    @memcpy(raw[36..56], "WINS Primary Display");
+    std.mem.writeInt(u32, raw[164..168], 5, .little);
+    return 1;
+}
+
+fn EnumDisplayDevicesW(lpDevice: ?[*:0]const u16, iDevNum: u32, lpDisplayDevice: ?*anyopaque, dwFlags: u32) callconv(W) i32 {
+    _ = lpDevice; _ = dwFlags;
+    if (iDevNum != 0) return 0;
+    const raw: [*]u8 = @ptrCast(lpDisplayDevice orelse return 0);
+    @memset(raw[4..840], 0);
+    const dn = "\\\\.\\DISPLAY1";
+    for (dn, 0..) |c, i| std.mem.writeInt(u16, raw[4 + i * 2 ..][0..2], c, .little);
+    const ds = "WINS Primary Display";
+    for (ds, 0..) |c, i| std.mem.writeInt(u16, raw[68 + i * 2 ..][0..2], c, .little);
+    std.mem.writeInt(u32, raw[324..328], 5, .little);
+    return 1;
 }
 
 fn GetCaretBlinkTime() callconv(W) u32 {
@@ -1414,8 +3373,7 @@ fn RegisterWindowMessageA(lpString: ?[*:0]const u8) callconv(W) u32 {
 }
 
 fn SendMessageA(hwnd: usize, msg: u32, wparam: usize, lparam: isize) callconv(W) isize {
-    _ = hwnd; _ = msg; _ = wparam; _ = lparam;
-    return 0;
+    return @bitCast(sendMessageW(hwnd, msg, wparam, @bitCast(lparam)));
 }
 
 fn SendMessageTimeoutA(hwnd: usize, msg: u32, wparam: usize, lparam: isize, fuFlags: u32, uTimeout: u32, lpdwResult: ?*usize) callconv(W) isize {
@@ -1464,47 +3422,121 @@ fn GetDesktopWindow() callconv(W) usize {
 }
 
 fn BeginPaint(hwnd: usize, lpPaint: ?*anyopaque) callconv(W) usize {
-    _ = hwnd; _ = lpPaint;
-    return 0xB001;
+    const hdc = allocDC(hwnd, false);
+    var w_width: i32 = 1024;
+    var w_height: i32 = 720;
+    if (findWin(hwnd)) |w| {
+        w.needs_paint = false;
+        w_width = @max(1, w.width);
+        w_height = @max(1, w.height);
+    }
+    if (lpPaint) |ptr| {
+        const ps: *PAINTSTRUCT = @ptrCast(@alignCast(ptr));
+        ps.* = .{
+            .hdc = if (hdc != 0) hdc else 0xB001,
+            .fErase = 1,
+            .rcPaint = .{ .left = 0, .top = 0, .right = w_width, .bottom = w_height },
+            .fRestore = 0,
+            .fIncUpdate = 0,
+            .rgbReserved = [_]u8{0} ** 32,
+        };
+    }
+    return if (hdc != 0) hdc else 0xB001;
 }
 
 fn EndPaint(hwnd: usize, lpPaint: ?*const anyopaque) callconv(W) i32 {
-    _ = hwnd; _ = lpPaint;
+    if (lpPaint) |ptr| {
+        const ps: *const PAINTSTRUCT = @ptrCast(@alignCast(ptr));
+        if (dcFromHandle(ps.hdc)) |dc| {
+            if (findWin(hwnd)) |w| {
+                if (winClassEqAscii(w, "SysTabControl32") or winClassEqAscii(w, "msctls_statusbar32")) {
+                    if (dcTarget(dc)) |tgt| {
+                        paintCommonControlOverlay(w, tgt);
+                    }
+                }
+            }
+            dc.* = .{};
+        }
+    }
+    markFbDirty(hwnd);
+    flushDirtyBlits();
     return 1;
 }
 
 fn InvalidateRect(hwnd: usize, lpRect: ?*const anyopaque, bErase: i32) callconv(W) i32 {
-    _ = hwnd; _ = lpRect; _ = bErase;
+    _ = lpRect;
+    _ = bErase;
+    if (hwnd == 0) {
+        for (&windows) |*w| {
+            if (w.in_use) w.needs_paint = true;
+        }
+    } else {
+        markTreeDirty(hwnd);
+    }
     return 1;
 }
 
 fn RedrawWindow(hwnd: usize, lprcUpdate: ?*const anyopaque, hrgnUpdate: usize, flags: u32) callconv(W) i32 {
-    _ = hwnd; _ = lprcUpdate; _ = hrgnUpdate; _ = flags;
+    _ = lprcUpdate;
+    _ = hrgnUpdate;
+    _ = flags;
+    if (hwnd != 0) markTreeDirty(hwnd);
     return 1;
 }
 
 fn FillRect(hdc: usize, lprc: ?*const anyopaque, hbr: usize) callconv(W) i32 {
-    _ = hdc; _ = lprc; _ = hbr;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    const r = readRectPtr(lprc) orelse return 1;
+    const b = brushFromHandle(hbr) orelse GdiBrush{ .in_use = true, .xrgb = 0x00F0F0F0 };
+    if (!b.is_null) {
+        gdi.fillRect(tgt.surface, tgt.clip, tgt.ox + r.left, tgt.oy + r.top, tgt.ox + r.right, tgt.oy + r.bottom, b.xrgb);
+        if (!dc.is_mem) markFbDirty(dc.hwnd);
+    }
     return 1;
 }
 
 fn FrameRect(hdc: usize, lprc: ?*const anyopaque, hbr: usize) callconv(W) i32 {
-    _ = hdc; _ = lprc; _ = hbr;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    const r = readRectPtr(lprc) orelse return 1;
+    const b = brushFromHandle(hbr) orelse GdiBrush{ .in_use = true, .xrgb = 0x00808080 };
+    if (!b.is_null) {
+        gdi.frameRect(tgt.surface, tgt.clip, tgt.ox + r.left, tgt.oy + r.top, tgt.ox + r.right, tgt.oy + r.bottom, b.xrgb);
+        if (!dc.is_mem) markFbDirty(dc.hwnd);
+    }
     return 1;
 }
 
 fn DrawEdge(hdc: usize, qrc: ?*anyopaque, edge: u32, grfFlags: u32) callconv(W) i32 {
-    _ = hdc; _ = qrc; _ = edge; _ = grfFlags;
+    _ = edge;
+    _ = grfFlags;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    const r = readRectPtr(qrc) orelse return 1;
+    gdi.frameRect(tgt.surface, tgt.clip, tgt.ox + r.left, tgt.oy + r.top, tgt.ox + r.right, tgt.oy + r.bottom, 0x00A0A0A0);
+    if (!dc.is_mem) markFbDirty(dc.hwnd);
     return 1;
 }
 
 fn DrawFrameControl(hdc: usize, lprc: ?*anyopaque, uType: u32, uState: u32) callconv(W) i32 {
-    _ = hdc; _ = lprc; _ = uType; _ = uState;
+    _ = uType;
+    _ = uState;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    const r = readRectPtr(lprc) orelse return 1;
+    gdi.fillRect(tgt.surface, tgt.clip, tgt.ox + r.left, tgt.oy + r.top, tgt.ox + r.right, tgt.oy + r.bottom, 0x00E1E1E1);
+    gdi.frameRect(tgt.surface, tgt.clip, tgt.ox + r.left, tgt.oy + r.top, tgt.ox + r.right, tgt.oy + r.bottom, 0x00A0A0A0);
+    if (!dc.is_mem) markFbDirty(dc.hwnd);
     return 1;
 }
 
 fn DrawFocusRect(hdc: usize, lprc: ?*const anyopaque) callconv(W) i32 {
-    _ = hdc; _ = lprc;
+    const dc = dcFromHandle(hdc) orelse return 1;
+    const tgt = dcTarget(dc) orelse return 1;
+    const r = readRectPtr(lprc) orelse return 1;
+    gdi.frameRect(tgt.surface, tgt.clip, tgt.ox + r.left, tgt.oy + r.top, tgt.ox + r.right, tgt.oy + r.bottom, 0x00606060);
+    if (!dc.is_mem) markFbDirty(dc.hwnd);
     return 1;
 }
 
@@ -1514,13 +3546,43 @@ fn DrawIconEx(hdc: usize, xLeft: i32, yTop: i32, hIcon: usize, cxWidth: i32, cyW
 }
 
 fn DrawTextW(hdc: usize, lpchText: ?[*:0]const u16, cchText: i32, lprc: ?*anyopaque, format: u32) callconv(W) i32 {
-    _ = hdc; _ = lpchText; _ = cchText; _ = lprc; _ = format;
+    const str = lpchText orelse return 0;
+    var len: usize = 0;
+    if (cchText < 0) {
+        while (len < 1024 and str[len] != 0) : (len += 1) {}
+    } else {
+        len = @intCast(@min(cchText, 1024));
+    }
+    const rc_ptr: *Rect = if (lprc) |p| @ptrCast(@alignCast(p)) else return 16;
+    const tw = textWidth(len);
+    if ((format & 0x00000400) != 0) { // DT_CALCRECT
+        rc_ptr.right = rc_ptr.left + tw;
+        rc_ptr.bottom = rc_ptr.top + 16;
+        return 16;
+    }
+    if (dcFromHandle(hdc)) |dc| {
+        if (dcTarget(dc)) |tgt| {
+            var x = rc_ptr.left;
+            var y = rc_ptr.top;
+            if ((format & 0x00000001) != 0) { // DT_CENTER
+                x = rc_ptr.left + @divTrunc((rc_ptr.right - rc_ptr.left) - tw, 2);
+            } else if ((format & 0x00000002) != 0) { // DT_RIGHT
+                x = rc_ptr.right - tw;
+            }
+            if ((format & 0x00000004) != 0) { // DT_VCENTER
+                y = rc_ptr.top + @divTrunc((rc_ptr.bottom - rc_ptr.top) - 16, 2);
+            }
+            const bg: ?u32 = if (dc.bk_mode == 2) dc.bk_xrgb else null;
+            gdi.drawTextU16(tgt.surface, tgt.clip, tgt.ox + x, tgt.oy + y, str[0..len], dc.text_xrgb, bg);
+            if (!dc.is_mem) markFbDirty(dc.hwnd);
+        }
+    }
     return 16;
 }
 
 fn DrawTextExW(hdc: usize, lpchText: ?[*:0]const u16, cchText: i32, lprc: ?*anyopaque, format: u32, lpdtp: ?*anyopaque) callconv(W) i32 {
-    _ = hdc; _ = lpchText; _ = cchText; _ = lprc; _ = format; _ = lpdtp;
-    return 16;
+    _ = lpdtp;
+    return DrawTextW(hdc, lpchText, cchText, lprc, format);
 }
 
 fn CreateMenu() callconv(W) usize {
@@ -1684,28 +3746,38 @@ fn SetCaretPos(X: i32, Y: i32) callconv(W) i32 {
 }
 
 fn GetWindowTextW(hWnd: usize, lpString: ?[*:0]u16, nMaxCount: i32) callconv(W) i32 {
-    _ = hWnd;
-    if (lpString) |s| {
-        if (nMaxCount > 0) s[0] = 0;
-    }
-    return 0;
+    const dst = lpString orelse return 0;
+    if (nMaxCount <= 0) return 0;
+    const w = findWin(hWnd) orelse {
+        dst[0] = 0;
+        return 0;
+    };
+    const cap: usize = @intCast(nMaxCount);
+    const n = @min(w.title_len, cap - 1);
+    @memcpy(dst[0..n], w.title[0..n]);
+    dst[n] = 0;
+    return @intCast(n);
 }
 
 fn GetWindowTextA(hWnd: usize, lpString: ?[*:0]u8, nMaxCount: i32) callconv(W) i32 {
-    _ = hWnd;
-    if (lpString) |s| {
-        if (nMaxCount > 0) s[0] = 0;
-    }
-    return 0;
+    const dst = lpString orelse return 0;
+    if (nMaxCount <= 0) return 0;
+    const w = findWin(hWnd) orelse {
+        dst[0] = 0;
+        return 0;
+    };
+    const cap: usize = @intCast(nMaxCount);
+    const n = encodeTitleUtf8(w.title[0..w.title_len], dst[0..cap]);
+    return @intCast(n);
 }
 
 fn GetWindowTextLengthW(hWnd: usize) callconv(W) i32 {
-    _ = hWnd;
-    return 0;
+    const w = findWin(hWnd) orelse return 0;
+    return @intCast(w.title_len);
 }
 
 fn IsWindow(hWnd: usize) callconv(W) i32 {
-    return if (hWnd != 0) 1 else 0;
+    return if (findWin(hWnd) != null) 1 else 0;
 }
 
 fn IsWindowEnabled(hWnd: usize) callconv(W) i32 {
@@ -1714,8 +3786,8 @@ fn IsWindowEnabled(hWnd: usize) callconv(W) i32 {
 }
 
 fn IsWindowVisible(hWnd: usize) callconv(W) i32 {
-    _ = hWnd;
-    return 1;
+    if (findWin(hWnd)) |w| return if (isWindowVisibleTree(w)) 1 else 0;
+    return 0;
 }
 
 fn IsIconic(hWnd: usize) callconv(W) i32 {
@@ -1729,18 +3801,30 @@ fn IsZoomed(hWnd: usize) callconv(W) i32 {
 }
 
 fn IsChild(hWndParent: usize, hWnd: usize) callconv(W) i32 {
-    _ = hWndParent; _ = hWnd;
+    var cur = findWin(hWnd) orelse return 0;
+    var hops: usize = 0;
+    while (hops < 16 and cur.parent != 0) : (hops += 1) {
+        if (cur.parent == hWndParent) return 1;
+        cur = findWin(cur.parent) orelse return 0;
+    }
     return 0;
 }
 
 fn SetParent(hWndChild: usize, hWndNewParent: usize) callconv(W) usize {
-    _ = hWndChild;
+    if (findWin(hWndChild)) |w| {
+        const old = w.parent;
+        w.parent = hWndNewParent;
+        return old;
+    }
     return hWndNewParent;
 }
 
 fn MoveWindow(hWnd: usize, X: i32, Y: i32, nWidth: i32, nHeight: i32, bRepaint: i32) callconv(W) i32 {
-    _ = hWnd; _ = X; _ = Y; _ = nWidth; _ = nHeight; _ = bRepaint;
-    return 1;
+    const res = SetWindowPos(hWnd, 0, X, Y, nWidth, nHeight, 0x0004 | 0x0010);
+    if (res != 0 and bRepaint != 0) {
+        _ = InvalidateRect(hWnd, null, 1);
+    }
+    return res;
 }
 
 fn BringWindowToTop(hWnd: usize) callconv(W) i32 {
@@ -1780,36 +3864,94 @@ fn GetClassNameA(hWnd: usize, lpClassName: ?[*:0]u8, nMaxCount: i32) callconv(W)
 }
 
 fn GetDlgCtrlID(hWnd: usize) callconv(W) i32 {
-    _ = hWnd;
+    if (findWin(hWnd)) |w| return @truncate(w.id);
     return 1;
 }
 
 fn GetSysColor(nIndex: i32) callconv(W) u32 {
     return switch (nIndex) {
-        5 => 0xFFFFFF,
-        8 => 0x000000,
-        15 => 0xF0F0F0,
-        else => 0xFFFFFF,
+        0 => 0xC8C8C8, // COLOR_SCROLLBAR
+        1 => 0x000000, // COLOR_BACKGROUND
+        2 => 0xD1B499, // COLOR_ACTIVECAPTION
+        3 => 0xDBCDBF, // COLOR_INACTIVECAPTION
+        4 => 0xF0F0F0, // COLOR_MENU
+        5 => 0xFFFFFF, // COLOR_WINDOW
+        6 => 0x646464, // COLOR_WINDOWFRAME
+        7 => 0x000000, // COLOR_MENUTEXT
+        8 => 0x000000, // COLOR_WINDOWTEXT
+        9 => 0x000000, // COLOR_CAPTIONTEXT
+        12 => 0xABABAB, // COLOR_APPWORKSPACE
+        13 => 0xD77800, // COLOR_HIGHLIGHT
+        14 => 0xFFFFFF, // COLOR_HIGHLIGHTTEXT
+        15 => 0xF0F0F0, // COLOR_BTNFACE
+        16 => 0xA0A0A0, // COLOR_BTNSHADOW
+        17 => 0x6D6D6D, // COLOR_GRAYTEXT
+        18 => 0x000000, // COLOR_BTNTEXT
+        20 => 0xFFFFFF, // COLOR_BTNHIGHLIGHT
+        21 => 0x696969, // COLOR_3DDKSHADOW
+        22 => 0xE3E3E3, // COLOR_3DLIGHT
+        23 => 0x000000, // COLOR_INFOTEXT
+        24 => 0xE1FFFF, // COLOR_INFOBK
+        else => 0xF0F0F0,
     };
 }
 
 fn GetSysColorBrush(nIndex: i32) callconv(W) usize {
-    _ = nIndex;
-    return 0xB005;
+    if (nIndex >= 0 and nIndex <= 30) {
+        return @intCast(nIndex + 1);
+    }
+    return GetStockObject(0);
+}
+
+fn propKeyHash(lpString: ?[*:0]const u16) u64 {
+    const p = lpString orelse return 0;
+    const addr = @intFromPtr(p);
+    if (addr < 0x10000) return addr;
+    var h: u64 = 0xcbf29ce484222325;
+    var i: usize = 0;
+    while (i < 128 and p[i] != 0) : (i += 1) {
+        h = (h ^ p[i]) *% 0x100000001b3;
+    }
+    return h;
 }
 
 fn SetPropW(hWnd: usize, lpString: ?[*:0]const u16, hData: usize) callconv(W) i32 {
-    _ = hWnd; _ = lpString; _ = hData;
+    const kh = propKeyHash(lpString);
+    if (kh == 0) return 0;
+    for (&win_props) |*wp| {
+        if (wp.in_use and wp.hwnd == hWnd and wp.key_hash == kh) {
+            wp.val = hData;
+            return 1;
+        }
+    }
+    for (&win_props) |*wp| {
+        if (!wp.in_use) {
+            wp.* = .{ .in_use = true, .hwnd = hWnd, .key_hash = kh, .val = hData };
+            return 1;
+        }
+    }
     return 1;
 }
 
 fn GetPropW(hWnd: usize, lpString: ?[*:0]const u16) callconv(W) usize {
-    _ = hWnd; _ = lpString;
+    const kh = propKeyHash(lpString);
+    if (kh == 0) return 0;
+    for (win_props) |wp| {
+        if (wp.in_use and wp.hwnd == hWnd and wp.key_hash == kh) return wp.val;
+    }
     return 0;
 }
 
 fn RemovePropW(hWnd: usize, lpString: ?[*:0]const u16) callconv(W) usize {
-    _ = hWnd; _ = lpString;
+    const kh = propKeyHash(lpString);
+    if (kh == 0) return 0;
+    for (&win_props) |*wp| {
+        if (wp.in_use and wp.hwnd == hWnd and wp.key_hash == kh) {
+            const v = wp.val;
+            wp.* = .{};
+            return v;
+        }
+    }
     return 0;
 }
 
@@ -1819,34 +3961,65 @@ fn SetLayeredWindowAttributes(hwnd: usize, crKey: u32, bAlpha: u8, dwFlags: u32)
 }
 
 fn GetWindowDC(hWnd: usize) callconv(W) usize {
-    _ = hWnd;
-    return 0xB001;
+    return GetDC(hWnd);
 }
 
 fn GetDCEx(hWnd: usize, hrgnClip: usize, flags: u32) callconv(W) usize {
-    _ = hWnd; _ = hrgnClip; _ = flags;
-    return 0xB001;
+    _ = hrgnClip; _ = flags;
+    return GetDC(hWnd);
 }
 
 fn MapWindowPoints(hWndFrom: usize, hWndTo: usize, lpPoints: ?*anyopaque, cPoints: u32) callconv(W) i32 {
-    _ = hWndFrom; _ = hWndTo; _ = lpPoints; _ = cPoints;
-    return 0;
+    const p = lpPoints orelse return 0;
+    const pts: [*]Point = @ptrCast(@alignCast(p));
+    const from_sp = if (hWndFrom != 0) winScreenPos(hWndFrom) else Point{ .x = 0, .y = 0 };
+    const to_sp = if (hWndTo != 0) winScreenPos(hWndTo) else Point{ .x = 0, .y = 0 };
+    const dx = from_sp.x - to_sp.x;
+    const dy = from_sp.y - to_sp.y;
+    for (0..cPoints) |i| {
+        pts[i].x += dx;
+        pts[i].y += dy;
+    }
+    return (@as(i32, dy & 0xffff) << 16) | (dx & 0xffff);
 }
 
 fn InflateRect(lprc: ?*anyopaque, dx: i32, dy: i32) callconv(W) i32 {
-    _ = dx; _ = dy;
-    if (lprc == null) return 0;
+    const ptr = lprc orelse return 0;
+    const r: *Rect = @ptrCast(@alignCast(ptr));
+    r.left -= dx;
+    r.top -= dy;
+    r.right += dx;
+    r.bottom += dy;
     return 1;
 }
 
 fn EqualRect(lprc1: ?*const anyopaque, lprc2: ?*const anyopaque) callconv(W) i32 {
-    _ = lprc1; _ = lprc2;
-    return 1;
+    const r1 = readRectPtr(lprc1) orelse return 0;
+    const r2 = readRectPtr(lprc2) orelse return 0;
+    return if (r1.left == r2.left and r1.top == r2.top and r1.right == r2.right and r1.bottom == r2.bottom) 1 else 0;
 }
 
 fn IntersectRect(lprcDst: ?*anyopaque, lprcSrc1: ?*const anyopaque, lprcSrc2: ?*const anyopaque) callconv(W) i32 {
-    _ = lprcDst; _ = lprcSrc1; _ = lprcSrc2;
-    return 1;
+    const dst_ptr = lprcDst orelse return 0;
+    const dst: *Rect = @ptrCast(@alignCast(dst_ptr));
+    const r1 = readRectPtr(lprcSrc1) orelse {
+        dst.* = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        return 0;
+    };
+    const r2 = readRectPtr(lprcSrc2) orelse {
+        dst.* = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        return 0;
+    };
+    const l = @max(r1.left, r2.left);
+    const t = @max(r1.top, r2.top);
+    const r = @min(r1.right, r2.right);
+    const b = @min(r1.bottom, r2.bottom);
+    if (l < r and t < b) {
+        dst.* = .{ .left = l, .top = t, .right = r, .bottom = b };
+        return 1;
+    }
+    dst.* = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    return 0;
 }
 
 fn SetRectEmpty(lprc: ?*anyopaque) callconv(W) i32 {
@@ -1877,9 +4050,84 @@ fn GetIconInfo(hIcon: usize, piconinfo: ?*anyopaque) callconv(W) i32 {
     return 1;
 }
 
-fn wsprintfW(buf: ?[*:0]u16, fmt: ?[*:0]const u16) callconv(W) i32 {
-    _ = buf; _ = fmt;
-    return 0;
+fn wsprintfW(buf: ?[*:0]u16, fmt: ?[*:0]const u16, a1: usize, a2: usize, a3: usize, a4: usize) callconv(W) i32 {
+    const dst = buf orelse return 0;
+    const f = fmt orelse {
+        dst[0] = 0;
+        return 0;
+    };
+    const args = [4]usize{ a1, a2, a3, a4 };
+    var ai: usize = 0;
+    var fi: usize = 0;
+    var di: usize = 0;
+    while (f[fi] != 0 and di < 500) {
+        if (f[fi] != '%') {
+            dst[di] = f[fi];
+            di += 1;
+            fi += 1;
+            continue;
+        }
+        fi += 1;
+        if (f[fi] == '%') {
+            dst[di] = '%';
+            di += 1;
+            fi += 1;
+            continue;
+        }
+        while (f[fi] == '0' or f[fi] == '-' or f[fi] == '+' or f[fi] == ' ' or (f[fi] >= '1' and f[fi] <= '9') or f[fi] == '.' or f[fi] == 'l' or f[fi] == 'h' or f[fi] == 'I') {
+            fi += 1;
+        }
+        const spec = f[fi];
+        if (spec == 0) break;
+        fi += 1;
+        const val: usize = if (ai < args.len) args[ai] else 0;
+        ai += 1;
+        if (spec == 'd' or spec == 'i') {
+            var tmp: [32]u8 = undefined;
+            const sval: i32 = @bitCast(@as(u32, @truncate(val)));
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{sval}) catch "";
+            for (s) |ch| {
+                if (di < 500) {
+                    dst[di] = ch;
+                    di += 1;
+                }
+            }
+        } else if (spec == 'u') {
+            var tmp: [32]u8 = undefined;
+            const uval: u32 = @truncate(val);
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{uval}) catch "";
+            for (s) |ch| {
+                if (di < 500) {
+                    dst[di] = ch;
+                    di += 1;
+                }
+            }
+        } else if (spec == 'x' or spec == 'X') {
+            var tmp: [32]u8 = undefined;
+            const uval: u32 = @truncate(val);
+            const s = std.fmt.bufPrint(&tmp, "{x}", .{uval}) catch "";
+            for (s) |ch| {
+                if (di < 500) {
+                    dst[di] = if (spec == 'X' and ch >= 'a' and ch <= 'f') ch - 32 else ch;
+                    di += 1;
+                }
+            }
+        } else if (spec == 's' or spec == 'S') {
+            if (val >= 0x10000) {
+                const wstr: [*:0]const u16 = @ptrFromInt(val);
+                var si: usize = 0;
+                while (wstr[si] != 0 and di < 500) : (si += 1) {
+                    dst[di] = wstr[si];
+                    di += 1;
+                }
+            }
+        } else if (spec == 'c') {
+            dst[di] = @truncate(val);
+            di += 1;
+        }
+    }
+    dst[di] = 0;
+    return @intCast(di);
 }
 
 fn GetScrollPos(hWnd: usize, nBar: i32) callconv(W) i32 {
@@ -1985,7 +4233,7 @@ fn BeginDeferWindowPos(nNumWindows: i32) callconv(W) usize {
 }
 
 fn DeferWindowPos(hWinPosInfo: usize, hWnd: usize, hWndInsertAfter: usize, x: i32, y: i32, cx: i32, cy: i32, uFlags: u32) callconv(W) usize {
-    _ = hWnd; _ = hWndInsertAfter; _ = x; _ = y; _ = cx; _ = cy; _ = uFlags;
+    _ = SetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
     return hWinPosInfo;
 }
 
@@ -2100,9 +4348,28 @@ fn LoadStringA(hInstance: usize, uID: u32, lpBuffer: ?[*:0]u8, cchBufferMax: i32
 }
 
 fn LoadStringW(hInstance: usize, uID: u32, lpBuffer: ?[*:0]u16, cchBufferMax: i32) callconv(W) i32 {
-    _ = hInstance; _ = uID;
-    if (lpBuffer) |b| {
-        if (cchBufferMax > 0) b[0] = 0;
+    const buf = lpBuffer orelse return 0;
+    if (cchBufferMax <= 0) return 0;
+    buf[0] = 0;
+    const k32 = @import("winrun_kernel32.zig");
+    const block_id: usize = (uID >> 4) + 1;
+    const raw = k32.findResourceBytes(hInstance, @ptrFromInt(block_id), @ptrFromInt(6)) orelse return 0; // RT_STRING=6
+    var off: usize = 0;
+    const idx_in_block = uID & 15;
+    for (0..16) |i| {
+        if (off + 2 > raw.len) return 0;
+        const nchars = std.mem.readInt(u16, raw[off..][0..2], .little);
+        off += 2;
+        if (off + @as(usize, nchars) * 2 > raw.len) return 0;
+        if (i == idx_in_block) {
+            const copy_n = @min(@as(usize, nchars), @as(usize, @intCast(cchBufferMax)) - 1);
+            for (0..copy_n) |j| {
+                buf[j] = std.mem.readInt(u16, raw[off + j * 2 ..][0..2], .little);
+            }
+            buf[copy_n] = 0;
+            return @intCast(copy_n);
+        }
+        off += @as(usize, nchars) * 2;
     }
     return 0;
 }
@@ -2113,8 +4380,14 @@ fn MessageBeep(uType: u32) callconv(W) i32 {
 }
 
 fn GetUpdateRgn(hWnd: usize, hRgn: usize, bErase: i32) callconv(W) i32 {
-    _ = hWnd; _ = hRgn; _ = bErase;
-    return 0;
+    _ = bErase;
+    if (regionFromHandle(hRgn)) |r| {
+        if (findWin(hWnd)) |w| {
+            r.rect = .{ .left = 0, .top = 0, .right = @max(1, w.width), .bottom = @max(1, w.height) };
+            return 2; // SIMPLEREGION
+        }
+    }
+    return 1; // NULLREGION
 }
 
 fn GetWindow(hWnd: usize, uCmd: u32) callconv(W) usize {
@@ -2122,9 +4395,76 @@ fn GetWindow(hWnd: usize, uCmd: u32) callconv(W) usize {
     return 0;
 }
 
+fn sleepMs(ms: u32) void {
+    const req = std.os.linux.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+    var rem: std.os.linux.timespec = undefined;
+    _ = std.os.linux.nanosleep(&req, &rem);
+}
+
+const QS_KEY: u32 = 0x0001;
+const QS_MOUSEMOVE: u32 = 0x0002;
+const QS_MOUSEBUTTON: u32 = 0x0004;
+const QS_POSTMESSAGE: u32 = 0x0008;
+const QS_TIMER: u32 = 0x0010;
+const QS_PAINT: u32 = 0x0080;
+const QS_SENDMESSAGE: u32 = 0x0040;
+const QS_HOTKEY: u32 = 0x0100;
+const QS_RAWINPUT: u32 = 0x0400;
+const QS_ALLINPUT: u32 = 0x04FF;
+const QS_ALLEVENTS: u32 = 0x0BF7;
+
+fn msgMatchesWake(msg: u32, mask: u32) bool {
+    if (mask & QS_KEY != 0 and msg >= 0x0100 and msg <= 0x0109) return true; // WM_KEYFIRST..KEYLAST + WM_CHAR
+    if (mask & QS_MOUSEMOVE != 0 and msg == 0x0200) return true;
+    if (mask & QS_MOUSEBUTTON != 0 and msg >= 0x0201 and msg <= 0x020E) return true;
+    if (mask & QS_RAWINPUT != 0 and msg == WM_INPUT) return true;
+    if (mask & QS_PAINT != 0 and msg == WM_PAINT) return true;
+    if (mask & QS_TIMER != 0 and msg == 0x0113) return true;
+    if (mask & QS_HOTKEY != 0 and msg == 0x0401) return true;
+    if (mask & (QS_POSTMESSAGE | QS_SENDMESSAGE) != 0) return true;
+    if (mask & QS_ALLINPUT != 0 and msg != WM_NULL and msg != WM_QUIT) return true;
+    if (mask & QS_ALLEVENTS != 0 and msg != WM_NULL) return true;
+    return false;
+}
+
+fn queueHasInput(wake_mask: u32) bool {
+    if (queue_count == 0) return false;
+    var i = queue_head;
+    var n: usize = 0;
+    while (n < queue_count) : (n += 1) {
+        if (msgMatchesWake(msg_queue[i].message, wake_mask)) return true;
+        i = (i + 1) % MAX_QUEUE;
+    }
+    return false;
+}
+
+/// MsgWaitForMultipleObjects: pump X11, return WAIT_OBJECT_0+nCount when a
+/// queued message matches dwWakeMask, otherwise wait on the handles (in
+/// slices so X11 input is still noticed) until the timeout elapses.
 fn MsgWaitForMultipleObjects(nCount: u32, pHandles: ?*const usize, fWaitAll: i32, dwMilliseconds: u32, dwWakeMask: u32) callconv(W) u32 {
-    _ = nCount; _ = pHandles; _ = fWaitAll; _ = dwMilliseconds; _ = dwWakeMask;
-    return 0;
+    const INFINITE: u32 = 0xFFFFFFFF;
+    var remaining = dwMilliseconds;
+    const infinite = dwMilliseconds == INFINITE;
+    const handles = if (nCount >= 1 and nCount <= threads.MAXIMUM_WAIT_OBJECTS) pHandles else null;
+    while (true) {
+        pumpX11Events(0);
+        if (queueHasInput(dwWakeMask)) return threads.WAIT_OBJECT_0 + nCount;
+        const slice: u32 = if (infinite) 50 else @min(remaining, 20);
+        if (handles) |hs| {
+            if (threads.waitMany(@as([*]const usize, @ptrCast(hs))[0..nCount], fWaitAll != 0, slice)) |r| {
+                if (r != threads.WAIT_TIMEOUT) return r;
+            } else {
+                // at least one handle is not ours: just sleep the slice
+                if (slice > 0) sleepMs(slice);
+            }
+        } else if (slice > 0) {
+            sleepMs(slice);
+        }
+        if (!infinite) {
+            if (remaining <= slice) return threads.WAIT_TIMEOUT;
+            remaining -= slice;
+        }
+    }
 }
 
 fn NotifyWinEvent(event: u32, hwnd: usize, idObject: i32, idChild: i32) callconv(W) void {
@@ -2132,8 +4472,10 @@ fn NotifyWinEvent(event: u32, hwnd: usize, idObject: i32, idChild: i32) callconv
 }
 
 fn CallWindowProcW(lpPrevWndFunc: ?*anyopaque, hWnd: usize, Msg: u32, wParam: usize, lParam: usize) callconv(W) isize {
-    _ = lpPrevWndFunc; _ = hWnd; _ = Msg; _ = wParam; _ = lParam;
-    return 0;
+    const f_ptr = lpPrevWndFunc orelse return @bitCast(defWindowProcW(hWnd, Msg, wParam, lParam));
+    if (@intFromPtr(f_ptr) < 0x10000) return @bitCast(defWindowProcW(hWnd, Msg, wParam, lParam));
+    const proc: WndProcFn = @ptrCast(@alignCast(f_ptr));
+    return @bitCast(proc(hWnd, Msg, wParam, lParam));
 }
 
 fn GetDoubleClickTime() callconv(W) u32 {
@@ -2142,6 +4484,28 @@ fn GetDoubleClickTime() callconv(W) u32 {
 
 fn SystemParametersInfoA(uiAction: u32, uiParam: u32, pvParam: ?*anyopaque, fWinIni: u32) callconv(W) i32 {
     _ = uiAction; _ = uiParam; _ = pvParam; _ = fWinIni;
+    return 1;
+}
+
+fn WaitForInputIdle(hProcess: usize, dwMilliseconds: u32) callconv(W) u32 {
+    _ = hProcess;
+    _ = dwMilliseconds;
+    return 0;
+}
+
+fn SendMessageTimeoutW(
+    hWnd: usize,
+    Msg: u32,
+    wParam: usize,
+    lParam: usize,
+    fuFlags: u32,
+    uTimeout: u32,
+    lpdwResult: ?*usize,
+) callconv(W) isize {
+    _ = fuFlags;
+    _ = uTimeout;
+    const res: usize = @bitCast(sendMessageW(hWnd, Msg, wParam, lParam));
+    if (lpdwResult) |out| out.* = res;
     return 1;
 }
 
@@ -2190,6 +4554,8 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "GetMessageExtraInfo")) return @intFromPtr(&GetMessageExtraInfo);
     if (std.mem.eql(u8, name, "DragDetect")) return @intFromPtr(&DragDetect);
     if (std.mem.eql(u8, name, "GetMessageA")) return @intFromPtr(&GetMessageA);
+    if (std.mem.eql(u8, name, "PeekMessageA")) return @intFromPtr(&PeekMessageA);
+    if (std.mem.eql(u8, name, "DispatchMessageA")) return @intFromPtr(&DispatchMessageA);
     if (std.mem.eql(u8, name, "CopyImage")) return @intFromPtr(&CopyImage);
     if (std.mem.eql(u8, name, "wvsprintfA")) return @intFromPtr(&wvsprintfA);
     if (std.mem.eql(u8, name, "wsprintfA")) return @intFromPtr(&wsprintfA);
@@ -2198,6 +4564,7 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "ChangeDisplaySettingsW")) return @intFromPtr(&ChangeDisplaySettingsW);
     if (std.mem.eql(u8, name, "EnumDisplayMonitors")) return @intFromPtr(&EnumDisplayMonitors);
     if (std.mem.eql(u8, name, "EnumDisplayDevicesA")) return @intFromPtr(&EnumDisplayDevicesA);
+    if (std.mem.eql(u8, name, "EnumDisplayDevicesW")) return @intFromPtr(&EnumDisplayDevicesW);
     if (std.mem.eql(u8, name, "GetCaretBlinkTime")) return @intFromPtr(&GetCaretBlinkTime);
     if (std.mem.eql(u8, name, "IsClipboardFormatAvailable")) return @intFromPtr(&IsClipboardFormatAvailable);
     if (std.mem.eql(u8, name, "LoadCursorA")) return @intFromPtr(&LoadCursorA);
@@ -2405,5 +4772,87 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "CallWindowProcW")) return @intFromPtr(&CallWindowProcW);
     if (std.mem.eql(u8, name, "GetDoubleClickTime")) return @intFromPtr(&GetDoubleClickTime);
     if (std.mem.eql(u8, name, "SystemParametersInfoA")) return @intFromPtr(&SystemParametersInfoA);
+    if (std.mem.eql(u8, name, "WaitForInputIdle")) return @intFromPtr(&WaitForInputIdle);
+    if (std.mem.eql(u8, name, "SendMessageTimeoutW")) return @intFromPtr(&SendMessageTimeoutW);
+    return null;
+}
+
+fn comctlInitCommonControls() callconv(W) void {}
+
+fn comctlSetWindowSubclass(hWnd: usize, pfnSubclass: ?SubclassProcFn, uIdSubclass: usize, dwRefData: usize) callconv(W) i32 {
+    const proc = pfnSubclass orelse return 0;
+    if (findWin(hWnd) == null) return 0;
+    for (&subclasses) |*sc| {
+        if (sc.in_use and sc.hwnd == hWnd and sc.proc == proc and sc.id == uIdSubclass) {
+            sc.ref_data = dwRefData;
+            return 1;
+        }
+    }
+    for (&subclasses) |*sc| {
+        if (!sc.in_use) {
+            sc.* = .{
+                .in_use = true,
+                .hwnd = hWnd,
+                .proc = proc,
+                .id = uIdSubclass,
+                .ref_data = dwRefData,
+            };
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn comctlGetWindowSubclass(hWnd: usize, pfnSubclass: ?SubclassProcFn, uIdSubclass: usize, pdwRefData: ?*usize) callconv(W) i32 {
+    const proc = pfnSubclass orelse return 0;
+    for (subclasses) |sc| {
+        if (sc.in_use and sc.hwnd == hWnd and sc.proc == proc and sc.id == uIdSubclass) {
+            if (pdwRefData) |out| out.* = sc.ref_data;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn comctlRemoveWindowSubclass(hWnd: usize, pfnSubclass: ?SubclassProcFn, uIdSubclass: usize) callconv(W) i32 {
+    const proc = pfnSubclass orelse return 0;
+    for (&subclasses) |*sc| {
+        if (sc.in_use and sc.hwnd == hWnd and sc.proc == proc and sc.id == uIdSubclass) {
+            sc.* = .{};
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn comctlDefSubclassProc(hWnd: usize, uMsg: u32, wParam: usize, lParam: usize) callconv(W) usize {
+    return dispatchSubclassFrom(hWnd, uMsg, wParam, lParam, active_subclass_idx);
+}
+
+fn comctlLoadIconMetric(hinst: usize, pszName: ?*const anyopaque, lims: i32, phico: ?*usize) callconv(W) i32 {
+    _ = hinst;
+    _ = pszName;
+    _ = lims;
+    if (phico) |p| p.* = 0x40001;
+    return 0;
+}
+
+fn comctlLoadIconWithScaleDown(hinst: usize, pszName: ?*const anyopaque, cx: i32, cy: i32, phico: ?*usize) callconv(W) i32 {
+    _ = hinst;
+    _ = pszName;
+    _ = cx;
+    _ = cy;
+    if (phico) |p| p.* = 0x40001;
+    return 0;
+}
+
+pub fn lookupComctl32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "InitCommonControls")) return @intFromPtr(&comctlInitCommonControls);
+    if (std.mem.eql(u8, name, "SetWindowSubclass")) return @intFromPtr(&comctlSetWindowSubclass);
+    if (std.mem.eql(u8, name, "GetWindowSubclass")) return @intFromPtr(&comctlGetWindowSubclass);
+    if (std.mem.eql(u8, name, "RemoveWindowSubclass")) return @intFromPtr(&comctlRemoveWindowSubclass);
+    if (std.mem.eql(u8, name, "DefSubclassProc")) return @intFromPtr(&comctlDefSubclassProc);
+    if (std.mem.eql(u8, name, "LoadIconMetric")) return @intFromPtr(&comctlLoadIconMetric);
+    if (std.mem.eql(u8, name, "LoadIconWithScaleDown")) return @intFromPtr(&comctlLoadIconWithScaleDown);
     return null;
 }

@@ -12,22 +12,14 @@ const W: std.builtin.CallingConvention = .winapi;
 // ---------------------------------------------------------------------------
 
 fn fillRandomBytes(buf: ?[*]u8, len: u32) u32 {
-    if (buf == null) return 0;
+    if (buf == null) return if (len == 0) 1 else 0;
     if (len == 0) return 1;
     var off: usize = 0;
     const total: usize = len;
     while (off < total) {
         const rc = linux.getrandom(buf.? + off, total - off, 0);
         if (linux.errno(rc) != .SUCCESS or rc == 0) {
-            // Fallback deterministic PRNG if getrandom is blocked
-            var seed: u64 = 0x9e3779b97f4a7c15 ^ @as(u64, off);
-            while (off < total) : (off += 1) {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                buf.?[off] = @truncate(seed);
-            }
-            break;
+            return 0;
         }
         off += rc;
     }
@@ -38,12 +30,19 @@ fn SystemFunction036(buf: ?[*]u8, len: u32) callconv(W) u8 {
     return @intCast(fillRandomBytes(buf, len));
 }
 
+const CryptoEntry = struct { active: bool = false };
+var crypto_entries: [128]CryptoEntry = [_]CryptoEntry{.{}} ** 128;
+const CRYPTO_BASE: usize = 0xCAFE0000;
+fn newCryptoHandle() ?usize { for (&crypto_entries, 0..) |*e, i| if (!e.active) { e.active = true; return CRYPTO_BASE + i * 4; }; return null; }
+fn validCrypto(h: usize) ?usize { if (h < CRYPTO_BASE or (h - CRYPTO_BASE) % 4 != 0) return null; const i = (h - CRYPTO_BASE) / 4; if (i >= crypto_entries.len or !crypto_entries[i].active) return null; return i; }
+
 fn CryptAcquireContextA(phProv: ?*usize, container: ?[*:0]const u8, provider: ?[*:0]const u8, prov_type: u32, flags: u32) callconv(W) i32 {
     _ = container;
     _ = provider;
     _ = prov_type;
     _ = flags;
-    if (phProv) |p| p.* = 0xCAFE0001;
+    const h = newCryptoHandle() orelse return 0;
+    if (phProv) |p| p.* = h else { crypto_entries[(h - CRYPTO_BASE) / 4].active = false; return 0; }
     return 1;
 }
 
@@ -52,33 +51,41 @@ fn CryptAcquireContextW(phProv: ?*usize, container: ?[*:0]const u16, provider: ?
     _ = provider;
     _ = prov_type;
     _ = flags;
-    if (phProv) |p| p.* = 0xCAFE0001;
+    const h = newCryptoHandle() orelse return 0;
+    if (phProv) |p| p.* = h else { crypto_entries[(h - CRYPTO_BASE) / 4].active = false; return 0; }
     return 1;
 }
 
 fn CryptGenRandom(hProv: usize, len: u32, buf: ?[*]u8) callconv(W) i32 {
-    _ = hProv;
+    if (validCrypto(hProv) == null) return 0;
     return @intCast(fillRandomBytes(buf, len));
 }
 
 fn CryptReleaseContext(hProv: usize, flags: u32) callconv(W) i32 {
-    _ = hProv;
     _ = flags;
+    const i = validCrypto(hProv) orelse return 0;
+    crypto_entries[i].active = false;
     return 1;
 }
 
+const TokenEntry = struct { active: bool = false, uid: u32 = 0, gid: u32 = 0 };
+var token_entries: [128]TokenEntry = [_]TokenEntry{.{}} ** 128;
+const TOKEN_BASE: usize = 0x70010000;
+fn tokenIndex(h: usize) ?usize { if (h < TOKEN_BASE or (h - TOKEN_BASE) % 4 != 0) return null; const i = (h - TOKEN_BASE) / 4; if (i >= token_entries.len or !token_entries[i].active) return null; return i; }
 fn OpenProcessToken(proc_h: usize, access: u32, token_h: ?*usize) callconv(W) i32 {
-    _ = proc_h;
     _ = access;
-    if (token_h) |t| t.* = 0x7001;
-    return 1;
+    if (proc_h != ~@as(usize, 0) and proc_h != @as(usize, @intCast(linux.getpid()))) return 0;
+    const out = token_h orelse return 0;
+    for (&token_entries, 0..) |*t, i| if (!t.active) { t.active = true; t.uid = linux.getuid(); t.gid = linux.getgid(); out.* = TOKEN_BASE + i * 4; return 1; };
+    return 0;
 }
 
 fn DuplicateToken(existing_token: usize, imp_level: u32, dup_token: ?*usize) callconv(W) i32 {
-    _ = existing_token;
+    const src = tokenIndex(existing_token) orelse return 0;
     _ = imp_level;
-    if (dup_token) |t| t.* = 0x7002;
-    return 1;
+    const out = dup_token orelse return 0;
+    for (&token_entries, 0..) |*t, i| if (!t.active) { t.* = token_entries[src]; out.* = TOKEN_BASE + i * 4; return 1; };
+    return 0;
 }
 
 fn GetTokenInformation(
@@ -88,12 +95,15 @@ fn GetTokenInformation(
     info_len: u32,
     ret_len: ?*u32,
 ) callconv(W) i32 {
-    _ = token_h;
-    _ = info_class;
-    if (ret_len) |r| r.* = 36;
-    if (info == null or info_len < 36) return 0;
-    @memset(info.?[0..info_len], 0);
-    return 1;
+    const ti = tokenIndex(token_h) orelse return 0;
+    if (info_class == 20) { // TokenElevation: effective process credentials
+        if (ret_len) |r| r.* = 4;
+        if (info == null or info_len < 4) return 0;
+        std.mem.writeInt(u32, info.?[0..4], if (token_entries[ti].uid == 0) 1 else 0, .little);
+        return 1;
+    }
+    if (ret_len) |r| r.* = 0;
+    return 0;
 }
 
 fn SetTokenInformation(token_h: usize, info_class: u32, info: ?*const anyopaque, info_len: u32) callconv(W) i32 {
@@ -186,63 +196,316 @@ fn SaferComputeTokenFromLevel(level_h: usize, in_token: usize, out_token: ?*usiz
     return 1;
 }
 
+const RegValueEntry = struct {
+    key_path: []u8,
+    name: []u8,
+    reg_type: u32,
+    data: []u8,
+};
+
+const RegHandleEntry = struct {
+    in_use: bool = false,
+    path: []u8 = &.{},
+};
+
+var reg_lock = std.atomic.Value(u32).init(0);
+var reg_loaded = false;
+var reg_handles: [256]RegHandleEntry = [_]RegHandleEntry{.{}} ** 256;
+var reg_values: std.ArrayListUnmanaged(RegValueEntry) = .empty;
+var reg_keys: std.ArrayListUnmanaged([]u8) = .empty;
+
+fn acquireRegLock() void {
+    while (reg_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+
+fn releaseRegLock() void {
+    reg_lock.store(0, .release);
+}
+
+fn regAllocLowerUtf16(p: ?[*:0]const u16) []u8 {
+    const a = std.heap.page_allocator;
+    const ptr = p orelse return a.dupe(u8, "") catch &.{};
+    var len: usize = 0;
+    while (ptr[len] != 0 and len < 1024) : (len += 1) {}
+    var buf = a.alloc(u8, len * 3 + 4) catch return &.{};
+    const n = std.unicode.utf16LeToUtf8(buf, ptr[0..len]) catch blk: {
+        for (0..len) |i| buf[i] = @truncate(ptr[i]);
+        break :blk len;
+    };
+    const out = a.alloc(u8, n) catch return &.{};
+    for (0..n) |i| {
+        const c = buf[i];
+        out[i] = if (c == '/') '\\' else std.ascii.toLower(c);
+    }
+    a.free(buf);
+    return out;
+}
+
+fn regAllocLowerAscii(p: ?[*:0]const u8) []u8 {
+    const a = std.heap.page_allocator;
+    const ptr = p orelse return a.dupe(u8, "") catch &.{};
+    const sl = std.mem.sliceTo(ptr, 0);
+    const out = a.alloc(u8, sl.len) catch return &.{};
+    for (sl, 0..) |c, i| out[i] = if (c == '/') '\\' else std.ascii.toLower(c);
+    return out;
+}
+
+fn regRootName(hKey: usize) ?[]const u8 {
+    return switch (hKey) {
+        0x80000000 => "hkcr",
+        0x80000001 => "hkcu",
+        0x80000002 => "hklm",
+        0x80000003 => "hku",
+        else => null,
+    };
+}
+
+fn regResolveKeyPath(hKey: usize, sub_lower: []const u8) []u8 {
+    const a = std.heap.page_allocator;
+    var prefix: []const u8 = "hkcu";
+    if (regRootName(hKey)) |rn| {
+        prefix = rn;
+    } else if (hKey >= 0x8001 and hKey < 0x8001 + reg_handles.len) {
+        const idx = hKey - 0x8001;
+        if (reg_handles[idx].in_use) prefix = reg_handles[idx].path;
+    }
+    const clean = std.mem.trim(u8, sub_lower, "\\");
+    if (clean.len == 0) return a.dupe(u8, prefix) catch &.{};
+    return std.fmt.allocPrint(a, "{s}\\{s}", .{ prefix, clean }) catch &.{};
+}
+
+fn regOpenHandle(path: []u8) ?usize {
+    for (&reg_handles, 0..) |*h, i| {
+        if (!h.in_use) {
+            h.in_use = true;
+            h.path = path;
+            return 0x8001 + i;
+        }
+    }
+    return null;
+}
+
+fn regFilePath(buf: *[512]u8) ?[:0]const u8 {
+    // Console loaders link no libc and have no persistent registry file.
+    if (comptime !@import("builtin").link_libc) return null;
+    const base_c = std.c.getenv("LOCALAPPDATA") orelse std.c.getenv("APPDATA") orelse return null;
+    const base = std.mem.sliceTo(base_c, 0);
+    return std.fmt.bufPrintZ(buf, "{s}/wins_reg.bin", .{base}) catch null;
+}
+
+fn regEnsureLoaded() void {
+    if (reg_loaded) return;
+    reg_loaded = true;
+    var pbuf: [512]u8 = undefined;
+    const fpath = regFilePath(&pbuf) orelse return;
+    const fd = linux.open(fpath.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (@as(isize, @bitCast(fd)) < 0) return;
+    defer _ = linux.close(@intCast(fd));
+    const a = std.heap.page_allocator;
+    const tmp = a.alloc(u8, 256 * 1024) catch return;
+    defer a.free(tmp);
+    const n_isize: isize = @bitCast(linux.read(@intCast(fd), tmp.ptr, tmp.len));
+    if (n_isize < 4) return;
+    const bytes = tmp[0..@intCast(n_isize)];
+    var off: usize = 0;
+    while (off + 12 <= bytes.len) {
+        const klen = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        const nlen = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
+        const rtype = std.mem.readInt(u32, bytes[off + 8 ..][0..4], .little);
+        const dlen = std.mem.readInt(u32, bytes[off + 12 ..][0..4], .little);
+        off += 16;
+        if (off + klen + nlen + dlen > bytes.len) break;
+        const kp = a.dupe(u8, bytes[off .. off + klen]) catch break;
+        off += klen;
+        const nm = a.dupe(u8, bytes[off .. off + nlen]) catch break;
+        off += nlen;
+        const dt = a.dupe(u8, bytes[off .. off + dlen]) catch break;
+        off += dlen;
+        reg_values.append(a, .{ .key_path = kp, .name = nm, .reg_type = rtype, .data = dt }) catch break;
+    }
+}
+
+fn regPersist() void {
+    var pbuf: [512]u8 = undefined;
+    const fpath = regFilePath(&pbuf) orelse return;
+    const fd = linux.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    if (@as(isize, @bitCast(fd)) < 0) return;
+    defer _ = linux.close(@intCast(fd));
+    for (reg_values.items) |e| {
+        var hdr: [16]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], @intCast(e.key_path.len), .little);
+        std.mem.writeInt(u32, hdr[4..8], @intCast(e.name.len), .little);
+        std.mem.writeInt(u32, hdr[8..12], e.reg_type, .little);
+        std.mem.writeInt(u32, hdr[12..16], @intCast(e.data.len), .little);
+        _ = linux.write(@intCast(fd), &hdr, 16);
+        _ = linux.write(@intCast(fd), e.key_path.ptr, e.key_path.len);
+        _ = linux.write(@intCast(fd), e.name.ptr, e.name.len);
+        _ = linux.write(@intCast(fd), e.data.ptr, e.data.len);
+    }
+}
+
+fn regKeyHasAny(full: []const u8) bool {
+    for (reg_keys.items) |k| {
+        if (std.mem.eql(u8, k, full)) return true;
+    }
+    for (reg_values.items) |v| {
+        if (std.mem.eql(u8, v.key_path, full)) return true;
+    }
+    return false;
+}
+
+fn regQueryCommon(hKey: usize, vname_lower: []const u8, lpType: ?*u32, lpData: ?[*]u8, lpcbData: ?*u32) i32 {
+    const kpath = regResolveKeyPath(hKey, "");
+    defer std.heap.page_allocator.free(kpath);
+    for (reg_values.items) |e| {
+        if (std.mem.eql(u8, e.key_path, kpath) and std.mem.eql(u8, e.name, vname_lower)) {
+            if (lpType) |t| t.* = e.reg_type;
+            const need: u32 = @intCast(e.data.len);
+            if (lpData == null) {
+                if (lpcbData) |cb| cb.* = need;
+                return 0;
+            }
+            const cap = if (lpcbData) |cb| cb.* else return 87;
+            if (cap < need) {
+                lpcbData.?.* = need;
+                return 234; // ERROR_MORE_DATA
+            }
+            @memcpy(lpData.?[0..need], e.data);
+            lpcbData.?.* = need;
+            return 0;
+        }
+    }
+    if (lpcbData) |cb| cb.* = 0;
+    return 2; // ERROR_FILE_NOT_FOUND
+}
+
+fn regSetCommon(hKey: usize, vname_lower: []u8, dwType: u32, lpData: ?[*]const u8, cbData: u32) i32 {
+    const a = std.heap.page_allocator;
+    const kpath = regResolveKeyPath(hKey, "");
+    const copy = a.alloc(u8, cbData) catch return 14;
+    if (lpData) |src| @memcpy(copy, src[0..cbData]) else @memset(copy, 0);
+    for (reg_values.items) |*e| {
+        if (std.mem.eql(u8, e.key_path, kpath) and std.mem.eql(u8, e.name, vname_lower)) {
+            a.free(e.data);
+            e.reg_type = dwType;
+            e.data = copy;
+            a.free(kpath);
+            a.free(vname_lower);
+            regPersist();
+            return 0;
+        }
+    }
+    reg_values.append(a, .{ .key_path = kpath, .name = vname_lower, .reg_type = dwType, .data = copy }) catch return 14;
+    regPersist();
+    return 0;
+}
+
 fn RegOpenKeyExW(hKey: usize, lpSubKey: ?[*:0]const u16, ulOptions: u32, samDesired: u32, phkResult: ?*usize) callconv(W) i32 {
-    _ = hKey; _ = lpSubKey; _ = ulOptions; _ = samDesired;
-    if (phkResult) |p| p.* = 0x8001;
+    _ = ulOptions; _ = samDesired;
+    const sub = regAllocLowerUtf16(lpSubKey);
+    defer std.heap.page_allocator.free(sub);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    const full = regResolveKeyPath(hKey, sub);
+    if (phkResult) |p| p.* = regOpenHandle(full) orelse 0x8001;
     return 0;
 }
 
 fn RegOpenKeyExA(hKey: usize, lpSubKey: ?[*:0]const u8, ulOptions: u32, samDesired: u32, phkResult: ?*usize) callconv(W) i32 {
-    _ = hKey; _ = lpSubKey; _ = ulOptions; _ = samDesired;
-    if (phkResult) |p| p.* = 0x8001;
+    _ = ulOptions; _ = samDesired;
+    const sub = regAllocLowerAscii(lpSubKey);
+    defer std.heap.page_allocator.free(sub);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    const full = regResolveKeyPath(hKey, sub);
+    if (phkResult) |p| p.* = regOpenHandle(full) orelse 0x8001;
     return 0;
 }
 
 fn RegCreateKeyExW(hKey: usize, lpSubKey: ?[*:0]const u16, Reserved: u32, lpClass: ?[*:0]const u16, dwOptions: u32, samDesired: u32, lpSecurityAttributes: ?*anyopaque, phkResult: ?*usize, lpdwDisposition: ?*u32) callconv(W) i32 {
-    _ = hKey; _ = lpSubKey; _ = Reserved; _ = lpClass; _ = dwOptions; _ = samDesired; _ = lpSecurityAttributes;
-    if (phkResult) |p| p.* = 0x8001;
-    if (lpdwDisposition) |p| p.* = 1;
+    _ = Reserved; _ = lpClass; _ = dwOptions; _ = samDesired; _ = lpSecurityAttributes;
+    const a = std.heap.page_allocator;
+    const sub = regAllocLowerUtf16(lpSubKey);
+    defer a.free(sub);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    const full = regResolveKeyPath(hKey, sub);
+    const existed = regKeyHasAny(full);
+    if (!existed) reg_keys.append(a, a.dupe(u8, full) catch &.{}) catch {};
+    if (phkResult) |p| p.* = regOpenHandle(full) orelse 0x8001;
+    if (lpdwDisposition) |p| p.* = if (existed) 2 else 1;
+    return 0;
+}
+
+fn RegCreateKeyExA(hKey: usize, lpSubKey: ?[*:0]const u8, Reserved: u32, lpClass: ?[*:0]const u8, dwOptions: u32, samDesired: u32, lpSecurityAttributes: ?*anyopaque, phkResult: ?*usize, lpdwDisposition: ?*u32) callconv(W) i32 {
+    _ = Reserved; _ = lpClass; _ = dwOptions; _ = samDesired; _ = lpSecurityAttributes;
+    const a = std.heap.page_allocator;
+    const sub = regAllocLowerAscii(lpSubKey);
+    defer a.free(sub);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    const full = regResolveKeyPath(hKey, sub);
+    const existed = regKeyHasAny(full);
+    if (!existed) reg_keys.append(a, a.dupe(u8, full) catch &.{}) catch {};
+    if (phkResult) |p| p.* = regOpenHandle(full) orelse 0x8001;
+    if (lpdwDisposition) |p| p.* = if (existed) 2 else 1;
     return 0;
 }
 
 fn RegCloseKey(hKey: usize) callconv(W) i32 {
-    _ = hKey;
+    if (hKey >= 0x8001 and hKey < 0x8001 + reg_handles.len) {
+        acquireRegLock();
+        defer releaseRegLock();
+        const idx = hKey - 0x8001;
+        if (reg_handles[idx].in_use) {
+            std.heap.page_allocator.free(reg_handles[idx].path);
+            reg_handles[idx].in_use = false;
+            reg_handles[idx].path = &.{};
+        }
+    }
     return 0;
 }
 
 fn RegQueryValueExW(hKey: usize, lpValueName: ?[*:0]const u16, lpReserved: ?*u32, lpType: ?*u32, lpData: ?[*]u8, lpcbData: ?*u32) callconv(W) i32 {
-    _ = hKey; _ = lpValueName; _ = lpReserved;
-    if (lpType) |t| t.* = 1;
-    if (lpData != null and lpcbData != null and lpcbData.?.* >= 2) {
-        lpData.?[0] = 0;
-        lpData.?[1] = 0;
-        lpcbData.?.* = 2;
-        return 0;
-    }
-    if (lpcbData) |s| s.* = 2;
-    return 0;
+    _ = lpReserved;
+    const vname = regAllocLowerUtf16(lpValueName);
+    defer std.heap.page_allocator.free(vname);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    return regQueryCommon(hKey, vname, lpType, lpData, lpcbData);
 }
 
 fn RegQueryValueExA(hKey: usize, lpValueName: ?[*:0]const u8, lpReserved: ?*u32, lpType: ?*u32, lpData: ?[*]u8, lpcbData: ?*u32) callconv(W) i32 {
-    _ = hKey; _ = lpValueName; _ = lpReserved;
-    if (lpType) |t| t.* = 1;
-    if (lpData != null and lpcbData != null and lpcbData.?.* >= 1) {
-        lpData.?[0] = 0;
-        lpcbData.?.* = 1;
-        return 0;
-    }
-    if (lpcbData) |s| s.* = 1;
-    return 0;
+    _ = lpReserved;
+    const vname = regAllocLowerAscii(lpValueName);
+    defer std.heap.page_allocator.free(vname);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    return regQueryCommon(hKey, vname, lpType, lpData, lpcbData);
 }
 
 fn RegSetValueExW(hKey: usize, lpValueName: ?[*:0]const u16, Reserved: u32, dwType: u32, lpData: ?[*]const u8, cbData: u32) callconv(W) i32 {
-    _ = hKey; _ = lpValueName; _ = Reserved; _ = dwType; _ = lpData; _ = cbData;
-    return 0;
+    _ = Reserved;
+    const vname = regAllocLowerUtf16(lpValueName);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    return regSetCommon(hKey, vname, dwType, lpData, cbData);
 }
 
 fn RegSetValueExA(hKey: usize, lpValueName: ?[*:0]const u8, Reserved: u32, dwType: u32, lpData: ?[*]const u8, cbData: u32) callconv(W) i32 {
-    _ = hKey; _ = lpValueName; _ = Reserved; _ = dwType; _ = lpData; _ = cbData;
-    return 0;
+    _ = Reserved;
+    const vname = regAllocLowerAscii(lpValueName);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    return regSetCommon(hKey, vname, dwType, lpData, cbData);
 }
 
 var sid_sub_auth: u32 = 0;
@@ -278,26 +541,47 @@ fn DeregisterEventSource(hEventLog: usize) callconv(W) i32 {
     return 1;
 }
 
+fn regDeleteCommon(hKey: usize, vname_lower: []const u8) i32 {
+    const a = std.heap.page_allocator;
+    const kpath = regResolveKeyPath(hKey, "");
+    defer a.free(kpath);
+    for (reg_values.items, 0..) |e, i| {
+        if (std.mem.eql(u8, e.key_path, kpath) and std.mem.eql(u8, e.name, vname_lower)) {
+            a.free(e.key_path);
+            a.free(e.name);
+            a.free(e.data);
+            _ = reg_values.swapRemove(i);
+            regPersist();
+            return 0;
+        }
+    }
+    return 2;
+}
+
 fn RegDeleteValueA(hKey: usize, lpValueName: ?[*:0]const u8) callconv(W) i32 {
-    _ = hKey; _ = lpValueName;
-    return 0;
+    const vname = regAllocLowerAscii(lpValueName);
+    defer std.heap.page_allocator.free(vname);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    return regDeleteCommon(hKey, vname);
 }
 
 fn RegDeleteValueW(hKey: usize, lpValueName: ?*const u16) callconv(W) i32 {
-    _ = hKey; _ = lpValueName;
-    return 0;
+    const vname = regAllocLowerUtf16(@ptrCast(lpValueName));
+    defer std.heap.page_allocator.free(vname);
+    acquireRegLock();
+    defer releaseRegLock();
+    regEnsureLoaded();
+    return regDeleteCommon(hKey, vname);
 }
 
 fn RegCreateKeyW(hKey: usize, lpSubKey: ?*const u16, phkResult: ?*usize) callconv(W) i32 {
-    _ = hKey; _ = lpSubKey;
-    if (phkResult) |p| p.* = 0x2001;
-    return 0;
+    return RegCreateKeyExW(hKey, @ptrCast(lpSubKey), 0, null, 0, 0, null, phkResult, null);
 }
 
 fn RegCreateKeyA(hKey: usize, lpSubKey: ?[*:0]const u8, phkResult: ?*usize) callconv(W) i32 {
-    _ = hKey; _ = lpSubKey;
-    if (phkResult) |p| p.* = 0x2001;
-    return 0;
+    return RegCreateKeyExA(hKey, lpSubKey, 0, null, 0, 0, null, phkResult, null);
 }
 
 fn AllocateAndInitializeSid(pIdentifierAuthority: ?*anyopaque, nSubAuthorityCount: u8, nSubAuthority0: u32, nSubAuthority1: u32, nSubAuthority2: u32, nSubAuthority3: u32, nSubAuthority4: u32, nSubAuthority5: u32, nSubAuthority6: u32, nSubAuthority7: u32, pSid: ?*?*anyopaque) callconv(W) i32 {
@@ -346,7 +630,168 @@ fn RegEnumKeyExW(hKey: usize, dwIndex: u32, lpName: ?[*:0]u16, lpcchName: ?*u32,
     return 259;
 }
 
+var default_sid_bytes: [12]u8 = .{ 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0 }; // S-1-5-18
+var default_acl_bytes: [16]u8 align(4) = .{ 2, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+fn GetLengthSid(pSid: ?*const anyopaque) callconv(W) u32 {
+    const p: [*]const u8 = @ptrCast(pSid orelse return 12);
+    return 8 + @as(u32, p[1]) * 4;
+}
+
+fn CopySid(nDestinationSidLength: u32, pDestinationSid: ?[*]u8, pSourceSid: ?*const anyopaque) callconv(W) i32 {
+    const src_ptr = pSourceSid orelse return 0;
+    const dst = pDestinationSid orelse return 0;
+    const len = GetLengthSid(src_ptr);
+    if (nDestinationSidLength < len) return 0;
+    const src: [*]const u8 = @ptrCast(src_ptr);
+    @memcpy(dst[0..len], src[0..len]);
+    return 1;
+}
+
+fn LookupAccountSidW(
+    lpSystemName: ?[*:0]const u16,
+    Sid: ?*const anyopaque,
+    Name: ?[*]u16,
+    cchName: ?*u32,
+    ReferencedDomainName: ?[*]u16,
+    cchReferencedDomainName: ?*u32,
+    peUse: ?*u32,
+) callconv(W) i32 {
+    _ = lpSystemName;
+    _ = Sid;
+    const u = [_]u16{ 'w', 'i', 'n', 's', 0 };
+    const d = [_]u16{ 'L', 'O', 'C', 'A', 'L', 0 };
+    if (cchName) |cn| {
+        if (Name != null and cn.* >= u.len) @memcpy(Name.?[0..u.len], &u);
+        cn.* = u.len - 1;
+    }
+    if (cchReferencedDomainName) |cd| {
+        if (ReferencedDomainName != null and cd.* >= d.len) @memcpy(ReferencedDomainName.?[0..d.len], &d);
+        cd.* = d.len - 1;
+    }
+    if (peUse) |pu| pu.* = 1; // SidTypeUser
+    return 1;
+}
+
+fn BuildTrusteeWithSidW(pTrustee: ?[*]usize, pSid: ?*anyopaque) callconv(W) void {
+    if (pTrustee) |t| {
+        @memset(t[0..4], 0);
+        t[3] = @intFromPtr(pSid);
+    }
+}
+
+fn GetNamedSecurityInfoW(
+    pObjectName: ?[*:0]const u16,
+    ObjectType: u32,
+    SecurityInfo: u32,
+    ppsidOwner: ?*?*anyopaque,
+    ppsidGroup: ?*?*anyopaque,
+    ppDacl: ?*?*anyopaque,
+    ppSacl: ?*?*anyopaque,
+    ppSecurityDescriptor: ?*?*anyopaque,
+) callconv(W) u32 {
+    _ = pObjectName;
+    _ = ObjectType;
+    _ = SecurityInfo;
+    if (ppsidOwner) |p| p.* = &default_sid_bytes;
+    if (ppsidGroup) |p| p.* = &default_sid_bytes;
+    if (ppDacl) |p| p.* = &default_acl_bytes;
+    if (ppSacl) |p| p.* = null;
+    if (ppSecurityDescriptor) |p| p.* = @ptrCast(std.heap.page_allocator.alloc(u8, 64) catch return 8);
+    return 0; // ERROR_SUCCESS
+}
+
+fn SetNamedSecurityInfoW(
+    pObjectName: ?[*:0]const u16,
+    ObjectType: u32,
+    SecurityInfo: u32,
+    psidOwner: ?*anyopaque,
+    psidGroup: ?*anyopaque,
+    pDacl: ?*anyopaque,
+    pSacl: ?*anyopaque,
+) callconv(W) u32 {
+    _ = pObjectName;
+    _ = ObjectType;
+    _ = SecurityInfo;
+    _ = psidOwner;
+    _ = psidGroup;
+    _ = pDacl;
+    _ = pSacl;
+    return 0;
+}
+
+fn GetEffectiveRightsFromAclW(pacl: ?*anyopaque, pTrustee: ?*anyopaque, pAccessRights: ?*u32) callconv(W) u32 {
+    _ = pacl;
+    _ = pTrustee;
+    if (pAccessRights) |r| r.* = 0x001F01FF; // FILE_ALL_ACCESS
+    return 0;
+}
+
+fn SetEntriesInAclW(cCountOfExplicitEntries: u32, pListOfExplicitEntries: ?*anyopaque, OldAcl: ?*anyopaque, NewAcl: ?*?*anyopaque) callconv(W) u32 {
+    _ = cCountOfExplicitEntries;
+    _ = pListOfExplicitEntries;
+    _ = OldAcl;
+    if (NewAcl) |p| p.* = @ptrCast(std.heap.page_allocator.alloc(u8, 16) catch return 8);
+    return 0;
+}
+
+fn OpenThreadToken(ThreadHandle: usize, DesiredAccess: u32, OpenAsSelf: i32, TokenHandle: ?*usize) callconv(W) i32 {
+    _ = ThreadHandle;
+    _ = DesiredAccess;
+    _ = OpenAsSelf;
+    if (TokenHandle) |t| t.* = 0;
+    return 0; // no per-thread impersonation token (caller falls back to OpenProcessToken)
+}
+
+fn ImpersonateLoggedOnUser(hToken: usize) callconv(W) i32 {
+    _ = hToken;
+    return 1;
+}
+
+fn RevertToSelf() callconv(W) i32 {
+    return 1;
+}
+
+fn CreateProcessWithLogonW(
+    lpUsername: ?[*:0]const u16,
+    lpDomain: ?[*:0]const u16,
+    lpPassword: ?[*:0]const u16,
+    dwLogonFlags: u32,
+    lpApplicationName: ?[*:0]const u16,
+    lpCommandLine: ?[*:0]const u16,
+    dwCreationFlags: u32,
+    lpEnvironment: ?*anyopaque,
+    lpCurrentDirectory: ?[*:0]const u16,
+    lpStartupInfo: ?*anyopaque,
+    lpProcessInformation: ?*anyopaque,
+) callconv(W) i32 {
+    _ = lpUsername;
+    _ = lpDomain;
+    _ = lpPassword;
+    _ = dwLogonFlags;
+    _ = lpApplicationName;
+    _ = lpCommandLine;
+    _ = dwCreationFlags;
+    _ = lpEnvironment;
+    _ = lpCurrentDirectory;
+    _ = lpStartupInfo;
+    _ = lpProcessInformation;
+    return 0; // deny logon-elevation cleanly
+}
+
 pub fn lookupAdvapi32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "GetLengthSid")) return @intFromPtr(&GetLengthSid);
+    if (std.mem.eql(u8, name, "CopySid")) return @intFromPtr(&CopySid);
+    if (std.mem.eql(u8, name, "LookupAccountSidW")) return @intFromPtr(&LookupAccountSidW);
+    if (std.mem.eql(u8, name, "BuildTrusteeWithSidW")) return @intFromPtr(&BuildTrusteeWithSidW);
+    if (std.mem.eql(u8, name, "GetNamedSecurityInfoW")) return @intFromPtr(&GetNamedSecurityInfoW);
+    if (std.mem.eql(u8, name, "SetNamedSecurityInfoW")) return @intFromPtr(&SetNamedSecurityInfoW);
+    if (std.mem.eql(u8, name, "GetEffectiveRightsFromAclW")) return @intFromPtr(&GetEffectiveRightsFromAclW);
+    if (std.mem.eql(u8, name, "SetEntriesInAclW")) return @intFromPtr(&SetEntriesInAclW);
+    if (std.mem.eql(u8, name, "OpenThreadToken")) return @intFromPtr(&OpenThreadToken);
+    if (std.mem.eql(u8, name, "ImpersonateLoggedOnUser")) return @intFromPtr(&ImpersonateLoggedOnUser);
+    if (std.mem.eql(u8, name, "RevertToSelf")) return @intFromPtr(&RevertToSelf);
+    if (std.mem.eql(u8, name, "CreateProcessWithLogonW")) return @intFromPtr(&CreateProcessWithLogonW);
     if (std.mem.eql(u8, name, "RegDeleteKeyW")) return @intFromPtr(&RegDeleteKeyW);
     if (std.mem.eql(u8, name, "RegGetValueW")) return @intFromPtr(&RegGetValueW);
     if (std.mem.eql(u8, name, "RegQueryInfoKeyW")) return @intFromPtr(&RegQueryInfoKeyW);
@@ -367,6 +812,7 @@ pub fn lookupAdvapi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "RegOpenKeyExW")) return @intFromPtr(&RegOpenKeyExW);
     if (std.mem.eql(u8, name, "RegOpenKeyExA")) return @intFromPtr(&RegOpenKeyExA);
     if (std.mem.eql(u8, name, "RegCreateKeyExW")) return @intFromPtr(&RegCreateKeyExW);
+    if (std.mem.eql(u8, name, "RegCreateKeyExA")) return @intFromPtr(&RegCreateKeyExA);
     if (std.mem.eql(u8, name, "RegCloseKey")) return @intFromPtr(&RegCloseKey);
     if (std.mem.eql(u8, name, "RegQueryValueExW")) return @intFromPtr(&RegQueryValueExW);
     if (std.mem.eql(u8, name, "RegQueryValueExA")) return @intFromPtr(&RegQueryValueExA);
@@ -401,6 +847,30 @@ pub fn lookupAdvapi32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "GetFileSecurityW")) return @intFromPtr(&stub5);
     if (std.mem.eql(u8, name, "LookupPrivilegeValueW")) return @intFromPtr(&stub3);
     return null;
+}
+
+test "crypto provider handles validate and getrandom fills bytes" {
+    var h: usize = 0;
+    try std.testing.expectEqual(@as(i32, 1), CryptAcquireContextA(&h, null, null, 0, 0));
+    var bytes: [32]u8 = [_]u8{0} ** 32;
+    try std.testing.expectEqual(@as(i32, 1), CryptGenRandom(h, bytes.len, &bytes));
+    try std.testing.expect(!std.mem.allEqual(u8, &bytes, 0));
+    try std.testing.expectEqual(@as(i32, 0), CryptGenRandom(0xdead, 1, &bytes));
+    try std.testing.expectEqual(@as(i32, 1), CryptReleaseContext(h, 0));
+    try std.testing.expectEqual(@as(i32, 0), CryptReleaseContext(h, 0));
+    var hw: usize = 0;
+    try std.testing.expectEqual(@as(i32, 1), CryptAcquireContextW(&hw, null, null, 0, 0));
+    try std.testing.expectEqual(@as(i32, 1), CryptReleaseContext(hw, 0));
+}
+
+test "process token handle and elevation query reflect effective uid" {
+    var h: usize = 0;
+    try std.testing.expectEqual(@as(i32, 1), OpenProcessToken(~@as(usize, 0), 0, &h));
+    var elevation: [4]u8 = undefined; var needed: u32 = 0;
+    try std.testing.expectEqual(@as(i32, 1), GetTokenInformation(h, 20, &elevation, elevation.len, &needed));
+    try std.testing.expectEqual(@as(u32, 4), needed);
+    try std.testing.expectEqual(@as(u32, if (linux.getuid() == 0) 1 else 0), std.mem.readInt(u32, &elevation, .little));
+    try std.testing.expectEqual(@as(i32, 0), GetTokenInformation(0x1234, 20, &elevation, elevation.len, &needed));
 }
 
 // ---------------------------------------------------------------------------
@@ -747,7 +1217,90 @@ fn wsaAsyncSelectUnsupported(s: usize, hWnd: usize, wMsg: u32, lEvent: u32) call
     return -1; // SOCKET_ERROR
 }
 
+const WSABUF = extern struct { len: u32, buf: ?[*]u8 };
+
+fn WSASocketW(af: i32, sock_type: i32, protocol: i32, proto_info: ?*anyopaque, g: u32, flags: u32) callconv(W) usize {
+    return WSASocketA(af, sock_type, protocol, proto_info, g, flags);
+}
+
+fn WSASend(
+    s: usize,
+    lpBuffers: ?[*]const WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesSent: ?*u32,
+    dwFlags: u32,
+    lpOverlapped: ?*anyopaque,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(W) i32 {
+    _ = lpOverlapped;
+    _ = lpCompletionRoutine;
+    const bufs = lpBuffers orelse return -1;
+    var total: u32 = 0;
+    var i: u32 = 0;
+    while (i < dwBufferCount) : (i += 1) {
+        if (bufs[i].buf == null or bufs[i].len == 0) continue;
+        const rc = linux.sendto(@intCast(s & 0x7fffffff), bufs[i].buf.?, bufs[i].len, @intCast(dwFlags), null, 0);
+        if (linux.errno(rc) != .SUCCESS) {
+            wsa_last_error = 10035;
+            if (lpNumberOfBytesSent) |p| p.* = total;
+            return if (total > 0) 0 else -1;
+        }
+        total += @intCast(rc);
+    }
+    if (lpNumberOfBytesSent) |p| p.* = total;
+    return 0;
+}
+
+fn WSARecv(
+    s: usize,
+    lpBuffers: ?[*]const WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesRecvd: ?*u32,
+    lpFlags: ?*u32,
+    lpOverlapped: ?*anyopaque,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(W) i32 {
+    _ = lpOverlapped;
+    _ = lpCompletionRoutine;
+    const bufs = lpBuffers orelse return -1;
+    const flags: u32 = if (lpFlags) |f| f.* else 0;
+    var total: u32 = 0;
+    var i: u32 = 0;
+    while (i < dwBufferCount) : (i += 1) {
+        if (bufs[i].buf == null or bufs[i].len == 0) continue;
+        const rc = linux.recvfrom(@intCast(s & 0x7fffffff), bufs[i].buf.?, bufs[i].len, @intCast(flags), null, null);
+        if (linux.errno(rc) != .SUCCESS) {
+            wsa_last_error = 10035;
+            if (lpNumberOfBytesRecvd) |p| p.* = total;
+            return if (total > 0) 0 else -1;
+        }
+        total += @intCast(rc);
+        if (rc < bufs[i].len) break;
+    }
+    if (lpNumberOfBytesRecvd) |p| p.* = total;
+    return 0;
+}
+
+fn getservbyname(name: ?[*:0]const u8, proto: ?[*:0]const u8) callconv(W) ?*anyopaque {
+    _ = name;
+    _ = proto;
+    wsa_last_error = 11004;
+    return null;
+}
+
+fn getservbyport(port: i32, proto: ?[*:0]const u8) callconv(W) ?*anyopaque {
+    _ = port;
+    _ = proto;
+    wsa_last_error = 11004;
+    return null;
+}
+
 pub fn lookupWs2_32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "WSASend")) return @intFromPtr(&WSASend);
+    if (std.mem.eql(u8, name, "WSARecv")) return @intFromPtr(&WSARecv);
+    if (std.mem.eql(u8, name, "WSASocketW")) return @intFromPtr(&WSASocketW);
+    if (std.mem.eql(u8, name, "getservbyname")) return @intFromPtr(&getservbyname);
+    if (std.mem.eql(u8, name, "getservbyport")) return @intFromPtr(&getservbyport);
     // FalloutNV imports WSAAsyncSelect by ordinal. The window-message
     // notification it provides cannot be modelled without a real message loop,
     // so it reports failure rather than pretending to have registered one --
@@ -892,18 +1445,19 @@ pub fn lookupUser32Console(name: []const u8) ?usize {
 // ---------------------------------------------------------------------------
 
 fn PathFileExistsW(pszPath: ?[*:0]const u16) callconv(W) i32 {
-    if (pszPath == null) return 0;
-    return 1;
+    const k32 = @import("winrun_kernel32.zig");
+    return if (k32.queryWinPathAttrsW(pszPath) != 0xFFFFFFFF) 1 else 0;
 }
 
 fn PathFileExistsA(pszPath: ?[*:0]const u8) callconv(W) i32 {
-    if (pszPath == null) return 0;
-    return 1;
+    const k32 = @import("winrun_kernel32.zig");
+    return if (k32.queryWinPathAttrsA(pszPath) != 0xFFFFFFFF) 1 else 0;
 }
 
 fn PathIsDirectoryW(pszPath: ?[*:0]const u16) callconv(W) i32 {
-    if (pszPath == null) return 0;
-    return 1;
+    const k32 = @import("winrun_kernel32.zig");
+    const attrs = k32.queryWinPathAttrsW(pszPath);
+    return if (attrs != 0xFFFFFFFF and (attrs & 0x00000010) != 0) 1 else 0;
 }
 
 fn PathFindFileNameW(pszPath: ?[*:0]const u16) callconv(W) ?[*:0]const u16 {
@@ -1067,6 +1621,18 @@ fn ShellExecuteW(hwnd: usize, op: ?[*:0]const u16, file: ?[*:0]const u16, params
     return 42; // > 32 indicates success
 }
 
+fn ShellExecuteA(hwnd: usize, op: ?[*:0]const u8, file: ?[*:0]const u8, params: ?[*:0]const u8, dir: ?[*:0]const u8, show: i32) callconv(W) usize {
+    _ = hwnd;
+    _ = show;
+    std.debug.print("[WINS:ShellExecuteA] op={s} file={s} params={s} dir={s}\n", .{
+        if (op) |p| std.mem.span(p) else "(null)",
+        if (file) |p| std.mem.span(p) else "(null)",
+        if (params) |p| std.mem.span(p) else "(null)",
+        if (dir) |p| std.mem.span(p) else "(null)",
+    });
+    return 42;
+}
+
 fn SHGetFolderPathW(hwnd: usize, csidl: i32, token: usize, flags: u32, pszPath: ?[*]u16) callconv(W) i32 {
     _ = hwnd; _ = csidl; _ = token; _ = flags;
     if (pszPath) |p| {
@@ -1074,6 +1640,24 @@ fn SHGetFolderPathW(hwnd: usize, csidl: i32, token: usize, flags: u32, pszPath: 
         @memcpy(p[0..default_path.len], &default_path);
     }
     return 0; // S_OK
+}
+
+fn SHGetKnownFolderPath(rfid: ?*const anyopaque, dwFlags: u32, hToken: usize, ppszPath: ?*?[*]u16) callconv(W) i32 {
+    _ = rfid;
+    _ = dwFlags;
+    _ = hToken;
+    const out = ppszPath orelse return @bitCast(@as(u32, 0x80070057));
+    const default_path = [_]u16{ 'C', ':', '\\', 'U', 's', 'e', 'r', 's', '\\', 'U', 's', 'e', 'r', '\\', 'A', 'p', 'p', 'D', 'a', 't', 'a', '\\', 'R', 'o', 'a', 'm', 'i', 'n', 'g', 0 };
+    const raw = CoTaskMemAlloc(default_path.len * 2) orelse return @bitCast(@as(u32, 0x8007000E));
+    const w: [*]u16 = @ptrCast(@alignCast(raw));
+    @memcpy(w[0..default_path.len], &default_path);
+    out.* = w;
+    return 0; // S_OK
+}
+
+fn SHCreateDirectory(hwnd: usize, pszPath: ?[*:0]const u16) callconv(W) i32 {
+    _ = hwnd; _ = pszPath;
+    return 0; // ERROR_SUCCESS
 }
 
 fn SHCreateDirectoryExW(hwnd: usize, pszPath: ?[*:0]const u16, psa: ?*anyopaque) callconv(W) i32 {
@@ -1143,12 +1727,27 @@ fn CommandLineToArgvW(lpCmdLine: ?*const u16, pNumArgs: ?*i32) callconv(W) ?[*]?
     return &argv_ptrs;
 }
 
+fn DllGetVersion(pdvi: ?[*]u32) callconv(W) i32 {
+    const info = pdvi orelse return @bitCast(@as(u32, 0x80004003)); // E_POINTER
+    const cb = info[0];
+    if (cb < 20) return @bitCast(@as(u32, 0x80070057)); // E_INVALIDARG
+    info[1] = 10; // dwMajorVersion (Windows 10 shell32 >= 5)
+    info[2] = 0; // dwMinorVersion
+    info[3] = 19045; // dwBuildNumber
+    info[4] = 2; // DLLVER_PLATFORM_NT
+    return 0; // S_OK
+}
+
 pub fn lookupShell32(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "DllGetVersion")) return @intFromPtr(&DllGetVersion);
     if (std.mem.eql(u8, name, "CommandLineToArgvW")) return @intFromPtr(&CommandLineToArgvW);
+    if (std.mem.eql(u8, name, "ShellExecuteA")) return @intFromPtr(&ShellExecuteA);
     if (std.mem.eql(u8, name, "ShellExecuteExA")) return @intFromPtr(&ShellExecuteExA);
     if (std.mem.eql(u8, name, "ShellExecuteExW")) return @intFromPtr(&ShellExecuteExW);
     if (std.mem.eql(u8, name, "ShellExecuteW")) return @intFromPtr(&ShellExecuteW);
     if (std.mem.eql(u8, name, "SHGetFolderPathW")) return @intFromPtr(&SHGetFolderPathW);
+    if (std.mem.eql(u8, name, "SHGetKnownFolderPath")) return @intFromPtr(&SHGetKnownFolderPath);
+    if (std.mem.eql(u8, name, "SHCreateDirectory")) return @intFromPtr(&SHCreateDirectory);
     if (std.mem.eql(u8, name, "SHCreateDirectoryExW")) return @intFromPtr(&SHCreateDirectoryExW);
     if (std.mem.eql(u8, name, "SHFileOperationW")) return @intFromPtr(&SHFileOperationW);
     if (std.mem.eql(u8, name, "SHCreateItemFromParsingName")) return @intFromPtr(&SHCreateItemFromParsingName);
@@ -1281,6 +1880,130 @@ fn GetErrorInfo(dwReserved: u32, ppErrInfo: ?*?*anyopaque) callconv(W) i32 {
     return 1; // S_FALSE
 }
 
+const SAFEARRAYBOUND = extern struct { cElements: u32, lLbound: i32 };
+const SAFEARRAY = extern struct {
+    cDims: u16,
+    fFeatures: u16,
+    cbElements: u32,
+    cLocks: u32,
+    pvData: ?[*]u8,
+    rgsabound: [1]SAFEARRAYBOUND,
+};
+
+fn safeArrayVtSize(vt: u16) u32 {
+    return switch (vt & 0xfff) {
+        2, 11, 17, 16, 18 => 2, // I2, BOOL, UI1/I1/UI2
+        3, 4, 19, 22, 23 => 4,  // I4, R4, UI4, INT, UINT
+        5, 6, 7, 8, 20, 21, 9, 13, 36 => 8, // R8, CY, DATE, BSTR, I8, UI8, IDispatch, IUnknown
+        12 => @truncate(VARIANT_SIZE),
+        else => 8,
+    };
+}
+
+fn SafeArrayCreate(vt: u16, cDims: u32, rgsabound: ?[*]const SAFEARRAYBOUND) callconv(W) ?*SAFEARRAY {
+    if (cDims == 0 or cDims > 16 or rgsabound == null) return null;
+    const elem_sz = safeArrayVtSize(vt);
+    var total_elems: usize = 1;
+    for (0..cDims) |i| total_elems *|= rgsabound.?[i].cElements;
+    const hdr_bytes = @sizeOf(SAFEARRAY) + (cDims - 1) * @sizeOf(SAFEARRAYBOUND);
+    const data_bytes = total_elems * elem_sz;
+    const mem = std.heap.page_allocator.alloc(u8, std.mem.alignForward(usize, hdr_bytes, 16) + @max(data_bytes, 16)) catch return null;
+    @memset(mem, 0);
+    const psa: *SAFEARRAY = @ptrCast(@alignCast(mem.ptr));
+    psa.cDims = @truncate(cDims);
+    psa.fFeatures = 0;
+    psa.cbElements = elem_sz;
+    psa.cLocks = 0;
+    psa.pvData = mem.ptr + std.mem.alignForward(usize, hdr_bytes, 16);
+    const bounds: [*]SAFEARRAYBOUND = @ptrCast(&psa.rgsabound[0]);
+    for (0..cDims) |i| bounds[i] = rgsabound.?[i];
+    return psa;
+}
+
+fn SafeArrayDestroy(psa: ?*SAFEARRAY) callconv(W) i32 {
+    _ = psa;
+    return 0; // S_OK
+}
+
+fn SafeArrayGetDim(psa: ?*const SAFEARRAY) callconv(W) u32 {
+    return if (psa) |p| p.cDims else 0;
+}
+
+fn SafeArrayGetLBound(psa: ?*const SAFEARRAY, nDim: u32, plLbound: ?*i32) callconv(W) i32 {
+    const p = psa orelse return @bitCast(@as(u32, 0x80070057));
+    if (nDim == 0 or nDim > p.cDims) return @bitCast(@as(u32, 0x8002000B));
+    const bounds: [*]const SAFEARRAYBOUND = @ptrCast(&p.rgsabound[0]);
+    if (plLbound) |out| out.* = bounds[nDim - 1].lLbound;
+    return 0;
+}
+
+fn SafeArrayGetUBound(psa: ?*const SAFEARRAY, nDim: u32, plUbound: ?*i32) callconv(W) i32 {
+    const p = psa orelse return @bitCast(@as(u32, 0x80070057));
+    if (nDim == 0 or nDim > p.cDims) return @bitCast(@as(u32, 0x8002000B));
+    const bounds: [*]const SAFEARRAYBOUND = @ptrCast(&p.rgsabound[0]);
+    const b = bounds[nDim - 1];
+    if (plUbound) |out| out.* = b.lLbound + @as(i32, @intCast(b.cElements)) - 1;
+    return 0;
+}
+
+fn SafeArrayPtrOfIndex(psa: ?*SAFEARRAY, rgIndices: ?[*]const i32, ppvData: ?*?*anyopaque) callconv(W) i32 {
+    const p = psa orelse return @bitCast(@as(u32, 0x80070057));
+    const idxs = rgIndices orelse return @bitCast(@as(u32, 0x80070057));
+    const data = p.pvData orelse return @bitCast(@as(u32, 0x80070057));
+    const bounds: [*]const SAFEARRAYBOUND = @ptrCast(&p.rgsabound[0]);
+    var offset: usize = 0;
+    var stride: usize = 1;
+    var d: usize = p.cDims;
+    while (d > 0) {
+        d -= 1;
+        const rel = idxs[d] - bounds[d].lLbound;
+        if (rel < 0 or rel >= @as(i32, @intCast(bounds[d].cElements))) return @bitCast(@as(u32, 0x8002000B));
+        offset += @as(usize, @intCast(rel)) * stride;
+        stride *= bounds[d].cElements;
+    }
+    if (ppvData) |out| out.* = @ptrCast(data + offset * p.cbElements);
+    return 0;
+}
+
+fn SafeArrayAccessData(psa: ?*SAFEARRAY, ppvData: ?*?*anyopaque) callconv(W) i32 {
+    const p = psa orelse return @bitCast(@as(u32, 0x80070057));
+    p.cLocks += 1;
+    if (ppvData) |out| out.* = if (p.pvData) |d| @ptrCast(d) else null;
+    return 0;
+}
+
+fn SafeArrayUnaccessData(psa: ?*SAFEARRAY) callconv(W) i32 {
+    const p = psa orelse return @bitCast(@as(u32, 0x80070057));
+    if (p.cLocks > 0) p.cLocks -= 1;
+    return 0;
+}
+
+fn SafeArrayPutElement(psa: ?*SAFEARRAY, rgIndices: ?[*]const i32, pv: ?*const anyopaque) callconv(W) i32 {
+    const p = psa orelse return @bitCast(@as(u32, 0x80070057));
+    var ptr: ?*anyopaque = null;
+    const rc = SafeArrayPtrOfIndex(p, rgIndices, &ptr);
+    if (rc != 0) return rc;
+    if (pv != null and ptr != null) {
+        const dst: [*]u8 = @ptrCast(ptr.?);
+        const src: [*]const u8 = @ptrCast(pv.?);
+        @memcpy(dst[0..p.cbElements], src[0..p.cbElements]);
+    }
+    return 0;
+}
+
+fn SafeArrayGetElement(psa: ?*SAFEARRAY, rgIndices: ?[*]const i32, pv: ?*anyopaque) callconv(W) i32 {
+    const p = psa orelse return @bitCast(@as(u32, 0x80070057));
+    var ptr: ?*anyopaque = null;
+    const rc = SafeArrayPtrOfIndex(p, rgIndices, &ptr);
+    if (rc != 0) return rc;
+    if (pv != null and ptr != null) {
+        const dst: [*]u8 = @ptrCast(pv.?);
+        const src: [*]const u8 = @ptrCast(ptr.?);
+        @memcpy(dst[0..p.cbElements], src[0..p.cbElements]);
+    }
+    return 0;
+}
+
 pub fn lookupOleaut32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "VariantCopy")) return @intFromPtr(&VariantCopy);
     if (std.mem.eql(u8, name, "VariantCopyInd")) return @intFromPtr(&VariantCopyInd);
@@ -1294,6 +2017,16 @@ pub fn lookupOleaut32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "VariantInit")) return @intFromPtr(&VariantInit);
     if (std.mem.eql(u8, name, "VariantClear")) return @intFromPtr(&VariantClear);
     if (std.mem.eql(u8, name, "GetErrorInfo")) return @intFromPtr(&GetErrorInfo);
+    if (std.mem.eql(u8, name, "SafeArrayCreate")) return @intFromPtr(&SafeArrayCreate);
+    if (std.mem.eql(u8, name, "SafeArrayDestroy")) return @intFromPtr(&SafeArrayDestroy);
+    if (std.mem.eql(u8, name, "SafeArrayGetDim")) return @intFromPtr(&SafeArrayGetDim);
+    if (std.mem.eql(u8, name, "SafeArrayGetLBound")) return @intFromPtr(&SafeArrayGetLBound);
+    if (std.mem.eql(u8, name, "SafeArrayGetUBound")) return @intFromPtr(&SafeArrayGetUBound);
+    if (std.mem.eql(u8, name, "SafeArrayPtrOfIndex")) return @intFromPtr(&SafeArrayPtrOfIndex);
+    if (std.mem.eql(u8, name, "SafeArrayAccessData")) return @intFromPtr(&SafeArrayAccessData);
+    if (std.mem.eql(u8, name, "SafeArrayUnaccessData")) return @intFromPtr(&SafeArrayUnaccessData);
+    if (std.mem.eql(u8, name, "SafeArrayPutElement")) return @intFromPtr(&SafeArrayPutElement);
+    if (std.mem.eql(u8, name, "SafeArrayGetElement")) return @intFromPtr(&SafeArrayGetElement);
     // This module does not distinguish the A and W variants of the BSTR family;
     // both names resolve to the wide implementation above.
     if (std.mem.eql(u8, name, "SysAllocStringA")) return @intFromPtr(&SysAllocString);
@@ -1323,13 +2056,49 @@ fn CoInitialize(pvReserved: ?*anyopaque) callconv(W) i32 {
     return 0; // S_OK
 }
 
+// "WINSCOTA" on 64-bit, "COTA" on the i386 loader (usize is 32 bits there).
+const COTASK_MAGIC: usize = if (@sizeOf(usize) == 8) 0x57494E53_434F5441 else 0x434F5441;
+
 fn CoTaskMemFree(pv: ?*anyopaque) callconv(W) void {
-    _ = pv;
+    const p = pv orelse return;
+    const raw: [*]align(16) usize = @ptrFromInt(@intFromPtr(p) - 16);
+    if (raw[0] != COTASK_MAGIC) return;
+    const len = raw[1];
+    const slice: [*]u8 = @ptrCast(raw);
+    std.heap.page_allocator.free(slice[0 .. len + 16]);
 }
 
 fn CoTaskMemAlloc(cb: usize) callconv(W) ?*anyopaque {
-    _ = cb;
-    return @ptrFromInt(0x900000);
+    const len = @max(cb, 1);
+    const slice = std.heap.page_allocator.alloc(u8, len + 16) catch return null;
+    const hdr: [*]usize = @ptrCast(@alignCast(slice.ptr));
+    hdr[0] = COTASK_MAGIC;
+    hdr[1] = len;
+    return @ptrCast(slice.ptr + 16);
+}
+
+fn CoTaskMemRealloc(pv: ?*anyopaque, cb: usize) callconv(W) ?*anyopaque {
+    if (pv == null) return CoTaskMemAlloc(cb);
+    if (cb == 0) {
+        CoTaskMemFree(pv);
+        return null;
+    }
+    const old_hdr: [*]usize = @ptrFromInt(@intFromPtr(pv.?) - 16);
+    const old_len: usize = if (old_hdr[0] == COTASK_MAGIC) old_hdr[1] else 0;
+    const new_p = CoTaskMemAlloc(cb) orelse return null;
+    if (old_len > 0) {
+        const dst: [*]u8 = @ptrCast(new_p);
+        const src: [*]const u8 = @ptrCast(pv.?);
+        @memcpy(dst[0..@min(old_len, cb)], src[0..@min(old_len, cb)]);
+        CoTaskMemFree(pv);
+    }
+    return new_p;
+}
+
+fn CoCreateFreeThreadedMarshaler(punkOuter: ?*anyopaque, ppunkMarshal: ?*?*anyopaque) callconv(W) i32 {
+    _ = punkOuter;
+    if (ppunkMarshal) |p| p.* = null;
+    return @bitCast(@as(u32, 0x80004002)); // E_NOINTERFACE
 }
 
 fn CoCreateGuid(pguid: ?*anyopaque) callconv(W) i32 {
@@ -1395,6 +2164,8 @@ pub fn lookupOle32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "CoInitialize")) return @intFromPtr(&CoInitialize);
     if (std.mem.eql(u8, name, "CoTaskMemFree")) return @intFromPtr(&CoTaskMemFree);
     if (std.mem.eql(u8, name, "CoTaskMemAlloc")) return @intFromPtr(&CoTaskMemAlloc);
+    if (std.mem.eql(u8, name, "CoTaskMemRealloc")) return @intFromPtr(&CoTaskMemRealloc);
+    if (std.mem.eql(u8, name, "CoCreateFreeThreadedMarshaler")) return @intFromPtr(&CoCreateFreeThreadedMarshaler);
     if (std.mem.eql(u8, name, "CoCreateGuid")) return @intFromPtr(&CoCreateGuid);
     if (std.mem.eql(u8, name, "PropVariantClear")) return @intFromPtr(&PropVariantClear);
     if (std.mem.eql(u8, name, "CoSetProxyBlanket")) return @intFromPtr(&CoSetProxyBlanket);
@@ -1498,9 +2269,167 @@ fn stub7(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: u
     return 0;
 }
 
-/// A null HANDLE / zero-returning stub, kept for the call sites that only need a
-/// "no handle" answer with no argument to balance.
-fn crypt_ret_zero() callconv(W) usize {
+/// Exact-signature CRYPT32 fail-closed handlers when no certificate store/chain exists.
+fn CryptQueryObject(
+    dwObjectType: u32,
+    pvObject: ?*const anyopaque,
+    dwExpectedContentTypeFlags: u32,
+    dwExpectedFormatTypeFlags: u32,
+    dwFlags: u32,
+    pdwMsgAndCertEncodingType: ?*u32,
+    pdwContentType: ?*u32,
+    pdwFormatType: ?*u32,
+    phCertStore: ?*usize,
+    phMsg: ?*usize,
+    ppvContext: ?*?*const anyopaque,
+) callconv(W) i32 {
+    _ = dwObjectType;
+    _ = pvObject;
+    _ = dwExpectedContentTypeFlags;
+    _ = dwExpectedFormatTypeFlags;
+    _ = dwFlags;
+    if (pdwMsgAndCertEncodingType) |p| p.* = 0;
+    if (pdwContentType) |p| p.* = 0;
+    if (pdwFormatType) |p| p.* = 0;
+    if (phCertStore) |p| p.* = 0;
+    if (phMsg) |p| p.* = 0;
+    if (ppvContext) |p| p.* = null;
+    return 0;
+}
+
+fn CryptMsgGetParam(hCryptMsg: usize, dwParamType: u32, dwIndex: u32, pvData: ?*anyopaque, pcbData: ?*u32) callconv(W) i32 {
+    _ = hCryptMsg;
+    _ = dwParamType;
+    _ = dwIndex;
+    _ = pvData;
+    if (pcbData) |p| p.* = 0;
+    return 0;
+}
+
+fn CryptDecodeObjectEx(dwCertEncodingType: u32, lpszStructType: ?*const anyopaque, pbEncoded: ?[*]const u8, cbEncoded: u32, dwFlags: u32, pDecodePara: ?*anyopaque, pvStructInfo: ?*anyopaque, pcbStructInfo: ?*u32) callconv(W) i32 {
+    _ = dwCertEncodingType;
+    _ = lpszStructType;
+    _ = pbEncoded;
+    _ = cbEncoded;
+    _ = dwFlags;
+    _ = pDecodePara;
+    _ = pvStructInfo;
+    if (pcbStructInfo) |p| p.* = 0;
+    return 0;
+}
+
+fn CryptStringToBinaryA(pszString: ?[*:0]const u8, cchString: u32, dwFlags: u32, pbBinary: ?[*]u8, pcbBinary: ?*u32, pdwSkip: ?*u32, pdwFlags: ?*u32) callconv(W) i32 {
+    _ = pszString;
+    _ = cchString;
+    _ = dwFlags;
+    _ = pbBinary;
+    if (pcbBinary) |p| p.* = 0;
+    if (pdwSkip) |p| p.* = 0;
+    if (pdwFlags) |p| p.* = 0;
+    return 0;
+}
+
+fn CryptStringToBinaryW(pszString: ?[*:0]const u16, cchString: u32, dwFlags: u32, pbBinary: ?[*]u8, pcbBinary: ?*u32, pdwSkip: ?*u32, pdwFlags: ?*u32) callconv(W) i32 {
+    _ = pszString;
+    _ = cchString;
+    _ = dwFlags;
+    _ = pbBinary;
+    if (pcbBinary) |p| p.* = 0;
+    if (pdwSkip) |p| p.* = 0;
+    if (pdwFlags) |p| p.* = 0;
+    return 0;
+}
+
+fn CryptImportPublicKeyInfoEx2(dwCertEncodingType: u32, pInfo: ?*const anyopaque, dwFlags: u32, pvAuxInfo: ?*anyopaque, phKey: ?*usize) callconv(W) i32 {
+    _ = dwCertEncodingType;
+    _ = pInfo;
+    _ = dwFlags;
+    _ = pvAuxInfo;
+    if (phKey) |p| p.* = 0;
+    return 0;
+}
+
+fn CertFindCertificateInStore(hCertStore: usize, dwCertEncodingType: u32, dwFindFlags: u32, dwFindType: u32, pvFindPara: ?*const anyopaque, pPrevCertContext: ?*const anyopaque) callconv(W) ?*const anyopaque {
+    _ = hCertStore;
+    _ = dwCertEncodingType;
+    _ = dwFindFlags;
+    _ = dwFindType;
+    _ = pvFindPara;
+    _ = pPrevCertContext;
+    return null;
+}
+
+fn CertEnumCertificatesInStore(hCertStore: usize, pPrevCertContext: ?*const anyopaque) callconv(W) ?*const anyopaque {
+    _ = hCertStore;
+    _ = pPrevCertContext;
+    return null;
+}
+
+fn CertGetCertificateContextProperty(pCertContext: ?*const anyopaque, dwPropId: u32, pvData: ?*anyopaque, pcbData: ?*u32) callconv(W) i32 {
+    _ = pCertContext;
+    _ = dwPropId;
+    _ = pvData;
+    if (pcbData) |p| p.* = 0;
+    return 0;
+}
+
+fn CertGetNameStringA(pCertContext: ?*const anyopaque, dwType: u32, dwFlags: u32, pvTypePara: ?*anyopaque, pszNameString: ?[*]u8, cchNameString: u32) callconv(W) u32 {
+    _ = pCertContext;
+    _ = dwType;
+    _ = dwFlags;
+    _ = pvTypePara;
+    if (pszNameString != null and cchNameString > 0) pszNameString.?[0] = 0;
+    return 0;
+}
+
+fn CertGetNameStringW(pCertContext: ?*const anyopaque, dwType: u32, dwFlags: u32, pvTypePara: ?*anyopaque, pszNameString: ?[*]u16, cchNameString: u32) callconv(W) u32 {
+    _ = pCertContext;
+    _ = dwType;
+    _ = dwFlags;
+    _ = pvTypePara;
+    if (pszNameString != null and cchNameString > 0) pszNameString.?[0] = 0;
+    return 0;
+}
+
+fn CertNameToStrW(dwCertEncodingType: u32, pName: ?*const anyopaque, dwStrType: u32, psz: ?[*]u16, csz: u32) callconv(W) u32 {
+    _ = dwCertEncodingType;
+    _ = pName;
+    _ = dwStrType;
+    if (psz != null and csz > 0) psz.?[0] = 0;
+    return 0;
+}
+
+fn CertGetCertificateChain(hChainEngine: usize, pCertContext: ?*const anyopaque, pTime: ?*const anyopaque, hAdditionalStore: usize, pChainPara: ?*const anyopaque, dwFlags: u32, pvReserved: ?*anyopaque, ppChainContext: ?*?*const anyopaque) callconv(W) i32 {
+    _ = hChainEngine;
+    _ = pCertContext;
+    _ = pTime;
+    _ = hAdditionalStore;
+    _ = pChainPara;
+    _ = dwFlags;
+    _ = pvReserved;
+    if (ppChainContext) |p| p.* = null;
+    return 0;
+}
+
+fn CertFreeCertificateChain(pChainContext: ?*const anyopaque) callconv(W) void {
+    _ = pChainContext;
+}
+
+fn CertFreeCertificateChainEngine(hChainEngine: usize) callconv(W) void {
+    _ = hChainEngine;
+}
+
+fn CertFindExtension(pszObjId: ?[*:0]const u8, cExtensions: u32, rgExtensions: ?*const anyopaque) callconv(W) ?*const anyopaque {
+    _ = pszObjId;
+    _ = cExtensions;
+    _ = rgExtensions;
+    return null;
+}
+
+fn PFXImportCertStore(pPFX: ?*const anyopaque, szPassword: ?[*:0]const u16, dwFlags: u32) callconv(W) usize {
+    _ = pPFX;
+    _ = szPassword;
+    _ = dwFlags;
     return 0;
 }
 
@@ -1514,17 +2443,278 @@ pub fn lookupCrypt32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "CertFreeCTLContext")) return @intFromPtr(&stub1);
     if (std.mem.eql(u8, name, "CertFreeCRLContext")) return @intFromPtr(&stub1);
     if (std.mem.eql(u8, name, "CryptMsgClose")) return @intFromPtr(&stub1);
-    // Crypt32 names not enumerated above are NOT stubbed: a zero-argument stub
-    // for an API of unknown arity leaves its arguments on the guest stack and
-    // shifts the frame, which is the defect this whole section exists to avoid.
-    // Exporting nothing makes the loader report the name as UNRESOLVED instead.
+    if (std.mem.eql(u8, name, "CryptQueryObject")) return @intFromPtr(&CryptQueryObject);
+    if (std.mem.eql(u8, name, "CryptMsgGetParam")) return @intFromPtr(&CryptMsgGetParam);
+    if (std.mem.eql(u8, name, "CryptDecodeObjectEx")) return @intFromPtr(&CryptDecodeObjectEx);
+    if (std.mem.eql(u8, name, "CryptStringToBinaryA")) return @intFromPtr(&CryptStringToBinaryA);
+    if (std.mem.eql(u8, name, "CryptStringToBinaryW")) return @intFromPtr(&CryptStringToBinaryW);
+    if (std.mem.eql(u8, name, "CryptImportPublicKeyInfoEx2")) return @intFromPtr(&CryptImportPublicKeyInfoEx2);
+    if (std.mem.eql(u8, name, "CertFindCertificateInStore")) return @intFromPtr(&CertFindCertificateInStore);
+    if (std.mem.eql(u8, name, "CertEnumCertificatesInStore")) return @intFromPtr(&CertEnumCertificatesInStore);
+    if (std.mem.eql(u8, name, "CertGetCertificateContextProperty")) return @intFromPtr(&CertGetCertificateContextProperty);
+    if (std.mem.eql(u8, name, "CertGetNameStringA")) return @intFromPtr(&CertGetNameStringA);
+    if (std.mem.eql(u8, name, "CertGetNameStringW")) return @intFromPtr(&CertGetNameStringW);
+    if (std.mem.eql(u8, name, "CertNameToStrW")) return @intFromPtr(&CertNameToStrW);
+    if (std.mem.eql(u8, name, "CertGetCertificateChain")) return @intFromPtr(&CertGetCertificateChain);
+    if (std.mem.eql(u8, name, "CertFreeCertificateChain")) return @intFromPtr(&CertFreeCertificateChain);
+    if (std.mem.eql(u8, name, "CertFreeCertificateChainEngine")) return @intFromPtr(&CertFreeCertificateChainEngine);
+    if (std.mem.eql(u8, name, "CertFindExtension")) return @intFromPtr(&CertFindExtension);
+    if (std.mem.eql(u8, name, "PFXImportCertStore")) return @intFromPtr(&PFXImportCertStore);
     return null;
 }
 
+const STATUS_SUCCESS_I32: i32 = 0;
+const STATUS_INVALID_HANDLE_I32: i32 = @bitCast(@as(u32, 0xC0000008));
+const STATUS_INVALID_PARAMETER_I32: i32 = @bitCast(@as(u32, 0xC000000D));
+const STATUS_BUFFER_TOO_SMALL_I32: i32 = @bitCast(@as(u32, 0xC0000023));
+const STATUS_NOT_SUPPORTED_I32: i32 = @bitCast(@as(u32, 0xC00000BB));
+const STATUS_INVALID_SIGNATURE_I32: i32 = @bitCast(@as(u32, 0xC000A000));
+
+const BCryptAlg = enum(usize) {
+    sha256 = 0xBC010001,
+    sha1 = 0xBC010002,
+    sha512 = 0xBC010003,
+    sha384 = 0xBC010004,
+    md5 = 0xBC010005,
+    rng = 0xBC010010,
+
+    fn fromHandle(h: usize) ?BCryptAlg {
+        return switch (h) {
+            0xBC010001 => .sha256,
+            0xBC010002 => .sha1,
+            0xBC010003 => .sha512,
+            0xBC010004 => .sha384,
+            0xBC010005 => .md5,
+            0xBC010010 => .rng,
+            else => null,
+        };
+    }
+
+    fn digestLen(self: BCryptAlg) ?u32 {
+        return switch (self) {
+            .sha256 => 32,
+            .sha1 => 20,
+            .sha512 => 64,
+            .sha384 => 48,
+            .md5 => 16,
+            .rng => null,
+        };
+    }
+};
+
+fn utf16EqIgnoreCaseAscii(w: [*:0]const u16, ascii: []const u8) bool {
+    var i: usize = 0;
+    while (i < ascii.len) : (i += 1) {
+        if (w[i] > 127) return false;
+        if (std.ascii.toUpper(@intCast(w[i])) != std.ascii.toUpper(ascii[i])) return false;
+    }
+    return w[ascii.len] == 0;
+}
+
+const BCryptHashState = union(enum) {
+    empty: void,
+    sha256: std.crypto.hash.sha2.Sha256,
+    sha1: std.crypto.hash.Sha1,
+    sha512: std.crypto.hash.sha2.Sha512,
+    sha384: std.crypto.hash.sha2.Sha384,
+    md5: std.crypto.hash.Md5,
+};
+
+const BCRYPT_HASH_HANDLE_BASE: usize = 0xBC020000;
+var bcrypt_hashes: [64]BCryptHashState = [_]BCryptHashState{.empty} ** 64;
+
+fn getHashSlot(h: usize) ?*BCryptHashState {
+    if (h < BCRYPT_HASH_HANDLE_BASE) return null;
+    const idx = h - BCRYPT_HASH_HANDLE_BASE;
+    if (idx >= bcrypt_hashes.len) return null;
+    if (bcrypt_hashes[idx] == .empty) return null;
+    return &bcrypt_hashes[idx];
+}
+
+fn BCryptOpenAlgorithmProvider(phAlgorithm: ?*usize, pszAlgId: ?[*:0]const u16, pszImplementation: ?[*:0]const u16, dwFlags: u32) callconv(W) i32 {
+    _ = pszImplementation;
+    _ = dwFlags;
+    if (phAlgorithm == null or pszAlgId == null) return STATUS_INVALID_PARAMETER_I32;
+    const w = pszAlgId.?;
+    const alg: BCryptAlg = if (utf16EqIgnoreCaseAscii(w, "SHA256"))
+        .sha256
+    else if (utf16EqIgnoreCaseAscii(w, "SHA1"))
+        .sha1
+    else if (utf16EqIgnoreCaseAscii(w, "SHA512"))
+        .sha512
+    else if (utf16EqIgnoreCaseAscii(w, "SHA384"))
+        .sha384
+    else if (utf16EqIgnoreCaseAscii(w, "MD5"))
+        .md5
+    else if (utf16EqIgnoreCaseAscii(w, "RNG"))
+        .rng
+    else {
+        phAlgorithm.?.* = 0;
+        return STATUS_NOT_SUPPORTED_I32;
+    };
+    phAlgorithm.?.* = @intFromEnum(alg);
+    return STATUS_SUCCESS_I32;
+}
+
+fn BCryptCloseAlgorithmProvider(hAlgorithm: usize, dwFlags: u32) callconv(W) i32 {
+    _ = dwFlags;
+    return if (BCryptAlg.fromHandle(hAlgorithm) != null) STATUS_SUCCESS_I32 else STATUS_INVALID_HANDLE_I32;
+}
+
+fn BCryptGetProperty(hObject: usize, pszProperty: ?[*:0]const u16, pbOutput: ?[*]u8, cbOutput: u32, pcbResult: ?*u32, dwFlags: u32) callconv(W) i32 {
+    _ = dwFlags;
+    if (pszProperty == null or pcbResult == null) return STATUS_INVALID_PARAMETER_I32;
+    const alg: BCryptAlg = BCryptAlg.fromHandle(hObject) orelse blk: {
+        const slot = getHashSlot(hObject) orelse return STATUS_INVALID_HANDLE_I32;
+        break :blk switch (slot.*) {
+            .sha256 => .sha256,
+            .sha1 => .sha1,
+            .sha512 => .sha512,
+            .sha384 => .sha384,
+            .md5 => .md5,
+            .empty => unreachable,
+        };
+    };
+    const prop = pszProperty.?;
+    var val: u32 = 0;
+    if (utf16EqIgnoreCaseAscii(prop, "HashDigestLength")) {
+        val = alg.digestLen() orelse return STATUS_NOT_SUPPORTED_I32;
+    } else if (utf16EqIgnoreCaseAscii(prop, "ObjectLength")) {
+        if (alg.digestLen() == null) return STATUS_NOT_SUPPORTED_I32;
+        val = 256;
+    } else {
+        return STATUS_NOT_SUPPORTED_I32;
+    }
+    pcbResult.?.* = 4;
+    if (pbOutput) |out| {
+        if (cbOutput < 4) return STATUS_BUFFER_TOO_SMALL_I32;
+        std.mem.writeInt(u32, out[0..4], val, .little);
+    }
+    return STATUS_SUCCESS_I32;
+}
+
+fn BCryptCreateHash(hAlgorithm: usize, phHash: ?*usize, pbHashObject: ?[*]u8, cbHashObject: u32, pbSecret: ?[*]const u8, cbSecret: u32, dwFlags: u32) callconv(W) i32 {
+    _ = pbHashObject;
+    _ = cbHashObject;
+    _ = dwFlags;
+    if (phHash == null) return STATUS_INVALID_PARAMETER_I32;
+    if (pbSecret != null and cbSecret > 0) return STATUS_NOT_SUPPORTED_I32;
+    const alg = BCryptAlg.fromHandle(hAlgorithm) orelse return STATUS_INVALID_HANDLE_I32;
+    if (alg == .rng) return STATUS_NOT_SUPPORTED_I32;
+    for (&bcrypt_hashes, 0..) |*slot, idx| {
+        if (slot.* == .empty) {
+            slot.* = switch (alg) {
+                .sha256 => .{ .sha256 = std.crypto.hash.sha2.Sha256.init(.{}) },
+                .sha1 => .{ .sha1 = std.crypto.hash.Sha1.init(.{}) },
+                .sha512 => .{ .sha512 = std.crypto.hash.sha2.Sha512.init(.{}) },
+                .sha384 => .{ .sha384 = std.crypto.hash.sha2.Sha384.init(.{}) },
+                .md5 => .{ .md5 = std.crypto.hash.Md5.init(.{}) },
+                .rng => unreachable,
+            };
+            phHash.?.* = BCRYPT_HASH_HANDLE_BASE + idx;
+            return STATUS_SUCCESS_I32;
+        }
+    }
+    return STATUS_INVALID_PARAMETER_I32;
+}
+
+fn BCryptHashData(hHash: usize, pbInput: ?[*]const u8, cbInput: u32, dwFlags: u32) callconv(W) i32 {
+    _ = dwFlags;
+    const slot = getHashSlot(hHash) orelse return STATUS_INVALID_HANDLE_I32;
+    if (cbInput == 0) return STATUS_SUCCESS_I32;
+    const slice = (pbInput orelse return STATUS_INVALID_PARAMETER_I32)[0..cbInput];
+    switch (slot.*) {
+        .sha256 => |*h| h.update(slice),
+        .sha1 => |*h| h.update(slice),
+        .sha512 => |*h| h.update(slice),
+        .sha384 => |*h| h.update(slice),
+        .md5 => |*h| h.update(slice),
+        .empty => return STATUS_INVALID_HANDLE_I32,
+    }
+    return STATUS_SUCCESS_I32;
+}
+
+fn BCryptFinishHash(hHash: usize, pbOutput: ?[*]u8, cbOutput: u32, dwFlags: u32) callconv(W) i32 {
+    _ = dwFlags;
+    const slot = getHashSlot(hHash) orelse return STATUS_INVALID_HANDLE_I32;
+    const out = pbOutput orelse return STATUS_INVALID_PARAMETER_I32;
+    switch (slot.*) {
+        .sha256 => |*h| {
+            if (cbOutput < 32) return STATUS_BUFFER_TOO_SMALL_I32;
+            var d: [32]u8 = undefined;
+            h.final(&d);
+            @memcpy(out[0..32], &d);
+        },
+        .sha1 => |*h| {
+            if (cbOutput < 20) return STATUS_BUFFER_TOO_SMALL_I32;
+            var d: [20]u8 = undefined;
+            h.final(&d);
+            @memcpy(out[0..20], &d);
+        },
+        .sha512 => |*h| {
+            if (cbOutput < 64) return STATUS_BUFFER_TOO_SMALL_I32;
+            var d: [64]u8 = undefined;
+            h.final(&d);
+            @memcpy(out[0..64], &d);
+        },
+        .sha384 => |*h| {
+            if (cbOutput < 48) return STATUS_BUFFER_TOO_SMALL_I32;
+            var d: [48]u8 = undefined;
+            h.final(&d);
+            @memcpy(out[0..48], &d);
+        },
+        .md5 => |*h| {
+            if (cbOutput < 16) return STATUS_BUFFER_TOO_SMALL_I32;
+            var d: [16]u8 = undefined;
+            h.final(&d);
+            @memcpy(out[0..16], &d);
+        },
+        .empty => return STATUS_INVALID_HANDLE_I32,
+    }
+    return STATUS_SUCCESS_I32;
+}
+
+fn BCryptDestroyHash(hHash: usize) callconv(W) i32 {
+    const slot = getHashSlot(hHash) orelse return STATUS_INVALID_HANDLE_I32;
+    slot.* = .empty;
+    return STATUS_SUCCESS_I32;
+}
+
+fn BCryptGenRandom(hAlgorithm: usize, pbBuffer: ?[*]u8, cbBuffer: u32, dwFlags: u32) callconv(W) i32 {
+    _ = hAlgorithm;
+    _ = dwFlags;
+    if (pbBuffer == null and cbBuffer > 0) return STATUS_INVALID_PARAMETER_I32;
+    _ = fillRandomBytes(pbBuffer, cbBuffer);
+    return STATUS_SUCCESS_I32;
+}
+
+fn BCryptDestroyKey(hKey: usize) callconv(W) i32 {
+    _ = hKey;
+    return STATUS_SUCCESS_I32;
+}
+
+fn BCryptVerifySignature(hKey: usize, pPaddingInfo: ?*const anyopaque, pbHash: ?[*]const u8, cbHash: u32, pbSignature: ?[*]const u8, cbSignature: u32, dwFlags: u32) callconv(W) i32 {
+    _ = hKey;
+    _ = pPaddingInfo;
+    _ = pbHash;
+    _ = cbHash;
+    _ = pbSignature;
+    _ = cbSignature;
+    _ = dwFlags;
+    return STATUS_INVALID_SIGNATURE_I32;
+}
+
 pub fn lookupNcrypt(name: []const u8) ?usize {
-    // Same reasoning as lookupCrypt32: NCrypt/BCrypt take arguments whose count
-    // is not knowable here, so no catch-all stub.
-    _ = name;
+    if (std.mem.eql(u8, name, "BCryptOpenAlgorithmProvider")) return @intFromPtr(&BCryptOpenAlgorithmProvider);
+    if (std.mem.eql(u8, name, "BCryptCloseAlgorithmProvider")) return @intFromPtr(&BCryptCloseAlgorithmProvider);
+    if (std.mem.eql(u8, name, "BCryptGetProperty")) return @intFromPtr(&BCryptGetProperty);
+    if (std.mem.eql(u8, name, "BCryptCreateHash")) return @intFromPtr(&BCryptCreateHash);
+    if (std.mem.eql(u8, name, "BCryptHashData")) return @intFromPtr(&BCryptHashData);
+    if (std.mem.eql(u8, name, "BCryptFinishHash")) return @intFromPtr(&BCryptFinishHash);
+    if (std.mem.eql(u8, name, "BCryptDestroyHash")) return @intFromPtr(&BCryptDestroyHash);
+    if (std.mem.eql(u8, name, "BCryptGenRandom")) return @intFromPtr(&BCryptGenRandom);
+    if (std.mem.eql(u8, name, "BCryptDestroyKey")) return @intFromPtr(&BCryptDestroyKey);
+    if (std.mem.eql(u8, name, "BCryptVerifySignature")) return @intFromPtr(&BCryptVerifySignature);
     return null;
 }
 
@@ -1664,9 +2854,16 @@ fn _TrackMouseEvent(lpEventTrack: ?*anyopaque) callconv(W) i32 {
     return 1;
 }
 
+fn InitCommonControls() callconv(W) void {}
+
 fn SetWindowSubclass(hWnd: usize, pfnSubclass: ?*anyopaque, uIdSubclass: usize, dwRefData: usize) callconv(W) i32 {
     _ = hWnd; _ = pfnSubclass; _ = uIdSubclass; _ = dwRefData;
     return 1;
+}
+
+fn GetWindowSubclass(hWnd: usize, pfnSubclass: ?*anyopaque, uIdSubclass: usize, pdwRefData: ?*usize) callconv(W) i32 {
+    _ = hWnd; _ = pfnSubclass; _ = uIdSubclass; _ = pdwRefData;
+    return 0;
 }
 
 fn RemoveWindowSubclass(hWnd: usize, pfnSubclass: ?*anyopaque, uIdSubclass: usize) callconv(W) i32 {
@@ -1676,6 +2873,18 @@ fn RemoveWindowSubclass(hWnd: usize, pfnSubclass: ?*anyopaque, uIdSubclass: usiz
 
 fn DefSubclassProc(hWnd: usize, uMsg: u32, wParam: usize, lParam: usize) callconv(W) isize {
     _ = hWnd; _ = uMsg; _ = wParam; _ = lParam;
+    return 0;
+}
+
+fn LoadIconMetric(hinst: usize, pszName: ?*const anyopaque, lims: i32, phico: ?*usize) callconv(W) i32 {
+    _ = hinst; _ = pszName; _ = lims;
+    if (phico) |p| p.* = 0x40001;
+    return 0;
+}
+
+fn LoadIconWithScaleDown(hinst: usize, pszName: ?*const anyopaque, cx: i32, cy: i32, phico: ?*usize) callconv(W) i32 {
+    _ = hinst; _ = pszName; _ = cx; _ = cy;
+    if (phico) |p| p.* = 0x40001;
     return 0;
 }
 
@@ -1717,9 +2926,13 @@ pub fn lookupComctl32(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "ImageList_DragMove")) return @intFromPtr(&ImageList_DragMove);
     if (std.mem.eql(u8, name, "ImageList_DragShowNolock")) return @intFromPtr(&ImageList_DragShowNolock);
     if (std.mem.eql(u8, name, "_TrackMouseEvent")) return @intFromPtr(&_TrackMouseEvent);
+    if (std.mem.eql(u8, name, "InitCommonControls")) return @intFromPtr(&InitCommonControls);
     if (std.mem.eql(u8, name, "SetWindowSubclass")) return @intFromPtr(&SetWindowSubclass);
+    if (std.mem.eql(u8, name, "GetWindowSubclass")) return @intFromPtr(&GetWindowSubclass);
     if (std.mem.eql(u8, name, "RemoveWindowSubclass")) return @intFromPtr(&RemoveWindowSubclass);
     if (std.mem.eql(u8, name, "DefSubclassProc")) return @intFromPtr(&DefSubclassProc);
+    if (std.mem.eql(u8, name, "LoadIconMetric")) return @intFromPtr(&LoadIconMetric);
+    if (std.mem.eql(u8, name, "LoadIconWithScaleDown")) return @intFromPtr(&LoadIconWithScaleDown);
     if (std.mem.eql(u8, name, "TaskDialogIndirect")) return @intFromPtr(&TaskDialogIndirect);
     if (std.mem.eql(u8, name, "TaskDialog")) return @intFromPtr(&TaskDialog);
     if (std.mem.eql(u8, name, "UnregisterClassW")) return @intFromPtr(&UnregisterClassW);
@@ -1991,6 +3204,105 @@ pub fn lookupImm32(name: []const u8) ?usize {
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// PSAPI.dll & MSWSOCK.dll (process/module info and overlapped socket I/O)
+// ---------------------------------------------------------------------------
+
+const MODULEINFO = extern struct {
+    lpBaseOfDll: usize,
+    SizeOfImage: u32,
+    EntryPoint: usize,
+};
+
+fn psapiEnumProcessModules(hProcess: usize, lphModule: ?[*]usize, cb: u32, lpcbNeeded: ?*u32) callconv(W) i32 {
+    _ = hProcess;
+    if (lpcbNeeded) |p| p.* = @sizeOf(usize);
+    if (lphModule != null and cb >= @sizeOf(usize)) lphModule.?[0] = 0x140000000;
+    return 1;
+}
+
+fn psapiEnumProcesses(pProcessIds: ?[*]u32, cb: u32, pBytesReturned: ?*u32) callconv(W) i32 {
+    const pid: u32 = @intCast(linux.getpid());
+    if (pBytesReturned) |p| p.* = 4;
+    if (pProcessIds != null and cb >= 4) pProcessIds.?[0] = pid;
+    return 1;
+}
+
+fn psapiGetModuleInformation(hProcess: usize, hModule: usize, lpmodinfo: ?*MODULEINFO, cb: u32) callconv(W) i32 {
+    _ = hProcess;
+    if (lpmodinfo == null or cb < @sizeOf(MODULEINFO)) return 0;
+    lpmodinfo.?.* = .{ .lpBaseOfDll = hModule, .SizeOfImage = 0x10000, .EntryPoint = hModule };
+    return 1;
+}
+
+fn psapiGetModuleBaseNameW(hProcess: usize, hModule: usize, lpBaseName: ?[*]u16, nSize: u32) callconv(W) u32 {
+    _ = hProcess;
+    _ = hModule;
+    if (lpBaseName == null or nSize == 0) return 0;
+    const mod = [_]u16{ 'a', 'p', 'p', '.', 'e', 'x', 'e', 0 };
+    const n = @min(nSize - 1, mod.len - 1);
+    @memcpy(lpBaseName.?[0..n], mod[0..n]);
+    lpBaseName.?[n] = 0;
+    return n;
+}
+
+fn psapiGetModuleFileNameExW(hProcess: usize, hModule: usize, lpFilename: ?[*]u16, nSize: u32) callconv(W) u32 {
+    _ = hProcess;
+    _ = hModule;
+    if (lpFilename == null or nSize == 0) return 0;
+    const p = [_]u16{ 'C', ':', '\\', 'a', 'p', 'p', '.', 'e', 'x', 'e', 0 };
+    const n = @min(nSize - 1, p.len - 1);
+    @memcpy(lpFilename.?[0..n], p[0..n]);
+    lpFilename.?[n] = 0;
+    return n;
+}
+
+pub fn lookupPsapi(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "EnumProcessModules")) return @intFromPtr(&psapiEnumProcessModules);
+    if (std.mem.eql(u8, name, "EnumProcesses")) return @intFromPtr(&psapiEnumProcesses);
+    if (std.mem.eql(u8, name, "GetModuleInformation")) return @intFromPtr(&psapiGetModuleInformation);
+    if (std.mem.eql(u8, name, "GetModuleBaseNameW")) return @intFromPtr(&psapiGetModuleBaseNameW);
+    if (std.mem.eql(u8, name, "GetModuleFileNameExW")) return @intFromPtr(&psapiGetModuleFileNameExW);
+    return null;
+}
+
+fn mswsockTransmitFile(
+    hSocket: usize,
+    hFile: usize,
+    nNumberOfBytesToWrite: u32,
+    nNumberOfBytesPerSend: u32,
+    lpOverlapped: ?*anyopaque,
+    lpTransmitBuffers: ?*const extern struct { Head: ?[*]const u8, HeadLength: u32, Tail: ?[*]const u8, TailLength: u32 },
+    dwReserved: u32,
+) callconv(W) i32 {
+    _ = nNumberOfBytesPerSend;
+    _ = lpOverlapped;
+    _ = dwReserved;
+    const sock: i32 = @intCast(hSocket & 0x7fffffff);
+    if (lpTransmitBuffers) |tb| {
+        if (tb.Head != null and tb.HeadLength > 0) _ = linux.sendto(sock, tb.Head.?, tb.HeadLength, 0, null, 0);
+    }
+    var buf: [4096]u8 = undefined;
+    var rem: usize = if (nNumberOfBytesToWrite == 0) std.math.maxInt(usize) else nNumberOfBytesToWrite;
+    const fd: i32 = @intCast(hFile & 0x7fffffff);
+    while (rem > 0) {
+        const chunk = @min(rem, buf.len);
+        const r = linux.read(fd, &buf, chunk);
+        if (linux.errno(r) != .SUCCESS or r == 0) break;
+        _ = linux.sendto(sock, &buf, r, 0, null, 0);
+        if (nNumberOfBytesToWrite != 0) rem -= r;
+    }
+    if (lpTransmitBuffers) |tb| {
+        if (tb.Tail != null and tb.TailLength > 0) _ = linux.sendto(sock, tb.Tail.?, tb.TailLength, 0, null, 0);
+    }
+    return 1;
+}
+
+pub fn lookupMswsock(name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "TransmitFile")) return @intFromPtr(&mswsockTransmitFile);
+    return null;
+}
+
 test "oleaut32 VARIANT sizing and VariantCopy VT_BSTR deep copy" {
     var src: [32]u8 align(8) = [_]u8{0xAA} ** 32;
     var dst: [32]u8 align(8) = [_]u8{0xBB} ** 32;
@@ -2012,4 +3324,37 @@ test "oleaut32 VARIANT sizing and VariantCopy VT_BSTR deep copy" {
     try std.testing.expect(copied_ptr != 0);
     try std.testing.expect(copied_ptr != @intFromPtr(bstr));
     try std.testing.expectEqual(@as(u32, 5), SysStringLen(@ptrFromInt(copied_ptr)));
+}
+
+test "BCrypt SHA-256 hashing and BCryptGetProperty match std.crypto" {
+    const sha256_name = [_:0]u16{ 'S', 'H', 'A', '2', '5', '6' };
+    const prop_len = [_:0]u16{ 'H', 'a', 's', 'h', 'D', 'i', 'g', 'e', 's', 't', 'L', 'e', 'n', 'g', 't', 'h' };
+    var alg: usize = 0;
+    try std.testing.expectEqual(@as(i32, 0), BCryptOpenAlgorithmProvider(&alg, &sha256_name, null, 0));
+    defer _ = BCryptCloseAlgorithmProvider(alg, 0);
+
+    var digest_len_buf: [4]u8 = undefined;
+    var cb_res: u32 = 0;
+    try std.testing.expectEqual(@as(i32, 0), BCryptGetProperty(alg, &prop_len, &digest_len_buf, 4, &cb_res, 0));
+    try std.testing.expectEqual(@as(u32, 4), cb_res);
+    try std.testing.expectEqual(@as(u32, 32), std.mem.readInt(u32, &digest_len_buf, .little));
+
+    var hash: usize = 0;
+    try std.testing.expectEqual(@as(i32, 0), BCryptCreateHash(alg, &hash, null, 0, null, 0, 0));
+    defer _ = BCryptDestroyHash(hash);
+
+    const msg = "WINS-BCrypt-test";
+    try std.testing.expectEqual(@as(i32, 0), BCryptHashData(hash, msg.ptr, msg.len, 0));
+    var got: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), BCryptFinishHash(hash, &got, 32, 0));
+
+    var want: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(msg, &want, .{});
+    try std.testing.expectEqualSlices(u8, &want, &got);
+
+    // Unknown algorithms must fail closed.
+    const bad_alg = [_:0]u16{ 'R', 'C', '4' };
+    var bad_h: usize = 123;
+    try std.testing.expectEqual(STATUS_NOT_SUPPORTED_I32, BCryptOpenAlgorithmProvider(&bad_h, &bad_alg, null, 0));
+    try std.testing.expectEqual(@as(usize, 0), bad_h);
 }

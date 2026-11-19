@@ -9,10 +9,27 @@ const linux = std.os.linux;
 
 const W: std.builtin.CallingConvention = .winapi;
 
+const seh64 = if (builtin.cpu.arch == .x86_64) @import("winrun_seh64.zig") else struct {
+    pub fn setExceptionTable(_: usize, _: usize, _: u32, _: u32) void {}
+};
+
 pub var image_base_addr: usize = 0;
+
+/// The thread's Win32 last-error slot lives in winrun_impl (one per Impl mode);
+/// its lookup() installs SetLastError here so kernel32 shims can report errors.
+pub var last_error_hook: ?*const fn (u32) callconv(W) void = null;
+
+fn setLastError(code: u32) void {
+    if (last_error_hook) |f| f(code);
+}
 
 pub fn setImageBase(base: usize) void {
     image_base_addr = base;
+}
+
+pub fn setExceptionTable(base: usize, image_len: usize, pdata_rva: u32, pdata_size: u32) void {
+    image_base_addr = base;
+    seh64.setExceptionTable(base, image_len, pdata_rva, pdata_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -75,55 +92,81 @@ pub fn isThreadNamingException(code: u32) bool {
 
 fn RaiseException(code: u32, flags: u32, nargs: u32, args: ?[*]const usize) callconv(W) void {
     _ = flags;
-    _ = nargs;
     _ = args;
     if (isThreadNamingException(code)) return; // handled in-process; continue
+    if (comptime builtin.link_libc) {
+        if (std.c.getenv("WINS_TRACE") != null) {
+            const ra = @returnAddress();
+            const rva = if (image_base_addr != 0 and ra >= image_base_addr) ra - image_base_addr else 0;
+            std.debug.print("[WINS:K32] RaiseException code=0x{x:0>8} nargs={d} ra=0x{x} rva=0x{x}\n", .{ code, nargs, ra, rva });
+        }
+    }
     linux.exit_group(@bitCast(code));
 }
 
+fn raiseExceptionAddr() usize {
+    return if (builtin.cpu.arch == .x86_64) @intFromPtr(&seh64.raiseExceptionEntry) else @intFromPtr(&RaiseException);
+}
+
 fn RtlPcToFileHeader(pc: usize, base: ?*usize) callconv(W) usize {
-    _ = pc;
-    if (base) |b| b.* = image_base_addr;
-    return image_base_addr;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        _ = seh64.lookupFunctionEntry(pc, base, null);
+        return if (base) |b| b.* else image_base_addr;
+    } else {
+        if (base) |b| b.* = image_base_addr;
+        return image_base_addr;
+    }
 }
 
 fn RtlUnwind(target_frame: ?*anyopaque, target_ip: ?*anyopaque, record: ?*anyopaque, return_val: ?*anyopaque) callconv(W) void {
-    _ = target_frame;
-    _ = target_ip;
-    _ = record;
-    _ = return_val;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        seh64.unwindEx(@intFromPtr(target_frame), @intFromPtr(target_ip), @ptrCast(@alignCast(record)), @intFromPtr(return_val), null, null);
+    }
 }
 
 fn RtlUnwindEx(target_frame: ?*anyopaque, target_ip: ?*anyopaque, record: ?*anyopaque, return_val: ?*anyopaque, ctx: ?*anyopaque, hist: ?*anyopaque) callconv(W) void {
-    _ = target_frame;
-    _ = target_ip;
-    _ = record;
-    _ = return_val;
-    _ = ctx;
-    _ = hist;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        seh64.unwindEx(@intFromPtr(target_frame), @intFromPtr(target_ip), @ptrCast(@alignCast(record)), @intFromPtr(return_val), @ptrCast(ctx), hist);
+    }
 }
 
 fn RtlCaptureContext(ctx: ?*anyopaque) callconv(W) void {
-    _ = ctx;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        if (ctx) |c| {
+            seh64.callCaptureContext(@ptrCast(c));
+        }
+    }
+}
+
+fn rtlCaptureContextAddr() usize {
+    return if (builtin.cpu.arch == .x86_64) @intFromPtr(&seh64.captureContextNaked) else @intFromPtr(&RtlCaptureContext);
 }
 
 fn RtlLookupFunctionEntry(pc: usize, base: ?*usize, hist: ?*anyopaque) callconv(W) ?*anyopaque {
-    _ = pc;
-    _ = hist;
-    if (base) |b| b.* = image_base_addr;
-    return null;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        return @ptrCast(@constCast(seh64.lookupFunctionEntry(pc, base, hist)));
+    } else {
+        if (base) |b| b.* = image_base_addr;
+        return null;
+    }
 }
 
-fn RtlVirtualUnwind(handler_type: u32, base: usize, pc: usize, entry: ?*anyopaque, ctx: ?*anyopaque, handler_data: ?*anyopaque, establisher_frame: ?*anyopaque, context_pointers: ?*anyopaque) callconv(W) u64 {
-    _ = handler_type;
-    _ = base;
-    _ = pc;
-    _ = entry;
-    _ = ctx;
-    _ = handler_data;
-    _ = establisher_frame;
-    _ = context_pointers;
-    return 0;
+fn RtlVirtualUnwind(handler_type: u32, base: usize, pc: usize, entry: ?*anyopaque, ctx: ?*anyopaque, handler_data: ?*anyopaque, establisher_frame: ?*anyopaque, context_pointers: ?*anyopaque) callconv(W) usize {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        const c = ctx orelse return 0;
+        return seh64.virtualUnwind(
+            handler_type,
+            base,
+            pc,
+            @ptrCast(@alignCast(entry)),
+            @ptrCast(c),
+            @ptrCast(@alignCast(handler_data)),
+            @ptrCast(@alignCast(establisher_frame)),
+            context_pointers,
+        );
+    } else {
+        return 0;
+    }
 }
 
 fn EncodePointer(ptr: ?*anyopaque) callconv(W) ?*anyopaque {
@@ -173,28 +216,32 @@ fn HeapAlloc(h: usize, flags: u32, bytes: usize) callconv(W) ?[*]u8 {
     return user;
 }
 
+fn heapHeaderFromUser(ptr: ?[*]u8) ?struct { base: [*]u8, hdr: *const HeapHeader } {
+    const p_user = ptr orelse return null;
+    const addr = @intFromPtr(p_user);
+    if (addr < 0x10000 + @sizeOf(HeapHeader)) return null;
+    const base_addr = addr - @sizeOf(HeapHeader);
+    // HeapAlloc is mmap-backed so every header sits on a 4 KiB page boundary.
+    if ((base_addr & 0xfff) != 0) return null;
+    const p: [*]u8 = @ptrFromInt(base_addr);
+    const hdr: *const HeapHeader = @ptrCast(@alignCast(p));
+    if (hdr.magic != HEAP_MAGIC) return null;
+    return .{ .base = p, .hdr = hdr };
+}
+
 fn HeapFree(h: usize, flags: u32, ptr: ?[*]u8) callconv(W) u32 {
     _ = h;
     _ = flags;
     if (ptr == null) return 1;
-    const p = @as([*]u8, @ptrCast(ptr.?)) - @sizeOf(HeapHeader);
-    const hdr: *const HeapHeader = @ptrCast(@alignCast(p));
-    if (hdr.magic != HEAP_MAGIC) {
-        // Not one of ours. The old code took the size from wherever the
-        // pointer happened to point and unmapped that much, which destroyed
-        // the real client's heap. Leave it alone.
-        std.debug.print("[WINS:Kernel32] HeapFree: 0x{x} was not allocated here; leaving it alone\n", .{@intFromPtr(ptr.?)});
-        return 0;
-    }
-    _ = linux.munmap(p, hdr.total);
+    const info = heapHeaderFromUser(ptr) orelse return 0;
+    _ = linux.munmap(info.base, info.hdr.total);
     return 1;
 }
 
 fn HeapReAlloc(h: usize, flags: u32, ptr: ?[*]u8, bytes: usize) callconv(W) ?[*]u8 {
     if (ptr == null) return HeapAlloc(h, flags, bytes);
-    const old_p = @as([*]u8, @ptrCast(ptr.?)) - @sizeOf(HeapHeader);
-    const old_hdr: *const HeapHeader = @ptrCast(@alignCast(old_p));
-    const old_bytes = old_hdr.bytes;
+    const info = heapHeaderFromUser(ptr) orelse return null;
+    const old_bytes = info.hdr.bytes;
     const new_ptr = HeapAlloc(h, flags, bytes) orelse return null;
     const copy_len = @min(old_bytes, bytes);
     if (copy_len > 0) @memcpy(new_ptr[0..copy_len], ptr.?[0..copy_len]);
@@ -205,11 +252,8 @@ fn HeapReAlloc(h: usize, flags: u32, ptr: ?[*]u8, bytes: usize) callconv(W) ?[*]
 fn HeapSize(h: usize, flags: u32, ptr: ?[*]u8) callconv(W) usize {
     _ = h;
     _ = flags;
-    if (ptr == null) return 0;
-    const p = @as([*]u8, @ptrCast(ptr.?)) - @sizeOf(HeapHeader);
-    const hdr: *const HeapHeader = @ptrCast(@alignCast(p));
-    if (hdr.magic != HEAP_MAGIC) return 0;
-    return hdr.bytes;
+    const info = heapHeaderFromUser(ptr) orelse return 0;
+    return info.hdr.bytes;
 }
 
 fn HeapValidate(h: usize, flags: u32, ptr: ?*anyopaque) callconv(W) u32 {
@@ -246,17 +290,42 @@ fn LocalFree(ptr: ?[*]u8) callconv(W) ?[*]u8 {
 // 3. Thread Local Storage (TLS) & Fiber Local Storage (FLS)
 // ---------------------------------------------------------------------------
 
-var tls_slots: [256]usize = [_]usize{0} ** 256;
+pub var teb_tls_enabled: bool = false;
+var tls_alloc_lock: std.atomic.Value(bool) = .init(false);
 var tls_used: [256]bool = [_]bool{false} ** 256;
+threadlocal var tls_ext_slots: [256]usize = [_]usize{0} ** 256;
 
-var fls_slots: [256]usize = [_]usize{0} ** 256;
 var fls_used: [256]bool = [_]bool{false} ** 256;
+threadlocal var fls_slots: [256]usize = [_]usize{0} ** 256;
+
+fn lockTlsAlloc() void {
+    while (tls_alloc_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockTlsAlloc() void {
+    tls_alloc_lock.store(false, .release);
+}
+
+fn currentTebAddr() usize {
+    if (!teb_tls_enabled) return 0;
+    var teb: usize = 0;
+    asm volatile ("mov %%gs:0x30, %[out]" : [out] "=r" (teb));
+    return teb;
+}
 
 fn TlsAlloc() callconv(W) u32 {
+    lockTlsAlloc();
+    defer unlockTlsAlloc();
     for (&tls_used, 0..) |*u, i| {
         if (!u.*) {
             u.* = true;
-            tls_slots[i] = 0;
+            if (i < 64) {
+                const teb = currentTebAddr();
+                if (teb != 0) @as(*usize, @ptrFromInt(teb + 0x1480 + i * 8)).* = 0;
+            }
+            tls_ext_slots[i] = 0;
             return @intCast(i);
         }
     }
@@ -264,22 +333,40 @@ fn TlsAlloc() callconv(W) u32 {
 }
 
 fn TlsGetValue(idx: u32) callconv(W) usize {
-    if (idx < 256 and tls_used[idx]) return tls_slots[idx];
+    if (idx < 256 and tls_used[idx]) {
+        if (idx < 64) {
+            const teb = currentTebAddr();
+            if (teb != 0) return @as(*const usize, @ptrFromInt(teb + 0x1480 + @as(usize, idx) * 8)).*;
+        }
+        return tls_ext_slots[idx];
+    }
     return 0;
 }
 
 fn TlsSetValue(idx: u32, val: usize) callconv(W) u32 {
     if (idx < 256 and tls_used[idx]) {
-        tls_slots[idx] = val;
+        if (idx < 64) {
+            const teb = currentTebAddr();
+            if (teb != 0) {
+                @as(*usize, @ptrFromInt(teb + 0x1480 + @as(usize, idx) * 8)).* = val;
+            }
+        }
+        tls_ext_slots[idx] = val;
         return 1;
     }
     return 0;
 }
 
 fn TlsFree(idx: u32) callconv(W) u32 {
+    lockTlsAlloc();
+    defer unlockTlsAlloc();
     if (idx < 256) {
         tls_used[idx] = false;
-        tls_slots[idx] = 0;
+        if (idx < 64) {
+            const teb = currentTebAddr();
+            if (teb != 0) @as(*usize, @ptrFromInt(teb + 0x1480 + @as(usize, idx) * 8)).* = 0;
+        }
+        tls_ext_slots[idx] = 0;
         return 1;
     }
     return 0;
@@ -287,6 +374,8 @@ fn TlsFree(idx: u32) callconv(W) u32 {
 
 fn FlsAlloc(cb: ?*anyopaque) callconv(W) u32 {
     _ = cb;
+    lockTlsAlloc();
+    defer unlockTlsAlloc();
     for (&fls_used, 0..) |*u, i| {
         if (!u.*) {
             u.* = true;
@@ -311,6 +400,8 @@ fn FlsSetValue(idx: u32, val: usize) callconv(W) u32 {
 }
 
 fn FlsFree(idx: u32) callconv(W) u32 {
+    lockTlsAlloc();
+    defer unlockTlsAlloc();
     if (idx < 256) {
         fls_used[idx] = false;
         fls_slots[idx] = 0;
@@ -709,18 +800,70 @@ fn GetStringTypeW(flags: u32, src: ?[*]const u16, cch: i32, chartype: ?[*]u16) c
     return 1;
 }
 
+fn formatErrorText(dwMessageId: u32, buf: []u8) []const u8 {
+    return switch (dwMessageId) {
+        0 => "The operation completed successfully.",
+        2 => "The system cannot find the file specified.",
+        3 => "The system cannot find the path specified.",
+        5 => "Access is denied.",
+        6 => "The handle is invalid.",
+        8 => "Not enough storage is available to process this command.",
+        87 => "The parameter is incorrect.",
+        126 => "The specified module could not be found.",
+        127 => "The specified procedure could not be found.",
+        else => std.fmt.bufPrint(buf, "Win32 error {d}.", .{dwMessageId}) catch "Win32 error.",
+    };
+}
+
 // x86_stdcall cannot be variadic (Zig rejects it), and 7zr never calls these
 // with more than the first four arguments, so a fixed signature is faithful here.
 fn FormatMessageW(dwFlags: u32, lpSource: ?*const anyopaque, dwMessageId: u32, dwLanguageId: u32, lpBuffer: ?[*]u16, nSize: u32, Arguments: ?*const anyopaque) callconv(W) u32 {
-    _ = dwFlags; _ = lpSource; _ = dwMessageId; _ = dwLanguageId; _ = nSize; _ = Arguments;
-    if (lpBuffer) |b| b[0] = 0;
-    return 0;
+    _ = lpSource;
+    _ = dwLanguageId;
+    _ = Arguments;
+    const buf_ptr = lpBuffer orelse return 0;
+    const FORMAT_MESSAGE_ALLOCATE_BUFFER: u32 = 0x0100;
+    var tmp: [128]u8 = undefined;
+    const msg = formatErrorText(dwMessageId, &tmp);
+    if ((dwFlags & FORMAT_MESSAGE_ALLOCATE_BUFFER) != 0) {
+        const cap = @max(msg.len + 1, @as(usize, nSize));
+        const raw = LocalAlloc(0, cap * 2) orelse return 0;
+        const out: [*]u16 = @ptrCast(@alignCast(raw));
+        for (msg, 0..) |ch, i| out[i] = ch;
+        out[msg.len] = 0;
+        const pp: *[*]u16 = @ptrCast(@alignCast(buf_ptr));
+        pp.* = out;
+        return @intCast(msg.len);
+    }
+    if (nSize == 0) return 0;
+    const copy_len = @min(msg.len, @as(usize, nSize) - 1);
+    for (msg[0..copy_len], 0..) |ch, i| buf_ptr[i] = ch;
+    buf_ptr[copy_len] = 0;
+    return @intCast(copy_len);
 }
 
 fn FormatMessageA(dwFlags: u32, lpSource: ?*const anyopaque, dwMessageId: u32, dwLanguageId: u32, lpBuffer: ?[*]u8, nSize: u32, Arguments: ?*const anyopaque) callconv(W) u32 {
-    _ = dwFlags; _ = lpSource; _ = dwMessageId; _ = dwLanguageId; _ = nSize; _ = Arguments;
-    if (lpBuffer) |b| b[0] = 0;
-    return 0;
+    _ = lpSource;
+    _ = dwLanguageId;
+    _ = Arguments;
+    const buf_ptr = lpBuffer orelse return 0;
+    const FORMAT_MESSAGE_ALLOCATE_BUFFER: u32 = 0x0100;
+    var tmp: [128]u8 = undefined;
+    const msg = formatErrorText(dwMessageId, &tmp);
+    if ((dwFlags & FORMAT_MESSAGE_ALLOCATE_BUFFER) != 0) {
+        const cap = @max(msg.len + 1, @as(usize, nSize));
+        const out = LocalAlloc(0, cap) orelse return 0;
+        @memcpy(out[0..msg.len], msg);
+        out[msg.len] = 0;
+        const pp: *[*]u8 = @ptrCast(@alignCast(buf_ptr));
+        pp.* = out;
+        return @intCast(msg.len);
+    }
+    if (nSize == 0) return 0;
+    const copy_len = @min(msg.len, @as(usize, nSize) - 1);
+    @memcpy(buf_ptr[0..copy_len], msg[0..copy_len]);
+    buf_ptr[copy_len] = 0;
+    return @intCast(copy_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -737,12 +880,14 @@ fn GetModuleHandleExW(flags: u32, name: ?[*:0]const u16, ph: ?*usize) callconv(W
 }
 
 fn GetModuleFileNameW(h: usize, buf: ?[*]u16, n: u32) callconv(W) u32 {
-    _ = h;
+    if (h != 0 and h != image_base_addr) return 0;
+    if (!module_path_initialized) return 0;
+    const mlen: usize = @min(module_path_len, if (n > 0) @as(usize, n) - 1 else 0);
     if (buf != null and n > 0) {
-        buf.?[0] = 0;
-        return 0;
+        for (0..mlen) |i| buf.?[i] = module_path_a[i];
+        buf.?[mlen] = 0;
     }
-    return 0;
+    return @intCast(mlen);
 }
 
 fn LoadLibraryExW(name: ?[*:0]const u16, file: usize, flags: u32) callconv(W) usize {
@@ -904,8 +1049,16 @@ fn hostLseek(fd: i32, offset: i64, whence: usize) ?i64 {
     return result;
 }
 
+fn fdFromHandle(h: usize) ?i32 {
+    if (h == 0xFFFFFFF6) return 0;
+    if (h == 0xFFFFFFF5) return 1;
+    if (h == 0xFFFFFFF4) return 2;
+    if (h >= 0x1000 and h < 0x5000) return @intCast(h - 0x1000);
+    return null;
+}
+
 fn SetFilePointerEx(h: usize, dist: i64, new_pos: ?*i64, method: u32) callconv(W) u32 {
-    const fd: i32 = if (h == 0xFFFFFFF6) 0 else if (h == 0xFFFFFFF5) 1 else if (h == 0xFFFFFFF4) 2 else return 0;
+    const fd = fdFromHandle(h) orelse return 0;
     const whence: u32 = switch (method) {
         0 => 0, // SEEK_SET
         1 => 1, // SEEK_CUR
@@ -918,22 +1071,31 @@ fn SetFilePointerEx(h: usize, dist: i64, new_pos: ?*i64, method: u32) callconv(W
 }
 
 fn SetFilePointer(h: usize, dist: i32, dist_high: ?*i32, method: u32) callconv(W) u32 {
+    var d: i64 = dist;
+    if (dist_high) |dh| {
+        d = (@as(i64, dh.*) << 32) | @as(u32, @bitCast(dist));
+    }
     var new_pos: i64 = 0;
-    const ok = SetFilePointerEx(h, @intCast(dist), &new_pos, method);
+    const ok = SetFilePointerEx(h, d, &new_pos, method);
     if (ok == 0) return 0xFFFFFFFF;
     if (dist_high) |dh| dh.* = @intCast(new_pos >> 32);
-    return @intCast(new_pos & 0xFFFFFFFF);
+    return @intCast(@as(u64, @bitCast(new_pos)) & 0xFFFFFFFF);
 }
 
 fn GetFileSize(h: usize, high: ?*u32) callconv(W) u32 {
-    _ = h;
-    if (high) |hi| hi.* = 0;
-    return 0;
+    var sz: i64 = 0;
+    if (GetFileSizeEx(h, &sz) == 0) return 0xFFFFFFFF;
+    const u: u64 = @bitCast(sz);
+    if (high) |hi| hi.* = @truncate(u >> 32);
+    return @truncate(u);
 }
 
 fn GetFileSizeEx(h: usize, size: ?*i64) callconv(W) u32 {
-    _ = h;
-    if (size) |s| s.* = 0;
+    const fd = fdFromHandle(h) orelse return 0;
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &stx);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    if (size) |s| s.* = @intCast(stx.size);
     return 1;
 }
 
@@ -944,8 +1106,16 @@ fn GetFileType(h: usize) callconv(W) u32 {
     };
 }
 
+pub var close_handle_hook: ?*const fn (usize) bool = null;
+
 fn CloseHandle(h: usize) callconv(W) u32 {
-    _ = h;
+    if (close_handle_hook) |hook| {
+        if (hook(h)) return 1;
+    }
+    if (closeMappingHandle(h)) return 1;
+    if (h >= 0x1003 and h < 0x5000) {
+        _ = linux.close(@intCast(h - 0x1000));
+    }
     return 1;
 }
 
@@ -966,20 +1136,68 @@ const empty_env_w: [2]u16 = .{ 0, 0 };
 var cmdline_storage_a: [2048:0]u8 = undefined;
 var cmdline_storage_w: [2048:0]u16 = undefined;
 var cmdline_initialized: bool = false;
+var module_path_a: [512:0]u8 = [_:0]u8{0} ** 512;
+var module_path_len: usize = 0;
+var module_path_initialized: bool = false;
 
 pub fn setCommandLine(args: []const []const u8) void {
     if (args.len == 0) return;
+    // Record canonical Windows-mapped module path for GetModuleFileNameA/W.
+    {
+        const raw = args[0];
+        var mpos: usize = 0;
+        const prefix = if (raw.len >= 2 and raw[1] == ':') "" else if (raw.len > 0 and raw[0] == '/') "Z:" else "Z:\\";
+        for (prefix) |c| {
+            if (mpos < module_path_a.len - 1) {
+                module_path_a[mpos] = c;
+                mpos += 1;
+            }
+        }
+        for (raw) |c| {
+            if (mpos < module_path_a.len - 1) {
+                module_path_a[mpos] = if (c == '/') '\\' else c;
+                mpos += 1;
+            }
+        }
+        module_path_a[mpos] = 0;
+        module_path_len = mpos;
+        module_path_initialized = true;
+    }
     var out_pos: usize = 0;
+    const cap = cmdline_storage_a.len - 1;
+    const push = struct {
+        fn byte(pos: *usize, max_cap: usize, b: u8) void {
+            if (pos.* < max_cap) {
+                cmdline_storage_a[pos.*] = b;
+                pos.* += 1;
+            }
+        }
+    }.byte;
     for (args, 0..) |arg, idx| {
-        if (idx > 0 and out_pos < 2047) {
-            cmdline_storage_a[out_pos] = ' ';
-            out_pos += 1;
+        if (idx > 0) push(&out_pos, cap, ' ');
+        const needs_quotes = arg.len == 0 or
+            std.mem.indexOfAny(u8, arg, " \t\"") != null;
+        if (!needs_quotes) {
+            for (arg) |c| push(&out_pos, cap, c);
+            continue;
         }
+        push(&out_pos, cap, '"');
+        var backslashes: usize = 0;
         for (arg) |c| {
-            if (out_pos >= 2047) break;
-            cmdline_storage_a[out_pos] = c;
-            out_pos += 1;
+            if (c == '\\') {
+                backslashes += 1;
+            } else if (c == '"') {
+                for (0..(backslashes * 2 + 1)) |_| push(&out_pos, cap, '\\');
+                push(&out_pos, cap, '"');
+                backslashes = 0;
+            } else {
+                for (0..backslashes) |_| push(&out_pos, cap, '\\');
+                push(&out_pos, cap, c);
+                backslashes = 0;
+            }
         }
+        for (0..(backslashes * 2)) |_| push(&out_pos, cap, '\\');
+        push(&out_pos, cap, '"');
     }
     cmdline_storage_a[out_pos] = 0;
     for (0..out_pos + 1) |i| {
@@ -998,13 +1216,68 @@ fn GetCommandLineW() callconv(W) ?[*:0]const u16 {
     return &empty_cmd_w;
 }
 
+fn firstWinCommandToken(input: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < input.len and (input[start] == ' ' or input[start] == '\t')) : (start += 1) {}
+    if (start == input.len) return input[0..0];
+    if (input[start] == '"') {
+        start += 1;
+        const end = std.mem.indexOfScalarPos(u8, input, start, '"') orelse input.len;
+        return input[start..end];
+    }
+    var end = start;
+    while (end < input.len and input[end] != ' ' and input[end] != '\t') : (end += 1) {}
+    return input[start..end];
+}
+
 fn GetEnvironmentStringsW() callconv(W) ?[*]const u16 {
-    return &empty_env_w;
+    rebuildEnvironmentBlocks();
+    return &env_block_w;
 }
 
 fn FreeEnvironmentStringsW(p: ?[*]const u16) callconv(W) u32 {
     _ = p;
     return 1;
+}
+
+const EnvEntry = struct { name: []u8, value: ?[]u8 };
+var env_entries: std.ArrayListUnmanaged(EnvEntry) = .empty;
+var env_lock = std.atomic.Value(u32).init(0);
+var env_block_w: [32768]u16 = [_]u16{0} ** 32768;
+fn lockEnv() void { while (env_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint(); }
+fn unlockEnv() void { env_lock.store(0, .release); }
+fn envNameEq(a: []const u8, b: []const u8) bool { return std.ascii.eqlIgnoreCase(a, b); }
+fn setEnvValue(name: []const u8, value: ?[]const u8) bool {
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '=') != null) { setLastError(87); return false; }
+    if (name.len > 512 or (if (value) |v| v.len > 1023 else false)) { setLastError(203); return false; }
+    lockEnv(); defer unlockEnv();
+    const alloc = std.heap.page_allocator;
+    for (env_entries.items) |*e| if (envNameEq(e.name, name)) {
+        if (value) |v| { e.value = alloc.dupe(u8, v) catch { setLastError(8); return false; }; } else e.value = null;
+        return true;
+    };
+    env_entries.append(alloc, .{ .name = alloc.dupe(u8, name) catch { setLastError(8); return false; }, .value = if (value) |v| alloc.dupe(u8, v) catch { setLastError(8); return false; } else null }) catch { setLastError(8); return false; };
+    return true;
+}
+fn getEnvA(name: []const u8, buf: ?[*]u8, size: u32) u32 {
+    lockEnv(); defer unlockEnv();
+    for (env_entries.items) |e| if (e.value) |v| if (envNameEq(e.name, name)) {
+        if (buf == null or size <= v.len) return @intCast(v.len + 1);
+        @memcpy(buf.?[0..v.len], v); buf.?[v.len] = 0; return @intCast(v.len);
+    };
+    return 0;
+}
+fn rebuildEnvironmentBlocks() void {
+    lockEnv(); defer unlockEnv();
+    @memset(&env_block_w, 0);
+    var at: usize = 0;
+    for (env_entries.items) |e| if (e.value) |v| {
+        if (at + e.name.len + v.len + 1 >= env_block_w.len - 2) break;
+        var text: [1536]u8 = undefined;
+        @memcpy(text[0..e.name.len], e.name); text[e.name.len] = '='; @memcpy(text[e.name.len + 1 ..][0..v.len], v);
+        const n = std.unicode.utf8ToUtf16Le(env_block_w[at .. env_block_w.len - 2 - at], text[0 .. e.name.len + v.len + 1]) catch continue;
+        at += n; if (at + 1 >= env_block_w.len) break; env_block_w[at] = 0; at += 1;
+    };
 }
 
 fn OutputDebugStringA(str: ?[*:0]const u8) callconv(W) void {
@@ -1022,11 +1295,45 @@ fn AreFileApisANSI() callconv(W) u32 {
 fn GetSystemInfo(si: ?[*]u8) callconv(W) void {
     if (si) |p| {
         @memset(p[0..48], 0);
-        // Page size 4096
-        std.mem.writeInt(u32, p[4..8], 4096, .little);
-        // Number of processors = 1
-        std.mem.writeInt(u32, p[32..36], 1, .little);
+        std.mem.writeInt(u16, p[0..2], 9, .little); // PROCESSOR_ARCHITECTURE_AMD64
+        std.mem.writeInt(u32, p[4..8], 4096, .little); // dwPageSize
+        std.mem.writeInt(u64, p[8..16], 0x10000, .little); // lpMinimumApplicationAddress
+        std.mem.writeInt(u64, p[16..24], 0x00007FFFFFFEFFFF, .little); // lpMaximumApplicationAddress
+        std.mem.writeInt(u64, p[24..32], 0xF, .little); // dwActiveProcessorMask
+        std.mem.writeInt(u32, p[32..36], 4, .little); // dwNumberOfProcessors
+        std.mem.writeInt(u32, p[36..40], 8664, .little); // PROCESSOR_AMD_X8664
+        std.mem.writeInt(u32, p[40..44], 65536, .little); // dwAllocationGranularity
+        std.mem.writeInt(u16, p[44..46], 6, .little); // wProcessorLevel
+        std.mem.writeInt(u16, p[46..48], 0x0101, .little); // wProcessorRevision
     }
+}
+
+fn GetLogicalProcessorInformation(buf: ?[*]u8, ret_len: ?*u32) callconv(W) i32 {
+    const rl = ret_len orelse {
+        setLastError(87);
+        return 0;
+    };
+    const need: u32 = 6 * 32; // 4 RelationProcessorCore + 1 RelationNumaNode + 1 RelationProcessorPackage (x64 = 32B each)
+    const avail = rl.*;
+    rl.* = need;
+    if (buf == null or avail < need) {
+        setLastError(122); // ERROR_INSUFFICIENT_BUFFER
+        return 0;
+    }
+    const p = buf.?;
+    @memset(p[0..need], 0);
+    for (0..4) |i| {
+        const off = i * 32;
+        std.mem.writeInt(u64, p[off..][0..8], @as(u64, 1) << @intCast(i), .little);
+        std.mem.writeInt(u32, p[off + 8 ..][0..4], 0, .little); // RelationProcessorCore
+    }
+    // RelationNumaNode (Relationship = 1)
+    std.mem.writeInt(u64, p[128..][0..8], 0xF, .little);
+    std.mem.writeInt(u32, p[136..][0..4], 1, .little);
+    // RelationProcessorPackage (Relationship = 3)
+    std.mem.writeInt(u64, p[160..][0..8], 0xF, .little);
+    std.mem.writeInt(u32, p[168..][0..4], 3, .little);
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,19 +1388,190 @@ fn WriteConsoleW(h: usize, buf: ?[*]const u16, n: u32, written: ?*u32, res: ?*an
     return 1;
 }
 
+fn asciiPrefixIgnoreCase(hay: []const u8, prefix: []const u8) bool {
+    if (hay.len < prefix.len) return false;
+    for (prefix, 0..) |p, idx| {
+        if (std.ascii.toLower(hay[idx]) != std.ascii.toLower(p)) return false;
+    }
+    return true;
+}
+
+fn envOr(name: [*:0]const u8, fallback: []const u8) []const u8 {
+    if (comptime builtin.link_libc) {
+        if (std.c.getenv(name)) |v| return std.mem.span(v);
+    }
+    return fallback;
+}
+
+/// Translate Windows PE paths (UNC/\\?\ prefixes, Z:\ -> /, C:\Users\User\AppData\Roaming -> $APPDATA,
+/// C:\Users\User\AppData\Local -> $LOCALAPPDATA, C:\Temp -> /tmp, C:\ -> /tmp/wins-c/) to Linux paths.
+pub fn translateWinPath(raw_utf8: []const u8, out: *[1024]u8) ?[:0]const u8 {
+    var norm: [1024]u8 = undefined;
+    var nlen: usize = 0;
+    for (raw_utf8) |ch| {
+        if (nlen >= norm.len - 1) break;
+        norm[nlen] = if (ch == '\\') '/' else ch;
+        nlen += 1;
+    }
+    var s = norm[0..nlen];
+    if (std.mem.startsWith(u8, s, "//?/") or std.mem.startsWith(u8, s, "//./")) {
+        s = s[4..];
+    }
+    if (s.len == 0) return null;
+
+    var pos: usize = 0;
+    const append = struct {
+        fn slice(dst: *[1024]u8, p: *usize, src: []const u8) void {
+            const avail = (dst.len - 1) -| p.*;
+            const n = @min(avail, src.len);
+            @memcpy(dst[p.*..][0..n], src[0..n]);
+            p.* += n;
+        }
+    }.slice;
+
+    if (s.len >= 2 and s[1] == ':' and std.ascii.isAlphabetic(s[0])) {
+        const drive = std.ascii.toLower(s[0]);
+        const rest = s[2..];
+        if (drive == 'z') {
+            if (rest.len == 0) {
+                append(out, &pos, "/");
+            } else {
+                append(out, &pos, rest);
+            }
+        } else if (drive == 'c') {
+            if (asciiPrefixIgnoreCase(rest, "/Users/User/AppData/Roaming")) {
+                append(out, &pos, envOr("APPDATA", "/tmp/wins-appdata"));
+                append(out, &pos, rest["/Users/User/AppData/Roaming".len..]);
+            } else if (asciiPrefixIgnoreCase(rest, "/Users/User/AppData/Local")) {
+                append(out, &pos, envOr("LOCALAPPDATA", "/tmp/wins-localappdata"));
+                append(out, &pos, rest["/Users/User/AppData/Local".len..]);
+            } else if (asciiPrefixIgnoreCase(rest, "/Users/User")) {
+                append(out, &pos, envOr("USERPROFILE", "/tmp"));
+                append(out, &pos, rest["/Users/User".len..]);
+            } else if (asciiPrefixIgnoreCase(rest, "/Temp") and (rest.len == 5 or rest[5] == '/')) {
+                append(out, &pos, "/tmp");
+                append(out, &pos, rest[5..]);
+            } else {
+                append(out, &pos, "/tmp/wins-c");
+                append(out, &pos, rest);
+            }
+        } else {
+            append(out, &pos, "/tmp/wins-drive-");
+            const d: [1]u8 = .{drive};
+            append(out, &pos, &d);
+            append(out, &pos, rest);
+        }
+    } else {
+        append(out, &pos, s);
+    }
+    out[pos] = 0;
+    return resolveCaseInsensitiveInPlace(out, pos);
+}
+
+/// If `out[0..pos]` exists as-is, return it immediately; otherwise walk
+/// existing parent directories matching components case-insensitively on Linux.
+fn resolveCaseInsensitiveInPlace(out: *[1024]u8, len_in: usize) [:0]const u8 {
+    if (len_in == 0) return out[0..0 :0];
+    var stx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, @ptrCast(out), 0, .{}, &stx)) == .SUCCESS) {
+        return out[0..len_in :0];
+    }
+    var src_copy: [1024]u8 = undefined;
+    @memcpy(src_copy[0..len_in], out[0..len_in]);
+    src_copy[len_in] = 0;
+    const src = src_copy[0..len_in];
+
+    var resolved: [1024]u8 = undefined;
+    var rlen: usize = 0;
+    var i: usize = 0;
+    if (src[0] == '/') {
+        resolved[0] = '/';
+        rlen = 1;
+        i = 1;
+    } else {
+        resolved[0] = '.';
+        rlen = 1;
+    }
+
+    while (i < src.len) {
+        while (i < src.len and src[i] == '/') : (i += 1) {}
+        if (i >= src.len) break;
+        const start = i;
+        while (i < src.len and src[i] != '/') : (i += 1) {}
+        const seg = src[start..i];
+        if (std.mem.eql(u8, seg, ".")) continue;
+
+        resolved[rlen] = 0;
+        var matched: ?[256]u8 = null;
+        var matched_len: usize = 0;
+        const dir_fd_rc = linux.open(@ptrCast(&resolved), .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        if (linux.errno(dir_fd_rc) == .SUCCESS) {
+            const dir_fd: i32 = @intCast(dir_fd_rc);
+            defer _ = linux.close(dir_fd);
+            var dbuf: [4096]u8 align(8) = undefined;
+            outer: while (true) {
+                const n = linux.getdents64(dir_fd, &dbuf, dbuf.len);
+                if (linux.errno(n) != .SUCCESS or n == 0) break;
+                var off: usize = 0;
+                while (off < n) {
+                    const ent: *align(1) const linux.dirent64 = @ptrCast(&dbuf[off]);
+                    const name_ptr: [*:0]const u8 = @ptrCast(&ent.name);
+                    const ename = std.mem.span(name_ptr);
+                    if (std.ascii.eqlIgnoreCase(ename, seg) and ename.len < 256) {
+                        matched = [_]u8{0} ** 256;
+                        @memcpy(matched.?[0..ename.len], ename);
+                        matched_len = ename.len;
+                        break :outer;
+                    }
+                    off += ent.reclen;
+                }
+            }
+        }
+        const chosen = if (matched) |*m| m[0..matched_len] else seg;
+        if (rlen > 1 or resolved[0] != '/') {
+            if (rlen < resolved.len - 2) {
+                resolved[rlen] = '/';
+                rlen += 1;
+            }
+        }
+        const copy_n = @min(chosen.len, resolved.len - 1 - rlen);
+        @memcpy(resolved[rlen..][0..copy_n], chosen[0..copy_n]);
+        rlen += copy_n;
+    }
+    const final_len = if (src[0] != '/' and rlen > 2 and std.mem.startsWith(u8, resolved[0..rlen], "./")) blk: {
+        const sub = rlen - 2;
+        @memcpy(out[0..sub], resolved[2..rlen]);
+        break :blk sub;
+    } else blk: {
+        @memcpy(out[0..rlen], resolved[0..rlen]);
+        break :blk rlen;
+    };
+    out[final_len] = 0;
+    return out[0..final_len :0];
+}
+
+fn wideToTranslatedPath(name: ?[*:0]const u16, out: *[1024]u8) ?[:0]const u8 {
+    if (name == null) return null;
+    var tmp: [1024]u8 = undefined;
+    var len: usize = 0;
+    while (name.?[len] != 0 and len < tmp.len - 1) : (len += 1) {
+        tmp[len] = @intCast(name.?[len] & 0xFF);
+    }
+    return translateWinPath(tmp[0..len], out);
+}
+
+fn narrowToTranslatedPath(name: ?[*:0]const u8, out: *[1024]u8) ?[:0]const u8 {
+    if (name == null) return null;
+    return translateWinPath(std.mem.span(name.?), out);
+}
+
 fn CreateFileW(name: ?[*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disp: u32, flags: u32, template: usize) callconv(W) usize {
     _ = share;
     _ = sa;
     _ = flags;
     _ = template;
-    if (name == null) return INVALID_HANDLE;
-    var path_buf: [512:0]u8 = undefined;
-    var len: usize = 0;
-    while (name.?[len] != 0 and len < 511) : (len += 1) {
-        const c = name.?[len];
-        path_buf[len] = if (c == '\\') '/' else @intCast(c & 0xFF);
-    }
-    path_buf[len] = 0;
+    var path_buf: [1024]u8 = undefined;
+    const host_path = wideToTranslatedPath(name, &path_buf) orelse return INVALID_HANDLE;
 
     var open_flags = linux.O{};
     if (access & 0x40000000 != 0 and access & 0x80000000 != 0) {
@@ -1110,7 +1588,7 @@ fn CreateFileW(name: ?[*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, 
         open_flags.CREAT = true;
     }
 
-    const rc = linux.open(&path_buf, open_flags, 0o666);
+    const rc = linux.open(host_path.ptr, open_flags, 0o666);
     if (linux.errno(rc) != .SUCCESS) return INVALID_HANDLE;
     return @as(usize, @intCast(rc)) + 0x1000;
 }
@@ -1120,14 +1598,8 @@ fn CreateFileA(name: ?[*:0]const u8, access: u32, share: u32, sa: ?*anyopaque, d
     _ = sa;
     _ = flags;
     _ = template;
-    if (name == null) return INVALID_HANDLE;
-    var path_buf: [512:0]u8 = undefined;
-    var len: usize = 0;
-    while (name.?[len] != 0 and len < 511) : (len += 1) {
-        const c = name.?[len];
-        path_buf[len] = if (c == '\\') '/' else c;
-    }
-    path_buf[len] = 0;
+    var path_buf: [1024]u8 = undefined;
+    const host_path = narrowToTranslatedPath(name, &path_buf) orelse return INVALID_HANDLE;
 
     var open_flags = linux.O{};
     if (access & 0x40000000 != 0 and access & 0x80000000 != 0) {
@@ -1144,26 +1616,22 @@ fn CreateFileA(name: ?[*:0]const u8, access: u32, share: u32, sa: ?*anyopaque, d
         open_flags.CREAT = true;
     }
 
-    const rc = linux.open(&path_buf, open_flags, 0o666);
+    const rc = linux.open(host_path.ptr, open_flags, 0o666);
     if (linux.errno(rc) != .SUCCESS) return INVALID_HANDLE;
     return @as(usize, @intCast(rc)) + 0x1000;
 }
 
 fn DeleteFileW(name: ?[*:0]const u16) callconv(W) u32 {
-    if (name == null) return 0;
-    var path_buf: [512:0]u8 = undefined;
-    var len: usize = 0;
-    while (name.?[len] != 0 and len < 511) : (len += 1) {
-        path_buf[len] = if (name.?[len] == '\\') '/' else @intCast(name.?[len] & 0xFF);
-    }
-    path_buf[len] = 0;
-    const rc = linux.unlink(&path_buf);
+    var path_buf: [1024]u8 = undefined;
+    const host_path = wideToTranslatedPath(name, &path_buf) orelse return 0;
+    const rc = linux.unlink(host_path.ptr);
     return if (linux.errno(rc) == .SUCCESS) 1 else 0;
 }
 
 fn DeleteFileA(name: ?[*:0]const u8) callconv(W) u32 {
-    if (name == null) return 0;
-    const rc = linux.unlink(name.?);
+    var path_buf: [1024]u8 = undefined;
+    const host_path = narrowToTranslatedPath(name, &path_buf) orelse return 0;
+    const rc = linux.unlink(host_path.ptr);
     return if (linux.errno(rc) == .SUCCESS) 1 else 0;
 }
 
@@ -1181,33 +1649,74 @@ fn SetFileAttributesW(name: ?[*:0]const u16, attr: u32) callconv(W) u32 {
     return 1;
 }
 
+fn statHostPath(host_path: [:0]const u8) ?u32 {
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, host_path.ptr, 0, .{ .TYPE = true }, &stx);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return if ((stx.mode & linux.S.IFMT) == linux.S.IFDIR) 0x00000010 else 0x00000080;
+}
+
+pub fn queryWinPathAttrsW(name: ?[*:0]const u16) u32 {
+    var path_buf: [1024]u8 = undefined;
+    const host_path = wideToTranslatedPath(name, &path_buf) orelse return 0xFFFFFFFF;
+    const attrs = statHostPath(host_path) orelse 0xFFFFFFFF;
+    if (comptime builtin.link_libc) {
+        if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:K32] attrs({s}) = 0x{x}\n", .{ host_path, attrs });
+    }
+    return attrs;
+}
+
+pub fn queryWinPathAttrsA(name: ?[*:0]const u8) u32 {
+    var path_buf: [1024]u8 = undefined;
+    const host_path = narrowToTranslatedPath(name, &path_buf) orelse return 0xFFFFFFFF;
+    return statHostPath(host_path) orelse 0xFFFFFFFF;
+}
+
 fn GetFileAttributesW(name: ?[*:0]const u16) callconv(W) u32 {
-    _ = name;
-    return 0x00000080; // FILE_ATTRIBUTE_NORMAL
+    return queryWinPathAttrsW(name);
 }
 
 fn GetFileAttributesA(name: ?[*:0]const u8) callconv(W) u32 {
-    _ = name;
-    return 0x00000080; // FILE_ATTRIBUTE_NORMAL
+    return queryWinPathAttrsA(name);
 }
 
 fn GetFileAttributesExW(name: ?[*:0]const u16, level: u32, info: ?[*]u8) callconv(W) u32 {
-    _ = name;
     _ = level;
+    var path_buf: [1024]u8 = undefined;
+    const host_path = wideToTranslatedPath(name, &path_buf) orelse return 0;
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, host_path.ptr, 0, .{ .TYPE = true, .SIZE = true }, &stx);
+    if (linux.errno(rc) != .SUCCESS) return 0;
     if (info) |p| {
         @memset(p[0..36], 0);
-        std.mem.writeInt(u32, p[0..4], 0x00000080, .little); // FILE_ATTRIBUTE_NORMAL
+        const attrs: u32 = if ((stx.mode & linux.S.IFMT) == linux.S.IFDIR) 0x00000010 else 0x00000080;
+        std.mem.writeInt(u32, p[0..4], attrs, .little);
+        std.mem.writeInt(u32, p[28..32], @truncate(stx.size >> 32), .little);
+        std.mem.writeInt(u32, p[32..36], @truncate(stx.size), .little);
     }
     return 1;
 }
 
 fn GetFileInformationByHandle(h: usize, info: ?[*]u8) callconv(W) u32 {
-    _ = h;
+    const fd = fdFromHandle(h) orelse return 0;
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .SIZE = true, .INO = true, .NLINK = true, .MTIME = true }, &stx);
+    if (linux.errno(rc) != .SUCCESS) return 0;
     if (info) |p| {
         @memset(p[0..52], 0);
-        std.mem.writeInt(u32, p[0..4], 0x00000080, .little); // FILE_ATTRIBUTE_NORMAL
-        std.mem.writeInt(u32, p[28..32], 1, .little); // VolumeSerialNumber = 1
-        std.mem.writeInt(u32, p[32..36], 1, .little); // nNumberOfLinks = 1
+        const attrs: u32 = if ((stx.mode & linux.S.IFMT) == linux.S.IFDIR) 0x00000010 else 0x00000080;
+        const mtime_sec: u64 = if (stx.mtime.sec > 0) @intCast(stx.mtime.sec) else 0;
+        const ft: u64 = (mtime_sec + 11644473600) * 10_000_000;
+        std.mem.writeInt(u32, p[0..4], attrs, .little);
+        std.mem.writeInt(u64, p[4..12], ft, .little); // ftCreationTime
+        std.mem.writeInt(u64, p[12..20], ft, .little); // ftLastAccessTime
+        std.mem.writeInt(u64, p[20..28], ft, .little); // ftLastWriteTime
+        std.mem.writeInt(u32, p[28..32], 1, .little); // dwVolumeSerialNumber
+        std.mem.writeInt(u32, p[32..36], @truncate(stx.size >> 32), .little); // nFileSizeHigh
+        std.mem.writeInt(u32, p[36..40], @truncate(stx.size), .little); // nFileSizeLow
+        std.mem.writeInt(u32, p[40..44], stx.nlink, .little); // nNumberOfLinks
+        std.mem.writeInt(u32, p[44..48], @truncate(stx.ino >> 32), .little); // nFileIndexHigh
+        std.mem.writeInt(u32, p[48..52], @truncate(stx.ino), .little); // nFileIndexLow
     }
     return 1;
 }
@@ -1250,32 +1759,68 @@ fn UnlockFileEx(h: usize, res: u32, len_l: u32, len_h: u32, ov: ?*anyopaque) cal
 }
 
 fn GetCurrentDirectoryW(n: u32, buf: ?[*]u16) callconv(W) u32 {
-    if (buf != null and n >= 3) {
-        buf.?[0] = 'C';
+    var cwd_buf: [1024]u8 = undefined;
+    const rc = linux.getcwd(&cwd_buf, cwd_buf.len);
+    const cwd = if (linux.errno(rc) == .SUCCESS) std.mem.sliceTo(&cwd_buf, 0) else "/";
+    const needed: usize = 2 + cwd.len; // "Z:" + cwd
+    if (buf != null and n > needed) {
+        buf.?[0] = 'Z';
         buf.?[1] = ':';
-        buf.?[2] = '\\';
-        buf.?[3] = 0;
-        return 3;
+        for (cwd, 0..) |ch, idx| buf.?[2 + idx] = if (ch == '/') '\\' else ch;
+        buf.?[needed] = 0;
+        return @intCast(needed);
     }
-    return 3;
+    return @intCast(needed + 1);
 }
 
 fn SetCurrentDirectoryW(path: ?[*:0]const u16) callconv(W) u32 {
-    _ = path;
-    return 1;
+    var path_buf: [1024]u8 = undefined;
+    const host_path = wideToTranslatedPath(path, &path_buf) orelse return 0;
+    const rc = linux.chdir(host_path.ptr);
+    return if (linux.errno(rc) == .SUCCESS) 1 else 0;
+}
+
+/// Win32 error for a failed Linux file-system call (the codes Win32 callers test for).
+pub fn win32ErrorFromErrno(e: linux.E) u32 {
+    return switch (e) {
+        .SUCCESS => 0,
+        .EXIST => 183, // ERROR_ALREADY_EXISTS
+        .NOENT, .NOTDIR => 3, // ERROR_PATH_NOT_FOUND
+        .ACCES, .PERM, .ROFS => 5, // ERROR_ACCESS_DENIED
+        .NOTEMPTY => 145, // ERROR_DIR_NOT_EMPTY
+        .NAMETOOLONG => 206, // ERROR_FILENAME_EXCED_RANGE
+        .NOSPC, .DQUOT => 112, // ERROR_DISK_FULL
+        .BUSY => 32, // ERROR_SHARING_VIOLATION
+        .INVAL => 87, // ERROR_INVALID_PARAMETER
+        else => 31, // ERROR_GEN_FAILURE
+    };
 }
 
 fn CreateDirectoryW(path: ?[*:0]const u16, sa: ?*anyopaque) callconv(W) u32 {
     _ = sa;
-    if (path == null) return 0;
-    var path_buf: [512:0]u8 = undefined;
-    var len: usize = 0;
-    while (path.?[len] != 0 and len < 511) : (len += 1) {
-        path_buf[len] = if (path.?[len] == '\\') '/' else @intCast(path.?[len] & 0xFF);
+    var path_buf: [1024]u8 = undefined;
+    const host_path = wideToTranslatedPath(path, &path_buf) orelse {
+        setLastError(3); // ERROR_PATH_NOT_FOUND
+        return 0;
+    };
+    // Ensure intermediate parents exist when mapping into /tmp/wins-* sandbox trees.
+    if (std.mem.startsWith(u8, host_path, "/tmp/")) {
+        var idx: usize = 5;
+        while (idx < host_path.len) : (idx += 1) {
+            if (host_path[idx] == '/') {
+                path_buf[idx] = 0;
+                _ = linux.mkdir(@ptrCast(&path_buf), 0o755);
+                path_buf[idx] = '/';
+            }
+        }
     }
-    path_buf[len] = 0;
-    const rc = linux.mkdir(&path_buf, 0o755);
-    return if (linux.errno(rc) == .SUCCESS) 1 else 0;
+    const rc = linux.mkdir(host_path.ptr, 0o755);
+    const e = linux.errno(rc);
+    if (e == .SUCCESS) return 1;
+    // Mono's Directory.CreateDirectory creates every component and treats
+    // ERROR_ALREADY_EXISTS as success; a stale or generic code makes it throw.
+    setLastError(win32ErrorFromErrno(e));
+    return 0;
 }
 
 fn GetFullPathNameW(file: ?[*:0]const u16, n: u32, buf: ?[*]u16, file_part: ?*?[*]u16) callconv(W) u32 {
@@ -1344,56 +1889,382 @@ fn GetDiskFreeSpaceA(root: ?[*:0]const u8, spc: ?*u32, bps: ?*u32, free_c: ?*u32
     return 1;
 }
 
+const FIND_MAGIC: u64 = 0x57494E53_46494E44;
+const FindState = struct {
+    magic: u64 = FIND_MAGIC,
+    dir_fd: i32 = -1,
+    pat: [260]u8 = [_]u8{0} ** 260,
+    pat_len: usize = 0,
+    buf: [4096]u8 align(8) = undefined,
+    pos: usize = 0,
+    end: usize = 0,
+};
+
+fn wildMatchIgnoreCase(pat: []const u8, s: []const u8) bool {
+    // Win32 "*.*" matches any name (even without a dot).
+    if (std.mem.eql(u8, pat, "*.*") or std.mem.eql(u8, pat, "*")) return true;
+    var pi: usize = 0;
+    var si: usize = 0;
+    var star_pi: ?usize = null;
+    var star_si: usize = 0;
+    while (si < s.len) {
+        if (pi < pat.len and (pat[pi] == '?' or std.ascii.toLower(pat[pi]) == std.ascii.toLower(s[si]))) {
+            pi += 1;
+            si += 1;
+        } else if (pi < pat.len and pat[pi] == '*') {
+            star_pi = pi;
+            star_si = si;
+            pi += 1;
+        } else if (star_pi) |sp| {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pat.len and pat[pi] == '*') : (pi += 1) {}
+    return pi == pat.len;
+}
+
+fn fillFindData(dir_fd: i32, ename: [:0]const u8, dtype: u8, data: [*]u8, wide: bool) void {
+    const struct_sz: usize = if (wide) 592 else 320;
+    @memset(data[0..struct_sz], 0);
+    var stx: linux.Statx = undefined;
+    var attrs: u32 = if (dtype == 4) 0x10 else 0x80; // DT_DIR=4 -> FILE_ATTRIBUTE_DIRECTORY
+    var size: u64 = 0;
+    if (linux.errno(linux.statx(dir_fd, ename.ptr, 0, .{ .TYPE = true, .SIZE = true }, &stx)) == .SUCCESS) {
+        attrs = if ((stx.mode & linux.S.IFMT) == linux.S.IFDIR) 0x10 else 0x80;
+        size = stx.size;
+    }
+    std.mem.writeInt(u32, data[0..4], attrs, .little);
+    std.mem.writeInt(u32, data[28..32], @truncate(size >> 32), .little);
+    std.mem.writeInt(u32, data[32..36], @truncate(size), .little);
+    if (wide) {
+        const wptr: [*]u16 = @ptrCast(@alignCast(data + 44));
+        const n = @min(ename.len, 259);
+        for (ename[0..n], 0..) |ch, idx| wptr[idx] = ch;
+        wptr[n] = 0;
+    } else {
+        const n = @min(ename.len, 259);
+        @memcpy(data[44..][0..n], ename[0..n]);
+        data[44 + n] = 0;
+    }
+}
+
+fn findStep(fs: *FindState, data: [*]u8, wide: bool) bool {
+    const pat = fs.pat[0..fs.pat_len];
+    while (true) {
+        if (fs.pos >= fs.end) {
+            const n = linux.getdents64(fs.dir_fd, &fs.buf, fs.buf.len);
+            if (linux.errno(n) != .SUCCESS or n == 0) return false;
+            fs.pos = 0;
+            fs.end = n;
+        }
+        const ent: *align(1) const linux.dirent64 = @ptrCast(&fs.buf[fs.pos]);
+        fs.pos += ent.reclen;
+        const nptr: [*:0]const u8 = @ptrCast(&ent.name);
+        const ename = std.mem.span(nptr);
+        if (!wildMatchIgnoreCase(pat, ename)) continue;
+        fillFindData(fs.dir_fd, ename, ent.type, data, wide);
+        return true;
+    }
+}
+
+fn findStart(host_pat: [:0]const u8, data_opt: ?[*]u8, wide: bool) usize {
+    const data = data_opt orelse return INVALID_HANDLE;
+    const slash = std.mem.lastIndexOfScalar(u8, host_pat, '/');
+    var dir_buf: [1024]u8 = undefined;
+    var dir_z: [:0]const u8 = undefined;
+    var pat: []const u8 = undefined;
+    if (slash) |idx| {
+        const dlen = if (idx == 0) 1 else idx;
+        @memcpy(dir_buf[0..dlen], if (idx == 0) "/" else host_pat[0..idx]);
+        dir_buf[dlen] = 0;
+        dir_z = resolveCaseInsensitiveInPlace(&dir_buf, dlen);
+        pat = host_pat[idx + 1 ..];
+    } else {
+        dir_buf[0] = '.';
+        dir_buf[1] = 0;
+        dir_z = dir_buf[0..1 :0];
+        pat = host_pat;
+    }
+    const fd_rc = linux.open(dir_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return INVALID_HANDLE;
+    const fs = std.heap.page_allocator.create(FindState) catch {
+        _ = linux.close(@intCast(fd_rc));
+        return INVALID_HANDLE;
+    };
+    fs.* = .{ .dir_fd = @intCast(fd_rc) };
+    const pn = @min(pat.len, fs.pat.len - 1);
+    @memcpy(fs.pat[0..pn], pat[0..pn]);
+    fs.pat_len = pn;
+    if (!findStep(fs, data, wide)) {
+        _ = linux.close(fs.dir_fd);
+        std.heap.page_allocator.destroy(fs);
+        return INVALID_HANDLE;
+    }
+    return @intFromPtr(fs);
+}
+
 fn FindFirstFileW(name: ?[*:0]const u16, data: ?[*]u8) callconv(W) usize {
-    _ = name;
-    _ = data;
-    return INVALID_HANDLE;
+    var raw_buf: [1024]u8 = undefined;
+    var tmp: [1024]u8 = undefined;
+    const n = name orelse return INVALID_HANDLE;
+    var len: usize = 0;
+    while (n[len] != 0 and len < tmp.len - 1) : (len += 1) tmp[len] = @intCast(n[len] & 0xFF);
+    // Translate prefix only (don't try case-insensitivity on the trailing wildcard component yet).
+    const tr = translateWinPathNoCi(tmp[0..len], &raw_buf) orelse return INVALID_HANDLE;
+    return findStart(tr, data, true);
+}
+
+fn translateWinPathNoCi(raw_utf8: []const u8, out: *[1024]u8) ?[:0]const u8 {
+    var norm: [1024]u8 = undefined;
+    var nlen: usize = 0;
+    for (raw_utf8) |ch| {
+        if (nlen >= norm.len - 1) break;
+        norm[nlen] = if (ch == '\\') '/' else ch;
+        nlen += 1;
+    }
+    var s = norm[0..nlen];
+    if (std.mem.startsWith(u8, s, "//?/") or std.mem.startsWith(u8, s, "//./")) s = s[4..];
+    if (s.len == 0) return null;
+    var pos: usize = 0;
+    const append = struct {
+        fn slice(dst: *[1024]u8, p: *usize, src: []const u8) void {
+            const avail = (dst.len - 1) -| p.*;
+            const n = @min(avail, src.len);
+            @memcpy(dst[p.*..][0..n], src[0..n]);
+            p.* += n;
+        }
+    }.slice;
+    if (s.len >= 2 and s[1] == ':' and std.ascii.isAlphabetic(s[0])) {
+        const drive = std.ascii.toLower(s[0]);
+        const rest = s[2..];
+        if (drive == 'z') {
+            append(out, &pos, if (rest.len == 0) "/" else rest);
+        } else if (drive == 'c') {
+            if (asciiPrefixIgnoreCase(rest, "/Users/User/AppData/Roaming")) {
+                append(out, &pos, envOr("APPDATA", "/tmp/wins-appdata"));
+                append(out, &pos, rest["/Users/User/AppData/Roaming".len..]);
+            } else if (asciiPrefixIgnoreCase(rest, "/Users/User/AppData/Local")) {
+                append(out, &pos, envOr("LOCALAPPDATA", "/tmp/wins-localappdata"));
+                append(out, &pos, rest["/Users/User/AppData/Local".len..]);
+            } else if (asciiPrefixIgnoreCase(rest, "/Users/User")) {
+                append(out, &pos, envOr("USERPROFILE", "/tmp"));
+                append(out, &pos, rest["/Users/User".len..]);
+            } else if (asciiPrefixIgnoreCase(rest, "/Temp") and (rest.len == 5 or rest[5] == '/')) {
+                append(out, &pos, "/tmp");
+                append(out, &pos, rest[5..]);
+            } else {
+                append(out, &pos, "/tmp/wins-c");
+                append(out, &pos, rest);
+            }
+        } else {
+            append(out, &pos, s[2..]);
+        }
+    } else {
+        append(out, &pos, s);
+    }
+    out[pos] = 0;
+    return out[0..pos :0];
 }
 
 fn FindFirstFileExW(name: ?[*:0]const u16, level: u32, data: ?[*]u8, op: u32, filter: ?*anyopaque, flags: u32) callconv(W) usize {
-    _ = name;
     _ = level;
-    _ = data;
     _ = op;
     _ = filter;
     _ = flags;
-    return INVALID_HANDLE;
+    return FindFirstFileW(name, data);
 }
 
 fn FindNextFileW(h: usize, data: ?[*]u8) callconv(W) u32 {
-    _ = h;
-    _ = data;
-    return 0;
+    if (h == 0 or h == INVALID_HANDLE) return 0;
+    const d = data orelse return 0;
+    const fs: *FindState = @ptrFromInt(h);
+    if (fs.magic != FIND_MAGIC) return 0;
+    return if (findStep(fs, d, true)) 1 else 0;
 }
 
 fn FindClose(h: usize) callconv(W) u32 {
-    _ = h;
+    if (h == 0 or h == INVALID_HANDLE) return 1;
+    if (h >= 0x10000) {
+        const fs: *FindState = @ptrFromInt(h);
+        if (fs.magic == FIND_MAGIC) {
+            fs.magic = 0;
+            _ = linux.close(fs.dir_fd);
+            std.heap.page_allocator.destroy(fs);
+        }
+    }
     return 1;
 }
 
+const MAP_HANDLE_BASE: usize = 0x30000;
+const MAX_MAPPINGS: usize = 512;
+const MAX_VIEWS: usize = 1024;
+const FileMapping = struct {
+    in_use: bool = false,
+    fd: i32 = -1,
+    max_size: u64 = 0,
+    prot: u32 = 0,
+    sec_image: bool = false,
+};
+const MappedView = struct {
+    in_use: bool = false,
+    ptr: usize = 0,
+    len: usize = 0,
+};
+var g_mappings: [MAX_MAPPINGS]FileMapping = [_]FileMapping{.{}} ** MAX_MAPPINGS;
+var g_views: [MAX_VIEWS]MappedView = [_]MappedView{.{}} ** MAX_VIEWS;
+var g_map_lock: std.atomic.Mutex = .unlocked;
+
+fn lockMaps() void {
+    while (!g_map_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
+pub fn closeMappingHandle(h: usize) bool {
+    if (h < MAP_HANDLE_BASE or h >= MAP_HANDLE_BASE + MAX_MAPPINGS) return false;
+    const idx = h - MAP_HANDLE_BASE;
+    lockMaps();
+    defer g_map_lock.unlock();
+    if (!g_mappings[idx].in_use) return false;
+    if (g_mappings[idx].fd >= 3) _ = linux.close(g_mappings[idx].fd);
+    g_mappings[idx] = .{};
+    return true;
+}
+
 fn CreateFileMappingW(file: usize, sa: ?*anyopaque, prot: u32, max_h: u32, max_l: u32, name: ?[*:0]const u16) callconv(W) usize {
-    _ = file;
     _ = sa;
-    _ = prot;
-    _ = max_h;
-    _ = max_l;
     _ = name;
-    return 0x3000;
+    var fd: i32 = -1;
+    var size: u64 = (@as(u64, max_h) << 32) | max_l;
+    if (file != INVALID_HANDLE) {
+        const orig_fd = fdFromHandle(file) orelse return 0;
+        const dup_rc = linux.dup(orig_fd);
+        if (linux.errno(dup_rc) != .SUCCESS) return 0;
+        fd = @intCast(dup_rc);
+        if (size == 0) {
+            var stx: linux.Statx = undefined;
+            if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &stx)) == .SUCCESS) {
+                size = stx.size;
+            }
+        }
+    }
+    lockMaps();
+    defer g_map_lock.unlock();
+    for (&g_mappings, 0..) |*m, idx| {
+        if (!m.in_use) {
+            m.* = .{
+                .in_use = true,
+                .fd = fd,
+                .max_size = if (size == 0) 65536 else size,
+                .prot = prot,
+                .sec_image = (prot & 0x01000000) != 0,
+            };
+            return MAP_HANDLE_BASE + idx;
+        }
+    }
+    if (fd >= 3) _ = linux.close(fd);
+    return 0;
+}
+
+fn mapSecImage(fd: i32, file_sz: u64) ?[*]u8 {
+    if (file_sz < 64 or file_sz > 256 * 1024 * 1024) return null;
+    const fbuf = std.heap.page_allocator.alloc(u8, @intCast(file_sz)) catch return null;
+    defer std.heap.page_allocator.free(fbuf);
+    var done: usize = 0;
+    while (done < fbuf.len) {
+        const rc = linux.pread(fd, fbuf.ptr + done, fbuf.len - done, @intCast(done));
+        if (linux.errno(rc) != .SUCCESS or rc == 0) break;
+        done += rc;
+    }
+    if (done < 64 or fbuf[0] != 'M' or fbuf[1] != 'Z') return null;
+    const pe = std.mem.readInt(u32, fbuf[0x3c..][0..4], .little);
+    if (@as(u64, pe) + 24 + 64 > done) return null;
+    const nsec = std.mem.readInt(u16, fbuf[pe + 6 ..][0..2], .little);
+    const opt_sz = std.mem.readInt(u16, fbuf[pe + 20 ..][0..2], .little);
+    const opt = pe + 24;
+    const size_of_image = std.mem.readInt(u32, fbuf[opt + 56 ..][0..4], .little);
+    const size_of_headers = std.mem.readInt(u32, fbuf[opt + 60 ..][0..4], .little);
+    if (size_of_image == 0 or size_of_image > 256 * 1024 * 1024) return null;
+    const map_len = std.mem.alignForward(usize, size_of_image, 4096);
+    const mrc = linux.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (linux.errno(mrc) != .SUCCESS) return null;
+    const dst: [*]u8 = @ptrFromInt(mrc);
+    const hdr_n = @min(@as(usize, size_of_headers), done);
+    @memcpy(dst[0..hdr_n], fbuf[0..hdr_n]);
+    const sec_off = opt + opt_sz;
+    var k: usize = 0;
+    while (k < nsec) : (k += 1) {
+        const o = sec_off + k * 40;
+        if (o + 40 > done) break;
+        const vsize = std.mem.readInt(u32, fbuf[o + 8 ..][0..4], .little);
+        const va = std.mem.readInt(u32, fbuf[o + 12 ..][0..4], .little);
+        const rsz = std.mem.readInt(u32, fbuf[o + 16 ..][0..4], .little);
+        const rptr = std.mem.readInt(u32, fbuf[o + 20 ..][0..4], .little);
+        const copy_n = @min(@as(usize, if (vsize != 0) @min(rsz, vsize) else rsz), done -| rptr);
+        if (copy_n > 0 and @as(u64, va) + copy_n <= map_len) {
+            @memcpy(dst[va..][0..copy_n], fbuf[rptr..][0..copy_n]);
+        }
+    }
+    lockMaps();
+    defer g_map_lock.unlock();
+    for (&g_views) |*v| {
+        if (!v.in_use) {
+            v.* = .{ .in_use = true, .ptr = mrc, .len = map_len };
+            break;
+        }
+    }
+    return dst;
 }
 
 fn MapViewOfFile(mapping: usize, access: u32, off_h: u32, off_l: u32, bytes: usize) callconv(W) ?[*]u8 {
-    _ = mapping;
-    _ = access;
-    _ = off_h;
-    _ = off_l;
-    const sz = if (bytes == 0) 65536 else std.mem.alignForward(usize, bytes, 4096);
-    const mrc = linux.mmap(null, sz, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (mapping < MAP_HANDLE_BASE or mapping >= MAP_HANDLE_BASE + MAX_MAPPINGS) return null;
+    lockMaps();
+    const m = g_mappings[mapping - MAP_HANDLE_BASE];
+    g_map_lock.unlock();
+    if (!m.in_use) return null;
+    const offset: u64 = (@as(u64, off_h) << 32) | off_l;
+    if (m.fd >= 0 and m.sec_image and offset == 0) {
+        if (mapSecImage(m.fd, m.max_size)) |p| return p;
+    }
+    const raw_len: usize = if (bytes != 0) bytes else if (m.max_size > offset) @intCast(m.max_size - offset) else 4096;
+    const sz = std.mem.alignForward(usize, @max(raw_len, 1), 4096);
+    const want_write = (access & 0x0002 != 0) or (access == 0x001f); // FILE_MAP_WRITE or FILE_MAP_ALL_ACCESS
+    const prot: linux.PROT = .{
+        .READ = true,
+        .WRITE = want_write or (access & 0x0001 != 0) or (m.fd < 0),
+        .EXEC = (access & 0x0020 != 0) or (m.prot & 0xF0 != 0),
+    };
+    const mflags: linux.MAP = if (m.fd >= 0)
+        .{ .TYPE = if (want_write) .SHARED else .PRIVATE }
+    else
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+    const mrc = linux.mmap(null, sz, prot, mflags, m.fd, @intCast(offset));
     if (linux.errno(mrc) != .SUCCESS) return null;
+    lockMaps();
+    for (&g_views) |*v| {
+        if (!v.in_use) {
+            v.* = .{ .in_use = true, .ptr = mrc, .len = sz };
+            break;
+        }
+    }
+    g_map_lock.unlock();
     return @ptrFromInt(mrc);
 }
 
 fn UnmapViewOfFile(ptr: ?[*]const u8) callconv(W) u32 {
-    _ = ptr;
+    const p = ptr orelse return 1;
+    const addr = @intFromPtr(p);
+    lockMaps();
+    defer g_map_lock.unlock();
+    for (&g_views) |*v| {
+        if (v.in_use and v.ptr == addr) {
+            _ = linux.munmap(@ptrFromInt(v.ptr), v.len);
+            v.* = .{};
+            return 1;
+        }
+    }
     return 1;
 }
 
@@ -1436,31 +2307,32 @@ fn CreateProcessW(
     si: ?*anyopaque,
     pi: ?*anyopaque,
 ) callconv(W) u32 {
-    _ = app; _ = pa; _ = ta; _ = inh; _ = flags; _ = env; _ = dir; _ = si;
-    if (cmd) |c| {
-        var utf8_buf: [1024]u8 = undefined;
-        var i: usize = 0;
-        while (c[i] != 0 and i < 1023) : (i += 1) {
-            utf8_buf[i] = @truncate(c[i]);
+    _ = pa; _ = ta; _ = inh; _ = flags; _ = env; _ = dir; _ = si;
+    if (pi) |p| @memset(@as([*]u8, @ptrCast(p))[0 .. 2 * @sizeOf(usize) + 8], 0);
+    var path_buf: [1024]u8 = undefined;
+    const image = wideToTranslatedPath(app, &path_buf) orelse blk: {
+        if (cmd) |line| {
+            var b: [1024]u8 = undefined;
+            var n: usize = 0;
+            while (line[n] != 0 and n < b.len - 1) : (n += 1) b[n] = @truncate(line[n]);
+            break :blk translateWinPath(firstWinCommandToken(b[0..n]), &path_buf);
         }
-        utf8_buf[i] = 0;
-        _ = @import("wins_graph.zig").translateCommandLine(utf8_buf[0..i]);
+        break :blk null;
+    };
+    if (image) |p| {
+        const fd = linux.open(@ptrCast(p), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) { setLastError(2); return 0; }
+        _ = linux.close(@intCast(fd));
     }
-    if (pi) |p| {
-        const ptr: [*]u8 = @ptrCast(p);
-        const one: usize = @sizeOf(usize);
-        std.mem.writeInt(usize, ptr[0..one], 0x6001, .little);
-        std.mem.writeInt(usize, ptr[one..2 * one], 0x6002, .little);
-        std.mem.writeInt(u32, ptr[2 * one .. 2 * one + 4], 1234, .little);
-        std.mem.writeInt(u32, ptr[2 * one + 4 .. 2 * one + 8], 1235, .little);
-    }
-    return 1;
+    setLastError(50);
+    return 0;
 }
 
 fn GetExitCodeProcess(proc: usize, exit_code: ?*u32) callconv(W) u32 {
-    _ = proc;
-    if (exit_code) |c| c.* = 0;
-    return 1;
+    if (exit_code == null) { setLastError(87); return 0; }
+    if (proc == ~@as(usize, 0)) { exit_code.?.* = 259; return 1; }
+    setLastError(6);
+    return 0;
 }
 
 fn CreateThread(sa: ?*anyopaque, stack_sz: usize, start: usize, param: usize, flags: u32, tid: ?*u32) callconv(W) usize {
@@ -1479,16 +2351,17 @@ fn ResumeThread(thread: usize) callconv(W) u32 {
 }
 
 fn GetEnvironmentVariableA(name: ?[*:0]const u8, buf: ?[*]u8, sz: u32) callconv(W) u32 {
-    _ = name;
-    _ = buf;
-    _ = sz;
-    return 0;
+    const n = name orelse { setLastError(87); return 0; };
+    return getEnvA(std.mem.span(n), buf, sz);
 }
 
 fn SetEnvironmentVariableW(name: ?[*:0]const u16, val: ?[*:0]const u16) callconv(W) u32 {
-    _ = name;
-    _ = val;
-    return 1;
+    const n = name orelse { setLastError(87); return 0; };
+    var nb: [512]u8 = undefined;
+    const nbytes = std.unicode.utf16LeToUtf8(&nb, std.mem.span(n)) catch { setLastError(87); return 0; };
+    var vb: [1024]u8 = undefined;
+    const v: ?[]const u8 = if (val) |x| blk: { const vbytes = std.unicode.utf16LeToUtf8(&vb, std.mem.span(x)) catch { setLastError(87); return 0; }; break :blk vb[0..vbytes]; } else null;
+    return if (setEnvValue(nb[0..nbytes], v)) 1 else 0;
 }
 
 fn DebugBreak() callconv(W) void {}
@@ -1646,8 +2519,8 @@ fn CreateNamedPipeA(name: ?[*:0]const u8, open_mode: u32, pipe_mode: u32, max_in
 }
 
 fn CreateFileMappingA(file: usize, sa: ?*anyopaque, prot: u32, max_h: u32, max_l: u32, name: ?[*:0]const u8) callconv(W) usize {
-    _ = file; _ = sa; _ = prot; _ = max_h; _ = max_l; _ = name;
-    return 0x3000;
+    _ = name;
+    return CreateFileMappingW(file, sa, prot, max_h, max_l, null);
 }
 
 fn CreateProcessA(
@@ -1663,19 +2536,18 @@ fn CreateProcessA(
     pi: ?*anyopaque,
 ) callconv(W) u32 {
     _ = pa; _ = ta; _ = inh; _ = flags; _ = env; _ = dir; _ = si;
-    const cmd_str: []const u8 = if (cmd) |c| std.mem.span(c) else if (app) |a| std.mem.span(a) else "";
-    if (cmd_str.len > 0) {
-        _ = @import("wins_graph.zig").translateCommandLine(cmd_str);
+    if (pi) |p| @memset(@as([*]u8, @ptrCast(p))[0 .. 2 * @sizeOf(usize) + 8], 0);
+    var path_buf: [1024]u8 = undefined;
+    const image = if (app) |a| narrowToTranslatedPath(a, &path_buf) else if (cmd) |c| blk: {
+        break :blk translateWinPath(firstWinCommandToken(std.mem.span(c)), &path_buf);
+    } else null;
+    if (image) |p| {
+        const fd = linux.open(@ptrCast(p), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) { setLastError(2); return 0; }
+        _ = linux.close(@intCast(fd));
     }
-    if (pi) |p| {
-        const ptr: [*]u8 = @ptrCast(p);
-        const one: usize = @sizeOf(usize);
-        std.mem.writeInt(usize, ptr[0..one], 0x6001, .little);
-        std.mem.writeInt(usize, ptr[one..2 * one], 0x6002, .little);
-        std.mem.writeInt(u32, ptr[2 * one .. 2 * one + 4], 1234, .little);
-        std.mem.writeInt(u32, ptr[2 * one + 4 .. 2 * one + 8], 1235, .little);
-    }
-    return 1;
+    setLastError(50);
+    return 0;
 }
 
 fn CreateRemoteThread(proc: usize, sa: ?*anyopaque, stack_sz: usize, start: usize, param: usize, flags: u32, tid: ?*u32) callconv(W) usize {
@@ -1706,13 +2578,18 @@ fn DeviceIoControl(h: usize, code: u32, in_buf: ?*anyopaque, in_sz: u32, out_buf
 }
 
 fn FindFirstFileA(name: ?[*:0]const u8, data: ?[*]u8) callconv(W) usize {
-    _ = name; _ = data;
-    return INVALID_HANDLE;
+    var raw_buf: [1024]u8 = undefined;
+    const p = name orelse return INVALID_HANDLE;
+    const tr = translateWinPathNoCi(std.mem.span(p), &raw_buf) orelse return INVALID_HANDLE;
+    return findStart(tr, data, false);
 }
 
 fn FindNextFileA(h: usize, data: ?[*]u8) callconv(W) u32 {
-    _ = h; _ = data;
-    return 0;
+    if (h == 0 or h == INVALID_HANDLE) return 0;
+    const d = data orelse return 0;
+    const fs: *FindState = @ptrFromInt(h);
+    if (fs.magic != FIND_MAGIC) return 0;
+    return if (findStep(fs, d, false)) 1 else 0;
 }
 
 fn FindFirstVolumeW(name: ?[*]u16, len: u32) callconv(W) usize {
@@ -1758,13 +2635,23 @@ fn GetDriveTypeA(root: ?[*:0]const u8) callconv(W) u32 {
 }
 
 fn GetEnvironmentVariableW(name: ?[*:0]const u16, buf: ?[*]u16, sz: u32) callconv(W) u32 {
-    _ = name; _ = buf; _ = sz;
-    return 0;
+    const n = name orelse { setLastError(87); return 0; };
+    var nb: [512]u8 = undefined;
+    const nbytes = std.unicode.utf16LeToUtf8(&nb, std.mem.span(n)) catch { setLastError(87); return 0; };
+    const ns = nb[0..nbytes];
+    var val: [1024]u8 = undefined;
+    const len = getEnvA(ns, &val, val.len);
+    if (len == 0) return 0;
+    const need = len + 1;
+    if (buf == null or sz < need) return need;
+    const written = std.unicode.utf8ToUtf16Le(buf.?[0 .. sz - 1], val[0..len]) catch { setLastError(87); return 0; };
+    buf.?[written] = 0;
+    return len;
 }
 
 fn SetEnvironmentVariableA(name: ?[*:0]const u8, val: ?[*:0]const u8) callconv(W) u32 {
-    _ = name; _ = val;
-    return 1;
+    const n = name orelse { setLastError(87); return 0; };
+    return if (setEnvValue(std.mem.span(n), if (val) |v| std.mem.span(v) else null)) 1 else 0;
 }
 
 fn GetFileAttributesExA(file: ?[*:0]const u8, level: u32, info: ?[*]u8) callconv(W) u32 {
@@ -1783,12 +2670,15 @@ fn GetLogicalDrives() callconv(W) u32 {
 }
 
 fn GetModuleFileNameA(mod: usize, buf: ?[*]u8, sz: u32) callconv(W) u32 {
-    _ = mod;
-    const name = "busybox.exe";
-    if (buf != null and sz > name.len) {
-        @memcpy(buf.?[0..name.len], name);
-        buf.?[name.len] = 0;
-        return name.len;
+    if (mod == 0 or mod == image_base_addr) {
+        if (module_path_initialized) {
+            const mlen: usize = @min(module_path_len, if (sz > 0) @as(usize, sz) - 1 else 0);
+            if (buf != null and sz > 0) {
+                @memcpy(buf.?[0..mlen], module_path_a[0..mlen]);
+                buf.?[mlen] = 0;
+            }
+            return @intCast(mlen);
+        }
     }
     return 0;
 }
@@ -2093,27 +2983,63 @@ fn SetFileInformationByHandle(h: usize, class: u32, buf: ?*const anyopaque, sz: 
 
 fn GlobalAlloc(uFlags: u32, dwBytes: usize) callconv(W) ?*anyopaque {
     _ = uFlags;
-    return HeapAlloc(HEAP_COOKIE, 0, dwBytes);
+    const ptr = HeapAlloc(HEAP_COOKIE, 0, dwBytes) orelse return null;
+    for (&global_locks) |*e| if (e.ptr == 0) { e.ptr = @intFromPtr(ptr); e.count = 0; break; };
+    return ptr;
 }
 
 fn GlobalLock(hMem: ?*anyopaque) callconv(W) ?*anyopaque {
-    return hMem;
+    const p = hMem orelse return null;
+    for (&global_locks) |*e| if (e.ptr == @intFromPtr(p)) { e.count +|= 1; return p; };
+    return null;
 }
 
 fn GlobalUnlock(hMem: ?*anyopaque) callconv(W) i32 {
-    _ = hMem;
-    return 1;
+    const p = hMem orelse { setLastError(6); return 0; };
+    for (&global_locks) |*e| if (e.ptr == @intFromPtr(p)) { if (e.count == 0) { setLastError(158); return 0; } e.count -= 1; if (e.count == 0) { setLastError(0); return 0; } return 1; };
+    setLastError(6); return 0;
 }
 
+const GlobalLockEntry = struct { ptr: usize = 0, count: u32 = 0 };
+var global_locks: [256]GlobalLockEntry = [_]GlobalLockEntry{.{}} ** 256;
+
 fn GlobalFree(hMem: ?*anyopaque) callconv(W) ?*anyopaque {
+    if (hMem) |p| for (&global_locks) |*e| if (e.ptr == @intFromPtr(p)) { e.* = .{}; break; };
     _ = HeapFree(HEAP_COOKIE, 0, if (hMem) |p| @ptrCast(p) else null);
     return null;
 }
 
 fn CopyFileW(lpExisting: ?[*:0]const u16, lpNew: ?[*:0]const u16, bFailIfExists: u32) callconv(W) u32 {
-    _ = lpExisting; _ = lpNew; _ = bFailIfExists;
+    var src_buf: [1024]u8 = undefined; var dst_buf: [1024]u8 = undefined;
+    const src = wideToTranslatedPath(lpExisting, &src_buf) orelse { setLastError(87); return 0; };
+    const dst = wideToTranslatedPath(lpNew, &dst_buf) orelse { setLastError(87); return 0; };
+    return copyHostFile(src, dst, bFailIfExists != 0);
+}
+fn CopyFileA(src: ?[*:0]const u8, dst: ?[*:0]const u8, fail: u32) callconv(W) u32 {
+    var src_buf: [1024]u8 = undefined; var dst_buf: [1024]u8 = undefined;
+    const s = narrowToTranslatedPath(src, &src_buf) orelse { setLastError(87); return 0; };
+    const d = narrowToTranslatedPath(dst, &dst_buf) orelse { setLastError(87); return 0; };
+    return copyHostFile(s, d, fail != 0);
+}
+
+fn copyHostFile(src: [:0]const u8, dst: [:0]const u8, fail_exists: bool) u32 {
+    const in = linux.open(@ptrCast(src), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(in) != .SUCCESS) { setLastError(2); return 0; }
+    defer _ = linux.close(@intCast(in));
+    const out = linux.open(@ptrCast(dst), .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true, .EXCL = fail_exists, .TRUNC = !fail_exists }, 0o666);
+    if (linux.errno(out) != .SUCCESS) { setLastError(if (fail_exists) 80 else 5); return 0; }
+    defer _ = linux.close(@intCast(out));
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        const n = linux.read(@intCast(in), &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS) { setLastError( readErr(n)); return 0; }
+        if (n == 0) break;
+        var off: usize = 0;
+        while (off < n) { const w = linux.write(@intCast(out), buf[off..n].ptr, n - off); if (linux.errno(w) != .SUCCESS or w == 0) { setLastError(5); return 0; } off += w; }
+    }
     return 1;
 }
+fn readErr(rc: usize) u32 { _ = rc; return 5; }
 
 fn ReleaseMutex(hMutex: usize) callconv(W) u32 {
     _ = hMutex;
@@ -2204,13 +3130,36 @@ fn SignalObjectAndWait(hObjectToSignal: usize, hObjectToWaitOn: usize, dwMillise
 }
 
 fn SetThreadPriority(hThread: usize, nPriority: i32) callconv(W) i32 {
-    _ = hThread; _ = nPriority;
-    return 1;
+    if (comptime builtin.link_libc) {
+        return if (@import("winrun_threads.zig").setThreadPriority(hThread, nPriority)) 1 else blk: { setLastError(6); break :blk 0; };
+    } else {
+        if (hThread == ~@as(usize, 1) and nPriority >= -15 and nPriority <= 15) { current_thread_priority = nPriority; return 1; }
+        setLastError(6); return 0;
+    }
 }
+threadlocal var current_thread_priority: i32 = 0;
 
 fn SetThreadAffinityMask(hThread: usize, dwThreadAffinityMask: usize) callconv(W) usize {
-    _ = hThread;
-    return dwThreadAffinityMask;
+    const tid: ?u32 = if (comptime builtin.link_libc) @import("winrun_threads.zig").threadTid(hThread) else if (hThread == ~@as(usize, 1)) @intCast(linux.gettid()) else null;
+    if (tid == null) { setLastError(6); return 0; }
+    if (dwThreadAffinityMask == 0) { setLastError(87); return 0; }
+    var old: [16]u64 = [_]u64{0} ** 16; var new: [16]u64 = [_]u64{0} ** 16;
+    const which: i32 = @intCast(tid.?);
+    const get = linux.syscall3(.sched_getaffinity, @intCast(which), @sizeOf(@TypeOf(old)), @intFromPtr(&old));
+    if (linux.errno(get) != .SUCCESS) { setLastError(87); return 0; }
+    const previous = old[0]; new = old; new[0] = dwThreadAffinityMask;
+    const set = linux.syscall3(.sched_setaffinity, @intCast(which), @sizeOf(@TypeOf(new)), @intFromPtr(&new));
+    if (linux.errno(set) != .SUCCESS) { setLastError(87); return 0; }
+    return @intCast(previous);
+}
+
+fn GetThreadPriority(hThread: usize) callconv(W) i32 {
+    if (comptime builtin.link_libc) {
+        return @import("winrun_threads.zig").getThreadPriority(hThread) orelse blk: { setLastError(6); break :blk 0x7FFFFFFF; };
+    } else {
+        if (hThread == ~@as(usize, 1)) return current_thread_priority;
+        setLastError(6); return 0x7FFFFFFF;
+    }
 }
 
 fn SwitchToThread() callconv(W) i32 {
@@ -2283,15 +3232,110 @@ const SystemPowerStatus = extern struct {
 };
 
 fn GetSystemPowerStatus(lpSystemPowerStatus: ?*SystemPowerStatus) callconv(W) i32 {
-    if (lpSystemPowerStatus) |s| {
-        s.ACLineStatus = 1;
-        s.BatteryFlag = 0;
-        s.BatteryLifePercent = 100;
-        s.SystemStatusFlag = 0;
-        s.BatteryLifeTime = 0xFFFFFFFF;
-        s.BatteryFullLifeTime = 0xFFFFFFFF;
+    const s = lpSystemPowerStatus orelse { setLastError(87); return 0; };
+    s.* = .{ .ACLineStatus = 255, .BatteryFlag = 255, .BatteryLifePercent = 255, .SystemStatusFlag = 0, .BatteryLifeTime = 0xFFFFFFFF, .BatteryFullLifeTime = 0xFFFFFFFF };
+    // Read common sysfs names. Missing devices remain honestly unknown (255).
+    for ([_][]const u8{"/sys/class/power_supply/AC/online", "/sys/class/power_supply/ACAD/online", "/sys/class/power_supply/ADP0/online"}) |path| {
+        var p: [128]u8 = [_]u8{0} ** 128; @memcpy(p[0..path.len], path);
+        const fd = linux.open(@ptrCast(&p), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) == .SUCCESS) { defer _ = linux.close(@intCast(fd)); var b: [8]u8 = undefined; const n = linux.read(@intCast(fd), &b, b.len); if (n > 0) s.ACLineStatus = if (b[0] == '1') 1 else 0; break; }
+    }
+    for ([_][]const u8{"/sys/class/power_supply/BAT0/capacity", "/sys/class/power_supply/BAT1/capacity"}) |path| {
+        var p: [128]u8 = [_]u8{0} ** 128; @memcpy(p[0..path.len], path);
+        const fd = linux.open(@ptrCast(&p), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) == .SUCCESS) {
+            defer _ = linux.close(@intCast(fd)); var b: [8]u8 = undefined; const n = linux.read(@intCast(fd), &b, b.len);
+            if (n > 0) { var pct: u32 = 0; for (b[0..n]) |ch| { if (ch < '0' or ch > '9') break; pct = pct * 10 + ch - '0'; } s.BatteryLifePercent = @intCast(@min(pct, 100)); s.BatteryFlag = if (s.ACLineStatus == 1) 8 else 0; }
+            break;
+        }
     }
     return 1;
+}
+
+test "environment A/W setters and getters share process state" {
+    const name_a = "WINS_KSTUB_TEST";
+    const value_a = "cafe";
+    try std.testing.expectEqual(@as(u32, 1), SetEnvironmentVariableA(name_a, value_a));
+    var out_a: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 4), GetEnvironmentVariableA(name_a, &out_a, out_a.len));
+    try std.testing.expectEqualStrings("cafe", out_a[0..4]);
+    const name_w = [_:0]u16{ 'W','I','N','S','_','K','S','T','U','B','_','T','E','S','T' };
+    const value_w = [_:0]u16{ 'r','e','a','l' };
+    try std.testing.expectEqual(@as(u32, 1), SetEnvironmentVariableW(&name_w, &value_w));
+    var out_w: [16]u16 = undefined;
+    try std.testing.expectEqual(@as(u32, 4), GetEnvironmentVariableW(&name_w, &out_w, out_w.len));
+    try std.testing.expectEqualSlices(u16, &[_]u16{'r','e','a','l'}, out_w[0..4]);
+    const block = GetEnvironmentStringsW().?;
+    try std.testing.expectEqualSlices(u16, &[_]u16{'W','I','N','S','_','K','S','T','U','B','_','T','E','S','T','=','r','e','a','l'}, block[0..20]);
+    try std.testing.expectEqual(@as(u32, 1), SetEnvironmentVariableA(name_a, null));
+    try std.testing.expectEqual(@as(u32, 0), GetEnvironmentVariableA(name_a, &out_a, out_a.len));
+}
+
+test "process creation fails honestly, clears output, and process pseudo-handle remains active" {
+    var pi: [2 * @sizeOf(usize) + 8]u8 = [_]u8{0xAA} ** (2 * @sizeOf(usize) + 8);
+    const app = [_:0]u16{'Z',':','\\','n','o','-','s','u','c','h','.','e','x','e'};
+    try std.testing.expectEqual(@as(u32, 0), CreateProcessW(&app, null, null, null, 0, 0, null, null, null, &pi));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** (2 * @sizeOf(usize) + 8)), &pi);
+    var pia: [2 * @sizeOf(usize) + 8]u8 = [_]u8{0xAA} ** (2 * @sizeOf(usize) + 8);
+    const app_a: [*:0]const u8 = "Z:\\no-such.exe";
+    try std.testing.expectEqual(@as(u32, 0), CreateProcessA(app_a, null, null, null, 0, 0, null, null, null, &pia));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** (2 * @sizeOf(usize) + 8)), &pia);
+    var code: u32 = 0;
+    try std.testing.expectEqual(@as(u32, 1), GetExitCodeProcess(~@as(usize, 0), &code));
+    try std.testing.expectEqual(@as(u32, 259), code);
+    try std.testing.expectEqual(@as(u32, 0), GetExitCodeProcess(0x12345, &code));
+}
+
+test "global lock count follows Windows last-unlock return" {
+    const p = GlobalAlloc(0, 32) orelse return error.OutOfMemory;
+    try std.testing.expect(GlobalLock(p) == p);
+    try std.testing.expect(GlobalLock(p) == p);
+    try std.testing.expectEqual(@as(i32, 1), GlobalUnlock(p));
+    try std.testing.expectEqual(@as(i32, 0), GlobalUnlock(p));
+    _ = GlobalFree(p);
+}
+
+test "CopyFile A and W honor translated paths and fail-if-exists" {
+    const src_path = "/tmp/wins-kstub-copy-src";
+    const dst_path = "/tmp/wins-kstub-copy-dst";
+    const srcfd = linux.open(@ptrCast(src_path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    try std.testing.expect(linux.errno(srcfd) == .SUCCESS);
+    _ = linux.write(@intCast(srcfd), "copy-content".ptr, 12); _ = linux.close(@intCast(srcfd));
+    const src_w = [_:0]u16{'Z',':','\\','t','m','p','\\','w','i','n','s','-','k','s','t','u','b','-','c','o','p','y','-','s','r','c'};
+    const dst_w = [_:0]u16{'Z',':','\\','t','m','p','\\','w','i','n','s','-','k','s','t','u','b','-','c','o','p','y','-','d','s','t'};
+    _ = linux.unlink(@ptrCast(dst_path.ptr));
+    try std.testing.expectEqual(@as(u32, 1), CopyFileW(&src_w, &dst_w, 1));
+    try std.testing.expectEqual(@as(u32, 0), CopyFileW(&src_w, &dst_w, 1));
+    _ = linux.unlink(@ptrCast(dst_path.ptr));
+    const src_a_buf = "Z:\\tmp\\wins-kstub-copy-src";
+    const dst_a_buf = "Z:\\tmp\\wins-kstub-copy-dst";
+    try std.testing.expectEqual(@as(u32, 1), CopyFileA(src_a_buf, dst_a_buf, 0));
+    _ = linux.unlink(@ptrCast(src_path.ptr)); _ = linux.unlink(@ptrCast(dst_path.ptr));
+}
+
+test "power status succeeds with explicit unknown fields when sysfs has no device" {
+    var s: SystemPowerStatus = undefined;
+    try std.testing.expectEqual(@as(i32, 1), GetSystemPowerStatus(&s));
+    try std.testing.expect(s.ACLineStatus <= 1 or s.ACLineStatus == 255);
+    try std.testing.expect(s.BatteryLifePercent <= 100 or s.BatteryLifePercent == 255);
+}
+
+test "thread priority APIs persist values and reject unknown handles" {
+    const current = ~@as(usize, 1);
+    try std.testing.expectEqual(@as(i32, 1), SetThreadPriority(current, -2));
+    try std.testing.expectEqual(@as(i32, -2), GetThreadPriority(current));
+    try std.testing.expectEqual(@as(i32, 0x7FFFFFFF), GetThreadPriority(0x1234));
+    try std.testing.expectEqual(@as(i32, 0), SetThreadPriority(0x1234, 0));
+}
+
+test "current-thread affinity returns its previous Linux mask" {
+    var mask: [16]u64 = [_]u64{0} ** 16;
+    const tid: usize = @intCast(linux.gettid());
+    const got = linux.syscall3(.sched_getaffinity, tid, @sizeOf(@TypeOf(mask)), @intFromPtr(&mask));
+    try std.testing.expect(linux.errno(got) == .SUCCESS);
+    try std.testing.expect(mask[0] != 0);
+    try std.testing.expectEqual(@as(usize, @intCast(mask[0])), SetThreadAffinityMask(~@as(usize, 1), @intCast(mask[0])));
+    try std.testing.expectEqual(@as(usize, 0), SetThreadAffinityMask(0x1234, 1));
 }
 
 fn GetComputerNameW(lpBuffer: ?[*]u16, nSize: ?*u32) callconv(W) i32 {
@@ -2346,8 +3390,16 @@ fn GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: ?[*]u8) callconv(W) u32 {
 }
 
 fn RemoveDirectoryW(lpPathName: ?*const u16) callconv(W) i32 {
-    _ = lpPathName;
-    return 1;
+    var path_buf: [1024]u8 = undefined;
+    const p: ?[*:0]const u16 = if (lpPathName) |q| @ptrCast(q) else null;
+    const host_path = wideToTranslatedPath(p, &path_buf) orelse {
+        setLastError(3); // ERROR_PATH_NOT_FOUND
+        return 0;
+    };
+    const e = linux.errno(linux.rmdir(host_path.ptr));
+    if (e == .SUCCESS) return 1;
+    setLastError(win32ErrorFromErrno(e));
+    return 0;
 }
 
 fn ReplaceFileW(lpReplacedFileName: ?*const u16, lpReplacementFileName: ?*const u16, lpBackupFileName: ?*const u16, dwReplaceFlags: u32, lpExclude: ?*anyopaque, lpReserved: ?*anyopaque) callconv(W) i32 {
@@ -2386,8 +3438,8 @@ fn FileTimeToDosDateTime(lpFileTime: ?*const u64, lpFatDate: ?*u16, lpFatTime: ?
 }
 
 fn FindFirstFileExA(lpFileName: ?[*:0]const u8, fInfoLevelId: u32, lpFindFileData: ?*anyopaque, fSearchOp: u32, lpSearchFilter: ?*anyopaque, dwAdditionalFlags: u32) callconv(W) usize {
-    _ = lpFileName; _ = fInfoLevelId; _ = lpFindFileData; _ = fSearchOp; _ = lpSearchFilter; _ = dwAdditionalFlags;
-    return ~@as(usize, 0);
+    _ = fInfoLevelId; _ = fSearchOp; _ = lpSearchFilter; _ = dwAdditionalFlags;
+    return FindFirstFileA(lpFileName, @ptrCast(lpFindFileData));
 }
 
 fn FlushConsoleInputBuffer(hConsoleInput: usize) callconv(W) i32 {
@@ -2531,24 +3583,172 @@ fn FindFirstStreamW(lpFileName: ?[*:0]const u16, InfoLevel: u32, lpFindStreamDat
     return ~@as(usize, 0);
 }
 
+const IMAGE_RESOURCE_DIRECTORY = extern struct {
+    Characteristics: u32,
+    TimeDateStamp: u32,
+    MajorVersion: u16,
+    MinorVersion: u16,
+    NumberOfNamedEntries: u16,
+    NumberOfIdEntries: u16,
+};
+
+const IMAGE_RESOURCE_DIRECTORY_ENTRY = extern struct {
+    NameOrId: u32,
+    OffsetToData: u32,
+};
+
+pub const IMAGE_RESOURCE_DATA_ENTRY = extern struct {
+    OffsetToData: u32,
+    Size: u32,
+    CodePage: u32,
+    Reserved: u32,
+};
+
+fn peResourceDirSlice(base: usize) ?struct { base: usize, img_size: usize, rsrc: []const u8 } {
+    if (base < 0x10000) return null;
+    const mem: [*]const u8 = @ptrFromInt(base);
+    if (mem[0] != 'M' or mem[1] != 'Z') return null;
+    const e_lfanew = std.mem.readInt(u32, mem[0x3c..][0..4], .little);
+    if (e_lfanew > 0x4000) return null;
+    const pe = mem + e_lfanew;
+    if (pe[0] != 'P' or pe[1] != 'E' or pe[2] != 0 or pe[3] != 0) return null;
+    const magic = std.mem.readInt(u16, pe[24..][0..2], .little);
+    const img_size = std.mem.readInt(u32, pe[24 + 56 ..][0..4], .little);
+    const dd_off: usize = if (magic == 0x20b) 24 + 112 else if (magic == 0x10b) 24 + 96 else return null;
+    // DataDirectory[2] = IMAGE_DIRECTORY_ENTRY_RESOURCE
+    const rsrc_rva = std.mem.readInt(u32, pe[dd_off + 2 * 8 ..][0..4], .little);
+    const rsrc_sz = std.mem.readInt(u32, pe[dd_off + 2 * 8 + 4 ..][0..4], .little);
+    if (rsrc_rva == 0 or rsrc_sz < @sizeOf(IMAGE_RESOURCE_DIRECTORY)) return null;
+    if (@as(u64, rsrc_rva) + rsrc_sz > img_size) return null;
+    return .{ .base = base, .img_size = img_size, .rsrc = mem[rsrc_rva .. rsrc_rva + rsrc_sz] };
+}
+
+fn rsrcMatchNameW(rsrc: []const u8, name_off: u32, target: []const u16) bool {
+    const off: usize = name_off & 0x7fffffff;
+    if (off + 2 > rsrc.len) return false;
+    const nchars = std.mem.readInt(u16, rsrc[off..][0..2], .little);
+    if (nchars != target.len or off + 2 + @as(usize, nchars) * 2 > rsrc.len) return false;
+    for (0..nchars) |i| {
+        const c = std.mem.readInt(u16, rsrc[off + 2 + i * 2 ..][0..2], .little);
+        const lc: u16 = if (c >= 'a' and c <= 'z') c - 32 else c;
+        const tc: u16 = if (target[i] >= 'a' and target[i] <= 'z') target[i] - 32 else target[i];
+        if (lc != tc) return false;
+    }
+    return true;
+}
+
+fn rsrcLookupLevel(rsrc: []const u8, dir_off: usize, key: ?*const anyopaque, ascii_key: ?[*:0]const u8) ?u32 {
+    if (dir_off + @sizeOf(IMAGE_RESOURCE_DIRECTORY) > rsrc.len) return null;
+    const dir: *const IMAGE_RESOURCE_DIRECTORY = @ptrCast(@alignCast(rsrc.ptr + dir_off));
+    const n_named: usize = dir.NumberOfNamedEntries;
+    const n_id: usize = dir.NumberOfIdEntries;
+    const ents_off = dir_off + @sizeOf(IMAGE_RESOURCE_DIRECTORY);
+    if (ents_off + (n_named + n_id) * @sizeOf(IMAGE_RESOURCE_DIRECTORY_ENTRY) > rsrc.len) return null;
+    const ents: [*]const IMAGE_RESOURCE_DIRECTORY_ENTRY = @ptrCast(@alignCast(rsrc.ptr + ents_off));
+
+    const raw_addr = if (key) |k| @intFromPtr(k) else @intFromPtr(ascii_key orelse return null);
+    if (raw_addr < 0x10000) {
+        const id: u32 = @intCast(raw_addr);
+        for (ents[n_named .. n_named + n_id]) |ent| {
+            if (ent.NameOrId == id) return ent.OffsetToData;
+        }
+        return null;
+    }
+    var wbuf: [128]u16 = undefined;
+    var wlen: usize = 0;
+    if (key != null) {
+        const ws: [*:0]const u16 = @ptrCast(@alignCast(key.?));
+        while (wlen < wbuf.len and ws[wlen] != 0) : (wlen += 1) wbuf[wlen] = ws[wlen];
+    } else if (ascii_key) |as| {
+        while (wlen < wbuf.len and as[wlen] != 0) : (wlen += 1) wbuf[wlen] = as[wlen];
+    }
+    for (ents[0..n_named]) |ent| {
+        if ((ent.NameOrId & 0x80000000) != 0 and rsrcMatchNameW(rsrc, ent.NameOrId, wbuf[0..wlen])) {
+            return ent.OffsetToData;
+        }
+    }
+    return null;
+}
+
+pub fn findResourceBytes(hModule: usize, lpName: ?*const anyopaque, lpType: ?*const anyopaque) ?[]const u8 {
+    const base = if (hModule == 0) image_base_addr else hModule;
+    const info = peResourceDirSlice(base) orelse return null;
+    const data_ent_ptr = FindResourceExInternal(info.rsrc, lpName, null, lpType, null, 0) orelse return null;
+    if (@as(u64, data_ent_ptr.OffsetToData) + data_ent_ptr.Size > info.img_size) return null;
+    const mem: [*]const u8 = @ptrFromInt(base);
+    return mem[data_ent_ptr.OffsetToData .. data_ent_ptr.OffsetToData + data_ent_ptr.Size];
+}
+
+fn FindResourceExInternal(
+    rsrc: []const u8,
+    lpNameW: ?*const anyopaque,
+    lpNameA: ?[*:0]const u8,
+    lpTypeW: ?*const anyopaque,
+    lpTypeA: ?[*:0]const u8,
+    lang: u16,
+) ?*const IMAGE_RESOURCE_DATA_ENTRY {
+    const type_off = rsrcLookupLevel(rsrc, 0, lpTypeW, lpTypeA) orelse return null;
+    if ((type_off & 0x80000000) == 0) return null;
+    const name_off = rsrcLookupLevel(rsrc, type_off & 0x7fffffff, lpNameW, lpNameA) orelse return null;
+    if ((name_off & 0x80000000) == 0) return null;
+    const lang_dir_off: usize = name_off & 0x7fffffff;
+    if (lang_dir_off + @sizeOf(IMAGE_RESOURCE_DIRECTORY) > rsrc.len) return null;
+    const lang_dir: *const IMAGE_RESOURCE_DIRECTORY = @ptrCast(@alignCast(rsrc.ptr + lang_dir_off));
+    const total = @as(usize, lang_dir.NumberOfNamedEntries) + lang_dir.NumberOfIdEntries;
+    const ents_off = lang_dir_off + @sizeOf(IMAGE_RESOURCE_DIRECTORY);
+    if (total == 0 or ents_off + total * @sizeOf(IMAGE_RESOURCE_DIRECTORY_ENTRY) > rsrc.len) return null;
+    const ents: [*]const IMAGE_RESOURCE_DIRECTORY_ENTRY = @ptrCast(@alignCast(rsrc.ptr + ents_off));
+    var chosen = ents[0].OffsetToData;
+    if (lang != 0) {
+        for (ents[0..total]) |e| {
+            if (e.NameOrId == lang) {
+                chosen = e.OffsetToData;
+                break;
+            }
+        }
+    }
+    if ((chosen & 0x80000000) != 0) return null;
+    if (@as(usize, chosen) + @sizeOf(IMAGE_RESOURCE_DATA_ENTRY) > rsrc.len) return null;
+    return @ptrCast(@alignCast(rsrc.ptr + chosen));
+}
+
 fn FindResourceW(hModule: usize, lpName: ?*const anyopaque, lpType: ?*const anyopaque) callconv(W) usize {
-    _ = hModule; _ = lpName; _ = lpType;
-    return 0x7001;
+    return FindResourceExW(hModule, lpType, lpName, 0);
+}
+
+fn FindResourceExW(hModule: usize, lpType: ?*const anyopaque, lpName: ?*const anyopaque, wLanguage: u16) callconv(W) usize {
+    const base = if (hModule == 0) image_base_addr else hModule;
+    const info = peResourceDirSlice(base) orelse return 0;
+    const ent = FindResourceExInternal(info.rsrc, lpName, null, lpType, null, wLanguage) orelse return 0;
+    return @intFromPtr(ent);
+}
+
+fn FindResourceA(hModule: usize, lpName: ?[*:0]const u8, lpType: ?[*:0]const u8) callconv(W) usize {
+    const base = if (hModule == 0) image_base_addr else hModule;
+    const info = peResourceDirSlice(base) orelse return 0;
+    const ent = FindResourceExInternal(info.rsrc, null, lpName, null, lpType, 0) orelse return 0;
+    return @intFromPtr(ent);
 }
 
 fn LoadResource(hModule: usize, hResInfo: usize) callconv(W) usize {
-    _ = hModule; _ = hResInfo;
-    return 0x8001;
+    if (hResInfo == 0) return 0;
+    const base = if (hModule == 0) image_base_addr else hModule;
+    const info = peResourceDirSlice(base) orelse return 0;
+    const ent: *const IMAGE_RESOURCE_DATA_ENTRY = @ptrFromInt(hResInfo);
+    if (@as(u64, ent.OffsetToData) + ent.Size > info.img_size) return 0;
+    return base + ent.OffsetToData;
 }
 
 fn LockResource(hResData: usize) callconv(W) ?*anyopaque {
-    _ = hResData;
-    return @ptrFromInt(0x8000);
+    if (hResData < 0x10000) return null;
+    return @ptrFromInt(hResData);
 }
 
 fn SizeofResource(hModule: usize, hResInfo: usize) callconv(W) u32 {
-    _ = hModule; _ = hResInfo;
-    return 64;
+    _ = hModule;
+    if (hResInfo < 0x10000) return 0;
+    const ent: *const IMAGE_RESOURCE_DATA_ENTRY = @ptrFromInt(hResInfo);
+    return ent.Size;
 }
 
 fn GetLongPathNameW(lpszShortPath: ?[*:0]const u16, lpszLongPath: ?[*:0]u16, cchBuffer: u32) callconv(W) u32 {
@@ -2682,6 +3882,165 @@ fn GetVersion() callconv(W) u32 {
     return 0x00060001;
 }
 
+fn FatalAppExitA(uAction: u32, lpMessageText: ?[*:0]const u8) callconv(W) void {
+    _ = uAction;
+    if (lpMessageText) |msg| {
+        std.debug.print("[WINS:FatalAppExitA] {s}\n", .{std.mem.span(msg)});
+    }
+    linux.exit_group(1);
+}
+
+fn SetHandleCount(uNumberOfHandles: u32) callconv(W) u32 {
+    return uNumberOfHandles;
+}
+
+fn HeapSetInformation(HeapHandle: usize, HeapInformationClass: u32, HeapInformation: ?*const anyopaque, HeapInformationLength: usize) callconv(W) i32 {
+    _ = HeapHandle;
+    _ = HeapInformationClass;
+    _ = HeapInformation;
+    _ = HeapInformationLength;
+    return 1;
+}
+
+fn ansiToWideBuf(src: ?[*:0]const u8, buf: []u16) ?[*:0]const u16 {
+    const p = src orelse return null;
+    const s = std.mem.span(p);
+    const n = @min(s.len, buf.len - 1);
+    for (s[0..n], 0..) |c, idx| buf[idx] = c;
+    buf[n] = 0;
+    return @ptrCast(buf.ptr);
+}
+
+fn CreateDirectoryA(lpPathName: ?[*:0]const u8, sa: ?*anyopaque) callconv(W) u32 {
+    var wbuf: [1024]u16 = undefined;
+    const wp = ansiToWideBuf(lpPathName, &wbuf) orelse {
+        setLastError(3);
+        return 0;
+    };
+    return CreateDirectoryW(wp, sa);
+}
+
+fn MoveFileA(lpExistingFileName: ?[*:0]const u8, lpNewFileName: ?[*:0]const u8) callconv(W) u32 {
+    var wsrc: [1024]u16 = undefined;
+    var wdst: [1024]u16 = undefined;
+    const ws = ansiToWideBuf(lpExistingFileName, &wsrc) orelse return 0;
+    const wd = ansiToWideBuf(lpNewFileName, &wdst) orelse return 0;
+    return MoveFileW(ws, wd);
+}
+
+fn LocalFileTimeToFileTime(lpLocalFileTime: ?*const u64, lpFileTime: ?*u64) callconv(W) i32 {
+    if (lpLocalFileTime == null or lpFileTime == null) return 0;
+    lpFileTime.?.* = lpLocalFileTime.?.*;
+    return 1;
+}
+
+fn RtlInstallFunctionTableCallback(
+    TableIdentifier: usize,
+    BaseAddress: usize,
+    Length: u32,
+    Callback: ?*const anyopaque,
+    Context: ?*anyopaque,
+    OutOfProcessCallbackDll: ?[*:0]const u16,
+) callconv(W) u8 {
+    _ = OutOfProcessCallbackDll;
+    return if (comptime builtin.cpu.arch == .x86_64)
+        seh64.installFunctionTableCallback(TableIdentifier, BaseAddress, Length, Callback, Context)
+    else
+        1;
+}
+
+fn RtlDeleteFunctionTable(FunctionTable: ?*anyopaque) callconv(W) u8 {
+    return if (comptime builtin.cpu.arch == .x86_64) seh64.deleteFunctionTable(FunctionTable) else 1;
+}
+
+fn RtlAddFunctionTable(FunctionTable: ?*anyopaque, EntryCount: u32, BaseAddress: usize) callconv(W) u8 {
+    return if (comptime builtin.cpu.arch == .x86_64)
+        seh64.addFunctionTable(@ptrCast(@alignCast(FunctionTable)), EntryCount, BaseAddress)
+    else
+        1;
+}
+
+fn GlobalReAlloc(hMem: ?*anyopaque, dwBytes: usize, uFlags: u32) callconv(W) ?*anyopaque {
+    _ = uFlags;
+    if (hMem == null) return HeapAlloc(HEAP_COOKIE, 0, dwBytes);
+    return HeapReAlloc(HEAP_COOKIE, 0, @ptrCast(hMem.?), dwBytes);
+}
+
+fn GetProcessWorkingSetSize(hProcess: usize, lpMinimumWorkingSetSize: ?*usize, lpMaximumWorkingSetSize: ?*usize) callconv(W) i32 {
+    _ = hProcess;
+    if (lpMinimumWorkingSetSize) |p| p.* = 1024 * 1024;
+    if (lpMaximumWorkingSetSize) |p| p.* = 64 * 1024 * 1024;
+    return 1;
+}
+
+fn SetProcessWorkingSetSize(hProcess: usize, dwMinimumWorkingSetSize: usize, dwMaximumWorkingSetSize: usize) callconv(W) i32 {
+    _ = hProcess;
+    _ = dwMinimumWorkingSetSize;
+    _ = dwMaximumWorkingSetSize;
+    return 1;
+}
+
+fn GetPriorityClass(hProcess: usize) callconv(W) u32 {
+    _ = hProcess;
+    return 0x20; // NORMAL_PRIORITY_CLASS
+}
+
+fn SetPriorityClass(hProcess: usize, dwPriorityClass: u32) callconv(W) i32 {
+    _ = hProcess;
+    _ = dwPriorityClass;
+    return 1;
+}
+
+fn OpenSemaphoreW(dwDesiredAccess: u32, bInheritHandle: i32, lpName: ?[*:0]const u16) callconv(W) usize {
+    _ = dwDesiredAccess;
+    _ = bInheritHandle;
+    _ = lpName;
+    return 0;
+}
+
+fn OpenThread(dwDesiredAccess: u32, bInheritHandle: i32, dwThreadId: u32) callconv(W) usize {
+    _ = dwDesiredAccess;
+    _ = bInheritHandle;
+    return 0x20000 | (@as(usize, dwThreadId) & 0xFFFF);
+}
+
+fn WaitForMultipleObjectsEx(nCount: u32, lpHandles: ?*const usize, bWaitAll: u32, dwMilliseconds: u32, bAlertable: i32) callconv(W) u32 {
+    _ = bAlertable;
+    return WaitForMultipleObjects(nCount, lpHandles, bWaitAll, dwMilliseconds);
+}
+
+fn FreeConsole() callconv(W) i32 {
+    return 1;
+}
+
+fn AddVectoredExceptionHandler(First: u32, Handler: ?*const anyopaque) callconv(W) ?*anyopaque {
+    return if (comptime builtin.cpu.arch == .x86_64)
+        seh64.addVectoredExceptionHandler(First, Handler)
+    else
+        @constCast(Handler);
+}
+
+fn RemoveVectoredExceptionHandler(Handle: ?*anyopaque) callconv(W) u32 {
+    return if (comptime builtin.cpu.arch == .x86_64) seh64.removeVectoredExceptionHandler(Handle) else 1;
+}
+
+fn EnumSystemLocalesA(lpLocaleEnumProc: ?*const anyopaque, dwFlags: u32) callconv(W) i32 {
+    _ = dwFlags;
+    const cb: *const fn ([*:0]const u8) callconv(W) i32 = @ptrCast(@alignCast(lpLocaleEnumProc orelse return 0));
+    _ = cb("00000409");
+    return 1;
+}
+
+fn VerLanguageNameW(wLang: u32, szLang: ?[*]u16, cchLang: u32) callconv(W) u32 {
+    _ = wLang;
+    const msg = [_]u16{ 'E', 'n', 'g', 'l', 'i', 's', 'h', ' ', '(', 'U', 'n', 'i', 't', 'e', 'd', ' ', 'S', 't', 'a', 't', 'e', 's', ')' };
+    if (szLang == null or cchLang == 0) return msg.len;
+    const n: u32 = @min(cchLang - 1, @as(u32, msg.len));
+    @memcpy(szLang.?[0..n], msg[0..n]);
+    szLang.?[n] = 0;
+    return n;
+}
+
 pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "VirtualAlloc")) return @intFromPtr(&VirtualAlloc);
     if (std.mem.eql(u8, name, "VirtualFree")) return @intFromPtr(&VirtualFree);
@@ -2694,6 +4053,7 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "CreateWaitableTimerA")) return @intFromPtr(&CreateWaitableTimerA);
     if (std.mem.eql(u8, name, "SignalObjectAndWait")) return @intFromPtr(&SignalObjectAndWait);
     if (std.mem.eql(u8, name, "SetThreadPriority")) return @intFromPtr(&SetThreadPriority);
+    if (std.mem.eql(u8, name, "GetThreadPriority")) return @intFromPtr(&GetThreadPriority);
     if (std.mem.eql(u8, name, "SetThreadAffinityMask")) return @intFromPtr(&SetThreadAffinityMask);
     if (std.mem.eql(u8, name, "SwitchToThread")) return @intFromPtr(&SwitchToThread);
     if (std.mem.eql(u8, name, "InterlockedPopEntrySList")) return @intFromPtr(&InterlockedPopEntrySList);
@@ -2727,6 +4087,7 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "GlobalUnlock")) return @intFromPtr(&GlobalUnlock);
     if (std.mem.eql(u8, name, "GlobalFree")) return @intFromPtr(&GlobalFree);
     if (std.mem.eql(u8, name, "CopyFileW")) return @intFromPtr(&CopyFileW);
+    if (std.mem.eql(u8, name, "CopyFileA")) return @intFromPtr(&CopyFileA);
     if (std.mem.eql(u8, name, "ReleaseMutex")) return @intFromPtr(&ReleaseMutex);
     if (std.mem.eql(u8, name, "CreateIoCompletionPort")) return @intFromPtr(&CreateIoCompletionPort);
     if (std.mem.eql(u8, name, "GetQueuedCompletionStatus")) return @intFromPtr(&GetQueuedCompletionStatus);
@@ -2741,11 +4102,11 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "FreeLibraryAndExitThread")) return @intFromPtr(&FreeLibraryAndExitThread);
     if (std.mem.eql(u8, name, "SetUnhandledExceptionFilter")) return @intFromPtr(&SetUnhandledExceptionFilter);
     if (std.mem.eql(u8, name, "UnhandledExceptionFilter")) return @intFromPtr(&UnhandledExceptionFilter);
-    if (std.mem.eql(u8, name, "RaiseException")) return @intFromPtr(&RaiseException);
+    if (std.mem.eql(u8, name, "RaiseException")) return raiseExceptionAddr();
     if (std.mem.eql(u8, name, "RtlPcToFileHeader")) return @intFromPtr(&RtlPcToFileHeader);
     if (std.mem.eql(u8, name, "RtlUnwind")) return @intFromPtr(&RtlUnwind);
     if (std.mem.eql(u8, name, "RtlUnwindEx")) return @intFromPtr(&RtlUnwindEx);
-    if (std.mem.eql(u8, name, "RtlCaptureContext")) return @intFromPtr(&RtlCaptureContext);
+    if (std.mem.eql(u8, name, "RtlCaptureContext")) return rtlCaptureContextAddr();
     if (std.mem.eql(u8, name, "RtlLookupFunctionEntry")) return @intFromPtr(&RtlLookupFunctionEntry);
     if (std.mem.eql(u8, name, "RtlVirtualUnwind")) return @intFromPtr(&RtlVirtualUnwind);
     if (std.mem.eql(u8, name, "EncodePointer")) return @intFromPtr(&EncodePointer);
@@ -2864,6 +4225,7 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "OutputDebugStringW")) return @intFromPtr(&OutputDebugStringW);
     if (std.mem.eql(u8, name, "AreFileApisANSI")) return @intFromPtr(&AreFileApisANSI);
     if (std.mem.eql(u8, name, "GetSystemInfo")) return @intFromPtr(&GetSystemInfo);
+    if (std.mem.eql(u8, name, "GetLogicalProcessorInformation")) return @intFromPtr(&GetLogicalProcessorInformation);
 
     // Extended File & Console APIs
     if (std.mem.eql(u8, name, "ReadConsoleW")) return @intFromPtr(&ReadConsoleW);
@@ -3025,6 +4387,8 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "GetFinalPathNameByHandleW")) return @intFromPtr(&GetFinalPathNameByHandleW);
     if (std.mem.eql(u8, name, "FindFirstStreamW")) return @intFromPtr(&FindFirstStreamW);
     if (std.mem.eql(u8, name, "FindResourceW")) return @intFromPtr(&FindResourceW);
+    if (std.mem.eql(u8, name, "FindResourceExW")) return @intFromPtr(&FindResourceExW);
+    if (std.mem.eql(u8, name, "FindResourceA")) return @intFromPtr(&FindResourceA);
     if (std.mem.eql(u8, name, "LoadResource")) return @intFromPtr(&LoadResource);
     if (std.mem.eql(u8, name, "LockResource")) return @intFromPtr(&LockResource);
     if (std.mem.eql(u8, name, "SizeofResource")) return @intFromPtr(&SizeofResource);
@@ -3052,6 +4416,105 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "InitOnceBeginInitialize")) return @intFromPtr(&InitOnceBeginInitialize);
     if (std.mem.eql(u8, name, "InitOnceComplete")) return @intFromPtr(&InitOnceComplete);
     if (std.mem.eql(u8, name, "GetVersion")) return @intFromPtr(&GetVersion);
+    if (std.mem.eql(u8, name, "FatalAppExitA")) return @intFromPtr(&FatalAppExitA);
+    if (std.mem.eql(u8, name, "SetHandleCount")) return @intFromPtr(&SetHandleCount);
+    if (std.mem.eql(u8, name, "HeapSetInformation")) return @intFromPtr(&HeapSetInformation);
+    if (std.mem.eql(u8, name, "CreateDirectoryA")) return @intFromPtr(&CreateDirectoryA);
+    if (std.mem.eql(u8, name, "MoveFileA")) return @intFromPtr(&MoveFileA);
+    if (std.mem.eql(u8, name, "LocalFileTimeToFileTime")) return @intFromPtr(&LocalFileTimeToFileTime);
+    if (std.mem.eql(u8, name, "RtlInstallFunctionTableCallback")) return @intFromPtr(&RtlInstallFunctionTableCallback);
+    if (std.mem.eql(u8, name, "RtlDeleteFunctionTable")) return @intFromPtr(&RtlDeleteFunctionTable);
+    if (std.mem.eql(u8, name, "RtlAddFunctionTable")) return @intFromPtr(&RtlAddFunctionTable);
+    if (std.mem.eql(u8, name, "GlobalReAlloc")) return @intFromPtr(&GlobalReAlloc);
+    if (std.mem.eql(u8, name, "GetProcessWorkingSetSize")) return @intFromPtr(&GetProcessWorkingSetSize);
+    if (std.mem.eql(u8, name, "SetProcessWorkingSetSize")) return @intFromPtr(&SetProcessWorkingSetSize);
+    if (std.mem.eql(u8, name, "GetPriorityClass")) return @intFromPtr(&GetPriorityClass);
+    if (std.mem.eql(u8, name, "SetPriorityClass")) return @intFromPtr(&SetPriorityClass);
+    if (std.mem.eql(u8, name, "OpenSemaphoreW")) return @intFromPtr(&OpenSemaphoreW);
+    if (std.mem.eql(u8, name, "OpenThread")) return @intFromPtr(&OpenThread);
+    if (std.mem.eql(u8, name, "WaitForMultipleObjectsEx")) return @intFromPtr(&WaitForMultipleObjectsEx);
+    if (std.mem.eql(u8, name, "FreeConsole")) return @intFromPtr(&FreeConsole);
+    if (std.mem.eql(u8, name, "AddVectoredExceptionHandler")) return @intFromPtr(&AddVectoredExceptionHandler);
+    if (std.mem.eql(u8, name, "RemoveVectoredExceptionHandler")) return @intFromPtr(&RemoveVectoredExceptionHandler);
+    if (std.mem.eql(u8, name, "EnumSystemLocalesA")) return @intFromPtr(&EnumSystemLocalesA);
+    if (std.mem.eql(u8, name, "VerLanguageNameW")) return @intFromPtr(&VerLanguageNameW);
 
     return null;
+}
+
+test "setCommandLine quotes spaces, empty args, quotes, and trailing backslashes" {
+    setCommandLine(&.{ "sqlite3.exe", ":memory:", "SELECT 40 + 2;" });
+    try std.testing.expectEqualStrings(
+        "sqlite3.exe :memory: \"SELECT 40 + 2;\"",
+        std.mem.sliceTo(&cmdline_storage_a, 0),
+    );
+
+    setCommandLine(&.{ "app.exe", "", "say \"hi\"", "C:\\dir with space\\" });
+    try std.testing.expectEqualStrings(
+        "app.exe \"\" \"say \\\"hi\\\"\" \"C:\\dir with space\\\\\"",
+        std.mem.sliceTo(&cmdline_storage_a, 0),
+    );
+}
+
+test "findResourceBytes traverses 3-level PE .rsrc directory tree" {
+    var img: [1024]u8 align(8) = [_]u8{0} ** 1024;
+    img[0] = 'M';
+    img[1] = 'Z';
+    std.mem.writeInt(u32, img[0x3c..][0..4], 0x40, .little);
+    img[0x40] = 'P';
+    img[0x41] = 'E';
+    std.mem.writeInt(u16, img[0x40 + 24 ..][0..2], 0x20b, .little);
+    std.mem.writeInt(u32, img[0x40 + 24 + 56 ..][0..4], img.len, .little);
+    const rsrc_rva: u32 = 0x180;
+    std.mem.writeInt(u32, img[0x40 + 24 + 112 + 16 ..][0..4], rsrc_rva, .little);
+    std.mem.writeInt(u32, img[0x40 + 24 + 112 + 20 ..][0..4], 0x100, .little);
+    // Level 1 (type): 1 ID entry -> type 6 (RT_STRING) -> subdir at offset 0x20
+    std.mem.writeInt(u16, img[rsrc_rva + 14 ..][0..2], 1, .little);
+    std.mem.writeInt(u32, img[rsrc_rva + 16 ..][0..4], 6, .little);
+    std.mem.writeInt(u32, img[rsrc_rva + 20 ..][0..4], 0x80000020, .little);
+    // Level 2 (name): 1 ID entry -> id 1 -> subdir at offset 0x40
+    std.mem.writeInt(u16, img[rsrc_rva + 0x20 + 14 ..][0..2], 1, .little);
+    std.mem.writeInt(u32, img[rsrc_rva + 0x20 + 16 ..][0..4], 1, .little);
+    std.mem.writeInt(u32, img[rsrc_rva + 0x20 + 20 ..][0..4], 0x80000040, .little);
+    // Level 3 (lang): 1 ID entry -> lang 0x0409 -> data entry at offset 0x60
+    std.mem.writeInt(u16, img[rsrc_rva + 0x40 + 14 ..][0..2], 1, .little);
+    std.mem.writeInt(u32, img[rsrc_rva + 0x40 + 16 ..][0..4], 0x0409, .little);
+    std.mem.writeInt(u32, img[rsrc_rva + 0x40 + 20 ..][0..4], 0x60, .little);
+    // IMAGE_RESOURCE_DATA_ENTRY at offset 0x60: RVA=0x300, Size=4
+    std.mem.writeInt(u32, img[rsrc_rva + 0x60 ..][0..4], 0x300, .little);
+    std.mem.writeInt(u32, img[rsrc_rva + 0x60 + 4 ..][0..4], 4, .little);
+    @memcpy(img[0x300..0x304], "WINS");
+
+    const hit = findResourceBytes(@intFromPtr(&img), @ptrFromInt(1), @ptrFromInt(6));
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqualStrings("WINS", hit.?);
+
+    const miss = findResourceBytes(@intFromPtr(&img), @ptrFromInt(99), @ptrFromInt(6));
+    try std.testing.expect(miss == null);
+}
+
+test "CreateDirectoryW reports ERROR_ALREADY_EXISTS and RemoveDirectoryW really removes" {
+    var last: u32 = 0;
+    const Hook = struct {
+        var slot: *u32 = undefined;
+        fn set(code: u32) callconv(W) void {
+            slot.* = code;
+        }
+    };
+    Hook.slot = &last;
+    const saved = last_error_hook;
+    last_error_hook = &Hook.set;
+    defer last_error_hook = saved;
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/wins-k32-dirtest-{d}", .{linux.getpid()});
+    var w: [64]u16 = undefined;
+    for (name, 0..) |ch, i| w[i] = ch;
+    w[name.len] = 0;
+    const wp: [*:0]const u16 = @ptrCast(&w);
+    try std.testing.expectEqual(@as(u32, 1), CreateDirectoryW(wp, null));
+    try std.testing.expectEqual(@as(u32, 0), CreateDirectoryW(wp, null));
+    try std.testing.expectEqual(@as(u32, 183), last);
+    try std.testing.expectEqual(@as(i32, 1), RemoveDirectoryW(@ptrCast(wp)));
+    try std.testing.expectEqual(@as(i32, 0), RemoveDirectoryW(@ptrCast(wp)));
+    try std.testing.expectEqual(@as(u32, 3), last);
 }

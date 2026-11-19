@@ -16,9 +16,9 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
             7 => "getsockopt",
             8 => "htonl",
             9 => "htons",
-            10 => "inet_addr",
-            11 => "inet_ntoa",
-            12 => "ioctlsocket",
+            10 => "ioctlsocket",
+            11 => "inet_addr",
+            12 => "inet_ntoa",
             13 => "listen",
             14 => "ntohl",
             15 => "ntohs",
@@ -69,6 +69,16 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
             10 => "VariantCopy",
             11 => "VariantCopyInd",
             12 => "VariantChangeType",
+            15 => "SafeArrayCreate",
+            16 => "SafeArrayDestroy",
+            17 => "SafeArrayGetDim",
+            19 => "SafeArrayGetUBound",
+            20 => "SafeArrayGetLBound",
+            23 => "SafeArrayAccessData",
+            24 => "SafeArrayUnaccessData",
+            25 => "SafeArrayGetElement",
+            26 => "SafeArrayPutElement",
+            148 => "SafeArrayPtrOfIndex",
             149 => "SysStringByteLen",
             150 => "SysAllocStringByteLen",
             200 => "GetErrorInfo",
@@ -78,20 +88,22 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
 
     if (std.ascii.eqlIgnoreCase(dll, "comctl32.dll")) {
         return switch (ord) {
-            17 => "_TrackMouseEvent",
-            345 => "SetWindowSubclass",
-            381 => "DefSubclassProc",
-            410 => "RemoveWindowSubclass",
-            411 => "TaskDialogIndirect",
-            412 => "TaskDialog",
-            413 => "UnregisterClassW",
+            17 => "InitCommonControls",
+            344 => "TaskDialog",
+            345 => "TaskDialogIndirect",
+            380 => "LoadIconMetric",
+            381 => "LoadIconWithScaleDown",
+            410 => "SetWindowSubclass",
+            411 => "GetWindowSubclass",
+            412 => "RemoveWindowSubclass",
+            413 => "DefSubclassProc",
             else => null,
         };
     }
 
     if (std.ascii.eqlIgnoreCase(dll, "shell32.dll")) {
         return switch (ord) {
-            165 => "SHCreateDirectoryExW",
+            165 => "SHCreateDirectory",
             else => null,
         };
     }
@@ -151,4 +163,17 @@ pub fn getOrdinalName(dll: []const u8, ord: u16) ?[]const u8 {
     }
 
     return null;
+}
+
+test "comctl32 and shell32 ordinals match Windows export tables" {
+    try std.testing.expectEqualStrings("InitCommonControls", getOrdinalName("COMCTL32.dll", 17).?);
+    try std.testing.expectEqualStrings("TaskDialog", getOrdinalName("comctl32.dll", 344).?);
+    try std.testing.expectEqualStrings("TaskDialogIndirect", getOrdinalName("comctl32.dll", 345).?);
+    try std.testing.expectEqualStrings("LoadIconMetric", getOrdinalName("comctl32.dll", 380).?);
+    try std.testing.expectEqualStrings("LoadIconWithScaleDown", getOrdinalName("comctl32.dll", 381).?);
+    try std.testing.expectEqualStrings("SetWindowSubclass", getOrdinalName("comctl32.dll", 410).?);
+    try std.testing.expectEqualStrings("GetWindowSubclass", getOrdinalName("comctl32.dll", 411).?);
+    try std.testing.expectEqualStrings("RemoveWindowSubclass", getOrdinalName("comctl32.dll", 412).?);
+    try std.testing.expectEqualStrings("DefSubclassProc", getOrdinalName("comctl32.dll", 413).?);
+    try std.testing.expectEqualStrings("SHCreateDirectory", getOrdinalName("SHELL32.dll", 165).?);
 }

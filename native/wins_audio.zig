@@ -15,6 +15,7 @@
 //! WINS_AUDIO=0 disables output (decode still works) for headless runs.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 extern fn dlopen(path: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, sym: [*:0]const u8) ?*anyopaque;
@@ -61,7 +62,11 @@ fn loadMpg() Error!*const Mpg {
         2 => return Error.LibraryMissing,
         else => {},
     }
-    const h = openLib("WINS_LIBMPG123", &.{ "libmpg123.so.0", "/usr/lib/i386-linux-gnu/libmpg123.so.0" }) orelse {
+    const mpg_candidates: []const [*:0]const u8 = if (builtin.cpu.arch == .x86_64)
+        &.{ "libmpg123.so.0", "/usr/lib/x86_64-linux-gnu/libmpg123.so.0", "/usr/lib64/libmpg123.so.0" }
+    else
+        &.{ "libmpg123.so.0", "/usr/lib/i386-linux-gnu/libmpg123.so.0" };
+    const h = openLib("WINS_LIBMPG123", mpg_candidates) orelse {
         mpg_once.store(2, .release);
         return Error.LibraryMissing;
     };
@@ -185,11 +190,16 @@ fn loadPa() Error!*const Pa {
         2 => return Error.LibraryMissing,
         else => {},
     }
-    const h = openLib("WINS_LIBPULSE_SIMPLE", &.{ "libpulse-simple.so.0", "/usr/lib/i386-linux-gnu/libpulse-simple.so.0" }) orelse {
+    const pa_candidates: []const [*:0]const u8 = if (builtin.cpu.arch == .x86_64)
+        &.{ "libpulse-simple.so.0", "/usr/lib/x86_64-linux-gnu/libpulse-simple.so.0", "/usr/lib64/libpulse-simple.so.0" }
+    else
+        &.{ "libpulse-simple.so.0", "/usr/lib/i386-linux-gnu/libpulse-simple.so.0" };
+    const h = openLib("WINS_LIBPULSE_SIMPLE", pa_candidates) orelse {
         pa_once.store(2, .release);
         return Error.LibraryMissing;
     };
-    const core = dlopen("libpulse.so.0", RTLD_NOW);
+    const core = dlopen("libpulse.so.0", RTLD_NOW) orelse
+        if (builtin.cpu.arch == .x86_64) dlopen("/usr/lib/x86_64-linux-gnu/libpulse.so.0", RTLD_NOW) else dlopen("/usr/lib/i386-linux-gnu/libpulse.so.0", RTLD_NOW);
     pa = .{
         .new = sym(@TypeOf(pa.new), h, "pa_simple_new") orelse return Error.SymbolMissing,
         .write = sym(@TypeOf(pa.write), h, "pa_simple_write") orelse return Error.SymbolMissing,
@@ -215,11 +225,13 @@ pub const Output = struct {
     channels: u32,
 
     pub fn open(rate: u32, channels: u32, stream_name: [*:0]const u8) Error!Output {
+        if (rate == 0 or channels == 0 or channels > 255) return Error.NoAudio;
         const p = try loadPa();
         const spec = PaSampleSpec{ .format = 3, .rate = rate, .channels = @intCast(channels) }; // PA_SAMPLE_S16LE
-        const bytes_per_sec = rate * channels * 2;
+        const bytes_per_sec: u64 = @as(u64, rate) * channels * 2;
+        const tlen: u32 = @intCast(@min(@as(u64, 0xFFFFFFFF), @max(@as(u64, 1), bytes_per_sec * 60 / 1000)));
         // ~60 ms target buffer so pause, seek and volume answer quickly.
-        const attr = PaBufferAttr{ .maxlength = 0xFFFFFFFF, .tlength = bytes_per_sec * 60 / 1000, .prebuf = 0xFFFFFFFF, .minreq = 0xFFFFFFFF, .fragsize = 0xFFFFFFFF };
+        const attr = PaBufferAttr{ .maxlength = 0xFFFFFFFF, .tlength = tlen, .prebuf = 0xFFFFFFFF, .minreq = 0xFFFFFFFF, .fragsize = 0xFFFFFFFF };
         var err: c_int = 0;
         const s = p.new(null, "WINS", 1, null, stream_name, &spec, null, &attr, &err) orelse {
             const why: [*:0]const u8 = if (p.strerror) |f| f(err) else "unknown";

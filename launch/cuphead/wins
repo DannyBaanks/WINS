@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+TOOL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+verb=${1:-}
+case "$verb" in
+  waitforexitandrun|run)
+    printf '[WINS Steam] verb=%s SteamAppId=%s SteamGameId=%s STEAM_COMPAT_APP_ID=%s args=%s\n' \
+      "$verb" "${SteamAppId:-unset}" "${SteamGameId:-unset}" "${STEAM_COMPAT_APP_ID:-unset}" "$#" >&2
+    WINS_STEAM_VERB="$verb"
+    export WINS_STEAM_VERB
+    exec "$TOOL_DIR/launch-cuphead"
+    ;;
+  *)
+    printf 'WINS Cuphead tool: unsupported Steam verb: %s\n' "$verb" >&2
+    exit 2
+    ;;
+esac
