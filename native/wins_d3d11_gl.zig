@@ -903,7 +903,7 @@ fn writeFileZ(path: [:0]const u8, data: []const u8) void {
     _ = fclose(f);
 }
 
-fn dumpFile(dir: []const u8, prog: GLuint, suffix: []const u8, data: []const u8) void {
+pub fn dumpFile(dir: []const u8, prog: GLuint, suffix: []const u8, data: []const u8) void {
     var path_buf: [1024]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/p{d:0>4}_{s}", .{ dir, prog, suffix }) catch return;
     const f = fopen(path.ptr, "wb") orelse return;

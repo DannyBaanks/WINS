@@ -835,6 +835,17 @@ fn devCreateBuffer(_: ?*anyopaque, desc: *const D3D11_BUFFER_DESC, init_data: ?*
     return S_OK;
 }
 
+/// A typeless texture bound as a depth-stencil target needs depth storage in
+/// GL (DS3 shadow maps are R16_TYPELESS with BIND_DEPTH_STENCIL; as R16F the
+/// FBO was incomplete and every shadow pass was dropped).
+fn depthStorageFormat(fmt: u32, bind: u32) u32 {
+    if (bind & 0x40 == 0) return fmt;
+    return switch (fmt) {
+        53 => 55, // R16_TYPELESS -> D16_UNORM
+        else => fmt,
+    };
+}
+
 fn devCreateTexture2D(_: ?*anyopaque, desc: *const D3D11_TEXTURE2D_DESC, init_data: ?[*]const D3D11_SUBRESOURCE_DATA, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
     const t = alloc.create(glb.Texture) catch return E_FAIL;
@@ -844,7 +855,7 @@ fn devCreateTexture2D(_: ?*anyopaque, desc: *const D3D11_TEXTURE2D_DESC, init_da
         .height = desc.Height,
         .mip_levels = desc.MipLevels,
         .array_size = desc.ArraySize,
-        .dxgi_fmt = desc.Format,
+        .dxgi_fmt = depthStorageFormat(desc.Format, desc.BindFlags),
         .bind_flags = desc.BindFlags,
         .usage = desc.Usage,
         .cpu_access = desc.CPUAccessFlags,
@@ -1130,8 +1141,16 @@ fn devCreatePixelShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*any
     return S_OK;
 }
 
-fn devCreateDummyShader(_: ?*anyopaque, _: [*]const u8, _: usize, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
+var dummy_shader_n: std.atomic.Value(u32) = .init(0);
+
+/// GS/HS/DS/CS are not translated yet. With WINS_D3D11_DUMP_DIR their DXBC is
+/// written as p<900000+n>_xs.dxbc so the missing stages can be studied offline.
+fn devCreateDummyShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
+    if (std.c.getenv("WINS_D3D11_DUMP_DIR")) |dz| {
+        const n = dummy_shader_n.fetchAdd(1, .monotonic);
+        glb.dumpFile(std.mem.span(dz), 900000 + n, "xs.dxbc", bc[0..bc_len]);
+    }
     pp.?.* = newCom(&child_vtbl, .query, 0, g_device);
     return S_OK;
 }
