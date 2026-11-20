@@ -244,3 +244,97 @@ test "foundation: symbols, classes, NSString/NSData and autorelease pool" {
     try std.testing.expect(d != null);
     objc.shim_objc_autoreleasePoolPop(pool);
 }
+
+fn testSwiftOnceCb(ctx: ?*anyopaque) callconv(.c) void {
+    const counter: *usize = @ptrCast(@alignCast(ctx.?));
+    counter.* += 1;
+}
+
+test "swift: runtime symbols, alloc/retain/release and swift_once" {
+    const shims = wins_macho.shims;
+    const swift = wins_macho.swift;
+
+    const required_syms = [_][]const u8{
+        "_putchar",
+        "_posix_memalign",
+        "_swift_allocObject",
+        "_swift_retain",
+        "_swift_release",
+        "_swift_retainCount",
+        "_swift_deallocObject",
+        "_swift_once",
+        "_swift_getObjectType",
+    };
+    for (required_syms) |sym| {
+        try std.testing.expect(shims.lookup(sym) != null);
+    }
+
+    const obj = swift.shim_swift_allocObject(0x1234, 32, 7);
+    try std.testing.expect(obj != null);
+    try std.testing.expectEqual(@as(usize, 0x1234), swift.shim_swift_getObjectType(obj));
+    try std.testing.expectEqual(@as(usize, 1), swift.shim_swift_retainCount(obj));
+    _ = swift.shim_swift_retain(obj);
+    try std.testing.expectEqual(@as(usize, 2), swift.shim_swift_retainCount(obj));
+    swift.shim_swift_release(obj);
+    try std.testing.expectEqual(@as(usize, 1), swift.shim_swift_retainCount(obj));
+    swift.shim_swift_release(obj);
+
+    var pred: isize = 0;
+    var count: usize = 0;
+    swift.shim_swift_once(&pred, &testSwiftOnceCb, &count);
+    swift.shim_swift_once(&pred, &testSwiftOnceCb, &count);
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+fn testDispatchApplyCb(ctx: ?*anyopaque, idx: usize) callconv(.c) void {
+    const acc: *usize = @ptrCast(@alignCast(ctx.?));
+    acc.* += idx + 1;
+}
+
+test "dispatch: queues, apply_f, semaphore and group" {
+    const shims = wins_macho.shims;
+    const dispatch = wins_macho.dispatch;
+
+    const required_syms = [_][]const u8{
+        "__Block_copy",
+        "__Block_release",
+        "__Block_object_assign",
+        "__Block_object_dispose",
+        "__dispatch_main_q",
+        "__dispatch_queue_attr_concurrent",
+        "_dispatch_get_global_queue",
+        "_dispatch_queue_create",
+        "_dispatch_queue_get_label",
+        "_dispatch_async_f",
+        "_dispatch_sync_f",
+        "_dispatch_apply_f",
+        "_dispatch_once_f",
+        "_dispatch_group_create",
+        "_dispatch_group_enter",
+        "_dispatch_group_leave",
+        "_dispatch_group_wait",
+        "_dispatch_semaphore_create",
+        "_dispatch_semaphore_wait",
+        "_dispatch_semaphore_signal",
+        "_dispatch_release",
+    };
+    for (required_syms) |sym| {
+        try std.testing.expect(shims.lookup(sym) != null);
+    }
+
+    const q = dispatch.shim_dispatch_queue_create("test.queue", null);
+    try std.testing.expect(q != null);
+    try std.testing.expectEqualStrings("test.queue", std.mem.span(dispatch.shim_dispatch_queue_get_label(q)));
+
+    var acc: usize = 0;
+    dispatch.shim_dispatch_apply_f(4, q, &acc, &testDispatchApplyCb);
+    try std.testing.expectEqual(@as(usize, 10), acc); // 1 + 2 + 3 + 4 = 10
+
+    const sem = dispatch.shim_dispatch_semaphore_create(1);
+    try std.testing.expect(sem != null);
+    try std.testing.expectEqual(@as(isize, 0), dispatch.shim_dispatch_semaphore_wait(sem, dispatch.DISPATCH_TIME_NOW));
+    _ = dispatch.shim_dispatch_semaphore_signal(sem);
+    dispatch.shim_dispatch_release(sem);
+
+    dispatch.shim_dispatch_release(q);
+}
