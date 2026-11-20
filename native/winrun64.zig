@@ -1926,7 +1926,7 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
         const off: i128 = @as(i128, rip) - @as(i128, im.base);
         std.debug.print("  image {s} base=0x{x} size=0x{x} rip-base={d}\n", .{ im.name, im.base, im.img.len, off });
     }
-    std.debug.print("  rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n  rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n  r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x}\n", .{ g[13], g[11], g[14], g[12], g[9], g[8], g[10], rsp, g[0], g[1], g[2], g[3] });
+    std.debug.print("  rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n  rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n  r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x}\n  r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n", .{ g[13], g[11], g[14], g[12], g[9], g[8], g[10], rsp, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7] });
     if (win_base != 0) {
         const slot = rsp - 8;
         std.debug.print("  stack writes to [rsp-8]=0x{x} ({d} logged writes total, {d} steps):\n", .{ slot, wlog_n, step_n });

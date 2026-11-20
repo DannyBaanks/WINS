@@ -2387,7 +2387,8 @@ fn dMap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, map
     const o: *ComObj = @ptrCast(@alignCast(res orelse return E_INVALIDARG));
     if (map_type != 4 and map_type != 5) return E_INVALIDARG;
     const sz = mapSize(o) orelse return E_INVALIDARG;
-    const mem = r.a().alloc(u8, @max(1, sz.len)) catch return E_FAIL;
+    // 16-aligned like a real driver: the game stores into mapped memory with movaps.
+    const mem = r.a().alignedAlloc(u8, .@"16", @max(1, sz.len)) catch return E_FAIL;
     var base: ?[]const u8 = null;
     if (map_type == 5) {
         var prev: ?[]const u8 = null;
