@@ -1293,7 +1293,9 @@ fn createTexture2DJob(raw: ?*anyopaque) void {
     t.is_depth = gf.is_depth;
     t.is_compressed = gf.compressed;
     t.target = switch (t.target) {
-        0x0DE0, 0x8C18 => if (t.array_size > 1) 0x8C18 else 0x0DE0, // TEXTURE_1D(_ARRAY)
+        // Always a 1D array: D3D binds a 1-slice Texture1D through Texture1DArray
+        // SRVs too, and GL samplers are typed by target.
+        0x0DE0, 0x8C18 => 0x8C18,
         0x806F => 0x806F, // TEXTURE_3D
         else => if (t.array_size >= 6 and (t.target == 0x8513)) 0x8513 else if (t.array_size > 1) 0x8C1A else 0x0DE1,
     };
@@ -1605,6 +1607,12 @@ pub fn destroySampler(s: *Sampler) void {
 pub fn createShader(sh: *Shader, bytes: []const u8, is_pixel: bool) bool {
     sh.is_pixel = is_pixel;
     sh.bytecode = alloc.dupe(u8, bytes) catch return false;
+    {
+        // Rare progress line: titles that stream thousands of shaders at boot.
+        const S = struct { var n = std.atomic.Value(u32).init(0); };
+        const n = S.n.fetchAdd(1, .monotonic) + 1;
+        if (n % 1000 == 0) std.debug.print("[WINS:D3D11:GL] {d} shaders created (present #{d})\n", .{ n, g_present_count });
+    }
     var tr = shader.translate(alloc, sh.bytecode) catch |e| {
         var h0: u32 = 0;
         var h1: u32 = 0;

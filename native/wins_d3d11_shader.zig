@@ -62,6 +62,70 @@ pub var last_error: []const u8 = "";
 /// absorbs any opcode >= 192).
 var unhandled_seen: [4]u64 = .{ 0, 0, 0, 0 };
 
+fn reportUnhandled(code: u16, stage: Stage, what: []const u8) void {
+    const bit = @as(u64, 1) << @intCast(code & 63);
+    const slot = &unhandled_seen[@min(code >> 6, unhandled_seen.len - 1)];
+    if (slot.* & bit == 0 or std.c.getenv("WINS_TRACE") != null) {
+        slot.* |= bit;
+        std.debug.print("[WINS:DXBC] unhandled opcode {d} ({s} shader): {s}\n", .{ code, @tagName(stage), what });
+    }
+}
+
+/// GLSL expression (a float holding the D3D integer bits) for a system-value
+/// input that GL exposes as a builtin; null for ordinary inputs.
+fn sysvalBuiltin(e: SigElem, stage: Stage) ?[]const u8 {
+    const eq = std.ascii.eqlIgnoreCase;
+    if (stage == .vertex) {
+        if (e.sysval == 6 or eq(e.name, "SV_VertexID")) return "intBitsToFloat(gl_VertexID)";
+        if (e.sysval == 8 or eq(e.name, "SV_InstanceID")) return "intBitsToFloat(gl_InstanceID)";
+        return null;
+    }
+    if (e.sysval == 9 or eq(e.name, "SV_IsFrontFace")) return "uintBitsToFloat(gl_FrontFacing ? 0xFFFFFFFFu : 0u)";
+    if (e.sysval == 7 or eq(e.name, "SV_PrimitiveID")) return "intBitsToFloat(gl_PrimitiveID)";
+    if (e.sysval == 10 or eq(e.name, "SV_SampleIndex")) return "intBitsToFloat(0)";
+    return null;
+}
+
+/// A Texture1D coordinate is a scalar in DXBC but WINS binds every 1D texture
+/// as a GL 1D array: append slice 0.
+fn tex1dCoord(a: std.mem.Allocator, dim: TexDim, expr: []const u8, ty: NumType) ![]const u8 {
+    if (dim != .tex1d) return expr;
+    return if (ty == .i) std.fmt.allocPrint(a, "ivec2({s}, 0)", .{expr}) else std.fmt.allocPrint(a, "vec2({s}, 0.0)", .{expr});
+}
+
+/// Components of a sample coordinate (array slice included) for a resource kind.
+fn sampleCoordMask(dim: TexDim) u8 {
+    return switch (dim) {
+        .tex1d, .buf => 0x1,
+        .tex2d_array, .tex3d, .cube => 0x7,
+        .cube_array => 0xF,
+        else => 0x3, // tex2d, tex2dms, tex1d_array (x + slice)
+    };
+}
+
+/// Integer components texelFetch takes (lod travels separately in .w).
+fn fetchCoordMask(dim: TexDim) u8 {
+    return switch (dim) {
+        .tex1d, .buf => 0x1,
+        .tex2d_array, .tex3d, .cube, .cube_array => 0x7,
+        else => 0x3,
+    };
+}
+
+/// GLSL sampler type for a declared resource kind. MS resources are backed by
+/// single-sample GL textures, so they bind as sampler2D.
+fn samplerType(dim: TexDim) []const u8 {
+    return switch (dim) {
+        .cube => "samplerCube",
+        .cube_array => "samplerCubeArray",
+        .tex3d => "sampler3D",
+        .tex1d, .tex1d_array => "sampler1DArray", // 1D textures are always GL 1D arrays
+        .tex2d_array => "sampler2DArray",
+        .buf => "samplerBuffer",
+        else => "sampler2D",
+    };
+}
+
 fn setErr(msg: []const u8) Error {
     last_error = msg;
     return error.Unsupported;
@@ -517,11 +581,33 @@ const SbOp = enum(u16) {
     dcl_temps = 104,
     dcl_indexable_temp = 105,
     dcl_global_flags = 106,
+    lod = 108,
+    gather4 = 109,
+    sample_pos = 110,
+    sample_info = 111,
+    bufinfo = 121,
     deriv_rtx_coarse = 122,
     deriv_rtx_fine = 123,
     deriv_rty_coarse = 124,
     deriv_rty_fine = 125,
     rcp = 129,
+    f32tof16 = 130,
+    f16tof32 = 131,
+    uaddc = 132,
+    usubb = 133,
+    countbits = 134,
+    firstbit_hi = 135,
+    firstbit_lo = 136,
+    firstbit_shi = 137,
+    ubfe = 138,
+    ibfe = 139,
+    bfi = 140,
+    bfrev = 141,
+    swapc = 142,
+    dcl_resource_raw = 161,
+    dcl_resource_structured = 162,
+    ld_raw = 165,
+    ld_structured = 167,
     _,
 };
 
@@ -905,17 +991,15 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 if (dq.op_type != 13) try assignDst(a, &body, &dq, try std.fmt.allocPrint(a, "({s} / {s})", .{ a0, a1 }), .u, stage);
                 if (dr.op_type != 13) try assignDst(a, &body, &dr, try std.fmt.allocPrint(a, "({s} % {s})", .{ a0, a1 }), .u, stage);
             },
-            .sample, .sample_c, .sample_c_lz, .sample_l, .sample_d, .sample_b, .ld => {
+            .sample, .sample_c, .sample_c_lz, .sample_l, .sample_d, .sample_b, .ld, .ld_ms => {
                 var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
                 const coord = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
                 const reg: u8 = @intCast(@min(15, res.indices[0].imm));
                 const tdim = tex_dims[reg];
-                const cmask: u8 = switch (tdim) {
-                    .tex1d => 1,
-                    .tex3d, .cube => 7,
-                    else => 3,
-                };
+                const cmask = sampleCoordMask(tdim);
+                // ld_ms carries a sample index; WINS backs MS resources with
+                // single-sample GL textures, so it reads sample 0 (lod 0).
                 if (op != .ld) _ = try decodeOperand(a, toks, &p);
                 var extra_e: []const u8 = "";
                 if (op == .sample_l) {
@@ -931,23 +1015,199 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                     extra_e = try formatSrc(a, &bias, 1, .f, stage);
                 }
                 const cname = if (stage == .pixel) "ptex" else "vtex";
-                const call_expr = if (op == .ld) blk: {
-                    const cexpr = try formatSrc(a, &coord, 3, .i, stage);
-                    const lod_e = try formatSrc(a, &coord, 8, .i, stage);
+                const call_expr = if (op == .ld or op == .ld_ms) blk: {
+                    const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, fetchCoordMask(tdim), .i, stage), .i);
+                    if (tdim == .buf) break :blk try std.fmt.allocPrint(a, "texelFetch({s}{d}, {s})", .{ cname, reg, cexpr });
+                    const lod_e = if (op == .ld_ms) "0" else try formatSrc(a, &coord, 8, .i, stage);
                     break :blk try std.fmt.allocPrint(a, "texelFetch({s}{d}, {s}, {s})", .{ cname, reg, cexpr, lod_e });
                 } else if (op == .sample_l) blk: {
-                    const cexpr = try formatSrc(a, &coord, cmask, .f, stage);
+                    const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
                     break :blk try std.fmt.allocPrint(a, "textureLod({s}{d}, {s}, {s})", .{ cname, reg, cexpr, extra_e });
                 } else if (op == .sample_b) blk: {
-                    const cexpr = try formatSrc(a, &coord, cmask, .f, stage);
+                    const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
                     break :blk try std.fmt.allocPrint(a, "texture({s}{d}, {s}, {s})", .{ cname, reg, cexpr, extra_e });
                 } else blk: {
-                    const cexpr = try formatSrc(a, &coord, cmask, .f, stage);
+                    const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
                     break :blk try std.fmt.allocPrint(a, "texture({s}{d}, {s})", .{ cname, reg, cexpr });
                 };
                 var swbuf: [5]u8 = undefined;
                 const sw = swzForMask(res.swz, dst.mask, &swbuf);
                 try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}.{s}", .{ call_expr, sw }), .f, stage);
+            },
+            .bfrev, .countbits, .firstbit_hi, .firstbit_lo, .firstbit_shi, .f32tof16, .f16tof32 => {
+                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                const s0 = try decodeOperand(a, toks, &p);
+                inline for (0..4) |c| {
+                    const bit: u8 = @as(u8, 1) << @intCast(c);
+                    if ((dst.mask & bit) != 0) {
+                        var sd = dst; sd.mask = bit;
+                        const u = try formatSrc(a, &s0, bit, .u, stage);
+                        switch (op) {
+                            .bfrev => try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "bitfieldReverse({s})", .{u}), .u, stage),
+                            .countbits => try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "uint(bitCount({s}))", .{u}), .u, stage),
+                            .firstbit_lo => try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "uint(findLSB({s}))", .{u}), .u, stage),
+                            // D3D counts firstbit_hi/shi from the MSB side.
+                            .firstbit_hi => try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "((findMSB({s}) < 0) ? 0xFFFFFFFFu : uint(31 - findMSB({s})))", .{ u, u }), .u, stage),
+                            .firstbit_shi => {
+                                const i = try formatSrc(a, &s0, bit, .i, stage);
+                                try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "((findMSB({s}) < 0) ? 0xFFFFFFFFu : uint(31 - findMSB({s})))", .{ i, i }), .u, stage);
+                            },
+                            .f32tof16 => {
+                                const f = try formatSrc(a, &s0, bit, .f, stage);
+                                try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "(packHalf2x16(vec2({s}, 0.0)) & 0xFFFFu)", .{f}), .u, stage);
+                            },
+                            .f16tof32 => try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "unpackHalf2x16({s}).x", .{u}), .f, stage),
+                            else => unreachable,
+                        }
+                    }
+                }
+            },
+            .ubfe, .ibfe => {
+                const dst = try decodeOperand(a, toks, &p);
+                const sw = try decodeOperand(a, toks, &p);
+                const so = try decodeOperand(a, toks, &p);
+                const ss = try decodeOperand(a, toks, &p);
+                inline for (0..4) |c| {
+                    const bit: u8 = @as(u8, 1) << @intCast(c);
+                    if ((dst.mask & bit) != 0) {
+                        var sd = dst; sd.mask = bit;
+                        const w = try std.fmt.allocPrint(a, "({s} & 31u)", .{try formatSrc(a, &sw, bit, .u, stage)});
+                        const o = try std.fmt.allocPrint(a, "({s} & 31u)", .{try formatSrc(a, &so, bit, .u, stage)});
+                        if (op == .ubfe) {
+                            const s = try formatSrc(a, &ss, bit, .u, stage);
+                            try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "(({s} == 0u) ? 0u : (({s} + {s} < 32u) ? bitfieldExtract({s}, int({s}), int({s})) : ({s} >> {s})))", .{ w, w, o, s, o, w, s, o }), .u, stage);
+                        } else {
+                            const s = try formatSrc(a, &ss, bit, .i, stage);
+                            try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "(({s} == 0u) ? 0 : (({s} + {s} < 32u) ? bitfieldExtract({s}, int({s}), int({s})) : ({s} >> int({s}))))", .{ w, w, o, s, o, w, s, o }), .i, stage);
+                        }
+                    }
+                }
+            },
+            .bfi => {
+                const dst = try decodeOperand(a, toks, &p);
+                const sw = try decodeOperand(a, toks, &p);
+                const so = try decodeOperand(a, toks, &p);
+                const si = try decodeOperand(a, toks, &p);
+                const sb = try decodeOperand(a, toks, &p);
+                inline for (0..4) |c| {
+                    const bit: u8 = @as(u8, 1) << @intCast(c);
+                    if ((dst.mask & bit) != 0) {
+                        var sd = dst; sd.mask = bit;
+                        const w = try std.fmt.allocPrint(a, "({s} & 31u)", .{try formatSrc(a, &sw, bit, .u, stage)});
+                        const o = try std.fmt.allocPrint(a, "({s} & 31u)", .{try formatSrc(a, &so, bit, .u, stage)});
+                        const ins = try formatSrc(a, &si, bit, .u, stage);
+                        const base = try formatSrc(a, &sb, bit, .u, stage);
+                        // bitmask = ((1 << width) - 1) << offset; insert bits shift up by offset.
+                        try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "((({s} << {s}) & (((1u << {s}) - 1u) << {s})) | ({s} & ~(((1u << {s}) - 1u) << {s})))", .{ ins, o, w, o, base, w, o }), .u, stage);
+                    }
+                }
+            },
+            .uaddc, .usubb => {
+                const d0 = try decodeOperand(a, toks, &p);
+                const d1 = try decodeOperand(a, toks, &p);
+                const s0 = try decodeOperand(a, toks, &p);
+                const s1 = try decodeOperand(a, toks, &p);
+                const m = if (d0.op_type != 13) d0.mask else d1.mask;
+                const tmp = try std.fmt.allocPrint(a, "wt{d}", .{k});
+                try appendFmt(&body, a, "    uvec4 {s}a = uvec4(0u), {s}b = uvec4(0u);\n", .{ tmp, tmp });
+                inline for (0..4) |c| {
+                    const bit: u8 = @as(u8, 1) << @intCast(c);
+                    if ((m & bit) != 0) {
+                        try appendFmt(&body, a, "    {s}a.{c} = {s}; {s}b.{c} = {s};\n", .{ tmp, swzChar(c), try formatSrc(a, &s0, bit, .u, stage), tmp, swzChar(c), try formatSrc(a, &s1, bit, .u, stage) });
+                    }
+                }
+                var mb: [5]u8 = undefined;
+                if (d0.op_type != 13) {
+                    const ms = maskStr(d0.mask, &mb);
+                    const e = if (op == .uaddc) "+" else "-";
+                    try assignDst(a, &body, &d0, try std.fmt.allocPrint(a, "({s}a.{s} {s} {s}b.{s})", .{ tmp, ms, e, tmp, ms }), .u, stage);
+                }
+                if (d1.op_type != 13) {
+                    // carry: a + b wrapped below a; borrow: a < b. One component at a time.
+                    inline for (0..4) |c| {
+                        const bit: u8 = @as(u8, 1) << @intCast(c);
+                        if ((d1.mask & bit) != 0) {
+                            var sd = d1; sd.mask = bit;
+                            const ch = swzChar(c);
+                            const rhs = if (op == .uaddc)
+                                try std.fmt.allocPrint(a, "(({s}a.{c} + {s}b.{c} < {s}a.{c}) ? 1u : 0u)", .{ tmp, ch, tmp, ch, tmp, ch })
+                            else
+                                try std.fmt.allocPrint(a, "(({s}a.{c} < {s}b.{c}) ? 1u : 0u)", .{ tmp, ch, tmp, ch });
+                            try assignDst(a, &body, &sd, rhs, .u, stage);
+                        }
+                    }
+                }
+            },
+            .swapc => {
+                const d0 = try decodeOperand(a, toks, &p);
+                const d1 = try decodeOperand(a, toks, &p);
+                const sc0 = try decodeOperand(a, toks, &p);
+                const s1 = try decodeOperand(a, toks, &p);
+                const s2 = try decodeOperand(a, toks, &p);
+                const tmp = try std.fmt.allocPrint(a, "wt{d}", .{k});
+                try appendFmt(&body, a, "    vec4 {s}a = vec4(0.0), {s}b = vec4(0.0);\n", .{ tmp, tmp });
+                inline for (0..4) |c| {
+                    const bit: u8 = @as(u8, 1) << @intCast(c);
+                    if (((d0.mask | d1.mask) & bit) != 0) {
+                        const ce = try formatSrc(a, &sc0, bit, .u, stage);
+                        const e1 = try formatSrc(a, &s1, bit, .f, stage);
+                        const e2 = try formatSrc(a, &s2, bit, .f, stage);
+                        try appendFmt(&body, a, "    {s}a.{c} = ({s} != 0u) ? {s} : {s}; {s}b.{c} = ({s} != 0u) ? {s} : {s};\n", .{ tmp, swzChar(c), ce, e2, e1, tmp, swzChar(c), ce, e1, e2 });
+                    }
+                }
+                var mb: [5]u8 = undefined;
+                if (d0.op_type != 13) try assignDst(a, &body, &d0, try std.fmt.allocPrint(a, "{s}a.{s}", .{ tmp, maskStr(d0.mask, &mb) }), .f, stage);
+                if (d1.op_type != 13) try assignDst(a, &body, &d1, try std.fmt.allocPrint(a, "{s}b.{s}", .{ tmp, maskStr(d1.mask, &mb) }), .f, stage);
+            },
+            .resinfo => {
+                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                const mip = try decodeOperand(a, toks, &p);
+                const res = try decodeOperand(a, toks, &p);
+                const reg: u8 = @intCast(@min(15, res.indices[0].imm));
+                const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ if (stage == .pixel) "p" else "v", reg });
+                const l = try formatSrc(a, &mip, 1, .i, stage);
+                const iv = switch (tex_dims[reg]) {
+                    .tex1d => try std.fmt.allocPrint(a, "ivec4(textureSize({s}, {s}).x, 0, 0, textureQueryLevels({s}))", .{ tname, l, tname }),
+                    .tex2d_array, .tex3d, .cube_array => try std.fmt.allocPrint(a, "ivec4(textureSize({s}, {s}), textureQueryLevels({s}))", .{ tname, l, tname }),
+                    .buf => try std.fmt.allocPrint(a, "ivec4(textureSize({s}), 0, 0, 1)", .{tname}),
+                    .none => try a.dupe(u8, "ivec4(0)"),
+                    else => try std.fmt.allocPrint(a, "ivec4(textureSize({s}, {s}), 0, textureQueryLevels({s}))", .{ tname, l, tname }),
+                };
+                const rt = (itok >> 11) & 3; // 0 float, 1 rcpFloat, 2 uint
+                const full = switch (rt) {
+                    1 => try std.fmt.allocPrint(a, "(vec4(1.0, 1.0, 1.0, 0.0) / max(vec4({s}), vec4(1.0)) * vec4(1.0, 1.0, 1.0, 0.0) + vec4(0.0, 0.0, 0.0, float({s}.w)))", .{ iv, iv }),
+                    2 => try std.fmt.allocPrint(a, "uvec4({s})", .{iv}),
+                    else => try std.fmt.allocPrint(a, "vec4({s})", .{iv}),
+                };
+                var swbuf: [5]u8 = undefined;
+                const swz = swzForMask(res.swz, dst.mask, &swbuf);
+                try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}.{s}", .{ full, swz }), if (rt == 2) .u else .f, stage);
+            },
+            .gather4, .lod => {
+                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                const coord = try decodeOperand(a, toks, &p);
+                const res = try decodeOperand(a, toks, &p);
+                _ = try decodeOperand(a, toks, &p); // sampler
+                const reg: u8 = @intCast(@min(15, res.indices[0].imm));
+                const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ if (stage == .pixel) "p" else "v", reg });
+                const cexpr = try tex1dCoord(a, tex_dims[reg], try formatSrc(a, &coord, sampleCoordMask(tex_dims[reg]), .f, stage), .f);
+                var swbuf: [5]u8 = undefined;
+                if (op == .gather4) {
+                    // The resource swizzle's first selector picks the gathered channel.
+                    const call = try std.fmt.allocPrint(a, "textureGather({s}, {s}, {d})", .{ tname, cexpr, res.swz[0] });
+                    try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}.{s}", .{ call, maskStr(dst.mask, &swbuf) }), .f, stage);
+                } else {
+                    const call = try std.fmt.allocPrint(a, "vec4(textureQueryLod({s}, {s}), 0.0, 0.0)", .{ tname, cexpr });
+                    try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}.{s}", .{ call, swzForMask(res.swz, dst.mask, &swbuf) }), .f, stage);
+                }
+            },
+            .dcl_resource_raw, .dcl_resource_structured => continue,
+            .bufinfo, .ld_structured, .ld_raw, .sample_pos, .sample_info => {
+                // Raw/structured buffers need SSBO plumbing WINS does not have yet:
+                // the destination reads as zero, reported once like an unhandled op.
+                const dst = try decodeOperand(a, toks, &p);
+                try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}(0u)", .{typePrefix(maskCount(dst.mask), .u)}), .u, stage);
+                reportUnhandled(@intFromEnum(op), stage, "approximated as 0");
             },
             .discard => {
                 const c0 = try decodeOperand(a, toks, &p);
@@ -991,21 +1251,13 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             },
             .default => try body.appendSlice(a, "    default:\n"),
             .endswitch => try body.appendSlice(a, "    }\n"),
-            else => {
-                // An unhandled opcode is silently dropped from the GLSL, so the
-                // draw renders wrong with no error: report each one once.
-                const code: u16 = @intFromEnum(op);
-                const bit = @as(u64, 1) << @intCast(code & 63);
-                const slot = &unhandled_seen[@min(code >> 6, unhandled_seen.len - 1)];
-                if (slot.* & bit == 0 or std.c.getenv("WINS_TRACE") != null) {
-                    slot.* |= bit;
-                    std.debug.print("[WINS:DXBC] unhandled opcode {d} ({s} shader)\n", .{ code, @tagName(stage) });
-                }
-            },
+            // An unhandled opcode is silently dropped from the GLSL, so the
+            // draw renders wrong with no error: report each one once.
+            else => reportUnhandled(@intFromEnum(op), stage, "dropped"),
         }
     }
     var hdr: std.ArrayList(u8) = .empty;
-    try hdr.appendSlice(a, "#version 420 core\n");
+    try hdr.appendSlice(a, "#version 420 core\n#extension GL_ARB_texture_query_levels : enable\n");
     const prefix = if (stage == .pixel) "p" else "v";
     const cb_base: u32 = if (stage == .pixel) 16 else 0;
     for (0..16) |i| {
@@ -1038,13 +1290,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     const tex_base: u32 = if (stage == .pixel) 0 else 16;
     for (0..16) |i| {
         if (tex_dims[i] != .none) {
-            const stype = switch (tex_dims[i]) {
-                .cube => "samplerCube",
-                .tex3d => "sampler3D",
-                .tex1d => "sampler1D",
-                .tex2d_array => "sampler2DArray",
-                else => "sampler2D",
-            };
+            const stype = samplerType(tex_dims[i]);
             try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d};\n", .{
                 tex_base + i, stype, prefix, i,
             });
@@ -1056,9 +1302,17 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     // TEXCOORD1.zw in o3); GLSL gets exactly one vec4 per register.
     var in_seen: u64 = 0;
     var out_seen: u64 = 0;
+    // System-value inputs (SV_VertexID, SV_IsFrontFace, ...) are GL builtins, not
+    // attributes/varyings: declare a plain vec4 and fill it at the top of main().
+    var sv_init: std.ArrayList(u8) = .empty;
     if (stage == .vertex) {
         for (inputs) |in_e| {
             if (!firstUseOfReg(&in_seen, in_e.reg)) continue;
+            if (sysvalBuiltin(in_e, stage)) |b| {
+                try appendFmt(&hdr, a, "vec4 vi{d};\n", .{in_e.reg});
+                try appendFmt(&sv_init, a, "    vi{d} = vec4({s}, 0.0, 0.0, 0.0);\n", .{ in_e.reg, b });
+                continue;
+            }
             try appendFmt(&hdr, a, "layout(location = {d}) in vec4 vi{d};\n", .{ in_e.reg, in_e.reg });
         }
         for (outputs) |out_e| {
@@ -1070,6 +1324,9 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             if (!firstUseOfReg(&in_seen, in_e.reg)) continue;
             if (sv_pos_in_reg != null and sv_pos_in_reg.? == in_e.reg) {
                 try appendFmt(&hdr, a, "vec4 vi{d};\n", .{in_e.reg});
+            } else if (sysvalBuiltin(in_e, stage)) |b| {
+                try appendFmt(&hdr, a, "vec4 vi{d};\n", .{in_e.reg});
+                try appendFmt(&sv_init, a, "    vi{d} = vec4({s}, 0.0, 0.0, 0.0);\n", .{ in_e.reg, b });
             } else {
                 var loc: u32 = in_e.reg;
                 if (vs_outputs) |vouts| {
@@ -1103,6 +1360,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             try appendFmt(&hdr, a, "    vi{d} = gl_FragCoord;\n", .{r});
         }
     }
+    try hdr.appendSlice(a, sv_init.items);
     try hdr.appendSlice(a, "    vec4 dummyNull;\n    float oDepth;\n");
     try hdr.appendSlice(a, body.items);
     try hdr.appendSlice(a, "}\n");

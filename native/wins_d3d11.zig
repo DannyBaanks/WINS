@@ -823,6 +823,29 @@ fn extractResTexture(res: ?*anyopaque) struct { tex: ?*glb.Texture, buf: ?*glb.B
     return .{ .tex = null, .buf = null };
 }
 
+/// D3D stores a view desc canonicalised: union members the view dimension does
+/// not use read back as 0, and an SRV's MipLevels = -1 ("all the rest") reads
+/// back resolved. Titles parse GetDesc generically (DS3 takes desc+0xC as a mip
+/// count even for a TEXTURE2D RTV), so stale caller bytes there are fatal.
+fn normalizeViewDesc(kind: ComObj.Kind, vd: *[6]u32, tex: ?*glb.Texture) void {
+    const dim = vd[1];
+    // Index of the first union dword and how many the dimension uses.
+    const first: usize = if (kind == .dsv) 3 else 2;
+    const used: usize = switch (kind) {
+        .rtv => switch (dim) { 1 => 2, 2, 4 => 1, 3, 5, 8 => 3, 7 => 2, else => 0 },
+        .dsv => switch (dim) { 1, 3 => 1, 2, 4 => 3, 6 => 2, else => 0 },
+        .srv => switch (dim) { 1, 2, 4, 7, 8, 9 => 2, 3, 5, 10 => 4, 11 => 3, else => 0 },
+        else => 4,
+    };
+    for (first + used..6) |i| vd[i] = 0;
+    if (kind == .srv and vd[3] == 0xFFFFFFFF) switch (dim) {
+        2, 3, 4, 5, 8, 9, 10 => if (tex) |t| {
+            vd[3] = @max(1, t.mip_levels) -| vd[2];
+        },
+        else => {},
+    };
+}
+
 fn devCreateSRV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_SHADER_RESOURCE_VIEW_DESC, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
     const r = extractResTexture(res);
@@ -842,6 +865,7 @@ fn devCreateSRV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_SHADER_RES
         o.view_res = @ptrCast(@alignCast(ro));
         _ = comAddRef(ro);
     }
+    normalizeViewDesc(.srv, &vd, r.tex);
     o.view_desc = vd;
     pp.?.* = o;
     return S_OK;
@@ -884,6 +908,7 @@ fn devCreateRTV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_RENDER_TAR
         o.view_res = @ptrCast(@alignCast(ro));
         _ = comAddRef(ro);
     }
+    normalizeViewDesc(.rtv, &vd, r.tex);
     o.view_desc = vd;
     pp.?.* = o;
     return S_OK;
@@ -908,6 +933,7 @@ fn devCreateDSV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_DEPTH_STEN
         o.view_res = @ptrCast(@alignCast(ro));
         _ = comAddRef(ro);
     }
+    normalizeViewDesc(.dsv, &vd, r.tex);
     o.view_desc = vd;
     pp.?.* = o;
     return S_OK;
@@ -1325,10 +1351,120 @@ fn ctxIASetTopology(_: ?*anyopaque, topo: u32) callconv(W) void {
     g_draw_state.topology = topo;
 }
 
+/// COM pointers behind the bound output-merger/rasterizer objects, for the
+/// Get* methods (DrawState keeps only the GL-side payloads). Not referenced:
+/// a getter AddRefs what it hands out, as D3D does.
+const BoundCom = struct {
+    rtv: [8]?*anyopaque = .{null} ** 8,
+    num_rtvs: u32 = 0,
+    dsv: ?*anyopaque = null,
+    blend: ?*anyopaque = null,
+    depth: ?*anyopaque = null,
+    rs: ?*anyopaque = null,
+};
+var g_bound: BoundCom = .{};
+
+/// What a deferred context's Get* methods report: the state recorded so far.
+const Shadow = struct {
+    com: BoundCom = .{},
+    vps: [8]D3D11_VIEWPORT = std.mem.zeroes([8]D3D11_VIEWPORT),
+    nvp: u32 = 0,
+    sc: [8]RECT = std.mem.zeroes([8]RECT),
+    nsc: u32 = 0,
+    blend_factor: [4]f32 = .{ 1, 1, 1, 1 },
+    sample_mask: u32 = 0xFFFFFFFF,
+    stencil_ref: u32 = 0,
+};
+
+fn shadowOf(this: ?*anyopaque) ?*Shadow {
+    const o: *ComObj = @ptrCast(@alignCast(this orelse return null));
+    if (o.kind != .deferred_ctx) return null;
+    return &recOf(this).shadow;
+}
+
+fn handOut(dst: ?*?*anyopaque, obj: ?*anyopaque) void {
+    const d = dst orelse return;
+    d.* = obj;
+    if (obj) |o| _ = comAddRef(o);
+}
+
+/// Snapshot of the calling context's OM/RS state: the recorder's shadow for a
+/// deferred context, the live draw state for the immediate one.
+fn curShadow(this: ?*anyopaque) Shadow {
+    if (shadowOf(this)) |sh| return sh.*;
+    var out: Shadow = .{ .com = g_bound, .nvp = g_draw_state.num_viewports, .nsc = g_draw_state.num_scissors };
+    for (0..g_draw_state.num_viewports) |i| {
+        const v = g_draw_state.viewports[i];
+        out.vps[i] = .{ .TopLeftX = v.x, .TopLeftY = v.y, .Width = v.w, .Height = v.h, .MinDepth = v.min_depth, .MaxDepth = v.max_depth };
+    }
+    for (0..g_draw_state.num_scissors) |i| {
+        const r = g_draw_state.scissors[i];
+        out.sc[i] = .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
+    }
+    out.blend_factor = g_draw_state.blend_factor;
+    out.sample_mask = g_draw_state.sample_mask;
+    out.stencil_ref = g_draw_state.stencil_ref;
+    return out;
+}
+
+fn getTrace(comptime name: []const u8, this: ?*anyopaque, ra: usize) void {
+    const S = struct { var n = std.atomic.Value(u32).init(0); };
+    if (S.n.fetchAdd(1, .monotonic) < 24 and std.c.getenv("WINS_D3D11_TRACE_GET") != null)
+        std.debug.print("[WINS:D3D11] {s} deferred={} ret=0x{x}\n", .{ name, shadowOf(this) != null, ra });
+}
+
+fn ctxOMGetRenderTargets(this: ?*anyopaque, num: u32, ppRTV: ?[*]?*anyopaque, ppDSV: ?*?*anyopaque) callconv(W) void {
+    getTrace("OMGetRenderTargets", this, @returnAddress());
+    const st = curShadow(this);
+    if (ppRTV) |arr| {
+        for (0..@min(8, num)) |i| handOut(&arr[i], if (i < st.com.num_rtvs) st.com.rtv[i] else null);
+    }
+    handOut(ppDSV, st.com.dsv);
+}
+
+fn ctxOMGetBlendState(this: ?*anyopaque, ppBS: ?*?*anyopaque, factor: ?*[4]f32, mask: ?*u32) callconv(W) void {
+    const st = curShadow(this);
+    handOut(ppBS, st.com.blend);
+    if (factor) |f| f.* = st.blend_factor;
+    if (mask) |m| m.* = st.sample_mask;
+}
+
+fn ctxOMGetDepthStencilState(this: ?*anyopaque, ppDS: ?*?*anyopaque, ref: ?*u32) callconv(W) void {
+    const st = curShadow(this);
+    handOut(ppDS, st.com.depth);
+    if (ref) |r| r.* = st.stencil_ref;
+}
+
+fn ctxRSGetState(this: ?*anyopaque, ppRS: ?*?*anyopaque) callconv(W) void {
+    handOut(ppRS, curShadow(this).com.rs);
+}
+
+fn ctxRSGetViewports(this: ?*anyopaque, pNum: ?*u32, vps: ?[*]D3D11_VIEWPORT) callconv(W) void {
+    getTrace("RSGetViewports", this, @returnAddress());
+    const num = pNum orelse return;
+    const st = curShadow(this);
+    if (vps) |arr| {
+        for (0..@min(8, num.*)) |i| arr[i] = if (i < st.nvp) st.vps[i] else std.mem.zeroes(D3D11_VIEWPORT);
+    }
+    num.* = st.nvp;
+}
+
+fn ctxRSGetScissorRects(this: ?*anyopaque, pNum: ?*u32, rects: ?[*]RECT) callconv(W) void {
+    const num = pNum orelse return;
+    const st = curShadow(this);
+    if (rects) |arr| {
+        for (0..@min(8, num.*)) |i| arr[i] = if (i < st.nsc) st.sc[i] else std.mem.zeroes(RECT);
+    }
+    num.* = st.nsc;
+}
+
 fn ctxOMSetRenderTargets(_: ?*anyopaque, num: u32, ppRTV: ?[*]const ?*anyopaque, pDSV: ?*anyopaque) callconv(W) void {
     const n = @min(8, num);
     g_draw_state.num_rtvs = n;
+    g_bound.num_rtvs = n;
+    g_bound.dsv = pDSV;
     for (0..8) |i| {
+        g_bound.rtv[i] = if (i < n and ppRTV != null) ppRTV.?[i] else null;
         if (i < n and ppRTV != null) {
             const raw = ppRTV.?[i];
             g_draw_state.rtv[i] = if (raw) |r| @ptrFromInt(@as(*ComObj, @ptrCast(@alignCast(r))).payload) else null;
@@ -1340,17 +1476,20 @@ fn ctxOMSetRenderTargets(_: ?*anyopaque, num: u32, ppRTV: ?[*]const ?*anyopaque,
 }
 
 fn ctxOMSetBlendState(_: ?*anyopaque, bs: ?*anyopaque, factor: ?*const [4]f32, mask: u32) callconv(W) void {
+    g_bound.blend = bs;
     g_draw_state.blend = if (bs) |r| @ptrFromInt(@as(*ComObj, @ptrCast(@alignCast(r))).payload) else null;
     if (factor) |f| g_draw_state.blend_factor = f.* else g_draw_state.blend_factor = .{ 1, 1, 1, 1 };
     g_draw_state.sample_mask = mask;
 }
 
 fn ctxOMSetDepthStencilState(_: ?*anyopaque, ds: ?*anyopaque, ref: u32) callconv(W) void {
+    g_bound.depth = ds;
     g_draw_state.depth_stencil = if (ds) |r| @ptrFromInt(@as(*ComObj, @ptrCast(@alignCast(r))).payload) else null;
     g_draw_state.stencil_ref = ref;
 }
 
 fn ctxRSSetState(_: ?*anyopaque, rs: ?*anyopaque) callconv(W) void {
+    g_bound.rs = rs;
     g_draw_state.rasterizer = if (rs) |r| @ptrFromInt(@as(*ComObj, @ptrCast(@alignCast(r))).payload) else null;
 }
 
@@ -1514,6 +1653,7 @@ fn ctxGetData(_: ?*anyopaque, q: ?*anyopaque, data: ?*anyopaque, sz: u32, _: u32
 
 fn ctxClearState(_: ?*anyopaque) callconv(W) void {
     g_draw_state = .{};
+    g_bound = .{};
 }
 
 fn ctxGetType(_: ?*anyopaque) callconv(W) u32 { return 0; } // IMMEDIATE
@@ -1654,6 +1794,18 @@ const device_vtbl = [_]?*const anyopaque{
     @ptrCast(&stubRetZero), // 42 GetExceptionMode
 };
 
+/// Unimplemented immediate-context method: does nothing, but names itself on
+/// first use (a title drawing through Dispatch/Indirect would otherwise just
+/// render black with no clue).
+fn iStub(comptime slot: usize) *const anyopaque {
+    return @ptrCast(&struct {
+        var told = std.atomic.Value(bool).init(false);
+        fn w() callconv(W) void {
+            if (!told.swap(true, .monotonic)) std.debug.print("[WINS:D3D11] context slot {d} called but not implemented (no-op)\n", .{slot});
+        }
+    }.w);
+}
+
 const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease), // 0..2
     @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), // 3..6
@@ -1672,47 +1824,57 @@ const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&ctxIASetIndexBuffer), // 19
     @ptrCast(&ctxDrawIndexedInstanced), // 20
     @ptrCast(&ctxDrawInstanced), // 21
-    @ptrCast(&stubVoid), // 22 GSSetConstantBuffers
-    @ptrCast(&stubVoid), // 23 GSSetShader
+    iStub(22), // 22 GSSetConstantBuffers
+    iStub(23), // 23 GSSetShader
     @ptrCast(&ctxIASetTopology), // 24
     @ptrCast(&ctxVSSetSRV), // 25
     @ptrCast(&ctxVSSetSamplers), // 26
-    @ptrCast(&stubVoid), // 27 Begin
-    @ptrCast(&stubVoid), // 28 End
+    iStub(27), // 27 Begin
+    iStub(28), // 28 End
     @ptrCast(&ctxGetData), // 29
-    @ptrCast(&stubVoid), // 30 SetPredication
-    @ptrCast(&stubVoid), // 31 GSSetShaderResources
-    @ptrCast(&stubVoid), // 32 GSSetSamplers
+    iStub(30), // 30 SetPredication
+    iStub(31), // 31 GSSetShaderResources
+    iStub(32), // 32 GSSetSamplers
     @ptrCast(&ctxOMSetRenderTargets), // 33
-    @ptrCast(&stubVoid), // 34 OMSetRenderTargetsAndUAVs
+    iStub(34), // 34 OMSetRenderTargetsAndUAVs
     @ptrCast(&ctxOMSetBlendState), // 35
     @ptrCast(&ctxOMSetDepthStencilState), // 36
-    @ptrCast(&stubVoid), // 37 SOSetTargets
-    @ptrCast(&stubVoid), // 38 DrawAuto
-    @ptrCast(&stubVoid), // 39 DrawIndexedInstancedIndirect
-    @ptrCast(&stubVoid), // 40 DrawInstancedIndirect
-    @ptrCast(&stubVoid), // 41 Dispatch
-    @ptrCast(&stubVoid), // 42 DispatchIndirect
+    iStub(37), // 37 SOSetTargets
+    iStub(38), // 38 DrawAuto
+    iStub(39), // 39 DrawIndexedInstancedIndirect
+    iStub(40), // 40 DrawInstancedIndirect
+    iStub(41), // 41 Dispatch
+    iStub(42), // 42 DispatchIndirect
     @ptrCast(&ctxRSSetState), // 43
     @ptrCast(&ctxRSSetViewports), // 44
     @ptrCast(&ctxRSSetScissors), // 45
     @ptrCast(&ctxCopySubresourceRegion), // 46
     @ptrCast(&ctxCopyResource), // 47
     @ptrCast(&ctxUpdateSubresource), // 48
-    @ptrCast(&stubVoid), // 49 CopyStructureCount
+    iStub(49), // 49 CopyStructureCount
     @ptrCast(&ctxClearRTV), // 50
-    @ptrCast(&stubVoid), // 51 ClearUnorderedAccessViewUint
-    @ptrCast(&stubVoid), // 52 ClearUnorderedAccessViewFloat
+    iStub(51), // 51 ClearUnorderedAccessViewUint
+    iStub(52), // 52 ClearUnorderedAccessViewFloat
     @ptrCast(&ctxClearDSV), // 53
     @ptrCast(&ctxGenerateMips), // 54
-    @ptrCast(&stubVoid), // 55 SetResourceMinLOD
+    iStub(55), // 55 SetResourceMinLOD
     @ptrCast(&stubRetZero), // 56 GetResourceMinLOD
     @ptrCast(&ctxResolveSubresource), // 57
     @ptrCast(&ctxExecuteCommandList), // 58
-    @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), // 59..62 HS
-    @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), // 63..66 DS
-    @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), // 67..71 CS
-} ++ ([_]?*const anyopaque{@ptrCast(&stubVoid)} ** 38) ++ [_]?*const anyopaque{ // 72..109 Getters
+    iStub(59), iStub(60), iStub(61), iStub(62), // 59..62 HS
+    iStub(63), iStub(64), iStub(65), iStub(66), // 63..66 DS
+    iStub(67), iStub(68), iStub(69), iStub(70), iStub(71), // 67..71 CS
+} ++ getterStubs: {
+    var g: [38]?*const anyopaque = undefined;
+    for (&g, 72..) |*e, i| e.* = iStub(i);
+    g[89 - 72] = @ptrCast(&ctxOMGetRenderTargets);
+    g[91 - 72] = @ptrCast(&ctxOMGetBlendState);
+    g[92 - 72] = @ptrCast(&ctxOMGetDepthStencilState);
+    g[94 - 72] = @ptrCast(&ctxRSGetState);
+    g[95 - 72] = @ptrCast(&ctxRSGetViewports);
+    g[96 - 72] = @ptrCast(&ctxRSGetScissorRects);
+    break :getterStubs g;
+} ++ [_]?*const anyopaque{ // 72..109 Getters
     @ptrCast(&ctxClearState), // 110
     @ptrCast(&stubVoid), // 111 Flush
     @ptrCast(&ctxGetType), // 112
@@ -1752,6 +1914,7 @@ const Recorder = struct {
     cmds: std.ArrayList(Cmd) = .empty,
     refs: std.ArrayList(*anyopaque) = .empty,
     maps: std.ArrayList(MapRec) = .empty,
+    shadow: Shadow = .{},
 
     fn a(r: *Recorder) std.mem.Allocator {
         return r.arena.allocator();
@@ -1912,22 +2075,46 @@ fn dIASetVertexBuffers(raw: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*a
 
 fn dOMSetRenderTargets(raw: ?*anyopaque, num: u32, pp: ?[*]const ?*anyopaque, dsv: ?*anyopaque) callconv(W) void {
     const r = recOf(raw);
+    const n = @min(8, num);
+    r.shadow.com.num_rtvs = n;
+    r.shadow.com.dsv = dsv;
+    for (0..8) |i| r.shadow.com.rtv[i] = if (i < n and pp != null) pp.?[i] else null;
     push(r, ctxOMSetRenderTargets, .{ raw, num, r.dupRefs(pp, num), r.ref(dsv) });
 }
 
 fn dOMSetBlendState(raw: ?*anyopaque, bs: ?*anyopaque, factor: ?*const [4]f32, mask: u32) callconv(W) void {
     const r = recOf(raw);
+    r.shadow.com.blend = bs;
+    r.shadow.blend_factor = if (factor) |f| f.* else .{ 1, 1, 1, 1 };
+    r.shadow.sample_mask = mask;
     const fc: ?*const [4]f32 = if (r.dup([4]f32, if (factor) |f| @ptrCast(f) else null, 1)) |p| &p[0] else null;
     push(r, ctxOMSetBlendState, .{ raw, r.ref(bs), fc, mask });
 }
 
+fn dOMSetDepthStencilState(raw: ?*anyopaque, ds: ?*anyopaque, ref: u32) callconv(W) void {
+    const r = recOf(raw);
+    r.shadow.com.depth = ds;
+    r.shadow.stencil_ref = ref;
+    push(r, ctxOMSetDepthStencilState, .{ raw, r.ref(ds), ref });
+}
+
+fn dRSSetState(raw: ?*anyopaque, rs: ?*anyopaque) callconv(W) void {
+    const r = recOf(raw);
+    r.shadow.com.rs = rs;
+    push(r, ctxRSSetState, .{ raw, r.ref(rs) });
+}
+
 fn dRSSetViewports(raw: ?*anyopaque, num: u32, vps: ?[*]const D3D11_VIEWPORT) callconv(W) void {
     const r = recOf(raw);
+    r.shadow.nvp = @min(8, num);
+    if (vps) |arr| for (0..r.shadow.nvp) |i| { r.shadow.vps[i] = arr[i]; };
     push(r, ctxRSSetViewports, .{ raw, num, r.dup(D3D11_VIEWPORT, vps, num) });
 }
 
 fn dRSSetScissors(raw: ?*anyopaque, num: u32, rects: ?[*]const RECT) callconv(W) void {
     const r = recOf(raw);
+    r.shadow.nsc = @min(8, num);
+    if (rects) |arr| for (0..r.shadow.nsc) |i| { r.shadow.sc[i] = arr[i]; };
     push(r, ctxRSSetScissors, .{ raw, num, r.dup(RECT, rects, num) });
 }
 
@@ -2083,6 +2270,7 @@ fn dFinishCommandList(raw: ?*anyopaque, restore: i32, pp: ?*?*anyopaque) callcon
     r.cmds = .empty;
     r.refs = .empty;
     r.maps = .empty;
+    r.shadow = .{};
     const o = newCom(&cmdlist_vtbl, .cmdlist, @intFromPtr(cl), g_device) orelse {
         destroyCmdList(cl);
         return E_FAIL;
@@ -2104,10 +2292,23 @@ fn ctxExecuteCommandList(_: ?*anyopaque, cl_raw: ?*anyopaque, restore: i32) call
     const o: *ComObj = @ptrCast(@alignCast(cl_raw orelse return));
     if (o.kind != .cmdlist) return;
     const cl: *CmdList = @ptrFromInt(o.payload);
+    {
+        // Rare progress line: shows whether a title renders through command lists.
+        const S = struct {
+            var n: u32 = 0;
+            var cmds: u64 = 0;
+        };
+        S.n += 1;
+        S.cmds += cl.cmds.len;
+        if (S.n <= 4 or S.n % 1024 == 0) std.debug.print("[WINS:D3D11] ExecuteCommandList #{d}: {d} cmds (total {d})\n", .{ S.n, cl.cmds.len, S.cmds });
+    }
     const saved = g_draw_state;
+    const saved_com = g_bound;
     g_draw_state = .{};
+    g_bound = .{};
     for (cl.cmds) |c| c.run(c.args);
     g_draw_state = if (restore != 0) saved else .{};
+    g_bound = if (restore != 0) saved_com else .{};
 }
 
 fn cmdlistGetContextFlags(_: ?*anyopaque) callconv(W) u32 {
@@ -2133,9 +2334,27 @@ const cmdlist_vtbl = [_]?*const anyopaque{
     @ptrCast(&cmdlistGetContextFlags),
 };
 
+/// Unrecorded deferred-context slot: it still runs the immediate method right
+/// away (out of order), but says so once per slot so missing recorders show.
+fn dUnrecorded(comptime slot: usize) *const anyopaque {
+    return @ptrCast(&struct {
+        var told = std.atomic.Value(bool).init(false);
+        fn w(a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64) callconv(W) u64 {
+            if (!told.swap(true, .monotonic)) std.debug.print("[WINS:D3D11] deferred context: slot {d} is not recorded (runs immediately)\n", .{slot});
+            const F = *const fn (u64, u64, u64, u64, u64, u64, u64, u64) callconv(W) u64;
+            const f: F = @ptrCast(context_vtbl[slot].?);
+            return f(a0, a1, a2, a3, a4, a5, a6, a7);
+        }
+    }.w);
+}
+
 /// The immediate vtable with every state-touching slot swapped for a recorder.
 const deferred_vtbl = blk: {
     var v = context_vtbl;
+    // Default: every state slot (below the getters, 87..109) logs its first use.
+    for (7..87) |i| v[i] = dUnrecorded(i);
+    v[110] = dUnrecorded(110);
+    v[111] = dUnrecorded(111);
     v[7] = dSetArr(ctxVSSetCB);
     v[8] = dSetArr(ctxPSSetSRV);
     v[9] = dSetShader(ctxPSSetShader);
@@ -2157,8 +2376,8 @@ const deferred_vtbl = blk: {
     v[29] = @ptrCast(&stubRetOk); // GetData is invalid on a deferred context
     v[33] = @ptrCast(&dOMSetRenderTargets);
     v[35] = @ptrCast(&dOMSetBlendState);
-    v[36] = dObj1(ctxOMSetDepthStencilState);
-    v[43] = dObj1(ctxRSSetState);
+    v[36] = @ptrCast(&dOMSetDepthStencilState);
+    v[43] = @ptrCast(&dRSSetState);
     v[44] = @ptrCast(&dRSSetViewports);
     v[45] = @ptrCast(&dRSSetScissors);
     v[46] = @ptrCast(&dCopySubresourceRegion);

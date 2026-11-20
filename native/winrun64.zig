@@ -1645,7 +1645,22 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
         const exec = (g[16] & ~@as(u64, 4095)) == wp_page;
         if (bp_mode and exec and g[16] == wp_addr and step_left == 0) {
             wp_hits += 1;
-            if (wp_hits <= 3 or wp_hits % 1000 == 0) std.debug.print("winload64: BREAK hit {d} tid={d}\n", .{ wp_hits, linux.gettid() });
+            if (wp_hits <= 3 or wp_hits % 1000 == 0) {
+                std.debug.print("winload64: BREAK hit {d} tid={d}\n  rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} r8=0x{x} r9=0x{x}\n", .{
+                    wp_hits, linux.gettid(), g[13], g[11], g[14], g[12], g[9], g[8], g[0], g[1],
+                });
+                // If rcx looks like a C++/COM object, name its first vtable slots.
+                if (g[14] > 0x10000 and g[14] & 7 == 0) {
+                    const vt: usize = @as(*const usize, @ptrFromInt(g[14])).*;
+                    if (vt > 0x10000 and vt & 7 == 0) {
+                        var vi: usize = 0;
+                        while (vi < 16) : (vi += 1) {
+                            var wbv: [128]u8 = undefined;
+                            std.debug.print("  [rcx]->vtbl[{d}] (+0x{x}) = {s}\n", .{ vi, vi * 8, where(&wbv, @as(*const usize, @ptrFromInt(vt + vi * 8)).*) });
+                        }
+                    }
+                }
+            }
             step_left = 3_000_000;
             step_n = 0;
             step_tid = linux.gettid();
