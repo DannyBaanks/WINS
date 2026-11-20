@@ -10,6 +10,7 @@ pub const resolver = @import("dyld/resolver.zig");
 pub const shims = @import("darwin/shims.zig");
 pub const filesystem = @import("darwin/filesystem.zig");
 pub const objc = @import("darwin/objc.zig");
+pub const foundation = @import("darwin/foundation.zig");
 pub const trace = @import("runtime/trace.zig");
 pub const signals = @import("runtime/signals.zig");
 pub const evidence = @import("runtime/evidence.zig");

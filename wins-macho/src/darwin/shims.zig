@@ -2,6 +2,7 @@ const std = @import("std");
 const trace = @import("../runtime/trace.zig");
 const fs_shim = @import("filesystem.zig");
 const objc_shim = @import("objc.zig");
+const foundation = @import("foundation.zig");
 
 pub const ShimStatus = enum {
     NATIVE_MAPPING,
@@ -36,6 +37,7 @@ extern "c" fn strlen(s: [*:0]const u8) usize;
 extern "c" fn strcmp(s1: [*:0]const u8, s2: [*:0]const u8) c_int;
 extern "c" fn memcpy(dst: *anyopaque, src: *const anyopaque, n: usize) *anyopaque;
 extern "c" fn memmove(dst: *anyopaque, src: *const anyopaque, n: usize) *anyopaque;
+extern "c" fn memcmp(s1: *const anyopaque, s2: *const anyopaque, n: usize) c_int;
 extern "c" fn memset(s: *anyopaque, c: c_int, n: usize) *anyopaque;
 extern "c" fn getpid() c_int;
 extern "c" fn exit(status: c_int) noreturn;
@@ -492,6 +494,7 @@ fn shim_dyld_stub_binder() callconv(.c) noreturn {
 
 pub fn lookup(symbol: []const u8) ?ShimEntry {
     initGlobals();
+    foundation.ensureInitialized();
     const table = [_]ShimEntry{
         .{ .darwin_symbol = "_write", .linux_equiv = "libc:write", .status = .THIN_SHIM, .address = @intFromPtr(&shim_write) },
         .{ .darwin_symbol = "_read", .linux_equiv = "libc:read", .status = .THIN_SHIM, .address = @intFromPtr(&shim_read) },
@@ -586,6 +589,7 @@ pub fn lookup(symbol: []const u8) ?ShimEntry {
         .{ .darwin_symbol = "_strncpy", .linux_equiv = "libc:strncpy", .status = .NATIVE_MAPPING, .address = @intFromPtr(&strncpy) },
         .{ .darwin_symbol = "_strncmp", .linux_equiv = "libc:strncmp", .status = .NATIVE_MAPPING, .address = @intFromPtr(&strncmp) },
         .{ .darwin_symbol = "_memchr", .linux_equiv = "libc:memchr", .status = .NATIVE_MAPPING, .address = @intFromPtr(&memchr) },
+        .{ .darwin_symbol = "_memcmp", .linux_equiv = "libc:memcmp", .status = .NATIVE_MAPPING, .address = @intFromPtr(&memcmp) },
         .{ .darwin_symbol = "_qsort", .linux_equiv = "libc:qsort", .status = .NATIVE_MAPPING, .address = @intFromPtr(&qsort) },
         .{ .darwin_symbol = "_fputc", .linux_equiv = "libc:fputc", .status = .NATIVE_MAPPING, .address = @intFromPtr(&fputc) },
         .{ .darwin_symbol = "_fputs", .linux_equiv = "libc:fputs", .status = .NATIVE_MAPPING, .address = @intFromPtr(&fputs) },
@@ -603,16 +607,42 @@ pub fn lookup(symbol: []const u8) ?ShimEntry {
         .{ .darwin_symbol = "_dlopen", .linux_equiv = "dyld:shim_dlopen", .status = .THIN_SHIM, .address = @intFromPtr(&shim_dlopen) },
         .{ .darwin_symbol = "_dlsym", .linux_equiv = "dyld:shim_dlsym", .status = .THIN_SHIM, .address = @intFromPtr(&shim_dlsym) },
         .{ .darwin_symbol = "_objc_msgSend", .linux_equiv = "reimplemented:libobjc_msgSend_x86_64", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_msgSend) },
+        .{ .darwin_symbol = "_objc_msgSendSuper", .linux_equiv = "reimplemented:libobjc_msgSendSuper_x86_64", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_msgSendSuper) },
+        .{ .darwin_symbol = "_objc_msgSendSuper2", .linux_equiv = "reimplemented:libobjc_msgSendSuper2_x86_64", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_msgSendSuper2) },
         .{ .darwin_symbol = "__objc_empty_cache", .linux_equiv = "data:objc_empty_cache", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.objc_empty_cache) },
         .{ .darwin_symbol = "_objc_alloc", .linux_equiv = "reimplemented:objc_alloc", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_alloc) },
         .{ .darwin_symbol = "_objc_alloc_init", .linux_equiv = "reimplemented:objc_alloc_init", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_alloc_init) },
-        .{ .darwin_symbol = "_objc_retain", .linux_equiv = "reimplemented:objc_retain", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&objc_shim.shim_objc_retain) },
-        .{ .darwin_symbol = "_objc_release", .linux_equiv = "reimplemented:objc_release", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&objc_shim.shim_objc_release) },
-        .{ .darwin_symbol = "_objc_autorelease", .linux_equiv = "reimplemented:objc_autorelease", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&objc_shim.shim_objc_autorelease) },
-        .{ .darwin_symbol = "_objc_autoreleasePoolPush", .linux_equiv = "reimplemented:objc_autoreleasePoolPush", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&objc_shim.shim_objc_autoreleasePoolPush) },
-        .{ .darwin_symbol = "_objc_autoreleasePoolPop", .linux_equiv = "reimplemented:objc_autoreleasePoolPop", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&objc_shim.shim_objc_autoreleasePoolPop) },
+        .{ .darwin_symbol = "_objc_retain", .linux_equiv = "reimplemented:objc_retain", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_retain) },
+        .{ .darwin_symbol = "_objc_release", .linux_equiv = "reimplemented:objc_release", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_release) },
+        .{ .darwin_symbol = "_objc_autorelease", .linux_equiv = "reimplemented:objc_autorelease", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_autorelease) },
+        .{ .darwin_symbol = "_objc_retainAutorelease", .linux_equiv = "reimplemented:objc_retainAutorelease", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_retainAutorelease) },
+        .{ .darwin_symbol = "_objc_retainAutoreleasedReturnValue", .linux_equiv = "reimplemented:objc_retainAutoreleasedReturnValue", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_retainAutoreleasedReturnValue) },
+        .{ .darwin_symbol = "_objc_autoreleaseReturnValue", .linux_equiv = "reimplemented:objc_autoreleaseReturnValue", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_autoreleaseReturnValue) },
+        .{ .darwin_symbol = "_objc_autoreleasePoolPush", .linux_equiv = "reimplemented:objc_autoreleasePoolPush", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_autoreleasePoolPush) },
+        .{ .darwin_symbol = "_objc_autoreleasePoolPop", .linux_equiv = "reimplemented:objc_autoreleasePoolPop", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_autoreleasePoolPop) },
         .{ .darwin_symbol = "_objc_opt_class", .linux_equiv = "reimplemented:objc_opt_class", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_opt_class) },
-        .{ .darwin_symbol = "_objc_storeStrong", .linux_equiv = "reimplemented:objc_storeStrong", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&objc_shim.shim_objc_storeStrong) },
+        .{ .darwin_symbol = "_objc_opt_isKindOfClass", .linux_equiv = "reimplemented:objc_opt_isKindOfClass", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_opt_isKindOfClass) },
+        .{ .darwin_symbol = "_objc_opt_respondsToSelector", .linux_equiv = "reimplemented:objc_opt_respondsToSelector", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_opt_respondsToSelector) },
+        .{ .darwin_symbol = "_objc_storeStrong", .linux_equiv = "reimplemented:objc_storeStrong", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_storeStrong) },
+        .{ .darwin_symbol = "_objc_getClass", .linux_equiv = "reimplemented:objc_getClass", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_getClass) },
+        .{ .darwin_symbol = "_sel_registerName", .linux_equiv = "reimplemented:sel_registerName", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_sel_registerName) },
+        .{ .darwin_symbol = "_class_createInstance", .linux_equiv = "reimplemented:class_createInstance", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_class_createInstance) },
+        .{ .darwin_symbol = "_object_getClass", .linux_equiv = "reimplemented:object_getClass", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_object_getClass) },
+        .{ .darwin_symbol = "_objc_enumerationMutation", .linux_equiv = "reimplemented:objc_enumerationMutation", .status = .REIMPLEMENTED, .address = @intFromPtr(&objc_shim.shim_objc_enumerationMutation) },
+        .{ .darwin_symbol = "___CFConstantStringClassReference", .linux_equiv = "foundation:CFConstantStringClass", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_CLASS_NSConstantString) },
+        .{ .darwin_symbol = "_OBJC_CLASS_$_NSObject", .linux_equiv = "foundation:NSObject", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_CLASS_NSObject) },
+        .{ .darwin_symbol = "_OBJC_METACLASS_$_NSObject", .linux_equiv = "foundation:NSObject_meta", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_METACLASS_NSObject) },
+        .{ .darwin_symbol = "_OBJC_CLASS_$_NSString", .linux_equiv = "foundation:NSString", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_CLASS_NSString) },
+        .{ .darwin_symbol = "_OBJC_METACLASS_$_NSString", .linux_equiv = "foundation:NSString_meta", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_METACLASS_NSString) },
+        .{ .darwin_symbol = "_OBJC_CLASS_$_NSData", .linux_equiv = "foundation:NSData", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_CLASS_NSData) },
+        .{ .darwin_symbol = "_OBJC_METACLASS_$_NSData", .linux_equiv = "foundation:NSData_meta", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_METACLASS_NSData) },
+        .{ .darwin_symbol = "_OBJC_CLASS_$_NSArray", .linux_equiv = "foundation:NSArray", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_CLASS_NSArray) },
+        .{ .darwin_symbol = "_OBJC_METACLASS_$_NSArray", .linux_equiv = "foundation:NSArray_meta", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_METACLASS_NSArray) },
+        .{ .darwin_symbol = "_OBJC_CLASS_$_NSMutableArray", .linux_equiv = "foundation:NSMutableArray", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_CLASS_NSMutableArray) },
+        .{ .darwin_symbol = "_OBJC_METACLASS_$_NSMutableArray", .linux_equiv = "foundation:NSMutableArray_meta", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_METACLASS_NSMutableArray) },
+        .{ .darwin_symbol = "_OBJC_CLASS_$_NSAutoreleasePool", .linux_equiv = "foundation:NSAutoreleasePool", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_CLASS_NSAutoreleasePool) },
+        .{ .darwin_symbol = "_OBJC_METACLASS_$_NSAutoreleasePool", .linux_equiv = "foundation:NSAutoreleasePool_meta", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.OBJC_METACLASS_NSAutoreleasePool) },
+        .{ .darwin_symbol = "_NSLog", .linux_equiv = "foundation:NSLog", .status = .REIMPLEMENTED, .address = @intFromPtr(&foundation.shim_NSLog) },
         .{ .darwin_symbol = "dyld_stub_binder", .linux_equiv = "runtime:trap", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&shim_dyld_stub_binder) },
     };
 

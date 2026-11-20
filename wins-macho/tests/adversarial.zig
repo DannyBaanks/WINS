@@ -207,3 +207,40 @@ test "chained fixups: parses imports and segment page starts" {
     try std.testing.expectEqual(@as(usize, 1), segs.len);
     try std.testing.expectEqual(@as(u16, 0x20), segs[0].page_starts[0]);
 }
+
+test "foundation: symbols, classes, NSString/NSData and autorelease pool" {
+    const shims = wins_macho.shims;
+    const objc = wins_macho.objc;
+    const foundation = wins_macho.foundation;
+
+    const required_syms = [_][]const u8{
+        "___CFConstantStringClassReference",
+        "_OBJC_CLASS_$_NSObject",
+        "_OBJC_METACLASS_$_NSObject",
+        "_OBJC_CLASS_$_NSString",
+        "_OBJC_CLASS_$_NSData",
+        "_OBJC_CLASS_$_NSArray",
+        "_OBJC_CLASS_$_NSMutableArray",
+        "_OBJC_CLASS_$_NSAutoreleasePool",
+        "_NSLog",
+        "_objc_msgSendSuper2",
+    };
+    for (required_syms) |sym| {
+        try std.testing.expect(shims.lookup(sym) != null);
+    }
+
+    try std.testing.expect(objc.shim_objc_getClass("NSObject") != null);
+    try std.testing.expect(objc.shim_objc_getClass("NSString") != null);
+    try std.testing.expect(objc.shim_objc_getClass("NSArray") != null);
+    try std.testing.expect(objc.shim_objc_getClass("NSMutableArray") != null);
+    try std.testing.expect(objc.shim_objc_getClass("NSData") != null);
+    try std.testing.expect(objc.shim_objc_getClass("NSAutoreleasePool") != null);
+
+    const pool = objc.shim_objc_autoreleasePoolPush();
+    const s = foundation.makeNSStringFromSlice("hello-foundation", true);
+    try std.testing.expect(s != null);
+    try std.testing.expectEqualStrings("hello-foundation", foundation.nsStringSlice(s));
+    const d = foundation.makeNSDataFromBytes("abc", 3, true);
+    try std.testing.expect(d != null);
+    objc.shim_objc_autoreleasePoolPop(pool);
+}
