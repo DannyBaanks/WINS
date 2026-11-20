@@ -50,13 +50,18 @@ pub var objc_empty_cache: [2]usize = .{ 0, 0 };
 extern "c" fn calloc(nmemb: usize, size: usize) ?*anyopaque;
 extern "c" fn free(ptr: ?*anyopaque) void;
 extern "c" fn abort() noreturn;
+extern "c" fn pthread_mutex_lock(mutex: *anyopaque) c_int;
+extern "c" fn pthread_mutex_unlock(mutex: *anyopaque) c_int;
 
+var objc_runtime_mutex: [64]u8 align(8) = .{0} ** 64;
 var retain_counts: std.AutoHashMapUnmanaged(usize, u32) = .{};
-var pool_objects: std.ArrayListUnmanaged(usize) = .empty;
-var pool_frames: std.ArrayListUnmanaged(usize) = .empty;
+threadlocal var pool_objects: std.ArrayListUnmanaged(usize) = .empty;
+threadlocal var pool_frames: std.ArrayListUnmanaged(usize) = .empty;
 var registered_classes: std.ArrayListUnmanaged(*ObjcClass) = .empty;
 
 pub fn registerClass(cls: *ObjcClass) void {
+    _ = pthread_mutex_lock(&objc_runtime_mutex);
+    defer _ = pthread_mutex_unlock(&objc_runtime_mutex);
     const alloc = std.heap.c_allocator;
     for (registered_classes.items) |existing| {
         if (existing == cls) return;
@@ -196,8 +201,9 @@ pub export fn wins_objc_lookup_super2_imp(super_ptr: ?*const ObjcSuper, op: ?[*:
     return wins_objc_lookup_super_imp(super_ptr, op, 1);
 }
 
-// Naked x86_64 dispatcher: preserves all System V AMD64 arg registers (rdi..r9, xmm0..xmm7)
-// and tail-jumps to the resolved IMP!
+// Naked x86_64 dispatcher: preserves all System V AMD64 arg registers (rdi..r9, rax, xmm0..xmm7)
+// and tail-jumps to the resolved IMP via %r11.
+// Entry rsp is 8 mod 16; 7 pushes (56 bytes) make rsp 0 mod 16; subq $128 preserves 16-byte alignment.
 pub fn shim_objc_msgSend() callconv(.naked) void {
     asm volatile (
         \\testq %%rdi, %%rdi
@@ -208,16 +214,21 @@ pub fn shim_objc_msgSend() callconv(.naked) void {
         \\pushq %%rcx
         \\pushq %%r8
         \\pushq %%r9
-        \\subq $8, %%rsp
+        \\pushq %%rax
+        \\subq $512, %%rsp
+        \\fxsave (%%rsp)
         \\call %[lookup:P]
-        \\addq $8, %%rsp
+        \\movq %%rax, %%r11
+        \\fxrstor (%%rsp)
+        \\addq $512, %%rsp
+        \\popq %%rax
         \\popq %%r9
         \\popq %%r8
         \\popq %%rcx
         \\popq %%rdx
         \\popq %%rsi
         \\popq %%rdi
-        \\jmpq *%%rax
+        \\jmpq *%%r11
         \\1:
         \\xorl %%eax, %%eax
         \\retq
@@ -230,8 +241,8 @@ pub fn shim_objc_msgSendSuper() callconv(.naked) void {
     asm volatile (
         \\testq %%rdi, %%rdi
         \\jz 1f
-        \\movq (%%rdi), %%rax
-        \\testq %%rax, %%rax
+        \\movq (%%rdi), %%r11
+        \\testq %%r11, %%r11
         \\jz 1f
         \\pushq %%rdi
         \\pushq %%rsi
@@ -239,9 +250,14 @@ pub fn shim_objc_msgSendSuper() callconv(.naked) void {
         \\pushq %%rcx
         \\pushq %%r8
         \\pushq %%r9
-        \\subq $8, %%rsp
+        \\pushq %%rax
+        \\subq $512, %%rsp
+        \\fxsave (%%rsp)
         \\call %[lookup:P]
-        \\addq $8, %%rsp
+        \\movq %%rax, %%r11
+        \\fxrstor (%%rsp)
+        \\addq $512, %%rsp
+        \\popq %%rax
         \\popq %%r9
         \\popq %%r8
         \\popq %%rcx
@@ -249,7 +265,7 @@ pub fn shim_objc_msgSendSuper() callconv(.naked) void {
         \\popq %%rsi
         \\popq %%rdi
         \\movq (%%rdi), %%rdi
-        \\jmpq *%%rax
+        \\jmpq *%%r11
         \\1:
         \\xorl %%eax, %%eax
         \\retq
@@ -262,8 +278,8 @@ pub fn shim_objc_msgSendSuper2() callconv(.naked) void {
     asm volatile (
         \\testq %%rdi, %%rdi
         \\jz 1f
-        \\movq (%%rdi), %%rax
-        \\testq %%rax, %%rax
+        \\movq (%%rdi), %%r11
+        \\testq %%r11, %%r11
         \\jz 1f
         \\pushq %%rdi
         \\pushq %%rsi
@@ -271,9 +287,14 @@ pub fn shim_objc_msgSendSuper2() callconv(.naked) void {
         \\pushq %%rcx
         \\pushq %%r8
         \\pushq %%r9
-        \\subq $8, %%rsp
+        \\pushq %%rax
+        \\subq $512, %%rsp
+        \\fxsave (%%rsp)
         \\call %[lookup:P]
-        \\addq $8, %%rsp
+        \\movq %%rax, %%r11
+        \\fxrstor (%%rsp)
+        \\addq $512, %%rsp
+        \\popq %%rax
         \\popq %%r9
         \\popq %%r8
         \\popq %%rcx
@@ -281,7 +302,7 @@ pub fn shim_objc_msgSendSuper2() callconv(.naked) void {
         \\popq %%rsi
         \\popq %%rdi
         \\movq (%%rdi), %%rdi
-        \\jmpq *%%rax
+        \\jmpq *%%r11
         \\1:
         \\xorl %%eax, %%eax
         \\retq
@@ -306,7 +327,9 @@ fn allocWithExtraBytes(cls_ptr: ?*ObjcClass, extra_bytes: usize) ?*anyopaque {
     const sz: usize = @max(@as(usize, ro.instanceSize) + extra_bytes, @sizeOf(usize));
     const obj = calloc(1, sz) orelse return null;
     @as(*usize, @ptrCast(@alignCast(obj))).* = @intFromPtr(cls);
+    _ = pthread_mutex_lock(&objc_runtime_mutex);
     retain_counts.put(std.heap.c_allocator, @intFromPtr(obj), 1) catch {};
+    _ = pthread_mutex_unlock(&objc_runtime_mutex);
     return obj;
 }
 
@@ -323,6 +346,8 @@ pub fn shim_objc_alloc_init(cls_ptr: ?*ObjcClass) callconv(.c) ?*anyopaque {
 
 pub fn getRetainCount(obj: ?*anyopaque) usize {
     const ptr = obj orelse return 0;
+    _ = pthread_mutex_lock(&objc_runtime_mutex);
+    defer _ = pthread_mutex_unlock(&objc_runtime_mutex);
     if (retain_counts.get(@intFromPtr(ptr))) |cnt| {
         return cnt;
     }
@@ -332,9 +357,11 @@ pub fn getRetainCount(obj: ?*anyopaque) usize {
 pub fn shim_objc_retain(obj: ?*anyopaque) callconv(.c) ?*anyopaque {
     if (trace.active_tracer) |t| t.recordExternalCall("_objc_retain");
     const ptr = obj orelse return null;
+    _ = pthread_mutex_lock(&objc_runtime_mutex);
     if (retain_counts.getPtr(@intFromPtr(ptr))) |cnt_ptr| {
         cnt_ptr.* +|= 1;
     }
+    _ = pthread_mutex_unlock(&objc_runtime_mutex);
     return ptr;
 }
 
@@ -342,12 +369,19 @@ pub fn shim_objc_release(obj: ?*anyopaque) callconv(.c) void {
     if (trace.active_tracer) |t| t.recordExternalCall("_objc_release");
     const ptr = obj orelse return;
     const addr = @intFromPtr(ptr);
+    var should_dealloc = false;
+    _ = pthread_mutex_lock(&objc_runtime_mutex);
     if (retain_counts.getPtr(addr)) |cnt_ptr| {
         if (cnt_ptr.* > 1) {
             cnt_ptr.* -= 1;
-            return;
+        } else {
+            _ = retain_counts.remove(addr);
+            should_dealloc = true;
         }
-        _ = retain_counts.remove(addr);
+    }
+    _ = pthread_mutex_unlock(&objc_runtime_mutex);
+
+    if (should_dealloc) {
         const isa_addr = @as(*const usize, @ptrCast(@alignCast(ptr))).*;
         if (isa_addr != 0 and (isa_addr & 0x7) == 0) {
             if (lookupMethodInHierarchy(isa_addr, "dealloc")) |imp| {
@@ -440,6 +474,8 @@ pub fn shim_objc_getClass(name: ?[*:0]const u8) callconv(.c) ?*ObjcClass {
     if (trace.active_tracer) |t| t.recordExternalCall("_objc_getClass");
     const n = name orelse return null;
     const span = std.mem.span(n);
+    _ = pthread_mutex_lock(&objc_runtime_mutex);
+    defer _ = pthread_mutex_unlock(&objc_runtime_mutex);
     for (registered_classes.items) |cls| {
         if (std.mem.eql(u8, getClassName(cls), span)) return cls;
     }

@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    mod.linkSystemLibrary("m", .{});
 
     const exe = b.addExecutable(.{
         .name = "wins_macho",
@@ -25,6 +26,34 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(exe);
+
+    const corpus_exe = b.addExecutable(.{
+        .name = "wins_macho_corpus",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/corpus_fuzzer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "wins_macho", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(corpus_exe);
+
+    const diff_exe = b.addExecutable(.{
+        .name = "wins_macho_diff",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/diff_fuzzer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "wins_macho", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(diff_exe);
 
     const run_step = b.step("run", "Run wins_macho");
     const run_cmd = b.addRunArtifact(exe);

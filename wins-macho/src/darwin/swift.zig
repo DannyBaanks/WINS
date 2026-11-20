@@ -8,12 +8,16 @@ extern "c" fn memcpy(dst: *anyopaque, src: *const anyopaque, n: usize) *anyopaqu
 extern "c" fn free(ptr: ?*anyopaque) void;
 extern "c" fn write(fd: c_int, buf: ?*const anyopaque, count: usize) isize;
 extern "c" fn abort() noreturn;
+extern "c" fn sched_yield() c_int;
+extern "c" fn pthread_mutex_lock(mutex: *anyopaque) c_int;
+extern "c" fn pthread_mutex_unlock(mutex: *anyopaque) c_int;
 
 pub const HeapObject = extern struct {
     metadata: usize,
     refCounts: u64,
 };
 
+var swift_refcounts_mutex: [64]u8 align(8) = .{0} ** 64;
 var swift_refcounts: std.AutoHashMapUnmanaged(usize, usize) = .{};
 
 pub fn shim_swift_allocObject(metadata: usize, required_size: usize, required_alignment_mask: usize) callconv(.c) ?*anyopaque {
@@ -27,16 +31,20 @@ pub fn shim_swift_allocObject(metadata: usize, required_size: usize, required_al
     const heap_obj: *HeapObject = @ptrCast(@alignCast(obj));
     heap_obj.metadata = metadata;
     heap_obj.refCounts = 1;
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
     swift_refcounts.put(std.heap.c_allocator, @intFromPtr(obj), 1) catch {};
+    _ = pthread_mutex_unlock(&swift_refcounts_mutex);
     return obj;
 }
 
 pub fn shim_swift_retain(obj: ?*anyopaque) callconv(.c) ?*anyopaque {
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_retain");
     const ptr = obj orelse return null;
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
     if (swift_refcounts.getPtr(@intFromPtr(ptr))) |cnt| {
         cnt.* +|= 1;
     }
+    _ = pthread_mutex_unlock(&swift_refcounts_mutex);
     return ptr;
 }
 
@@ -44,19 +52,25 @@ pub fn shim_swift_release(obj: ?*anyopaque) callconv(.c) void {
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_release");
     const ptr = obj orelse return;
     const addr = @intFromPtr(ptr);
+    var should_free = false;
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
     if (swift_refcounts.getPtr(addr)) |cnt| {
         if (cnt.* > 1) {
             cnt.* -= 1;
-            return;
+        } else {
+            _ = swift_refcounts.remove(addr);
+            should_free = true;
         }
-        _ = swift_refcounts.remove(addr);
-        free(ptr);
     }
+    _ = pthread_mutex_unlock(&swift_refcounts_mutex);
+    if (should_free) free(ptr);
 }
 
 pub fn shim_swift_retainCount(obj: ?*anyopaque) callconv(.c) usize {
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_retainCount");
     const ptr = obj orelse return 0;
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
+    defer _ = pthread_mutex_unlock(&swift_refcounts_mutex);
     return swift_refcounts.get(@intFromPtr(ptr)) orelse 1;
 }
 
@@ -65,7 +79,9 @@ pub fn shim_swift_deallocObject(obj: ?*anyopaque, allocated_size: usize, allocat
     _ = allocated_align_mask;
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_deallocObject");
     const ptr = obj orelse return;
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
     _ = swift_refcounts.remove(@intFromPtr(ptr));
+    _ = pthread_mutex_unlock(&swift_refcounts_mutex);
     free(ptr);
 }
 
@@ -77,8 +93,13 @@ pub fn shim_swift_deallocClassInstance(obj: ?*anyopaque, allocated_size: usize, 
 pub fn shim_swift_once(predicate: *isize, fn_ptr: *const fn (?*anyopaque) callconv(.c) void, context: ?*anyopaque) callconv(.c) void {
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_once");
     if (@atomicLoad(isize, predicate, .acquire) == -1) return;
-    if (@cmpxchgStrong(isize, predicate, 0, -1, .seq_cst, .acquire) == null) {
+    if (@cmpxchgStrong(isize, predicate, 0, 1, .acq_rel, .acquire) == null) {
         fn_ptr(context);
+        @atomicStore(isize, predicate, -1, .release);
+        return;
+    }
+    while (@atomicLoad(isize, predicate, .acquire) != -1) {
+        _ = sched_yield();
     }
 }
 
@@ -108,7 +129,10 @@ pub fn shim_swift_bridgeObjectRelease(obj: ?*anyopaque) callconv(.c) void {
 pub fn shim_swift_unknownObjectRetain(obj: ?*anyopaque) callconv(.c) ?*anyopaque {
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_unknownObjectRetain");
     const ptr = obj orelse return null;
-    if (swift_refcounts.contains(@intFromPtr(ptr))) {
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
+    const is_swift = swift_refcounts.contains(@intFromPtr(ptr));
+    _ = pthread_mutex_unlock(&swift_refcounts_mutex);
+    if (is_swift) {
         return shim_swift_retain(ptr);
     }
     return objc.shim_objc_retain(ptr);
@@ -117,7 +141,10 @@ pub fn shim_swift_unknownObjectRetain(obj: ?*anyopaque) callconv(.c) ?*anyopaque
 pub fn shim_swift_unknownObjectRelease(obj: ?*anyopaque) callconv(.c) void {
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_unknownObjectRelease");
     const ptr = obj orelse return;
-    if (swift_refcounts.contains(@intFromPtr(ptr))) {
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
+    const is_swift = swift_refcounts.contains(@intFromPtr(ptr));
+    _ = pthread_mutex_unlock(&swift_refcounts_mutex);
+    if (is_swift) {
         shim_swift_release(ptr);
         return;
     }
@@ -179,9 +206,11 @@ pub const swift_meta_any: TypeMetadata = .{ .vwt = &swift_vwt_string, .kind = 0x
 pub fn shim_swift_retain_n(obj: ?*anyopaque, n: u32) callconv(.c) ?*anyopaque {
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_retain_n");
     const ptr = obj orelse return null;
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
     if (swift_refcounts.getPtr(@intFromPtr(ptr))) |cnt| {
         cnt.* +|= n;
     }
+    _ = pthread_mutex_unlock(&swift_refcounts_mutex);
     return ptr;
 }
 
@@ -189,14 +218,18 @@ pub fn shim_swift_release_n(obj: ?*anyopaque, n: u32) callconv(.c) void {
     if (trace.active_tracer) |t| t.recordExternalCall("_swift_release_n");
     const ptr = obj orelse return;
     const addr = @intFromPtr(ptr);
+    var should_free = false;
+    _ = pthread_mutex_lock(&swift_refcounts_mutex);
     if (swift_refcounts.getPtr(addr)) |cnt| {
         if (cnt.* > n) {
             cnt.* -= n;
-            return;
+        } else {
+            _ = swift_refcounts.remove(addr);
+            should_free = true;
         }
-        _ = swift_refcounts.remove(addr);
-        free(ptr);
     }
+    _ = pthread_mutex_unlock(&swift_refcounts_mutex);
+    if (should_free) free(ptr);
 }
 
 pub fn shim_swift_allocBox(metadata: ?*const TypeMetadata) callconv(.c) BoxPair {
