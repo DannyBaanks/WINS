@@ -2077,10 +2077,35 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
     std.process.exit(9);
 }
 
+/// SIGUSR2 = "where is this thread?": prints RIP, RSP and the PE return
+/// addresses on its stack, then resumes. Send it per thread (tgkill) to
+/// see what a hung or spinning thread is doing without ptrace.
+fn onSample(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    const g: [*]u64 = @ptrFromInt(@intFromPtr(ctx.?) + 40);
+    var b1: [160]u8 = undefined;
+    std.debug.print("[WINS:SAMPLE] tid={d} rip={s} rsp=0x{x} rax=0x{x} rcx=0x{x}\n", .{ linux.gettid(), where(&b1, g[16]), g[15], g[13], g[14] });
+    const rsp = g[15];
+    var n: usize = 0;
+    var k: usize = 0;
+    while (k < 2048 and n < 16) : (k += 1) {
+        const at = rsp + k * 8;
+        if (linux.errno(linux.madvise(@ptrFromInt(at & ~@as(usize, 4095)), 4096, linux.MADV.NORMAL)) != .SUCCESS) break;
+        const v = @as(*const u64, @ptrFromInt(at)).*;
+        for (crash_images) |im| if (v >= im.base and v < im.base + im.img.len and inExec(im.secs, v - im.base)) {
+            std.debug.print("    [rsp+0x{x}] {s}\n", .{ k * 8, where(&b1, v) });
+            n += 1;
+        };
+    }
+}
+
 fn installCrashReport(images: []const Image) void {
     crash_images = images;
     var act: linux.Sigaction = .{ .handler = .{ .sigaction = &onCrash }, .mask = std.mem.zeroes(linux.sigset_t), .flags = linux.SA.SIGINFO };
     for ([_]linux.SIG{ .SEGV, .BUS, .ILL, .FPE, .TRAP }) |s| _ = linux.sigaction(s, &act, null);
+    var sample: linux.Sigaction = .{ .handler = .{ .sigaction = &onSample }, .mask = std.mem.zeroes(linux.sigset_t), .flags = linux.SA.SIGINFO | linux.SA.RESTART };
+    _ = linux.sigaction(.USR2, &sample, null);
 }
 
 const Loader = struct {

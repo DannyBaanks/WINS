@@ -161,7 +161,7 @@ pub const Connection = struct {
         if (width == 0 or height == 0 or width > 65535 or height > 65535) return error.InvalidSize;
         const window = XCreateSimpleWindow(self.display, XDefaultRootWindow(self.display), x, y, width, height, 0, 0x000000, 0xf0f0f0);
         if (window == 0) return error.CreateFailed;
-        const mask: c_long = (1 << 15) | (1 << 17) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6); // Exposure | StructureNotify | Key/Button/Pointer
+        const mask: c_long = (1 << 15) | (1 << 17) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 21); // Exposure | StructureNotify | Key/Button/Pointer | FocusChange
         _ = XSelectInput(self.display, window, mask);
         var wm_delete = XInternAtom(self.display, "WM_DELETE_WINDOW", 0);
         if (wm_delete != 0) {

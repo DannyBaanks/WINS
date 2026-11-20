@@ -7,6 +7,7 @@ const gdi = @import("winrun_gdi_fb.zig");
 const gl64 = @import("wins_gl_win64.zig");
 const kbd = @import("wins_input64_kbd.zig");
 const dxmod = @import("winrun_directx.zig");
+const dinput = @import("wins_dinput.zig");
 const threads = @import("winrun_threads.zig");
 const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
 
@@ -78,6 +79,11 @@ const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_QUIT: u32 = 0x0012;
 const WM_SHOWWINDOW: u32 = 0x0018;
+const WM_ACTIVATE: u32 = 0x0006;
+const WM_SETFOCUS: u32 = 0x0007;
+const WM_KILLFOCUS: u32 = 0x0008;
+const WM_ACTIVATEAPP: u32 = 0x001C;
+const WM_NCACTIVATE: u32 = 0x0086;
 const WM_NCDESTROY: u32 = 0x0082;
 
 const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
@@ -1049,6 +1055,30 @@ fn ensureX11Window(w: *WinObj) void {
     }
 }
 
+/// The top-level window Windows considers active (it got WM_ACTIVATE). Games
+/// (FromSoftware's among them) ignore input until their window procedure has
+/// seen WM_ACTIVATEAPP/WM_ACTIVATE, so these follow X11 focus and the first
+/// ShowWindow of a top-level window, as on Windows.
+var g_activated_hwnd: usize = 0;
+
+fn setActivation(hwnd: usize, on: bool, sync: bool) void {
+    if (on and g_activated_hwnd == hwnd) return;
+    if (!on and g_activated_hwnd != hwnd) return;
+    g_activated_hwnd = if (on) hwnd else 0;
+    const seq = if (on)
+        [_][3]usize{ .{ WM_ACTIVATEAPP, 1, 0 }, .{ WM_NCACTIVATE, 1, 0 }, .{ WM_ACTIVATE, 1, 0 }, .{ WM_SETFOCUS, 0, 0 } }
+    else
+        [_][3]usize{ .{ WM_KILLFOCUS, 0, 0 }, .{ WM_NCACTIVATE, 0, 0 }, .{ WM_ACTIVATE, 0, 0 }, .{ WM_ACTIVATEAPP, 0, 0 } };
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:USER32] {s} hwnd=0x{x}\n", .{ if (on) "activate" else "deactivate", hwnd });
+    for (seq) |m| {
+        if (sync) {
+            _ = dispatchSubclassFrom(hwnd, @intCast(m[0]), m[1], @bitCast(m[2]), null);
+        } else {
+            _ = pushMsg(.{ .hwnd = hwnd, .message = @intCast(m[0]), .wParam = m[1], .lParam = @bitCast(m[2]), .time = 0, .pt = .{ .x = 0, .y = 0 } });
+        }
+    }
+}
+
 fn showWindow(window: usize, cmd_show: i32) callconv(W) i32 {
     const w = findWin(window) orelse return 0;
     const was_visible: i32 = if (w.visible) 1 else 0;
@@ -1073,6 +1103,10 @@ fn showWindow(window: usize, cmd_show: i32) callconv(W) i32 {
         if (resized) {
             _ = dispatchSubclassFrom(window, WM_SIZE, 0, (@as(usize, @intCast(w.height)) << 16) | @as(usize, @intCast(w.width & 0xffff)), null);
         }
+        // Showing a top-level window activates it (SW_SHOWNA/SW_SHOWNOACTIVATE/
+        // SW_SHOWMINNOACTIVE = 8/4/7 do not).
+        if ((w.style & WS_CHILD) == 0 and w.parent == 0 and was_visible == 0 and g_activated_hwnd == 0 and !g_focus_lost and cmd_show != 4 and cmd_show != 7 and cmd_show != 8)
+            setActivation(window, true, true);
     } else {
         w.visible = false;
         w.style &= ~WS_VISIBLE;
@@ -1489,6 +1523,10 @@ fn enqueueDirtyPaints() void {
 
 var g_last_mouse_x: i32 = 0;
 var g_last_mouse_y: i32 = 0;
+// DirectInput relative motion (separate from the RawInput deltas above).
+var g_dinput_last_x: i32 = 0;
+var g_dinput_last_y: i32 = 0;
+var g_have_dinput_last = false;
 
 /// One X11 key event -> Win32: VK in wParam, VK-state table (shared with
 /// GetKeyState/GetAsyncKeyState via winrun_directx.feedKeyState), WM_INPUT
@@ -1498,6 +1536,7 @@ fn postKeyEvent(w: *WinObj, conn: *const x11.Connection, ke: *const x11.XKeyEven
     const vk = kbd.handleKeyEvent(conn, ke, down);
     if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:KBD] keycode={d} vk=0x{x} down={} hwnd=0x{x}\n", .{ ke.keycode, vk, down, w.hwnd });
     if (vk != 0) dxmod.feedKeyState(vk, down);
+    dinput.keyEvent(dinput.dikFromX11(ke.keycode), down);
     if (vk != 0 and std.c.getenv("WINS_KBD_NO_RAW") == null) {
         if (dxmod.getRegisteredRawInputTarget(1, 6)) |hwnd| { // HID usage page 1, usage 6 = keyboard
             const h = dxmod.pushRawKeyEvent(vk, @intCast(ke.keycode), kbd.isExtendedVk(vk), down);
@@ -1518,6 +1557,16 @@ fn postMouseButton(w: *WinObj, be: *const x11.XButtonEvent, down: bool) void {
         3 => if (down) dxmod.RI_MOUSE_RIGHT_BUTTON_DOWN else dxmod.RI_MOUSE_RIGHT_BUTTON_UP,
         else => 0,
     };
+    switch (be.button) {
+        1 => dinput.mouseButton(0, down),
+        2 => dinput.mouseButton(2, down),
+        3 => dinput.mouseButton(1, down),
+        4 => if (down) dinput.mouseWheel(120),
+        5 => if (down) dinput.mouseWheel(-120),
+        8 => dinput.mouseButton(3, down),
+        9 => dinput.mouseButton(4, down),
+        else => {},
+    }
     const lp: usize = (@as(usize, @intCast(@max(0, be.y))) << 16) | @as(usize, @intCast(@max(0, be.x) & 0xffff));
     if (ri_flags != 0) {
         if (dxmod.getRegisteredRawInputTarget(1, 2)) |hwnd| { // usage page 1, usage 2 = mouse
@@ -1579,6 +1628,10 @@ fn pumpX11Events(wait_ms: i32) void {
                 const me: *const x11.XButtonEvent = @ptrCast(&ev); // same prefix layout as XMotionEvent
                 const lp: usize = (@as(usize, @intCast(@max(0, me.y))) << 16) | @as(usize, @intCast(@max(0, me.x) & 0xffff));
                 _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_MOUSEMOVE, .wParam = 0, .lParam = lp, .time = 0, .pt = .{ .x = me.x, .y = me.y } });
+                if (g_have_dinput_last) dinput.mouseMove(me.x - g_dinput_last_x, me.y - g_dinput_last_y);
+                g_dinput_last_x = me.x;
+                g_dinput_last_y = me.y;
+                g_have_dinput_last = true;
                 if (dxmod.getRegisteredRawInputTarget(1, 2)) |hwnd| {
                     const rx = me.x - g_last_mouse_x;
                     const ry = me.y - g_last_mouse_y;
@@ -1587,6 +1640,21 @@ fn pumpX11Events(wait_ms: i32) void {
                     const h = dxmod.pushRawMouseEvent(rx, ry, 0, 0);
                     _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = me.x, .y = me.y } });
                 }
+            },
+            9 => { // FocusIn
+                g_focus_hwnd = w.hwnd;
+                g_focus_lost = false;
+                dinput.focus(true);
+                setActivation(w.hwnd, true, false);
+            },
+            10 => { // FocusOut: Windows releases every key of a background window
+                if (g_focus_hwnd == w.hwnd or g_focus_hwnd == 0) {
+                    g_focus_hwnd = 0;
+                    g_focus_lost = true;
+                    setActivation(w.hwnd, false, false);
+                }
+                dinput.focus(false);
+                g_have_dinput_last = false;
             },
             2 => postKeyEvent(w, &conn, @ptrCast(&ev), true), // KeyPress
             3 => postKeyEvent(w, &conn, @ptrCast(&ev), false), // KeyRelease
@@ -2867,8 +2935,26 @@ fn DestroyIcon(hIcon: usize) callconv(W) i32 {
     return 1;
 }
 
+/// Keyboard focus as X11 reports it: the HWND of the last FocusIn, or none
+/// after a FocusOut. Before any focus event, the first visible top-level
+/// window counts as active (a fresh Windows process owns the foreground).
+var g_focus_hwnd: usize = 0;
+var g_focus_lost = false;
+
+fn activeTopLevel() usize {
+    if (g_focus_hwnd != 0) return g_focus_hwnd;
+    if (g_focus_lost) return 0;
+    for (&windows) |*w| {
+        if (w.in_use and w.parent == 0 and w.visible) return w.hwnd;
+    }
+    for (&windows) |*w| {
+        if (w.in_use and w.parent == 0) return w.hwnd;
+    }
+    return 0;
+}
+
 fn GetActiveWindow() callconv(W) usize {
-    return 1;
+    return activeTopLevel();
 }
 
 fn GetAncestor(hwnd: usize, gaFlags: u32) callconv(W) usize {
@@ -2877,7 +2963,7 @@ fn GetAncestor(hwnd: usize, gaFlags: u32) callconv(W) usize {
 }
 
 fn GetFocus() callconv(W) usize {
-    return 1;
+    return activeTopLevel();
 }
 
 fn GetKeyState(nVirtKey: i32) callconv(W) i16 {
@@ -3097,8 +3183,14 @@ fn SetCursor(hCursor: usize) callconv(W) usize {
     return hCursor;
 }
 
+/// Windows keeps a display counter (0 with a mouse attached): ShowCursor adds
+/// or subtracts 1 and returns the new value, and the cursor shows while it is
+/// >= 0. Games hide it with `while (ShowCursor(FALSE) >= 0) {}`, which spins
+/// forever unless the count really moves.
+var g_cursor_count = std.atomic.Value(i32).init(0);
+
 fn ShowCursor(bShow: i32) callconv(W) i32 {
-    return if (bShow != 0) 1 else 0;
+    return if (bShow != 0) g_cursor_count.fetchAdd(1, .monotonic) + 1 else g_cursor_count.fetchSub(1, .monotonic) - 1;
 }
 
 fn SetCursorPos(x: i32, y: i32) callconv(W) i32 {
@@ -4267,7 +4359,12 @@ fn mouse_event(dwFlags: u32, dx: u32, dy: u32, dwData: u32, dwExtraInfo: usize) 
 }
 
 fn GetKeyboardState(lpKeyState: ?[*]u8) callconv(W) i32 {
-    if (lpKeyState) |s| @memset(s[0..256], 0);
+    const out = lpKeyState orelse return 0;
+    // Per VK: 0x80 = down, 0x01 = toggled, the same table GetKeyState reads.
+    for (0..256) |vk| {
+        const st: u16 = @bitCast(kbd.getKeyState(@intCast(vk)));
+        out[vk] = (if ((st & 0x8000) != 0) @as(u8, 0x80) else 0) | @as(u8, @intCast(st & 1));
+    }
     return 1;
 }
 
