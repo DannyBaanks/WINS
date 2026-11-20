@@ -522,3 +522,71 @@ test "libcxx: Darwin ABI v1 std::string SSO/long, shared_weak_count, mutex+cv, s
     // 4. system_clock::now() returns positive epoch microseconds
     try std.testing.expect(libcxx.shim_system_clock_now() > 1_700_000_000_000_000);
 }
+
+test "libcxx + unwind: RTTI inheritance matching, CxaException ABI, and compact unwind RBP/frameless step" {
+    const libcxx = wins_macho.libcxx;
+    const unwind = wins_macho.unwind;
+    const shims = wins_macho.shims;
+
+    libcxx.ensureInitialized();
+
+    // 1. All exception/unwind symbols are REIMPLEMENTED (zero probe-only stubs)
+    const eh_syms = [_][]const u8{
+        "___cxa_allocate_exception",
+        "___cxa_free_exception",
+        "___cxa_throw",
+        "___cxa_rethrow",
+        "___cxa_begin_catch",
+        "___cxa_end_catch",
+        "___gxx_personality_v0",
+        "__Unwind_RaiseException",
+        "__Unwind_Resume",
+        "__Unwind_GetIP",
+        "__Unwind_SetIP",
+        "__Unwind_SetGR",
+        "__Unwind_GetLanguageSpecificData",
+        "__Unwind_GetRegionStart",
+    };
+    for (eh_syms) |sym| {
+        const entry = shims.lookup(sym) orelse return error.MissingSymbol;
+        try std.testing.expectEqual(shims.ShimStatus.REIMPLEMENTED, entry.status);
+    }
+
+    // 2. Itanium RTTI inheritance matching: std::out_of_range -> std::logic_error -> std::exception
+    var dummy_obj: u64 = 0x1234;
+    var adj: ?*anyopaque = @ptrCast(&dummy_obj);
+    try std.testing.expect(libcxx.typeInfoCanCatch(
+        @ptrCast(&libcxx.ti_exception),
+        @ptrCast(&libcxx.ti_out_of_range),
+        &adj,
+    ));
+    try std.testing.expect(libcxx.typeInfoCanCatch(
+        @ptrCast(&libcxx.ti_logic_error),
+        @ptrCast(&libcxx.ti_out_of_range),
+        &adj,
+    ));
+    try std.testing.expect(!libcxx.typeInfoCanCatch(
+        @ptrCast(&libcxx.ti_runtime_error),
+        @ptrCast(&libcxx.ti_out_of_range),
+        &adj,
+    ));
+
+    // 3. Synthetic x86_64 RBP-frame compact unwind step restores RBX, R12, old RBP, RIP, RSP
+    var fake_stack = [_]u64{
+        0x1111_2222_3333_4444, // [0] rbp - 16 (saved RBX)
+        0x5555_6666_7777_8888, // [1] rbp - 8  (saved R12)
+        0xAAAA_BBBB_CCCC_DDDD, // [2] rbp      (saved old RBP)
+        0x0000_0001_0000_9999, // [3] rbp + 8  (saved return RIP)
+    };
+    var regs = unwind.UnwindRegs{};
+    regs.r[unwind.UnwindRegs.RBP] = @intFromPtr(&fake_stack[2]);
+    regs.r[unwind.UnwindRegs.RSP] = @intFromPtr(&fake_stack[0]);
+    // MODE_RBP_FRAME (0x01000000), offset=2 (0x00020000), slot0=RBX(1), slot1=R12(2 << 3 = 16 = 0x10)
+    const enc: u32 = 0x0102_0011;
+    try std.testing.expect(unwind.stepCompactX86_64(enc, 0, &regs));
+    try std.testing.expectEqual(@as(u64, 0x1111_2222_3333_4444), regs.r[unwind.UnwindRegs.RBX]);
+    try std.testing.expectEqual(@as(u64, 0x5555_6666_7777_8888), regs.r[unwind.UnwindRegs.R12]);
+    try std.testing.expectEqual(@as(u64, 0xAAAA_BBBB_CCCC_DDDD), regs.r[unwind.UnwindRegs.RBP]);
+    try std.testing.expectEqual(@as(u64, 0x0000_0001_0000_9999), regs.r[unwind.UnwindRegs.RIP]);
+    try std.testing.expectEqual(@as(u64, @intFromPtr(&fake_stack[2]) + 16), regs.r[unwind.UnwindRegs.RSP]);
+}

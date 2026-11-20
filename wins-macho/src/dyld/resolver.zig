@@ -7,6 +7,7 @@ const image = @import("../loader/image.zig");
 const mapper = @import("../loader/mapper.zig");
 const shims = @import("../darwin/shims.zig");
 const objc = @import("../darwin/objc.zig");
+const unwind = @import("../darwin/unwind.zig");
 const rpath = @import("rpath.zig");
 
 pub const DepKind = enum {
@@ -75,6 +76,7 @@ pub const DyldContext = struct {
     }
 
     pub fn deinit(self: *DyldContext) void {
+        unwind.clearImages();
         for (self.images.items) |*img| img.deinit();
         self.images.deinit(self.allocator);
         for (self.owned_raw_buffers.items) |buf| self.allocator.free(buf);
@@ -387,11 +389,50 @@ pub const DyldContext = struct {
 
         // Initialize Mach-O TLS (__thread_vars) while __DATA is writable, then
         // restore final segment protections (never leave segments globally RWX)
-        // and register any Objective-C classes defined inside the loaded Mach-O images.
+        // and register Objective-C classes + Mach-O compact unwind sections.
         for (self.images.items) |*img| {
             initializeMachoTlv(img);
             try mapper.finalizeProtections(img);
             registerMachoObjcClasses(img);
+            registerMachoUnwind(img);
+        }
+    }
+
+    fn registerMachoUnwind(img: *const image.MappedImage) void {
+        var text_start: usize = 0;
+        var text_end: usize = 0;
+        var unwind_info_addr: usize = 0;
+        var unwind_info_size: usize = 0;
+        var eh_frame_addr: usize = 0;
+        var eh_frame_size: usize = 0;
+
+        for (img.parsed.segments) |seg| {
+            if (std.mem.eql(u8, seg.cmd.name(), "__TEXT")) {
+                text_start = img.vmToActual(seg.cmd.vmaddr);
+                text_end = text_start + @as(usize, @intCast(seg.cmd.vmsize));
+            }
+            for (seg.sections) |sec| {
+                const sname = sec.name();
+                if (std.mem.eql(u8, sname, "__unwind_info") and sec.size > 0) {
+                    unwind_info_addr = img.vmToActual(sec.addr);
+                    unwind_info_size = @intCast(sec.size);
+                } else if (std.mem.eql(u8, sname, "__eh_frame") and sec.size > 0) {
+                    eh_frame_addr = img.vmToActual(sec.addr);
+                    eh_frame_size = @intCast(sec.size);
+                }
+            }
+        }
+
+        if (text_start != 0 and (unwind_info_addr != 0 or eh_frame_addr != 0)) {
+            unwind.registerImage(.{
+                .dso_base = text_start,
+                .text_start = text_start,
+                .text_end = text_end,
+                .unwind_info_addr = unwind_info_addr,
+                .unwind_info_size = unwind_info_size,
+                .eh_frame_addr = eh_frame_addr,
+                .eh_frame_size = eh_frame_size,
+            });
         }
     }
 
