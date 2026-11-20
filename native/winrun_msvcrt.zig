@@ -2229,6 +2229,17 @@ fn _vsnprintf(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const 
     return vsnprintf_impl(buf, count, fmt, ap_raw);
 }
 
+/// vsprintf has no bound; the formatter still needs one, so use a large one
+/// (a real C runtime trusts the caller's buffer the same way).
+fn vsprintf(buf: ?[*]u8, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(C) i32 {
+    return vsnprintf_impl(buf, 1 << 30, fmt, ap_raw);
+}
+
+/// C99 vsnprintf: always returns the would-be length.
+fn vsnprintf_c99(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(C) i32 {
+    return vsnprintf_impl(buf, count, fmt, ap_raw);
+}
+
 fn _vscprintf(fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(C) i32 {
     return vsnprintf_impl(null, 0, fmt, ap_raw);
 }
@@ -3661,6 +3672,8 @@ pub fn lookup(name: []const u8) ?usize {
     // Formatting & Scanning
     if (std.mem.eql(u8, name, "_vsnprintf")) return @intFromPtr(&_vsnprintf);
     if (std.mem.eql(u8, name, "_vscprintf")) return @intFromPtr(&_vscprintf);
+    if (std.mem.eql(u8, name, "vsprintf")) return @intFromPtr(&vsprintf);
+    if (std.mem.eql(u8, name, "vsnprintf")) return @intFromPtr(&vsnprintf_c99);
     if (std.mem.eql(u8, name, "sprintf")) return @intFromPtr(&sprintf);
     if (std.mem.eql(u8, name, "sscanf")) return @intFromPtr(&sscanf);
 

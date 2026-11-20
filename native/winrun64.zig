@@ -188,7 +188,12 @@ fn moduleKey(buf: []u8, raw: []const u8) []const u8 {
 }
 
 fn handleFor(key: []const u8) usize {
-    if (steam64.isSteamClientDll(key)) return steam64.getModuleHandle(key);
+    if (steam64.isSteamClientDll(key)) {
+        // Facade mode: like Windows, the module has no handle until loaded.
+        if (g_ld) |ld| if (ld.pins.get(steam64_name) != null)
+            return if (g_steam_facade_idx) |k| ld.images.items[k].base else 0;
+        return steam64.getModuleHandle(key);
+    }
     const ld = g_ld orelse return 0;
     if (ld.find(key)) |k| return ld.images.items[k].base;
     for (system_dlls, 0..) |d, k| if (std.mem.eql(u8, d, key)) {
@@ -311,12 +316,85 @@ fn ldLock() void {
     while (!g_ld_lock.tryLock()) std.atomic.spinLoopHint();
 }
 
+// ---------------------------------------------------------------- steamclient64 facade
+// Steam's DRM wrapper (SteamStub's steamdrmp.dll) resolves CreateInterface from
+// steamclient64.dll, asks GetModuleHandleEx(FROM_ADDRESS) which module holds it,
+// verifies Valve's signature on that file and compares the in-memory PE headers
+// with it. When the launcher pins the host's real steamclient64.dll (shipped by
+// Steam for Linux, the same file Proton copies into prefixes), WINS maps it as an
+// image WITHOUT running any of its code -- no imports bound, no TLS callbacks, no
+// DllMain -- and points every export at the Linux Steam bridge: bridged exports
+// jump to SteamBridge64, the others to a trap that reports and stops. Same idea as
+// Proton's steamclient trampolines, without Wine.
+var g_steam_facade_idx: ?usize = null;
+
+fn facadeTrampoline(at: [*]u8, target: usize) void {
+    at[0] = 0xFF; // jmp qword [rip+0]
+    at[1] = 0x25;
+    std.mem.writeInt(u32, at[2..6], 0, .little);
+    std.mem.writeInt(u64, at[6..14], target, .little);
+}
+
+/// Maps the pinned host steamclient64.dll as a facade. Caller holds g_ld_lock.
+fn mapSteamClientFacade(ld: *Loader) usize {
+    if (g_steam_facade_idx) |k| return ld.images.items[k].base;
+    if (steam64.getModuleHandle(steam64_name) == 0) return 0; // no live Steam client
+    var pb: [1024]u8 = undefined;
+    const path = steam64.hostWindowsClientPath(&pb) orelse return 0;
+    const idx = ld.map(path); // SHA-256 pin enforced by readPinned
+    const im = &ld.images.items[idx];
+    const d = im.dirs[0];
+    if (d.size == 0) die(.bad_image, "steamclient64.dll has no exports", .{});
+    const nfun = need(u32, im.img, d.rva + 20, "export functions count");
+    const nnames = need(u32, im.img, d.rva + 24, "export names");
+    const afun = need(u32, im.img, d.rva + 28, "export functions");
+    const anames = need(u32, im.img, d.rva + 32, "export name ptrs");
+    const aords = need(u32, im.img, d.rva + 36, "export ordinals");
+    // Every export body must have room for the 14-byte jump before the next one.
+    var rvas: [256]u32 = undefined;
+    if (nfun > rvas.len) die(.refused, "steamclient64.dll: {d} exports (facade supports {d})", .{ nfun, rvas.len });
+    for (0..nfun) |k| rvas[k] = need(u32, im.img, afun + k * 4, "export rva");
+    std.mem.sort(u32, rvas[0..nfun], {}, std.sort.asc(u32));
+    for (1..nfun) |k| if (rvas[k] != rvas[k - 1] and rvas[k] - rvas[k - 1] < 14)
+        die(.refused, "steamclient64.dll: exports 0x{x}/0x{x} too close for a facade jump", .{ rvas[k - 1], rvas[k] });
+    var bridged: usize = 0;
+    var i: usize = 0;
+    while (i < nnames) : (i += 1) {
+        const n = cstr(im.img, need(u32, im.img, anames + i * 4, "export name rva"), "export name");
+        const ord = need(u16, im.img, aords + i * 2, "export ordinal");
+        const rva = need(u32, im.img, afun + @as(usize, ord) * 4, "export rva");
+        if (!inExec(im.secs, rva) or rva + 14 > im.size_of_image) die(.refused, "steamclient64.dll: export {s} is not code", .{n});
+        var target = steam64.bridgedExport(n);
+        if (target != 0) {
+            bridged += 1;
+        } else if (n_traps < max_traps) {
+            trap_names[n_traps] = std.fmt.allocPrint(ld.a, "steamclient64.dll!{s} (facade: not bridged)", .{n}) catch "?";
+            target = @intFromPtr(trap_table[n_traps]);
+            n_traps += 1;
+        } else die(.refused, "steamclient64.dll: out of trap slots", .{});
+        facadeTrampoline(im.img.ptr + rva, target);
+    }
+    im.state = .initialized; // its own code never runs
+    ld.protectImage(idx);
+    crash_images = ld.images.items;
+    g_steam_facade_idx = idx;
+    steam64.module_handle = im.base;
+    std.debug.print("[WINS:SteamBridge64] mapped host steamclient64.dll as a facade at 0x{x} ({d}/{d} exports bridged)\n", .{ im.base, bridged, nnames });
+    return im.base;
+}
+const steam64_name = "steamclient64.dll";
+
 fn loadDynamicModule(raw: []const u8, what: []const u8) usize {
     if (std.c.getenv("WINS_TRACE") != null) std.debug.print("winload64: {s}(\"{s}\")\n", .{ what, raw });
     var b: [272]u8 = undefined;
     const key = moduleKey(&b, raw);
     ldLock();
     defer g_ld_lock.unlock();
+    if (steam64.isSteamClientDll(key)) if (g_ld) |ld| if (ld.pins.get(steam64_name) != null) {
+        const h = mapSteamClientFacade(ld);
+        if (h == 0) setLastError(ERROR_MOD_NOT_FOUND);
+        return h;
+    };
     const h0 = handleFor(key);
     if (h0 != 0) return h0;
     if (g_ld) |ld| {
@@ -655,8 +733,89 @@ fn wideName(name: ?[*:0]const u16, tmp: *[48]u8) ?[]const u8 {
 }
 fn openNamed(kind: threads.Kind, name: ?[]const u8) usize {
     const h = if (name) |n| threads.openNamed(kind, n) else 0;
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("winload64: Open{s}(\"{s}\") -> 0x{x}\n", .{ @tagName(kind), name orelse "(null)", h });
     if (h == 0) setLastError(2);
     return h;
+}
+
+/// IsBad*Ptr: probe every page of the range with process_vm_readv (EFAULT, never a
+/// fault, when unmapped/PROT_NONE). Write access is then read from /proc/self/maps.
+fn rangeReadable(p: usize, n: usize) bool {
+    if (n == 0) return true;
+    if (p == 0 or p +% n < p) return false;
+    var byte: u8 = undefined;
+    var at = p;
+    while (true) {
+        var local = [_]std.posix.iovec{.{ .base = @ptrCast(&byte), .len = 1 }};
+        var remote = [_]std.posix.iovec_const{.{ .base = @ptrFromInt(at), .len = 1 }};
+        const got = linux.process_vm_readv(linux.getpid(), &local, &remote, 0);
+        if (linux.errno(got) != .SUCCESS or got != 1) return false;
+        const next = (at & ~@as(usize, 4095)) + 4096;
+        if (next >= p + n) return true;
+        at = next;
+    }
+}
+fn rangeWritable(p: usize, n: usize) bool {
+    if (!rangeReadable(p, n)) return false;
+    if (n == 0) return true;
+    const fd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return true;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [65536]u8 = undefined;
+    var carry: usize = 0;
+    var want = p; // first byte not yet proven writable
+    while (true) {
+        const r = linux.read(@intCast(fd), buf[carry..].ptr, buf.len - carry);
+        if (linux.errno(r) != .SUCCESS) return true;
+        const total = carry + r;
+        var it = std.mem.splitScalar(u8, buf[0..total], '\n');
+        var consumed: usize = 0;
+        while (it.next()) |line| {
+            if (it.index == null and r != 0) break; // partial last line
+            consumed = if (it.index) |ix| ix else total;
+            const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const lo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+            const hi = std.fmt.parseInt(usize, line[dash + 1 .. sp], 16) catch continue;
+            if (want >= lo and want < hi) {
+                if (line.len < sp + 3 or line[sp + 2] != 'w') return false;
+                want = hi;
+                if (want >= p + n) return true;
+            }
+        }
+        if (r == 0) return want >= p + n;
+        carry = total - consumed;
+        std.mem.copyForwards(u8, buf[0..carry], buf[consumed..total]);
+    }
+}
+fn winIsBadReadPtr(p: usize, n: usize) callconv(W) i32 {
+    const bad = !rangeReadable(p, n);
+    if (std.c.getenv("WINS_TRACE") != null) {
+        var b1: [128]u8 = undefined;
+        var b2: [128]u8 = undefined;
+        std.debug.print("winload64: IsBadReadPtr({s}, {d}) -> {} caller={s}\n", .{ where(&b2, p), n, bad, where(&b1, @returnAddress()) });
+    }
+    return @intFromBool(bad);
+}
+fn winIsBadCodePtr(p: usize) callconv(W) i32 { return @intFromBool(!rangeReadable(p, 1)); }
+fn winIsBadWritePtr(p: usize, n: usize) callconv(W) i32 { return @intFromBool(!rangeWritable(p, n)); }
+
+/// Named file mappings: none exist yet in winrun64. Report the name (WINS_TRACE)
+/// and fail the way Windows does when no process created the object.
+fn winOpenFileMappingA(access: u32, inherit: i32, name: ?[*:0]const u8) callconv(W) usize {
+    _ = access;
+    _ = inherit;
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("winload64: OpenFileMappingA(\"{s}\") -> 0\n", .{if (name) |p| std.mem.span(p) else "(null)"});
+    setLastError(2);
+    return 0;
+}
+fn winOpenFileMappingW(access: u32, inherit: i32, name: ?[*:0]const u16) callconv(W) usize {
+    _ = access;
+    _ = inherit;
+    var b: [48]u8 = undefined;
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("winload64: OpenFileMappingW(\"{s}\") -> 0\n", .{wideName(name, &b) orelse "(null)"});
+    setLastError(2);
+    return 0;
 }
 fn winOpenEventA(access: u32, inherit: i32, name: ?[*:0]const u8) callconv(W) usize { _ = access; _ = inherit; return openNamed(.event, if (name) |p| std.mem.span(p) else null); }
 fn winOpenEventW(access: u32, inherit: i32, name: ?[*:0]const u16) callconv(W) usize { _ = access; _ = inherit; var b: [48]u8 = undefined; return openNamed(.event, wideName(name, &b)); }
@@ -764,10 +923,46 @@ fn FreeLibrary(h: usize) callconv(W) i32 {
     _ = h;
     return 1; // images stay mapped for the process lifetime
 }
+/// Diagnostic: WINS_DUMP_PE=<hex base>[,<path>] writes the in-memory PE image at
+/// that base (SizeOfImage from its own header) when the guest resolves
+/// MessageBoxA -- the moment a loader stub is about to report a failure.
+fn dumpPeOnFailure() void {
+    const spec = std.mem.span(std.c.getenv("WINS_DUMP_PE") orelse return);
+    const comma = std.mem.indexOfScalar(u8, spec, ',');
+    const base = std.fmt.parseInt(usize, std.mem.trimStart(u8, spec[0 .. comma orelse spec.len], "0x"), 16) catch return;
+    const path = if (comma) |c| spec[c + 1 ..] else "/tmp/wins-pe-dump.bin";
+    if (!rangeReadable(base, 0x400)) return;
+    const hdr: [*]const u8 = @ptrFromInt(base);
+    const e_lfanew = std.mem.readInt(u32, hdr[0x3c..0x40], .little);
+    if (e_lfanew > 0x300) return;
+    const size = std.mem.readInt(u32, hdr[e_lfanew + 0x50 ..][0..4], .little);
+    var pz: [512]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&pz, "{s}", .{path}) catch return;
+    const fd = linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    var off: usize = 0;
+    var zero: [4096]u8 = @splat(0);
+    while (off < size) : (off += 4096) {
+        const chunk = @min(4096, size - off);
+        const src: [*]const u8 = if (rangeReadable(base + off, chunk)) @ptrFromInt(base + off) else &zero;
+        _ = linux.write(@intCast(fd), src, chunk);
+    }
+    std.debug.print("winload64: dumped PE at 0x{x} ({d} bytes) to {s}\n", .{ base, size, path });
+}
+
 fn GetProcAddress(h: usize, name: ?[*:0]const u8) callconv(W) usize {
+    if (name != null and @intFromPtr(name) >= 0x10000 and std.mem.eql(u8, std.mem.span(name.?), "MessageBoxA")) dumpPeOnFailure();
     if (h == steam64.module_handle) {
         const symbol = name orelse return 0;
-        return steam64.getProcAddress(h, std.mem.span(symbol));
+        if (@intFromPtr(symbol) < 0x10000) return 0;
+        const sym = std.mem.span(symbol);
+        const impl = steam64.getProcAddress(h, sym);
+        if (impl == 0) return 0;
+        // Facade: hand out the export's address inside the real image (its jump
+        // goes to `impl`), so callers that check which module holds it see Valve's.
+        if (g_steam_facade_idx) |k| if (g_ld) |ld| if (ld.exportByName(k, sym, 0)) |a| return a;
+        return impl;
     }
     const ld = g_ld orelse return 0;
     var symbuf: [16]u8 = undefined;
@@ -787,6 +982,18 @@ fn GetProcAddress(h: usize, name: ?[*:0]const u8) callconv(W) usize {
         return 0;
     };
     const addr = ld.resolve(l, sym, 0) orelse {
+        // Diagnostic (with --trap-unresolved): WINS_TRAP_GETPROC=<image> hands callers
+        // inside that image a trap instead of NULL, so one run lists every function a
+        // loader stub resolves and only the ones it really calls stop the process.
+        if (trap_all and n_traps < max_traps) if (std.c.getenv("WINS_TRAP_GETPROC")) |only| {
+            var b1: [128]u8 = undefined;
+            if (std.ascii.startsWithIgnoreCase(where(&b1, @returnAddress()), std.mem.span(only))) {
+                trap_names[n_traps] = std.fmt.allocPrint(std.heap.page_allocator, "{s}!{s} (GetProcAddress)", .{ l, sym }) catch "?";
+                std.debug.print("winload64: GetProcAddress({s}, {s}) -> TRAP #{d}\n", .{ l, sym, n_traps });
+                n_traps += 1;
+                return @intFromPtr(trap_table[n_traps - 1]);
+            }
+        };
         std.debug.print("winload64: GetProcAddress({s}, {s}) -> not implemented (ERROR_PROC_NOT_FOUND)\n", .{ l, sym });
         setLastError(ERROR_PROC_NOT_FOUND);
         return 0;
@@ -1011,6 +1218,10 @@ fn VirtualQuery(addr: ?*const anyopaque, out: ?*MBI, len: usize) callconv(W) usi
         }
     }
     out.?.* = m;
+    if (std.c.getenv("WINS_TRACE_VQ") != null) {
+        var b1: [128]u8 = undefined;
+        std.debug.print("winload64: VirtualQuery(0x{x}) -> base=0x{x} alloc=0x{x} size=0x{x} state=0x{x} prot=0x{x} type=0x{x} caller={s}\n", .{ @intFromPtr(addr), m.BaseAddress, m.AllocationBase, m.RegionSize, m.State, m.Protect, m.Type, where(&b1, @returnAddress()) });
+    }
     return @sizeOf(MBI);
 }
 
@@ -1061,7 +1272,9 @@ fn RegOpenKeyExA(hKey: usize, subKey: ?[*:0]const u8, options: u32, desired: u32
     }
     const fallback = @import("winrun_extra_dlls.zig").lookupAdvapi32("RegOpenKeyExA") orelse return 127;
     const call: *const fn (usize, ?[*:0]const u8, u32, u32, ?*usize) callconv(W) i32 = @ptrFromInt(fallback);
-    return call(hKey, subKey, options, desired, result);
+    const rc = call(hKey, subKey, options, desired, result);
+    regTrace("RegOpenKeyExA", hKey, if (subKey) |p| std.mem.span(p) else "", rc);
+    return rc;
 }
 
 fn RegQueryValueExA(hKey: usize, name: ?[*:0]const u8, reserved: ?*u32, valueType: ?*u32, data: ?[*]u8, size: ?*u32) callconv(W) i32 {
@@ -1073,7 +1286,65 @@ fn RegQueryValueExA(hKey: usize, name: ?[*:0]const u8, reserved: ?*u32, valueTyp
     }
     const fallback = @import("winrun_extra_dlls.zig").lookupAdvapi32("RegQueryValueExA") orelse return 127;
     const call: *const fn (usize, ?[*:0]const u8, ?*u32, ?*u32, ?[*]u8, ?*u32) callconv(W) i32 = @ptrFromInt(fallback);
-    return call(hKey, name, reserved, valueType, data, size);
+    const rc = call(hKey, name, reserved, valueType, data, size);
+    regTrace("RegQueryValueExA", hKey, if (name) |p| std.mem.span(p) else "", rc);
+    return rc;
+}
+
+fn regTrace(comptime what: []const u8, hKey: usize, name: []const u8, rc: i32) void {
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("winload64: " ++ what ++ "(0x{x}, \"{s}\") -> {d}\n", .{ hKey, name, rc });
+}
+
+fn RegOpenKeyExW(hKey: usize, subKey: ?[*:0]const u16, options: u32, desired: u32, result: ?*usize) callconv(W) i32 {
+    var b: [272]u8 = undefined;
+    const sub: []const u8 = if (subKey) |w| wideToUtf8Tmp(w, &b) else "";
+    if (@as(u32, @truncate(hKey)) == 0x80000001 and std.ascii.eqlIgnoreCase(sub, "Software\\Valve\\Steam\\ActiveProcess")) {
+        if (result) |out| out.* = steam_active_process_key;
+        regTrace("RegOpenKeyExW", hKey, sub, 0);
+        return 0;
+    }
+    const fallback = @import("winrun_extra_dlls.zig").lookupAdvapi32("RegOpenKeyExW") orelse return 127;
+    const call: *const fn (usize, ?[*:0]const u16, u32, u32, ?*usize) callconv(W) i32 = @ptrFromInt(fallback);
+    const rc = call(hKey, subKey, options, desired, result);
+    regTrace("RegOpenKeyExW", hKey, sub, rc);
+    return rc;
+}
+
+/// REG_SZ as UTF-16 (RegQueryValueExW): size in bytes including the NUL.
+fn writeRegSzW(value: []const u8, value_type: ?*u32, data: ?[*]u8, size: ?*u32) i32 {
+    const bytes_needed: u32 = @intCast((value.len + 1) * 2);
+    if (value_type) |out| out.* = 1;
+    if (size) |out| {
+        const supplied = out.*;
+        out.* = bytes_needed;
+        if (data) |dst| {
+            if (supplied < bytes_needed) return 234;
+            for (value, 0..) |c, k| std.mem.writeInt(u16, dst[k * 2 ..][0..2], c, .little);
+            std.mem.writeInt(u16, dst[value.len * 2 ..][0..2], 0, .little);
+        }
+    } else if (data != null) return 87;
+    return 0;
+}
+
+fn RegQueryValueExW(hKey: usize, name: ?[*:0]const u16, reserved: ?*u32, valueType: ?*u32, data: ?[*]u8, size: ?*u32) callconv(W) i32 {
+    var b: [272]u8 = undefined;
+    const n: []const u8 = if (name) |w| wideToUtf8Tmp(w, &b) else "";
+    if (hKey == steam_active_process_key) {
+        const rc: i32 = if (std.ascii.eqlIgnoreCase(n, "pid"))
+            steam64.querySteamPidValue(steam64.steamClientPid(), valueType, data, size)
+        else if (std.ascii.eqlIgnoreCase(n, "SteamClientDll64")) blk: {
+            var path_buf: [2048]u8 = undefined;
+            const path = steam64.fileName(steam64.module_handle, &path_buf) orelse break :blk 2;
+            break :blk writeRegSzW(path, valueType, data, size);
+        } else 2;
+        regTrace("RegQueryValueExW[ActiveProcess]", hKey, n, rc);
+        return rc;
+    }
+    const fallback = @import("winrun_extra_dlls.zig").lookupAdvapi32("RegQueryValueExW") orelse return 127;
+    const call: *const fn (usize, ?[*:0]const u16, ?*u32, ?*u32, ?[*]u8, ?*u32) callconv(W) i32 = @ptrFromInt(fallback);
+    const rc = call(hKey, name, reserved, valueType, data, size);
+    regTrace("RegQueryValueExW", hKey, n, rc);
+    return rc;
 }
 
 fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
@@ -1082,10 +1353,15 @@ fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
     if (std.mem.eql(u8, key, "advapi32.dll")) {
         if (std.mem.eql(u8, sym, "RegOpenKeyExA")) return @intFromPtr(&RegOpenKeyExA);
         if (std.mem.eql(u8, sym, "RegQueryValueExA")) return @intFromPtr(&RegQueryValueExA);
+        if (std.mem.eql(u8, sym, "RegOpenKeyExW")) return @intFromPtr(&RegOpenKeyExW);
+        if (std.mem.eql(u8, sym, "RegQueryValueExW")) return @intFromPtr(&RegQueryValueExW);
     }
     if (std.mem.eql(u8, key, "kernel32.dll") or std.mem.eql(u8, key, "kernelbase.dll")) {
         if (std.mem.eql(u8, sym, "OpenProcess")) return @intFromPtr(&OpenProcess);
         if (std.mem.eql(u8, sym, "GetExitCodeProcess")) return @intFromPtr(&GetExitCodeProcess);
+    }
+    if (std.mem.eql(u8, key, "ntdll.dll")) {
+        if (@import("winrun_ntdll64.zig").lookup(sym)) |a| return a;
     }
     if (@import("wins_audio64.zig").lookupOverride(key, sym)) |a| return a;
     if (@import("winload64_sync.zig").lookup(key, sym)) |a| return a;
@@ -1137,6 +1413,8 @@ fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
         .{ "SleepEx", &winSleepEx }, .{ "QueueUserAPC", &winQueueUserAPC },
         .{ "SignalObjectAndWait", &winSignalObjectAndWait },
         .{ "OpenEventA", &winOpenEventA }, .{ "OpenEventW", &winOpenEventW },
+        .{ "IsBadReadPtr", &winIsBadReadPtr }, .{ "IsBadWritePtr", &winIsBadWritePtr }, .{ "IsBadCodePtr", &winIsBadCodePtr },
+        .{ "OpenFileMappingA", &winOpenFileMappingA }, .{ "OpenFileMappingW", &winOpenFileMappingW },
         .{ "OpenSemaphoreA", &winOpenSemaphoreA }, .{ "OpenSemaphoreW", &winOpenSemaphoreW },
         .{ "OpenMutexA", &winOpenMutexA }, .{ "OpenMutexW", &winOpenMutexW },
         .{ "CreateWaitableTimerA", &winCreateWaitableTimerA }, .{ "CreateWaitableTimerW", &winCreateWaitableTimerW },
@@ -1172,6 +1450,11 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
         else => null,
     };
     if (exc_code) |code| {
+        if (std.c.getenv("WINS_TRACE") != null) {
+            var t1: [128]u8 = undefined;
+            var t2: [128]u8 = undefined;
+            std.debug.print("winload64: exception 0x{x} at {s} addr={s} -> SEH\n", .{ code, where(&t1, g[16]), where(&t2, fault_addr) });
+        }
         if (seh64.dispatchHardwareException(code, fault_addr, g)) return;
     }
     const rip = g[16];
@@ -1771,6 +2054,7 @@ pub fn main(init: std.process.Init) !void {
     std.mem.writeInt(usize, teb[0x58..][0..8], @intFromPtr(tls_array.ptr), .little); // ThreadLocalStoragePointer
     std.mem.writeInt(usize, teb[0x60..][0..8], @intFromPtr(peb.ptr), .little); // ProcessEnvironmentBlock
     g_peb_ptr = @intFromPtr(peb.ptr);
+    @import("winrun_ntdll64.zig").peb_ptr = g_peb_ptr;
     std.mem.writeInt(usize, peb[0x10..][0..8], ld.images.items[root_idx].base, .little); // ImageBaseAddress
     std.mem.writeInt(usize, peb[0x18..][0..8], 0x10000, .little); // ProcessHeap (opaque)
     std.mem.writeInt(usize, peb[0x20..][0..8], @intFromPtr(params.ptr), .little); // ProcessParameters
