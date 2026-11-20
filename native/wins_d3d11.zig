@@ -407,6 +407,20 @@ fn comQiDefault(raw: ?*anyopaque, riid: *const GUID, ppv: *?*anyopaque) callconv
 }
 
 fn stubRetOk() callconv(W) i32 { return S_OK; }
+
+/// Device creation methods WINS does not implement: fail with E_NOTIMPL and a
+/// NULL object (reported once per method) instead of S_OK with no object.
+fn notImplCreate(comptime name: []const u8, comptime out_index: usize) *const anyopaque {
+    return @ptrCast(&struct {
+        var told = std.atomic.Value(bool).init(false);
+        fn f(a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) callconv(W) i32 {
+            const args = [_]usize{ a1, a2, a3, a4, a5 };
+            if (args[out_index] != 0) @as(*usize, @ptrFromInt(args[out_index])).* = 0;
+            if (!told.swap(true, .monotonic)) std.debug.print("[WINS:D3D11] {s} is not implemented (E_NOTIMPL)\n", .{name});
+            return E_NOTIMPL;
+        }
+    }.f);
+}
 fn stubVoid() callconv(W) void {}
 fn stubRetZero() callconv(W) u32 { return 0; }
 fn dxgiGetParent(raw: ?*anyopaque, riid: *const GUID, pp: *?*anyopaque) callconv(W) i32 {
@@ -1399,9 +1413,9 @@ const view_vtbl = [_]?*const anyopaque{
 const device_vtbl = [_]?*const anyopaque{
     @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease), // 0..2
     @ptrCast(&devCreateBuffer), // 3
-    @ptrCast(&stubRetOk), // 4 CreateTexture1D
+    notImplCreate("CreateTexture1D", 3), // 4
     @ptrCast(&devCreateTexture2D), // 5
-    @ptrCast(&stubRetOk), // 6 CreateTexture3D
+    notImplCreate("CreateTexture3D", 3), // 6
     @ptrCast(&devCreateSRV), // 7
     @ptrCast(&devCreateUAV), // 8
     @ptrCast(&devCreateRTV), // 9
@@ -1414,16 +1428,16 @@ const device_vtbl = [_]?*const anyopaque{
     @ptrCast(&devCreateDummyShader), // 16 HS
     @ptrCast(&devCreateDummyShader), // 17 DS
     @ptrCast(&devCreateDummyShader), // 18 CS
-    @ptrCast(&stubRetOk), // 19 CreateClassLinkage
+    notImplCreate("CreateClassLinkage", 1), // 19
     @ptrCast(&devCreateBlendState), // 20
     @ptrCast(&devCreateDepthStencilState), // 21
     @ptrCast(&devCreateRasterizerState), // 22
     @ptrCast(&devCreateSamplerState), // 23
     @ptrCast(&devCreateQuery), // 24
     @ptrCast(&devCreateQuery), // 25 CreatePredicate
-    @ptrCast(&stubRetOk), // 26 CreateCounter
-    @ptrCast(&stubRetOk), // 27 CreateDeferredContext
-    @ptrCast(&stubRetOk), // 28 OpenSharedResource
+    notImplCreate("CreateCounter", 2), // 26
+    notImplCreate("CreateDeferredContext", 2), // 27
+    notImplCreate("OpenSharedResource", 3), // 28
     @ptrCast(&devCheckFormatSupport), // 29
     @ptrCast(&devCheckMultisample), // 30
     @ptrCast(&stubVoid), // 31 CheckCounterInfo

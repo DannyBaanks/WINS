@@ -684,7 +684,7 @@ fn steamGetApiCallResultWin(pipe: u32, call: u64, buffer: ?[*]u8, buffer_size: i
 /// ISteamClient revisions whose vtable prefix matches 017 for every slot the
 /// adapter treats specially (pipe/user 0 and 2, getters, callback hooks 21/31-33).
 fn clientRevisionBridged(name: []const u8) bool {
-    const revisions = [_][]const u8{ "SteamClient014", "SteamClient015", "SteamClient016" };
+    const revisions = [_][]const u8{ "SteamClient012", "SteamClient013", "SteamClient014", "SteamClient015", "SteamClient016" };
     for (revisions) |r| if (std.mem.eql(u8, name, r)) return true;
     return false;
 }

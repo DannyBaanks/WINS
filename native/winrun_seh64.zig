@@ -815,6 +815,31 @@ fn raiseExceptionDispatch(code: u32, flags: u32, nargs: u32, args: ?[*]const usi
 /// Dispatch hardware faults (SIGSEGV / SIGFPE / SIGILL) from Linux sigaction
 /// to Windows Vectored Exception Handlers (used heavily by Mono JIT) and SEH.
 /// gregs follows Linux x86-64 mcontext_t gregset_t order (R8=0 .. EFLAGS=17).
+/// Crash-report backtrace: unwinds from the signal context with the images'
+/// .pdata (the same unwinder RtlVirtualUnwind uses) and reports each return
+/// address through `emit`. Stops at the first frame outside any known table or
+/// when the stack stops growing. Diagnostic only.
+pub fn backtrace(gregs: [*]const u64, max: usize, emit: *const fn (usize, usize) void) void {
+    var ctx: [CTX_SIZE]u8 align(16) = [_]u8{0} ** CTX_SIZE;
+    const map_from_greg = [16]usize{ 13, 14, 12, 11, 15, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7 };
+    for (0..16) |wreg| writeCtxReg(&ctx, wreg, gregs[map_from_greg[wreg]]);
+    writeCtxRip(&ctx, gregs[16]);
+    var k: usize = 0;
+    while (k < max) : (k += 1) {
+        const pc = readCtxRip(&ctx);
+        const sp = readCtxReg(&ctx, 4);
+        if (pc == 0) return;
+        emit(k, pc);
+        var base: usize = 0;
+        const entry = lookupFunctionEntry(pc, &base, null);
+        if (entry == null and k > 0) return; // unknown code: no reliable unwind
+        var hd: ?*const anyopaque = null;
+        var ef: u64 = 0;
+        _ = virtualUnwind(0, base, pc, entry, &ctx, &hd, &ef, null);
+        if (readCtxReg(&ctx, 4) <= sp) return;
+    }
+}
+
 pub fn dispatchHardwareException(code: u32, fault_addr: usize, gregs: [*]u64) bool {
     var win_ctx: [CTX_SIZE]u8 align(16) = [_]u8{0} ** CTX_SIZE;
     std.mem.writeInt(u32, win_ctx[CTX_FLAGS..][0..4], 0x10000F, .little);

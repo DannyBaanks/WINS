@@ -929,7 +929,8 @@ fn FreeLibrary(h: usize) callconv(W) i32 {
 fn dumpPeOnFailure() void {
     const spec = std.mem.span(std.c.getenv("WINS_DUMP_PE") orelse return);
     const comma = std.mem.indexOfScalar(u8, spec, ',');
-    const base = std.fmt.parseInt(usize, std.mem.trimStart(u8, spec[0 .. comma orelse spec.len], "0x"), 16) catch return;
+    const base_s = spec[0 .. comma orelse spec.len];
+    const base = if (std.mem.eql(u8, base_s, "root")) rootBase() else std.fmt.parseInt(usize, std.mem.trimStart(u8, base_s, "0x"), 16) catch return;
     const path = if (comma) |c| spec[c + 1 ..] else "/tmp/wins-pe-dump.bin";
     if (!rangeReadable(base, 0x400)) return;
     const hdr: [*]const u8 = @ptrFromInt(base);
@@ -1347,6 +1348,15 @@ fn RegQueryValueExW(hKey: usize, name: ?[*:0]const u16, reserved: ?*u32, valueTy
     return rc;
 }
 
+const gaps64 = @import("winrun_win64_gaps.zig");
+fn gapsSetLastError(code: u32) void {
+    setLastError(code);
+}
+fn gapsResolve(lib: []const u8, sym: []const u8) ?usize {
+    if (registryOverride(lib, sym)) |a| return a;
+    return winrun.lookup(shimLibrary(lib), sym);
+}
+
 fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
     var b: [272]u8 = undefined;
     const key = moduleKey(&b, lib);
@@ -1362,6 +1372,16 @@ fn registryOverride(lib: []const u8, sym: []const u8) ?usize {
     }
     if (std.mem.eql(u8, key, "ntdll.dll")) {
         if (@import("winrun_ntdll64.zig").lookup(sym)) |a| return a;
+    }
+    if (std.mem.eql(u8, key, "d3dcompiler_43.dll") or std.mem.eql(u8, key, "d3dcompiler_47.dll") or std.mem.eql(u8, key, "d3dcompiler.dll")) {
+        // Real ID3DBlob / ID3D11ShaderReflection (winrun_directx only had NULL stubs).
+        const refl = @import("wins_d3d_reflect.zig");
+        if (std.mem.eql(u8, sym, "D3DCreateBlob")) return @intFromPtr(&refl.createBlob);
+        if (std.mem.eql(u8, sym, "D3DReflect")) return @intFromPtr(&refl.reflect);
+    }
+    if (gaps64.lookup(key, sym)) |a| {
+        // Only where nothing else implements it (the gaps module never shadows).
+        if (winrun.lookup(shimLibrary(lib), sym) == null) return a;
     }
     if (@import("wins_audio64.zig").lookupOverride(key, sym)) |a| return a;
     if (@import("winload64_sync.zig").lookup(key, sym)) |a| return a;
@@ -1463,6 +1483,13 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
     var b2: [128]u8 = undefined;
     std.debug.print("winload64: CRASH signal {d} at {s} (trapno={d} err=0x{x} cr2={s})\n", .{ @intFromEnum(sig), where(&b1, rip), g[20], g[19], where(&b2, g[22]) });
     std.debug.print("  rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n  rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n  r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x}\n", .{ g[13], g[11], g[14], g[12], g[9], g[8], g[10], rsp, g[0], g[1], g[2], g[3] });
+    std.debug.print("  unwound call chain (.pdata):\n", .{});
+    seh64.backtrace(g, 32, &struct {
+        fn f(k: usize, pc: usize) void {
+            var bb: [128]u8 = undefined;
+            std.debug.print("    #{d} {s}\n", .{ k, where(&bb, pc) });
+        }
+    }.f);
     std.debug.print("  stack words pointing into executable sections (candidate return addresses):\n", .{});
     var n: usize = 0;
     var k: usize = 0;
@@ -1480,6 +1507,7 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
             n += 1;
         };
     }
+    dumpPeOnFailure();
     std.process.exit(9);
 }
 
@@ -1941,6 +1969,8 @@ fn shimLibrary(lib: []const u8) []const u8 {
         std.ascii.eqlIgnoreCase(lib, "vcruntime140_1.dll") or
         std.ascii.eqlIgnoreCase(lib, "msvcp140.dll")) return "ucrtbase.dll";
     if (std.ascii.startsWithIgnoreCase(lib, "api-ms-win-core-")) return "kernel32.dll";
+    // D3DCompiler_43 (June 2010 SDK) exports the same reflection API as _47.
+    if (std.ascii.eqlIgnoreCase(lib, "d3dcompiler_43.dll")) return "d3dcompiler_47.dll";
     return lib;
 }
 
@@ -2008,6 +2038,8 @@ pub fn main(init: std.process.Init) !void {
         die(.usage, "execution requires the boxed launcher; use winload64_box.py", .{});
 
     g_ld = &ld;
+    gaps64.set_last_error = &gapsSetLastError;
+    gaps64.resolve = &gapsResolve;
     steam64.setIo(ld.io);
     if (winrun.lookup("kernel32.dll", "SetLastError")) |f| @import("winload64_sync.zig").set_last_error = @ptrFromInt(f);
     const root_idx = ld.map(root.?);
@@ -2070,6 +2102,9 @@ pub fn main(init: std.process.Init) !void {
     k32.setCommandLine(target_args.items);
 
     installCrashReport(ld.images.items);
+    // KUSER_SHARED_DATA at 0x7FFE0000, before any guest code (DllMain included) runs.
+    if (!@import("winrun_kuser64.zig").install())
+        std.debug.print("winload64: KUSER_SHARED_DATA could not be mapped at 0x7ffe0000; guests reading it will fault\n", .{});
     ld.initialize(root_idx);
 
     if (run_exe or calls.items.len == 0) {
