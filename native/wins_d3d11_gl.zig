@@ -121,6 +121,10 @@ const Gl = struct {
     glCompressedTexSubImage2D: *const fn (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, ?*const anyopaque) callconv(.c) void,
     glTexImage3D: *const fn (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
     glTexSubImage3D: *const fn (GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
+    glCompressedTexImage3D: *const fn (GLenum, GLint, GLenum, GLsizei, GLsizei, GLsizei, GLint, GLsizei, ?*const anyopaque) callconv(.c) void,
+    glCompressedTexSubImage3D: *const fn (GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLsizei, ?*const anyopaque) callconv(.c) void,
+    glTexImage1D: *const fn (GLenum, GLint, GLint, GLsizei, GLint, GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
+    glTexSubImage1D: *const fn (GLenum, GLint, GLint, GLsizei, GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
     glGenerateMipmap: *const fn (GLenum) callconv(.c) void,
 
     glGenSamplers: *const fn (GLsizei, *GLuint) callconv(.c) void,
@@ -983,7 +987,7 @@ fn traceProgConstants(s: *const DrawState, prog: GLuint, fw: u32, fh: u32) void 
 
 fn attachTextureView(att: GLenum, v: *View) void {
     const tex = v.tex orelse return;
-    if (tex.target == 0x8C1A or tex.target == 0x806F) { // TEXTURE_2D_ARRAY / 3D
+    if (tex.target == 0x8C1A or tex.target == 0x806F or tex.target == 0x8C18) { // 2D_ARRAY / 3D / 1D_ARRAY
         gl.glFramebufferTextureLayer(0x8D40, att, tex.gl_id, @intCast(v.first_mip), @intCast(v.first_slice));
     } else if (tex.target == 0x8513) { // CUBE_MAP
         const face: GLenum = 0x8515 + @as(GLenum, @intCast(v.first_slice % 6));
@@ -1211,7 +1215,43 @@ const TexCreateJob = struct {
     t: *Texture,
     init_ptrs: ?[*]const ?*const anyopaque,
     init_pitches: ?[*]const u32,
+    init_slice_pitches: ?[*]const u32 = null,
 };
+
+/// Copy a (possibly padded) row/slice-pitched 3D block into a tightly packed
+/// buffer so GL can take it without UNPACK_* state. `row_bytes` is the tight
+/// row size and `rows` the rows per slice (block rows for compressed formats).
+fn packSlices(src: [*]const u8, row_pitch: u32, slice_pitch: u32, row_bytes: u32, rows: u32, depth: u32) ?[]u8 {
+    const tmp = alloc.alloc(u8, @as(usize, row_bytes) * rows * depth) catch return null;
+    const rp: usize = if (row_pitch == 0) row_bytes else row_pitch;
+    const sp: usize = if (slice_pitch == 0) rp * rows else slice_pitch;
+    for (0..depth) |z| for (0..rows) |y| {
+        @memcpy(tmp[(z * rows + y) * row_bytes ..][0..row_bytes], src[z * sp + y * rp ..][0..row_bytes]);
+    };
+    return tmp;
+}
+
+fn upload3DLevel(level: u32, w: u32, h: u32, d: u32, gf: GlTexFmt, ptr: ?*const anyopaque, pitch: u32, slice_pitch: u32) void {
+    const bw = if (gf.compressed) @max(1, (w + 3) / 4) else w;
+    const rows = if (gf.compressed) @max(1, (h + 3) / 4) else h;
+    const row_bytes = if (gf.compressed) bw * gf.block_bytes else w * @max(1, gf.bpp);
+    var packbuf: ?[]u8 = null;
+    defer if (packbuf) |pk| alloc.free(pk);
+    var data: ?*const anyopaque = ptr;
+    if (ptr) |p| {
+        const tight_rp = pitch == 0 or pitch == row_bytes;
+        const tight_sp = slice_pitch == 0 or slice_pitch == row_bytes * rows;
+        if (!(tight_rp and tight_sp)) {
+            packbuf = packSlices(@ptrCast(p), pitch, slice_pitch, row_bytes, rows, d);
+            data = if (packbuf) |pk| pk.ptr else null;
+        }
+    }
+    if (gf.compressed) {
+        gl.glCompressedTexImage3D(0x806F, @intCast(level), @intCast(gf.internal), @intCast(w), @intCast(h), @intCast(d), 0, @intCast(row_bytes * rows * d), data);
+    } else {
+        gl.glTexImage3D(0x806F, @intCast(level), gf.internal, @intCast(w), @intCast(h), @intCast(d), 0, gf.format, gf.ty, data);
+    }
+}
 
 fn uploadMipSlice2D(target: GLenum, level: u32, w: u32, h: u32, gf: GlTexFmt, ptr: ?*const anyopaque, pitch: u32) void {
     if (gf.compressed) {
@@ -1252,7 +1292,11 @@ fn createTexture2DJob(raw: ?*anyopaque) void {
     const gf = dxgiToGlFormat(t.dxgi_fmt);
     t.is_depth = gf.is_depth;
     t.is_compressed = gf.compressed;
-    t.target = if (t.array_size >= 6 and (t.target == 0x8513)) 0x8513 else if (t.array_size > 1) 0x8C1A else 0x0DE1;
+    t.target = switch (t.target) {
+        0x0DE0, 0x8C18 => if (t.array_size > 1) 0x8C18 else 0x0DE0, // TEXTURE_1D(_ARRAY)
+        0x806F => 0x806F, // TEXTURE_3D
+        else => if (t.array_size >= 6 and (t.target == 0x8513)) 0x8513 else if (t.array_size > 1) 0x8C1A else 0x0DE1,
+    };
 
     gl.glGenTextures(1, &t.gl_id);
     gl.glBindTexture(t.target, t.gl_id);
@@ -1266,7 +1310,38 @@ fn createTexture2DJob(raw: ?*anyopaque) void {
         gl.glTexParameteri(t.target, 0x8E45, 0x1903);
     }
 
-    if (t.target == 0x0DE1) {
+    if (t.target == 0x0DE0) { // TEXTURE_1D (D3D has no compressed 1D formats)
+        var mw = t.width;
+        for (0..t.mip_levels) |m| {
+            const p = if (j.init_ptrs) |ps| ps[m] else null;
+            gl.glTexImage1D(0x0DE0, @intCast(m), gf.internal, @intCast(mw), 0, gf.format, gf.ty, p);
+            mw = @max(1, mw >> 1);
+        }
+    } else if (t.target == 0x8C18) { // TEXTURE_1D_ARRAY: GL stores it as w x layers
+        var mw = t.width;
+        for (0..t.mip_levels) |m| {
+            gl.glTexImage2D(0x8C18, @intCast(m), gf.internal, @intCast(mw), @intCast(t.array_size), 0, gf.format, gf.ty, null);
+            if (j.init_ptrs) |ps| {
+                for (0..t.array_size) |sl| {
+                    if (ps[sl * t.mip_levels + m]) |p| gl.glTexSubImage2D(0x8C18, @intCast(m), 0, @intCast(sl), @intCast(mw), 1, gf.format, gf.ty, p);
+                }
+            }
+            mw = @max(1, mw >> 1);
+        }
+    } else if (t.target == 0x806F) { // TEXTURE_3D
+        var mw = t.width;
+        var mh = t.height;
+        var md = t.depth;
+        for (0..t.mip_levels) |m| {
+            const p = if (j.init_ptrs) |ps| ps[m] else null;
+            const pitch = if (j.init_pitches) |pits| pits[m] else 0;
+            const spitch = if (j.init_slice_pitches) |sps| sps[m] else 0;
+            upload3DLevel(@intCast(m), mw, mh, md, gf, p, pitch, spitch);
+            mw = @max(1, mw >> 1);
+            mh = @max(1, mh >> 1);
+            md = @max(1, md >> 1);
+        }
+    } else if (t.target == 0x0DE1) {
         var mw = t.width;
         var mh = t.height;
         for (0..t.mip_levels) |m| {
@@ -1313,10 +1388,17 @@ fn createTexture2DJob(raw: ?*anyopaque) void {
 }
 
 pub fn createTexture2D(t: *Texture, init_ptrs: ?[*]const ?*const anyopaque, init_pitches: ?[*]const u32) void {
+    createTexture(t, init_ptrs, init_pitches, null);
+}
+
+/// Create a 1D/2D/3D/cube texture; `t.target` picks the kind (TEXTURE_1D,
+/// TEXTURE_3D, CUBE_MAP; anything else is 2D/2D-array by `array_size`).
+pub fn createTexture(t: *Texture, init_ptrs: ?[*]const ?*const anyopaque, init_pitches: ?[*]const u32, init_slice_pitches: ?[*]const u32) void {
     t.width = @max(1, t.width);
     t.height = @max(1, t.height);
+    t.depth = @max(1, t.depth);
     if (t.mip_levels == 0) {
-        t.mip_levels = 1 + @max(std.math.log2_int(u32, t.width), std.math.log2_int(u32, t.height));
+        t.mip_levels = 1 + @max(std.math.log2_int(u32, t.width), std.math.log2_int(u32, t.height), std.math.log2_int(u32, t.depth));
     }
     // Allocate staging shadow buffer when CPU read/write is requested
     if (t.usage == 3 or (t.cpu_access & 0x30000) != 0) {
@@ -1324,7 +1406,7 @@ pub fn createTexture2D(t: *Texture, init_ptrs: ?[*]const ?*const anyopaque, init
         const pitch = if (gf.compressed) @max(1, (t.width + 3) / 4) * gf.block_bytes else t.width * @max(1, gf.bpp);
         const rows = if (gf.compressed) @max(1, (t.height + 3) / 4) else t.height;
         t.row_pitch = pitch;
-        t.shadow = alloc.alloc(u8, @max(1, pitch * rows)) catch null;
+        t.shadow = alloc.alloc(u8, @max(1, pitch * rows * t.depth)) catch null;
         if (t.shadow) |sh| {
             @memset(sh, 0);
             if (init_ptrs) |ps| {
@@ -1332,15 +1414,16 @@ pub fn createTexture2D(t: *Texture, init_ptrs: ?[*]const ?*const anyopaque, init
                     const src: [*]const u8 = @ptrCast(p);
                     const sp = if (init_pitches) |pits| pits[0] else pitch;
                     const copy_row = @min(pitch, sp);
-                    for (0..rows) |r| {
-                        @memcpy(sh[r * pitch ..][0..copy_row], src[r * sp ..][0..copy_row]);
-                    }
+                    const ssp: usize = if (init_slice_pitches) |sps| (if (sps[0] != 0) sps[0] else sp * rows) else sp * rows;
+                    for (0..t.depth) |z| for (0..rows) |r| {
+                        @memcpy(sh[(z * rows + r) * pitch ..][0..copy_row], src[z * ssp + r * sp ..][0..copy_row]);
+                    };
                 }
             }
         }
         if (t.usage == 3) return; // D3D11_USAGE_STAGING needs no GL texture
     }
-    var j: TexCreateJob = .{ .t = t, .init_ptrs = init_ptrs, .init_pitches = init_pitches };
+    var j: TexCreateJob = .{ .t = t, .init_ptrs = init_ptrs, .init_pitches = init_pitches, .init_slice_pitches = init_slice_pitches };
     run(&createTexture2DJob, &j);
 }
 
@@ -1367,6 +1450,7 @@ const TexUpdateJob = struct {
     bx: [6]u32,
     data: [*]const u8,
     row_pitch: u32,
+    depth_pitch: u32 = 0,
 };
 
 fn updateSubresourceTextureJob(raw: ?*anyopaque) void {
@@ -1384,6 +1468,10 @@ fn updateSubresourceTextureJob(raw: ?*anyopaque) void {
     const h: u32 = if (j.has_box) @max(1, j.bx[4] -| j.bx[1]) else mh;
     const gf = dxgiToGlFormat(t.dxgi_fmt);
 
+    if (t.target == 0x0DE0 or t.target == 0x8C18 or t.target == 0x806F) {
+        updateSubresource1D3D(j, mip, slice, x0, y0, w, h, gf);
+        return;
+    }
     gl.glBindTexture(t.target, t.gl_id);
     const gl_t: GLenum = if (t.target == 0x8513) 0x8515 + @as(GLenum, @intCast(slice % 6)) else t.target;
     if (gf.compressed) {
@@ -1411,8 +1499,33 @@ fn updateSubresourceTextureJob(raw: ?*anyopaque) void {
     gl.glBindTexture(t.target, 0);
 }
 
-pub fn updateSubresourceTexture(t: *Texture, sub: u32, has_box: bool, bx: [6]u32, data: [*]const u8, row_pitch: u32, _: u32) void {
-    var j: TexUpdateJob = .{ .t = t, .sub = sub, .has_box = has_box, .bx = bx, .data = data, .row_pitch = row_pitch };
+fn updateSubresource1D3D(j: *TexUpdateJob, mip: u32, slice: u32, x0: u32, y0: u32, w: u32, h: u32, gf: GlTexFmt) void {
+    const t = j.t;
+    gl.glBindTexture(t.target, t.gl_id);
+    defer gl.glBindTexture(t.target, 0);
+    switch (t.target) {
+        0x0DE0 => gl.glTexSubImage1D(0x0DE0, @intCast(mip), @intCast(x0), @intCast(w), gf.format, gf.ty, @ptrCast(j.data)),
+        0x8C18 => gl.glTexSubImage2D(0x8C18, @intCast(mip), @intCast(x0), @intCast(slice), @intCast(w), 1, gf.format, gf.ty, @ptrCast(j.data)),
+        else => { // TEXTURE_3D: the box's front/back pick the depth range
+            const md = @max(1, t.depth >> @intCast(@min(31, mip)));
+            const z0: u32 = if (j.has_box) j.bx[2] else 0;
+            const d: u32 = if (j.has_box) @max(1, j.bx[5] -| j.bx[2]) else md;
+            const bw = if (gf.compressed) @max(1, (w + 3) / 4) else w;
+            const rows = if (gf.compressed) @max(1, (h + 3) / 4) else h;
+            const row_bytes = if (gf.compressed) bw * gf.block_bytes else w * @max(1, gf.bpp);
+            const packbuf = packSlices(j.data, j.row_pitch, j.depth_pitch, row_bytes, rows, d) orelse return;
+            defer alloc.free(packbuf);
+            if (gf.compressed) {
+                gl.glCompressedTexSubImage3D(0x806F, @intCast(mip), @intCast(x0), @intCast(y0), @intCast(z0), @intCast(w), @intCast(h), @intCast(d), @intCast(gf.internal), @intCast(packbuf.len), packbuf.ptr);
+            } else {
+                gl.glTexSubImage3D(0x806F, @intCast(mip), @intCast(x0), @intCast(y0), @intCast(z0), @intCast(w), @intCast(h), @intCast(d), gf.format, gf.ty, packbuf.ptr);
+            }
+        },
+    }
+}
+
+pub fn updateSubresourceTexture(t: *Texture, sub: u32, has_box: bool, bx: [6]u32, data: [*]const u8, row_pitch: u32, depth_pitch: u32) void {
+    var j: TexUpdateJob = .{ .t = t, .sub = sub, .has_box = has_box, .bx = bx, .data = data, .row_pitch = row_pitch, .depth_pitch = depth_pitch };
     run(&updateSubresourceTextureJob, &j);
 }
 

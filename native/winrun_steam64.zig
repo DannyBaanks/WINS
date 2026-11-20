@@ -374,6 +374,7 @@ fn dispatch(slot: usize, this: usize, a1: usize, a2: usize, a3: usize, a4: usize
     if (address == 0) return 0;
     const method: *const fn (usize, usize, usize, usize, usize, usize, usize, usize, usize) callconv(C) usize = @ptrFromInt(address);
     const result = method(adapter.real, a1, a2, a3, a4, a5, a6, a7, a8);
+    @import("winrun_seh64.zig").maybeArmStep(@intCast(0x10000 + slot));
     if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] {s}{d}[{d}](0x{x}, 0x{x}, 0x{x}) -> 0x{x}\n", .{ @tagName(adapter.kind), adapter.version, slot, a1, a2, a3, result });
     if (adapter.kind != .client) return result;
     if (!isClientGetter(slot)) return result;

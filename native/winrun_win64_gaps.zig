@@ -107,8 +107,7 @@ fn SetThreadIdealProcessor(thread: usize, cpu: u32) callconv(W) u32 {
     return 0;
 }
 
-// The shim heaps have no walkable block list: HeapWalk ends immediately, as on a
-// heap with no entries. Lock/Unlock are real no-ops (each allocation is atomic).
+// Lock/Unlock are real no-ops (each allocation is atomic).
 fn HeapLock(h: usize) callconv(W) i32 {
     _ = h;
     return 1;
@@ -117,11 +116,75 @@ fn HeapUnlock(h: usize) callconv(W) i32 {
     _ = h;
     return 1;
 }
-fn HeapWalk(h: usize, entry: ?*anyopaque) callconv(W) i32 {
+/// PROCESS_HEAP_ENTRY (x64, 0x28 bytes).
+const PROCESS_HEAP_ENTRY = extern struct {
+    lpData: usize,
+    cbData: u32,
+    cbOverhead: u8,
+    iRegionIndex: u8,
+    wFlags: u16,
+    u: extern union {
+        block: extern struct { hMem: usize, dwReserved: [3]u32 },
+        region: extern struct { dwCommittedSize: u32, dwUnCommittedSize: u32, lpFirstBlock: usize, lpLastBlock: usize },
+    },
+};
+
+comptime {
+    std.debug.assert(@sizeOf(PROCESS_HEAP_ENTRY) == 0x28);
+}
+
+/// The shim heaps hand out independent mappings, so there is no block list to
+/// walk. A Windows process heap is never empty, though (HeapWalk's first call
+/// always yields the heap's region), and protectors (Arxan, in Dark Souls
+/// III) treat an immediately-empty walk as tampering. So the walk describes
+/// one real 64 KiB region WINS reserves for it: the region entry, one busy
+/// zero-filled block and the free remainder, then ERROR_NO_MORE_ITEMS. All
+/// three ranges are genuinely committed, readable memory.
+const WALK_REGION = 0x10000;
+const WALK_FIRST = 0x40; // first block, after a header-sized gap
+const WALK_BUSY = 0x100; // busy block payload size
+const WALK_OVERHEAD = 0x10;
+var walk_region: [WALK_REGION]u8 align(4096) = [_]u8{0} ** WALK_REGION;
+
+fn HeapWalk(h: usize, entry_raw: ?*anyopaque) callconv(W) i32 {
     _ = h;
-    _ = entry;
+    const e: *align(1) PROCESS_HEAP_ENTRY = @ptrCast(entry_raw orelse {
+        lastError(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    });
+    const base = @intFromPtr(&walk_region);
+    const busy = base + WALK_FIRST;
+    const free = busy + WALK_BUSY + WALK_OVERHEAD;
+    if (e.lpData == 0) { // first call: the region
+        e.* = .{ .lpData = base, .cbData = WALK_REGION, .cbOverhead = 0, .iRegionIndex = 0, .wFlags = 0x0001, .u = .{ .region = .{
+            .dwCommittedSize = WALK_REGION,
+            .dwUnCommittedSize = 0,
+            .lpFirstBlock = busy,
+            .lpLastBlock = base + WALK_REGION,
+        } } }; // PROCESS_HEAP_REGION
+        return 1;
+    }
+    if (e.lpData == base) {
+        e.* = .{ .lpData = busy, .cbData = WALK_BUSY, .cbOverhead = WALK_OVERHEAD, .iRegionIndex = 0, .wFlags = 0x0004, .u = .{ .block = .{ .hMem = 0, .dwReserved = .{ 0, 0, 0 } } } }; // PROCESS_HEAP_ENTRY_BUSY
+        return 1;
+    }
+    if (e.lpData == busy) {
+        e.* = .{ .lpData = free, .cbData = @intCast(base + WALK_REGION - free - WALK_OVERHEAD), .cbOverhead = WALK_OVERHEAD, .iRegionIndex = 0, .wFlags = 0, .u = .{ .block = .{ .hMem = 0, .dwReserved = .{ 0, 0, 0 } } } }; // free block
+        return 1;
+    }
     lastError(259); // ERROR_NO_MORE_ITEMS
     return 0;
+}
+
+test "HeapWalk yields region, busy block, free block, then ends" {
+    var e = std.mem.zeroes(PROCESS_HEAP_ENTRY);
+    var flags: [3]u16 = undefined;
+    for (&flags) |*f| {
+        try std.testing.expectEqual(@as(i32, 1), HeapWalk(0x10000, &e));
+        f.* = e.wFlags;
+    }
+    try std.testing.expectEqualSlices(u16, &.{ 1, 4, 0 }, &flags);
+    try std.testing.expectEqual(@as(i32, 0), HeapWalk(0x10000, &e));
 }
 
 fn GetWindowsDirectoryA(buf: ?[*]u8, n: u32) callconv(W) u32 {

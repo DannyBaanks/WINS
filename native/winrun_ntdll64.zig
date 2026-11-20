@@ -21,12 +21,42 @@ pub var peb_ptr: usize = 0;
 const CURRENT_PROCESS: usize = @bitCast(@as(isize, -1));
 const CURRENT_THREAD: usize = @bitCast(@as(isize, -2));
 
+/// Threads that set ThreadHideFromDebugger. Windows keeps the flag per thread
+/// (ETHREAD.HideFromDebugger) and NtQueryInformationThread reports it back;
+/// protectors set it and then read it to detect a hooked ntdll, so the bit
+/// must stick. Keyed by Linux tid for the current-thread pseudo handle, by
+/// handle value otherwise.
+var hidden_threads: [256]std.atomic.Value(usize) = [_]std.atomic.Value(usize){std.atomic.Value(usize).init(0)} ** 256;
+
+fn threadKey(thread: usize) usize {
+    return if (thread == CURRENT_THREAD) @as(usize, @intCast(linux.gettid())) | (@as(usize, 1) << 63) else thread;
+}
+
+fn isHidden(thread: usize) bool {
+    const k = threadKey(thread);
+    for (&hidden_threads) |*slot| if (slot.load(.acquire) == k) return true;
+    return false;
+}
+
+fn traceOn() bool {
+    if (comptime !@import("builtin").link_libc) return false;
+    return std.c.getenv("WINS_TRACE") != null;
+}
+
 /// ThreadHideFromDebugger (0x11) with no buffer is the only class a caller can
-/// set meaningfully here: there is no debugger to hide from, so it is a no-op that
-/// succeeds, as on Windows. Other classes are not modelled.
+/// set meaningfully here: there is no debugger to hide from, so it only records
+/// the flag (see `hidden_threads`) and succeeds, as on Windows. Other classes
+/// are not modelled.
 fn NtSetInformationThread(thread: usize, class: u32, info: ?*anyopaque, len: u32) callconv(W) i32 {
-    _ = thread;
-    if (class == 0x11) return if (info == null and len == 0) STATUS_SUCCESS else STATUS_INFO_LENGTH_MISMATCH;
+    if (traceOn()) std.debug.print("[WINS:ntdll] NtSetInformationThread(0x{x}, class=0x{x}, info={?*}, len={d})\n", .{ thread, class, info, len });
+    if (class == 0x11) {
+        if (info != null or len != 0) return STATUS_INFO_LENGTH_MISMATCH;
+        if (!isHidden(thread)) {
+            const k = threadKey(thread);
+            for (&hidden_threads) |*slot| if (slot.cmpxchgStrong(0, k, .acq_rel, .acquire) == null) break;
+        }
+        return STATUS_SUCCESS;
+    }
     return STATUS_INVALID_INFO_CLASS;
 }
 
@@ -39,6 +69,7 @@ fn put(comptime T: type, info: ?*anyopaque, len: u32, ret_len: ?*u32, v: T) i32 
 }
 
 fn NtQueryInformationProcess(proc: usize, class: u32, info: ?*anyopaque, len: u32, ret_len: ?*u32) callconv(W) i32 {
+    if (traceOn()) std.debug.print("[WINS:ntdll] NtQueryInformationProcess(0x{x}, class=0x{x}, len={d})\n", .{ proc, class, len });
     if (proc != CURRENT_PROCESS) return STATUS_INVALID_HANDLE;
     switch (class) {
         0 => { // ProcessBasicInformation
@@ -65,8 +96,8 @@ fn NtQueryInformationProcess(proc: usize, class: u32, info: ?*anyopaque, len: u3
 }
 
 fn NtQueryInformationThread(thread: usize, class: u32, info: ?*anyopaque, len: u32, ret_len: ?*u32) callconv(W) i32 {
-    _ = thread;
-    if (class == 0x11) return put(u8, info, len, ret_len, 0); // ThreadHideFromDebugger: not hidden
+    if (traceOn()) std.debug.print("[WINS:ntdll] NtQueryInformationThread(0x{x}, class=0x{x}, len={d})\n", .{ thread, class, len });
+    if (class == 0x11) return put(u8, info, len, ret_len, @intFromBool(isHidden(thread))); // ThreadHideFromDebugger
     return STATUS_INVALID_INFO_CLASS;
 }
 
@@ -117,6 +148,11 @@ test "debug queries describe an undebugged process" {
     var small: u32 = 7;
     try std.testing.expectEqual(STATUS_INFO_LENGTH_MISMATCH, NtQueryInformationProcess(CURRENT_PROCESS, 7, &small, 4, null));
     try std.testing.expectEqual(@as(u32, 7), small);
+    var hidden: u8 = 7;
+    try std.testing.expectEqual(STATUS_SUCCESS, NtQueryInformationThread(CURRENT_THREAD, 0x11, &hidden, 1, null));
+    try std.testing.expectEqual(@as(u8, 0), hidden);
     try std.testing.expectEqual(STATUS_SUCCESS, NtSetInformationThread(CURRENT_THREAD, 0x11, null, 0));
+    try std.testing.expectEqual(STATUS_SUCCESS, NtQueryInformationThread(CURRENT_THREAD, 0x11, &hidden, 1, null));
+    try std.testing.expectEqual(@as(u8, 1), hidden); // the flag sticks, as on Windows
     try std.testing.expectEqual(STATUS_INVALID_INFO_CLASS, NtSetInformationThread(CURRENT_THREAD, 0x99, null, 0));
 }

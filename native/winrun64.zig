@@ -92,6 +92,8 @@ const Image = struct {
     tls_zero_fill: usize = 0,
     tls_cb_rvas: std.ArrayList(u32) = .empty,
     pdata_entries: usize = 0,
+    pref_base: u64 = 0, // OptionalHeader.ImageBase as linked (LDR entry OriginalBase)
+    timestamp: u32 = 0,
     state: enum { mapped, binding, bound, initialized } = .mapped,
 };
 
@@ -1460,8 +1462,232 @@ fn where(buf: []u8, addr: u64) []const u8 {
     return std.fmt.bufPrint(buf, "0x{x}", .{addr}) catch "?";
 }
 
+// Diagnostic single-step ring (WINS_STEP_AFTER_INT2D=<steps>): rips executed
+// after the first int 0x2d resumes, dumped by the crash report.
+var step_ring: [4096]u64 = [_]u64{0} ** 4096;
+var step_rsp: [4096]u64 = [_]u64{0} ** 4096;
+var step_n: usize = 0;
+var step_left: usize = 0;
+var step_tid: i32 = 0; // when non-zero, only this thread records/keeps TF
+// Stack write tracer (WINS_STEP_FROM_VEH=<steps>): from the first
+// AddVectoredExceptionHandler, diff a stack window after every step.
+const WIN_LO: usize = 0x1000;
+const WIN_HI: usize = 0x3000;
+var win_base: usize = 0;
+var win_prev: [(WIN_LO + WIN_HI) / 8]u64 = undefined;
+var wlog: [65536][4]u64 = undefined; // step, rip of writer, addr, new value
+var wlog_n: usize = 0;
+var prev_rip: u64 = 0;
+
+fn armFromVeh(rsp: usize) bool {
+    if (step_n != 0 or step_left != 0) return false;
+    const v = std.c.getenv("WINS_STEP_FROM_VEH") orelse return false;
+    step_left = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 100000;
+    win_base = rsp - WIN_LO;
+    @memcpy(std.mem.sliceAsBytes(&win_prev), @as([*]const u8, @ptrFromInt(win_base))[0 .. WIN_LO + WIN_HI]);
+    std.debug.print("winload64: stepping from AddVectoredExceptionHandler, stack window 0x{x}..0x{x}\n", .{ win_base, win_base + WIN_LO + WIN_HI });
+    return true;
+}
+
+// Diagnostic read watchpoint (WINS_WATCH_RVA=<rva in the root image>): the
+// page is kept PROT_NONE; each fault on it is logged (data reads of the exact
+// qword start single-stepping that thread), the page is opened for one
+// single-stepped instruction and closed again.
+var wp_addr: usize = 0;
+var wp_page: usize = 0;
+var wp_reprotect = std.atomic.Value(u32).init(0); // tid that must re-close the page
+var wp_hits: usize = 0;
+
+var bp_mode = false; // WINS_BREAK_RVA: execution breakpoint (page PROT_READ)
+
+fn wpInstall(root_base: usize) void {
+    if (std.c.getenv("WINS_BREAK_RVA")) |bv| {
+        const rva = std.fmt.parseInt(usize, std.mem.span(bv), 0) catch return;
+        wp_addr = root_base + rva;
+        wp_page = wp_addr & ~@as(usize, 4095);
+        bp_mode = true;
+        _ = linux.mprotect(@ptrFromInt(wp_page), 4096, .{ .READ = true });
+        std.debug.print("winload64: execution breakpoint on 0x{x} (page 0x{x})\n", .{ wp_addr, wp_page });
+        return;
+    }
+    const v = std.c.getenv("WINS_WATCH_RVA") orelse return;
+    const rva = std.fmt.parseInt(usize, std.mem.span(v), 0) catch return;
+    wp_addr = root_base + rva;
+    wp_page = wp_addr & ~@as(usize, 4095);
+    _ = linux.mprotect(@ptrFromInt(wp_page), 4096, .{});
+    std.debug.print("winload64: read watchpoint on 0x{x} (page 0x{x})\n", .{ wp_addr, wp_page });
+}
+
+var last_present: u32 = 0;
+
+// Multi-thread stepping (WINS_STEP_ALL_AT_PRESENT=<n>[,<steps>]): at Present #n
+// every guest thread (one with a TEB in GS) gets a real-time signal whose
+// handler sets TF; each thread then fills its own ring.
+const MT_SLOTS = 256;
+const MT_RING = 4096;
+const MtSlot = struct { tid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), left: usize = 0, n: usize = 0, ring: [MT_RING]u64 = undefined };
+var mt_slots: [MT_SLOTS]MtSlot = [_]MtSlot{.{}} ** MT_SLOTS;
+var mt_active = std.atomic.Value(bool).init(false);
+var mt_budget: usize = 50_000_000;
+const MT_SIG: u6 = 41; // SIGRTMIN+7
+
+fn mtSlot(tid: u32, claim: bool) ?*MtSlot {
+    var i: usize = (tid *% 2654435761) % MT_SLOTS;
+    var probes: usize = 0;
+    while (probes < MT_SLOTS) : (probes += 1) {
+        const cur = mt_slots[i].tid.load(.acquire);
+        if (cur == tid) return &mt_slots[i];
+        if (cur == 0) {
+            if (!claim) return null;
+            if (mt_slots[i].tid.cmpxchgStrong(0, tid, .acq_rel, .acquire) == null) return &mt_slots[i];
+            continue;
+        }
+        i = (i + 1) % MT_SLOTS;
+    }
+    return null;
+}
+
+fn onMtArm(_: linux.SIG, _: *const linux.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    const g: [*]u64 = @ptrFromInt(@intFromPtr(ctx.?) + 40);
+    var gs: usize = 0;
+    _ = linux.syscall2(.arch_prctl, 0x1004, @intFromPtr(&gs)); // ARCH_GET_GS
+    if (gs == 0) return; // not a guest thread (GL worker, driver, Steam)
+    const sl = mtSlot(@intCast(linux.gettid()), true) orelse return;
+    sl.left = mt_budget;
+    g[17] |= 0x100;
+}
+
+fn mtArmAll() void {
+    var act: linux.Sigaction = .{ .handler = .{ .sigaction = &onMtArm }, .mask = std.mem.zeroes(linux.sigset_t), .flags = linux.SA.SIGINFO | linux.SA.RESTART };
+    _ = linux.sigaction(@enumFromInt(MT_SIG), &act, null);
+    mt_active.store(true, .release);
+    const fd = linux.open("/proc/self/task", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [16384]u8 align(8) = undefined;
+    var sent: usize = 0;
+    while (true) {
+        const n = linux.getdents64(@intCast(fd), &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        var off: usize = 0;
+        while (off < n) {
+            const reclen = std.mem.readInt(u16, buf[off + 16 ..][0..2], .little);
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&buf[off + 19])), 0);
+            if (std.fmt.parseInt(i32, name, 10)) |tid| {
+                _ = linux.tgkill(linux.getpid(), tid, @enumFromInt(MT_SIG));
+                sent += 1;
+            } else |_| {}
+            off += reclen;
+        }
+    }
+    std.debug.print("winload64: multi-thread stepping armed ({d} threads signalled, budget {d})\n", .{ sent, mt_budget });
+}
+
+fn armAtPresent(n: u32) bool {
+    if (n < 0x10000) last_present = n;
+    if (n < 0x10000) if (std.c.getenv("WINS_STEP_ALL_AT_PRESENT")) |v| {
+        const spec = std.mem.span(v);
+        const comma = std.mem.indexOfScalar(u8, spec, ',');
+        const at = std.fmt.parseInt(u32, spec[0 .. comma orelse spec.len], 10) catch 0;
+        if (comma) |c| mt_budget = std.fmt.parseInt(usize, spec[c + 1 ..], 10) catch mt_budget;
+        if (n == at and !mt_active.load(.acquire)) mtArmAll();
+        return false;
+    };
+    if (n >= 0x10000) { // Steam slot n-0x10000: re-arm a rolling window on every call
+        if (last_present < 100) return false; // steady state only (Steam's own init owns SIGTRAP early)
+        const v = std.c.getenv("WINS_STEP_AT_STEAMSLOT") orelse return false;
+        const want = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return false;
+        if (n - 0x10000 != want) return false;
+        step_left = 3_000_000;
+        return true;
+    }
+    if (std.c.getenv("WINS_STEP_AT_PRESENT") == null) return false;
+    if (step_left != 0) return false;
+    const want = std.fmt.parseInt(u32, std.mem.span(std.c.getenv("WINS_STEP_AT_PRESENT").?), 10) catch return false;
+    if (n != want) return false;
+    step_left = 200_000_000;
+    std.debug.print("winload64: single-stepping the presenting thread from Present #{d}\n", .{n});
+    return true;
+}
+
+var watch_addr: usize = 0;
+var watch_val: u64 = 0;
+var watch_events: [32][4]u64 = undefined;
+var watch_n: usize = 0;
+
 fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
     const g: [*]u64 = @ptrFromInt(@intFromPtr(ctx.?) + 40); // ucontext.uc_mcontext.gregs
+    if (sig == .TRAP and info.code == 2 and wp_reprotect.load(.acquire) == linux.gettid()) {
+        _ = linux.mprotect(@ptrFromInt(wp_page), 4096, if (bp_mode) .{ .READ = true } else .{});
+        wp_reprotect.store(0, .release);
+        if (step_left == 0 or (step_tid != 0 and step_tid != linux.gettid())) {
+            g[17] &= ~@as(u64, 0x100);
+            return;
+        }
+    }
+    if (sig == .SEGV and wp_page != 0 and (g[22] & ~@as(u64, 4095)) == wp_page) {
+        const fault = g[22];
+        const exec = (g[16] & ~@as(u64, 4095)) == wp_page;
+        if (bp_mode and exec and g[16] == wp_addr and step_left == 0) {
+            wp_hits += 1;
+            if (wp_hits <= 3 or wp_hits % 1000 == 0) std.debug.print("winload64: BREAK hit {d} tid={d}\n", .{ wp_hits, linux.gettid() });
+            step_left = 3_000_000;
+            step_n = 0;
+            step_tid = linux.gettid();
+        }
+        if (!bp_mode and !exec and wp_hits < 64) {
+            var wb2: [128]u8 = undefined;
+            std.debug.print("winload64: WATCH page data access 0x{x} (+0x{x}) by {s} tid={d}\n", .{ fault, fault - wp_page, where(&wb2, g[16]), linux.gettid() });
+        }
+        if (!bp_mode and !exec and fault + 16 > wp_addr and fault < wp_addr + 8) {
+            wp_hits += 1;
+            var wb: [128]u8 = undefined;
+            std.debug.print("winload64: WATCH read of 0x{x} by {s} tid={d} (hit {d})\n", .{ fault, where(&wb, g[16]), linux.gettid(), wp_hits });
+            if (step_left == 0 and wp_hits == 1) step_left = 2_000_000;
+        }
+        // Spin until no other thread is mid-step on this page, then open it for one instruction.
+        while (wp_reprotect.cmpxchgWeak(0, @intCast(linux.gettid()), .acq_rel, .acquire) != null) {}
+        _ = linux.mprotect(@ptrFromInt(wp_page), 4096, .{ .READ = true, .WRITE = true, .EXEC = true });
+        g[17] |= 0x100;
+        return;
+    }
+    if (sig == .TRAP and info.code == 2 and mt_active.load(.acquire)) {
+        if (mtSlot(@intCast(linux.gettid()), false)) |sl| if (sl.left > 0) {
+            sl.ring[sl.n % MT_RING] = g[16];
+            sl.n += 1;
+            sl.left -= 1;
+            if (sl.left == 0) g[17] &= ~@as(u64, 0x100) else g[17] |= 0x100;
+            return;
+        };
+    }
+    if (sig == .TRAP and info.code == 2 and step_left > 0 and (step_tid == 0 or step_tid == linux.gettid())) { // TRAP_TRACE from our own TF
+        step_ring[step_n % step_ring.len] = g[16];
+        step_rsp[step_n % step_ring.len] = g[15];
+        if (win_base != 0) {
+            const cur: [*]const u64 = @ptrFromInt(win_base);
+            for (&win_prev, 0..) |*pv, i| if (cur[i] != pv.*) {
+                if (wlog_n < wlog.len) {
+                    wlog[wlog_n] = .{ step_n, prev_rip, win_base + i * 8, cur[i] };
+                    wlog_n += 1;
+                }
+                pv.* = cur[i];
+            };
+            prev_rip = g[16];
+        }
+        if (watch_addr != 0) {
+            const v = @as(*const u64, @ptrFromInt(watch_addr)).*;
+            if (v != watch_val and watch_n < watch_events.len) {
+                watch_events[watch_n] = .{ step_n, g[16], watch_val, v };
+                watch_n += 1;
+            }
+            watch_val = v;
+        }
+        step_n += 1;
+        step_left -= 1;
+        // keep stepping even if the program's own popf cleared TF
+        if (step_left == 0) g[17] &= ~@as(u64, 0x100) else g[17] |= 0x100;
+        return;
+    }
     const fault_addr: usize = if (sig == .SEGV or sig == .BUS) @intFromPtr(info.fields.sigfault.addr) else @intCast(g[22]);
     const exc_code: ?u32 = switch (sig) {
         .SEGV, .BUS => 0xC0000005, // EXCEPTION_ACCESS_VIOLATION (Mono JIT null/GC trap)
@@ -1469,6 +1695,42 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
         .ILL => 0xC000001D,        // EXCEPTION_ILLEGAL_INSTRUCTION
         else => null,
     };
+    // `int 0x2d` (Windows debug service, an anti-debug probe) and `int3`:
+    // Windows raises EXCEPTION_BREAKPOINT into the program's own handlers.
+    // Linux delivers `int 0x2d` as #GP (trapno 13, err = vector*8+2, rip at
+    // the instruction) and int3 as SIGTRAP (rip after the 0xCC). On x64
+    // Windows, KiDebugServiceTrap bumps Rip past `cd 2d` by one and
+    // KiDispatchException steps BREAKPOINT back by one, so the context resumes
+    // right after the 2-byte instruction (the one-byte skip is x86-only), with
+    // Rax/Rcx/Rdx as the three parameters. int3 resumes at the 0xCC itself.
+    // Either way the dispatch runs on the thread's own stack.
+    {
+        const fx: ?[*]const u8 = @ptrFromInt(g[23]); // uc_mcontext.fpregs
+        const rip_now = g[16];
+        if (sig == .SEGV and g[20] == 13 and g[19] == 0x2d * 8 + 2) {
+            const code_bytes: [*]const u8 = @ptrFromInt(rip_now);
+            if (code_bytes[0] == 0xCD and code_bytes[1] == 0x2D) {
+                if (std.c.getenv("WINS_TRACE") != null) std.debug.print("winload64: int 0x2d at 0x{x} -> EXCEPTION_BREAKPOINT\n", .{rip_now});
+                if (step_left > 0) seh64.step_on_resume.store(true, .release);
+                if (step_n == 0) if (std.c.getenv("WINS_STEP_AFTER_INT2D")) |v| {
+                    step_left = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 100000;
+                    if (std.c.getenv("WINS_STEP_WATCH")) |wv| {
+                        watch_addr = g[15] +% (std.fmt.parseInt(usize, std.mem.span(wv), 0) catch 0);
+                        watch_val = @as(*const u64, @ptrFromInt(watch_addr)).*;
+                        var wb: [128]u8 = undefined;
+                        std.debug.print("winload64: watching [rsp+{s}] = 0x{x}: {s}\n", .{ std.mem.span(wv), watch_addr, where(&wb, watch_val) });
+                    }
+                    seh64.step_on_resume.store(true, .release);
+                };
+                seh64.raiseFromSignal(g, fx, 0x80000003, rip_now + 2, .{ g[13], g[14], g[12] });
+                return;
+            }
+        }
+        if (sig == .TRAP and info.code == 0x80 and rip_now > 0 and @as(*const u8, @ptrFromInt(rip_now - 1)).* == 0xCC) { // SI_KERNEL: int3
+            seh64.raiseFromSignal(g, fx, 0x80000003, rip_now - 1, .{ 0, 0, 0 });
+            return;
+        }
+    }
     if (exc_code) |code| {
         if (std.c.getenv("WINS_TRACE") != null) {
             var t1: [128]u8 = undefined;
@@ -1482,7 +1744,120 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
     var b1: [128]u8 = undefined;
     var b2: [128]u8 = undefined;
     std.debug.print("winload64: CRASH signal {d} at {s} (trapno={d} err=0x{x} cr2={s})\n", .{ @intFromEnum(sig), where(&b1, rip), g[20], g[19], where(&b2, g[22]) });
+    std.debug.print("  tid={d} last_present={d}\n", .{ linux.gettid(), last_present });
+    for (crash_images) |im| {
+        const off: i128 = @as(i128, rip) - @as(i128, im.base);
+        std.debug.print("  image {s} base=0x{x} size=0x{x} rip-base={d}\n", .{ im.name, im.base, im.img.len, off });
+    }
     std.debug.print("  rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n  rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n  r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x}\n", .{ g[13], g[11], g[14], g[12], g[9], g[8], g[10], rsp, g[0], g[1], g[2], g[3] });
+    if (win_base != 0) {
+        const slot = rsp - 8;
+        std.debug.print("  stack writes to [rsp-8]=0x{x} ({d} logged writes total, {d} steps):\n", .{ slot, wlog_n, step_n });
+        for (wlog[0..wlog_n]) |e| if (e[2] == slot)
+            std.debug.print("    step {d} by {s}: 0x{x}\n", .{ e[0], where(&b2, e[1]), e[3] });
+    }
+    for (watch_events[0..watch_n]) |e| {
+        var wb: [128]u8 = undefined;
+        std.debug.print("  watch: step {d} at {s}: 0x{x} -> 0x{x}\n", .{ e[0], where(&b2, e[1]), e[2], e[3] });
+        _ = &wb;
+    }
+    if (mt_active.load(.acquire)) if (mtSlot(@intCast(linux.gettid()), false)) |sl| {
+        const show = @min(sl.n, MT_RING);
+        std.debug.print("  last {d} of {d} single-stepped rips of this thread:\n", .{ show, sl.n });
+        var i = sl.n - show;
+        while (i < sl.n) : (i += 1) std.debug.print("    {s}\n", .{where(&b2, sl.ring[i % MT_RING])});
+    };
+    if (step_n > 0) {
+        const show = @min(step_n, step_ring.len);
+        std.debug.print("  last {d} of {d} single-stepped rips:\n", .{ show, step_n });
+        var i = step_n - show;
+        while (i < step_n) : (i += 1) std.debug.print("    {s} rsp=0x{x}\n", .{ where(&b2, step_ring[i % step_ring.len]), step_rsp[i % step_ring.len] });
+    }
+    if (std.c.getenv("WINS_CRASH_STACK") != null) {
+        // Which mapping holds rip (and is it executable)?
+        const mfd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(mfd) == .SUCCESS) {
+            defer _ = linux.close(@intCast(mfd));
+            var mbuf: [1 << 16]u8 = undefined;
+            var carry: usize = 0;
+            while (true) {
+                const n = linux.read(@intCast(mfd), mbuf[carry..].ptr, mbuf.len - carry);
+                if (linux.errno(n) != .SUCCESS or n == 0) break;
+                const have = carry + n;
+                var it = std.mem.splitScalar(u8, mbuf[0..have], '\n');
+                var last_start: usize = 0;
+                while (it.next()) |line| {
+                    if (it.index == null) {
+                        last_start = @intFromPtr(line.ptr) - @intFromPtr(&mbuf);
+                        break;
+                    }
+                    const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+                    const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+                    const lo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+                    const hi = std.fmt.parseInt(usize, line[dash + 1 .. sp1], 16) catch continue;
+                    if (rip >= lo and rip < hi) std.debug.print("  rip mapping: {s}\n", .{line});
+                }
+                std.mem.copyForwards(u8, &mbuf, mbuf[last_start..have]);
+                carry = have - last_start;
+            }
+        }
+        if (std.c.getenv("WINS_CRASH_SCAN")) |sv| {
+            // Scan every rw mapping for qwords equal to rip and to rip - delta.
+            const delta = std.fmt.parseInt(u64, std.mem.span(sv), 0) catch 0;
+            const want = [2]u64{ rip, rip -% delta };
+            const mfd2 = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(mfd2) == .SUCCESS) {
+                defer _ = linux.close(@intCast(mfd2));
+                var mb: [1 << 20]u8 = undefined;
+                var have: usize = 0;
+                while (have < mb.len) {
+                    const r = linux.read(@intCast(mfd2), mb[have..].ptr, mb.len - have);
+                    if (linux.errno(r) != .SUCCESS or r == 0) break;
+                    have += r;
+                }
+                var shown: usize = 0;
+                var lines = std.mem.splitScalar(u8, mb[0..have], '\n');
+                while (lines.next()) |line| {
+                    if (line.len < 30) continue;
+                    const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+                    const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+                    if (line[sp1 + 1] != 'r' or line[sp1 + 2] != 'w') continue;
+                    const lo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+                    const hi = std.fmt.parseInt(usize, line[dash + 1 .. sp1], 16) catch continue;
+                    if (hi - lo > 1 << 32) continue;
+                    var at = lo;
+                    while (at + 8 <= hi) : (at += 8) {
+                        const v = @as(*const u64, @ptrFromInt(at)).*;
+                        if (v == want[0] or v == want[1]) {
+                            if (shown < 40) std.debug.print("  scan: [0x{x}] = 0x{x} ({s}) in {s}\n", .{ at, v, if (v == want[0]) "bad" else "good", line[sp1 + 1 ..] });
+                            shown += 1;
+                        }
+                    }
+                }
+                std.debug.print("  scan: {d} hits\n", .{shown});
+            }
+        }
+        {
+            std.debug.print("  stale exe pointers below rsp (most recent last-called frames):\n", .{});
+            var q: usize = 0x2000;
+            while (q >= 8) : (q -= 8) {
+                const at = rsp - q;
+                if (linux.errno(linux.madvise(@ptrFromInt(at & ~@as(usize, 4095)), 4096, linux.MADV.NORMAL)) != .SUCCESS) continue;
+                const v = @as(*const u64, @ptrFromInt(at)).*;
+                for (crash_images) |im| if (v >= im.base and v < im.base + im.img.len and inExec(im.secs, v - im.base)) {
+                    std.debug.print("    [rsp-0x{x}] {s}\n", .{ q, where(&b2, v) });
+                };
+                if (v == rip) std.debug.print("    [rsp-0x{x}] = crash target\n", .{q});
+            }
+        }
+        std.debug.print("  raw stack:\n", .{});
+        var q: isize = -8;
+        while (q < 24) : (q += 1) {
+            const at: usize = @intCast(@as(isize, @intCast(rsp)) + q * 8);
+            if (linux.errno(linux.madvise(@ptrFromInt(at & ~@as(usize, 4095)), 4096, linux.MADV.NORMAL)) != .SUCCESS) continue;
+            std.debug.print("    [rsp{s}0x{x}] {s}\n", .{ if (q < 0) "-" else "+", @abs(q) * 8, where(&b2, @as(*const u64, @ptrFromInt(at)).*) });
+        }
+    }
     std.debug.print("  unwound call chain (.pdata):\n", .{});
     seh64.backtrace(g, 32, &struct {
         fn f(k: usize, pc: usize) void {
@@ -1647,7 +2022,7 @@ const Loader = struct {
         }
 
         const full_path = self.a.dupe(u8, path) catch die(.map_failed, "out of memory", .{});
-        var im: Image = .{ .name = name, .full_path = full_path, .is_dll = (fchars & 0x2000) != 0, .base = base, .img = img, .size_of_image = size_of_image, .size_of_headers = size_of_headers, .entry_rva = entry_rva, .pdata_rva = dirs[3].rva, .pdata_size = dirs[3].size, .secs = secs, .dirs = dirs };
+        var im: Image = .{ .name = name, .full_path = full_path, .is_dll = (fchars & 0x2000) != 0, .base = base, .img = img, .size_of_image = size_of_image, .size_of_headers = size_of_headers, .entry_rva = entry_rva, .pdata_rva = dirs[3].rva, .pdata_size = dirs[3].size, .secs = secs, .dirs = dirs, .pref_base = image_base, .timestamp = need(u32, file, pe + 8, "TimeDateStamp") };
 
         // TLS directory (VAs are still relative to ImageBase here: read before relocating).
         if (dirs[9].size != 0) {
@@ -1711,6 +2086,10 @@ const Loader = struct {
             p += bsize;
         }
         if (p != rend) die(.bad_image, "{s}: truncated relocation block", .{name});
+        // The Windows loader rewrites OptionalHeader.ImageBase in the mapped
+        // headers to the address it actually chose; code that rebases through
+        // its own header (Arxan in Dark Souls III does) relies on that.
+        std.mem.writeInt(u64, img[opt + 24 ..][0..8], base, .little);
 
         // .pdata: validate bounds (RUNTIME_FUNCTION = 12 bytes); recorded, not dispatched.
         if (dirs[3].size != 0) {
@@ -1912,6 +2291,126 @@ fn callTarget(ld: *Loader, root_idx: usize, spec: []const u8) ?usize {
     return ld.exportByName(root_idx, spec, 0);
 }
 
+/// The process heap handle is an opaque cookie (the shim heap hands out
+/// independent mappings), but on Windows it is the address of the NT heap's
+/// HEAP structure and anti-debug code reads it directly: Flags (+0x70) and
+/// ForceFlags (+0x74) gain HEAP_TAIL/FREE_CHECKING and
+/// HEAP_VALIDATE_PARAMETERS_ENABLED (0x40000060) under a debugger. Map one
+/// read-only page at the cookie with the header fields of an undebugged
+/// Windows 10 x64 process heap. The handle value itself does not change.
+fn mapProcessHeapHeader(handle: usize) void {
+    const rc = linux.mmap(@ptrFromInt(handle), 4096, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true }, -1, 0);
+    if (linux.errno(rc) != .SUCCESS or rc != handle) {
+        std.debug.print("winload64: could not map the process heap header at 0x{x}\n", .{handle});
+        return;
+    }
+    const h: [*]u8 = @ptrFromInt(handle);
+    std.mem.writeInt(u32, h[0x10..][0..4], 0xFFEEFFEE, .little); // Segment.SegmentSignature
+    std.mem.writeInt(u32, h[0x14..][0..4], 0x00000002, .little); // Segment.SegmentFlags (HEAP_SEGMENT_FLAGS_DEFAULT)
+    std.mem.writeInt(usize, h[0x18..][0..8], handle + 0x18, .little); // SegmentListEntry (empty)
+    std.mem.writeInt(usize, h[0x20..][0..8], handle + 0x18, .little);
+    std.mem.writeInt(usize, h[0x28..][0..8], handle, .little); // Heap (self)
+    std.mem.writeInt(usize, h[0x30..][0..8], handle, .little); // BaseAddress
+    std.mem.writeInt(u32, h[0x70..][0..4], 0x00000002, .little); // Flags = HEAP_GROWABLE
+    std.mem.writeInt(u32, h[0x74..][0..4], 0x00000000, .little); // ForceFlags
+    _ = linux.mprotect(@ptrFromInt(handle), 4096, .{ .READ = true });
+}
+
+/// PEB.Ldr: a PEB_LDR_DATA whose three module lists hold one
+/// LDR_DATA_TABLE_ENTRY (Windows 10 x64 layout, 0x120 bytes) per PE image WINS
+/// mapped, root image first, in load order. Protectors walk this list (DllBase,
+/// SizeOfImage, names, OriginalBase) and probe it with IsBadReadPtr; a bogus Ldr
+/// pointer makes them silently compute garbage. WINS' own kernel32/ntdll are not
+/// PE images and are therefore not listed.
+fn buildLoaderData(a: std.mem.Allocator, ld: *Loader) !usize {
+    const n = ld.images.items.len;
+    const LDR_SIZE = 0x58;
+    const ENTRY_SIZE = 0x120;
+    const blob = try a.alignedAlloc(u8, .fromByteUnits(16), LDR_SIZE + n * ENTRY_SIZE);
+    @memset(blob, 0);
+    const ldr = @intFromPtr(blob.ptr);
+    const entry = struct {
+        fn at(l: usize, i: usize) usize {
+            return l + 0x58 + i * 0x120;
+        }
+    }.at;
+    std.mem.writeInt(u32, blob[0..4], LDR_SIZE, .little); // Length
+    blob[4] = 1; // Initialized
+    // Order: root (the exe) first, then the rest in mapping order.
+    var order = try a.alloc(usize, n);
+    var k: usize = 0;
+    for (ld.images.items, 0..) |im, i| if (!im.is_dll) {
+        order[k] = i;
+        k += 1;
+    };
+    for (ld.images.items, 0..) |im, i| if (im.is_dll) {
+        order[k] = i;
+        k += 1;
+    };
+    const W64 = struct {
+        fn put(addr: usize, v: u64) void {
+            @as(*align(1) u64, @ptrFromInt(addr)).* = v;
+        }
+        fn put32(addr: usize, v: u32) void {
+            @as(*align(1) u32, @ptrFromInt(addr)).* = v;
+        }
+        fn put16(addr: usize, v: u16) void {
+            @as(*align(1) u16, @ptrFromInt(addr)).* = v;
+        }
+        fn ustr(al: std.mem.Allocator, at_: usize, s_: []const u8) !void {
+            const w = try al.alloc(u16, s_.len + 1);
+            for (s_, 0..) |c, j| w[j] = c;
+            w[s_.len] = 0;
+            put16(at_, @intCast(s_.len * 2)); // Length
+            put16(at_ + 2, @intCast((s_.len + 1) * 2)); // MaximumLength
+            put(at_ + 8, @intFromPtr(w.ptr)); // Buffer
+        }
+    };
+    // Three circular doubly-linked lists; heads at ldr+0x10/0x20/0x30, links at
+    // entry+0x00/0x10/0x20 (each list's LIST_ENTRY points at the same-offset link).
+    for (0..3) |list| {
+        const head = ldr + 0x10 + list * 0x10;
+        const link_off = list * 0x10;
+        if (n == 0) {
+            W64.put(head, head);
+            W64.put(head + 8, head);
+            continue;
+        }
+        for (0..n) |pos| {
+            const me = entry(ldr, pos) + link_off;
+            const next = if (pos + 1 < n) entry(ldr, pos + 1) + link_off else head;
+            const prev = if (pos > 0) entry(ldr, pos - 1) + link_off else head;
+            W64.put(me, next);
+            W64.put(me + 8, prev);
+        }
+        W64.put(head, entry(ldr, 0) + link_off);
+        W64.put(head + 8, entry(ldr, n - 1) + link_off);
+    }
+    for (order, 0..) |idx, pos| {
+        const im = ld.images.items[idx];
+        const e = entry(ldr, pos);
+        W64.put(e + 0x30, im.base); // DllBase
+        W64.put(e + 0x38, if (im.entry_rva != 0) im.base + im.entry_rva else 0); // EntryPoint
+        W64.put32(e + 0x40, im.size_of_image); // SizeOfImage
+        // Windows shows the DOS path the program was started from; WINS maps the
+        // game directory at C:\ with the original file names.
+        const base_name = std.fs.path.basename(im.full_path);
+        const full = try std.fmt.allocPrint(a, "C:\\{s}", .{base_name});
+        try W64.ustr(a, e + 0x48, full); // FullDllName
+        try W64.ustr(a, e + 0x58, base_name); // BaseDllName
+        W64.put32(e + 0x68, if (im.is_dll) 0x000CC004 else 0x00004000); // Flags: ImageDll|EntryProcessed|... / exe
+        W64.put16(e + 0x6C, 0xFFFF); // ObsoleteLoadCount (static)
+        W64.put(e + 0x70, e + 0x70); // HashLinks: self (unhashed)
+        W64.put(e + 0x78, e + 0x70);
+        W64.put32(e + 0x80, im.timestamp); // TimeDateStamp
+        W64.put(e + 0xA0, e + 0xA0); // NodeModuleLink: self
+        W64.put(e + 0xA8, e + 0xA0);
+        W64.put(e + 0xF8, im.pref_base); // OriginalBase
+        W64.put32(e + 0x114, 1); // ReferenceCount
+    }
+    return ldr;
+}
+
 fn initGuestThread(o: *threads.Object) void {
     const ld = g_ld orelse return;
     const alloc = std.heap.page_allocator;
@@ -2088,7 +2587,9 @@ pub fn main(init: std.process.Init) !void {
     g_peb_ptr = @intFromPtr(peb.ptr);
     @import("winrun_ntdll64.zig").peb_ptr = g_peb_ptr;
     std.mem.writeInt(usize, peb[0x10..][0..8], ld.images.items[root_idx].base, .little); // ImageBaseAddress
-    std.mem.writeInt(usize, peb[0x18..][0..8], 0x10000, .little); // ProcessHeap (opaque)
+    std.mem.writeInt(usize, peb[0x18..][0..8], buildLoaderData(a, &ld) catch 0, .little); // Ldr
+    std.mem.writeInt(usize, peb[0x30..][0..8], k32.processHeapHandle(), .little); // ProcessHeap (== GetProcessHeap())
+    mapProcessHeapHeader(k32.processHeapHandle());
     std.mem.writeInt(usize, peb[0x20..][0..8], @intFromPtr(params.ptr), .little); // ProcessParameters
     if (linux.errno(linux.syscall2(.arch_prctl, 0x1001, @intFromPtr(teb.ptr))) != .SUCCESS) die(.map_failed, "arch_prctl(ARCH_SET_GS) failed", .{});
     k32.teb_tls_enabled = true;
@@ -2096,12 +2597,15 @@ pub fn main(init: std.process.Init) !void {
     const crt = @import("winrun_msvcrt.zig");
     k32.setImageBase(ld.images.items[root_idx].base);
     k32.close_handle_hook = &threadsCloseHook;
+    if (std.c.getenv("WINS_STEP_FROM_VEH") != null) seh64.on_add_veh = &armFromVeh;
+    if (std.c.getenv("WINS_STEP_AT_PRESENT") != null or std.c.getenv("WINS_STEP_AT_STEAMSLOT") != null or std.c.getenv("WINS_STEP_ALL_AT_PRESENT") != null) seh64.arm_hook = &armAtPresent;
     threads.g_thread_init = &initGuestThread;
     for (ld.images.items) |im| seh64.addExceptionTable(im.base, im.img.len, im.dirs[3].rva, im.dirs[3].size);
     crt.setArgs(target_args.items);
     k32.setCommandLine(target_args.items);
 
     installCrashReport(ld.images.items);
+    wpInstall(ld.images.items[root_idx].base);
     // KUSER_SHARED_DATA at 0x7FFE0000, before any guest code (DllMain included) runs.
     if (!@import("winrun_kuser64.zig").install())
         std.debug.print("winload64: KUSER_SHARED_DATA could not be mapped at 0x7ffe0000; guests reading it will fault\n", .{});

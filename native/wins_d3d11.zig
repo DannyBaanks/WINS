@@ -76,6 +76,8 @@ const IID_IDXGISwapChain = GUID{ .data1 = 0x310d36a0, .data2 = 0xd2e7, .data3 = 
 const IID_ID3D11Device = GUID{ .data1 = 0xdb6f6ddb, .data2 = 0xac77, .data3 = 0x4e88, .data4 = .{ 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40 } };
 const IID_ID3D11DeviceContext = GUID{ .data1 = 0xc0bfa96c, .data2 = 0xe089, .data3 = 0x44fb, .data4 = .{ 0x8e, 0xaf, 0x26, 0xf8, 0x79, 0x61, 0x90, 0xda } };
 const IID_ID3D11Texture2D = GUID{ .data1 = 0x6f15aaf2, .data2 = 0xd208, .data3 = 0x4e89, .data4 = .{ 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c } };
+const IID_ID3D11Texture1D = GUID{ .data1 = 0xf8fb5c27, .data2 = 0xc6b3, .data3 = 0x4f75, .data4 = .{ 0xa4, 0xc8, 0x43, 0x9a, 0xf2, 0xef, 0x56, 0x4c } };
+const IID_ID3D11Texture3D = GUID{ .data1 = 0x037e866e, .data2 = 0xf56d, .data3 = 0x4357, .data4 = .{ 0xa8, 0xaf, 0x9d, 0xab, 0xbe, 0x6e, 0x25, 0x0e } };
 const IID_ID3D11Buffer = GUID{ .data1 = 0x48570b85, .data2 = 0xd1ee, .data3 = 0x4fcd, .data4 = .{ 0xa2, 0x50, 0xeb, 0x35, 0x07, 0x22, 0xb0, 0x37 } };
 const IID_ID3D11Resource = GUID{ .data1 = 0xdc8e63f3, .data2 = 0xd12b, .data3 = 0x4952, .data4 = .{ 0xb4, 0x7b, 0x5e, 0x45, 0x02, 0x6a, 0x86, 0x2d } };
 
@@ -151,6 +153,29 @@ const D3D11_TEXTURE2D_DESC = extern struct {
     ArraySize: u32,
     Format: u32,
     SampleDesc: DXGI_SAMPLE_DESC,
+    Usage: u32,
+    BindFlags: u32,
+    CPUAccessFlags: u32,
+    MiscFlags: u32,
+};
+
+const D3D11_TEXTURE1D_DESC = extern struct {
+    Width: u32,
+    MipLevels: u32,
+    ArraySize: u32,
+    Format: u32,
+    Usage: u32,
+    BindFlags: u32,
+    CPUAccessFlags: u32,
+    MiscFlags: u32,
+};
+
+const D3D11_TEXTURE3D_DESC = extern struct {
+    Width: u32,
+    Height: u32,
+    Depth: u32,
+    MipLevels: u32,
+    Format: u32,
     Usage: u32,
     BindFlags: u32,
     CPUAccessFlags: u32,
@@ -280,8 +305,13 @@ const ComObj = extern struct {
     view_res: ?*ComObj = null,
     view_desc: [6]u32 = .{ 0, 0, 0, 0, 0, 0 },
     desc2d: D3D11_TEXTURE2D_DESC = std.mem.zeroes(D3D11_TEXTURE2D_DESC),
+    desc1d: D3D11_TEXTURE1D_DESC = std.mem.zeroes(D3D11_TEXTURE1D_DESC),
+    desc3d: D3D11_TEXTURE3D_DESC = std.mem.zeroes(D3D11_TEXTURE3D_DESC),
     descbuf: D3D11_BUFFER_DESC = std.mem.zeroes(D3D11_BUFFER_DESC),
     swap_desc: DXGI_SWAP_CHAIN_DESC = std.mem.zeroes(DXGI_SWAP_CHAIN_DESC),
+    /// Copy of the creation desc for state objects and queries (GetDesc).
+    desc_blob: ?[*]u8 = null,
+    desc_len: usize = 0,
 
     const Kind = enum(u32) {
         factory,
@@ -293,6 +323,8 @@ const ComObj = extern struct {
         context,
         buffer,
         texture2d,
+        texture1d,
+        texture3d,
         rtv,
         dsv,
         srv,
@@ -305,6 +337,8 @@ const ComObj = extern struct {
         rasterizer,
         sampler,
         query,
+        deferred_ctx,
+        cmdlist,
     };
 };
 
@@ -323,17 +357,25 @@ fn comRelease(raw: ?*anyopaque) callconv(W) u32 {
     const o: *ComObj = @ptrCast(@alignCast(raw orelse return 0));
     const prev = @atomicRmw(u32, &o.ref_count, .Sub, 1, .acq_rel);
     if (prev == 1) {
+        if (o.desc_blob) |b| alloc.free(b[0..o.desc_len]);
         switch (o.kind) {
             .buffer => if (o.payload != 0) {
                 const b: *glb.Buffer = @ptrFromInt(o.payload);
                 glb.destroyBuffer(b);
                 alloc.destroy(b);
             },
-            .texture2d => if (o.payload != 0) {
+            .texture2d, .texture1d, .texture3d => if (o.payload != 0) {
                 const t: *glb.Texture = @ptrFromInt(o.payload);
                 glb.destroyTexture(t);
                 alloc.destroy(t);
             },
+            .deferred_ctx => if (o.payload != 0) {
+                const r: *Recorder = @ptrFromInt(o.payload);
+                r.reset();
+                r.arena.deinit();
+                alloc.destroy(r);
+            },
+            .cmdlist => if (o.payload != 0) destroyCmdList(@ptrFromInt(o.payload)),
             .rtv, .dsv, .srv, .uav => if (o.payload != 0) {
                 const v: *glb.View = @ptrFromInt(o.payload);
                 alloc.destroy(v);
@@ -372,7 +414,7 @@ fn comQiDefault(raw: ?*anyopaque, riid: *const GUID, ppv: *?*anyopaque) callconv
         ppv.* = raw;
         return S_OK;
     }
-    if (o.kind == .context and eqlGuid(riid, &IID_ID3D11DeviceContext)) {
+    if ((o.kind == .context or o.kind == .deferred_ctx) and eqlGuid(riid, &IID_ID3D11DeviceContext)) {
         _ = comAddRef(raw);
         ppv.* = raw;
         return S_OK;
@@ -393,6 +435,13 @@ fn comQiDefault(raw: ?*anyopaque, riid: *const GUID, ppv: *?*anyopaque) callconv
         return S_OK;
     }
     if (o.kind == .texture2d and (eqlGuid(riid, &IID_ID3D11Texture2D) or eqlGuid(riid, &IID_ID3D11Resource))) {
+        _ = comAddRef(raw);
+        ppv.* = raw;
+        return S_OK;
+    }
+    if ((o.kind == .texture1d and (eqlGuid(riid, &IID_ID3D11Texture1D) or eqlGuid(riid, &IID_ID3D11Resource))) or
+        (o.kind == .texture3d and (eqlGuid(riid, &IID_ID3D11Texture3D) or eqlGuid(riid, &IID_ID3D11Resource))))
+    {
         _ = comAddRef(raw);
         ppv.* = raw;
         return S_OK;
@@ -599,11 +648,15 @@ fn scGetDevice(_: ?*anyopaque, riid: *const GUID, pp: *?*anyopaque) callconv(W) 
     return E_NOINTERFACE;
 }
 
+var present_count: u32 = 0;
+
 fn scPresent(raw: ?*anyopaque, sync: u32, _: u32) callconv(W) i32 {
     const sc: *ComObj = @ptrCast(@alignCast(raw orelse return E_INVALIDARG));
     const bb_obj: *ComObj = @ptrFromInt(sc.payload);
     const bb_tex: *glb.Texture = @ptrFromInt(bb_obj.payload);
     glb.present(bb_tex, sc.swap_desc.OutputWindow, sync);
+    present_count += 1;
+    @import("winrun_seh64.zig").maybeArmStep(present_count);
     return S_OK;
 }
 
@@ -696,9 +749,76 @@ fn devCreateTexture2D(_: ?*anyopaque, desc: *const D3D11_TEXTURE2D_DESC, init_da
     return S_OK;
 }
 
+fn collectInit(init_data: ?[*]const D3D11_SUBRESOURCE_DATA, nsubs_in: u32, ptrs: *[64]?*const anyopaque, pitches: *[64]u32, slices: *[64]u32) bool {
+    const subs = init_data orelse return false;
+    const nsubs = @min(64, nsubs_in);
+    for (0..nsubs) |i| {
+        ptrs[i] = subs[i].pSysMem;
+        pitches[i] = subs[i].SysMemPitch;
+        slices[i] = subs[i].SysMemSlicePitch;
+    }
+    return true;
+}
+
+fn devCreateTexture1D(_: ?*anyopaque, desc: *const D3D11_TEXTURE1D_DESC, init_data: ?[*]const D3D11_SUBRESOURCE_DATA, pp: ?*?*anyopaque) callconv(W) i32 {
+    if (pp == null) return S_FALSE;
+    const t = alloc.create(glb.Texture) catch return E_FAIL;
+    t.* = .{
+        .width = desc.Width,
+        .height = 1,
+        .mip_levels = desc.MipLevels,
+        .array_size = @max(1, desc.ArraySize),
+        .dxgi_fmt = desc.Format,
+        .bind_flags = desc.BindFlags,
+        .usage = desc.Usage,
+        .cpu_access = desc.CPUAccessFlags,
+        .target = if (desc.ArraySize > 1) 0x8C18 else 0x0DE0,
+    };
+    var ptrs: [64]?*const anyopaque = [_]?*const anyopaque{null} ** 64;
+    var pitches: [64]u32 = [_]u32{0} ** 64;
+    var slices: [64]u32 = [_]u32{0} ** 64;
+    const nmips = if (desc.MipLevels == 0) 1 else desc.MipLevels;
+    const has_init = collectInit(init_data, nmips * @max(1, desc.ArraySize), &ptrs, &pitches, &slices);
+    traceFmt(desc.Format, "create1d {d} mips={d} arr={d} usage={d} bind=0x{x} init={}", .{ desc.Width, desc.MipLevels, desc.ArraySize, desc.Usage, desc.BindFlags, has_init });
+    glb.createTexture(t, if (has_init) &ptrs else null, if (has_init) &pitches else null, null);
+    const o = newCom(&tex1d_vtbl, .texture1d, @intFromPtr(t), g_device) orelse return E_FAIL;
+    o.desc1d = desc.*;
+    o.desc1d.MipLevels = t.mip_levels;
+    pp.?.* = o;
+    return S_OK;
+}
+
+fn devCreateTexture3D(_: ?*anyopaque, desc: *const D3D11_TEXTURE3D_DESC, init_data: ?[*]const D3D11_SUBRESOURCE_DATA, pp: ?*?*anyopaque) callconv(W) i32 {
+    if (pp == null) return S_FALSE;
+    const t = alloc.create(glb.Texture) catch return E_FAIL;
+    t.* = .{
+        .width = desc.Width,
+        .height = desc.Height,
+        .depth = desc.Depth,
+        .mip_levels = desc.MipLevels,
+        .array_size = 1,
+        .dxgi_fmt = desc.Format,
+        .bind_flags = desc.BindFlags,
+        .usage = desc.Usage,
+        .cpu_access = desc.CPUAccessFlags,
+        .target = 0x806F,
+    };
+    var ptrs: [64]?*const anyopaque = [_]?*const anyopaque{null} ** 64;
+    var pitches: [64]u32 = [_]u32{0} ** 64;
+    var slices: [64]u32 = [_]u32{0} ** 64;
+    const has_init = collectInit(init_data, if (desc.MipLevels == 0) 1 else desc.MipLevels, &ptrs, &pitches, &slices);
+    traceFmt(desc.Format, "create3d {d}x{d}x{d} mips={d} usage={d} bind=0x{x} init={}", .{ desc.Width, desc.Height, desc.Depth, desc.MipLevels, desc.Usage, desc.BindFlags, has_init });
+    glb.createTexture(t, if (has_init) &ptrs else null, if (has_init) &pitches else null, if (has_init) &slices else null);
+    const o = newCom(&tex3d_vtbl, .texture3d, @intFromPtr(t), g_device) orelse return E_FAIL;
+    o.desc3d = desc.*;
+    o.desc3d.MipLevels = t.mip_levels;
+    pp.?.* = o;
+    return S_OK;
+}
+
 fn extractResTexture(res: ?*anyopaque) struct { tex: ?*glb.Texture, buf: ?*glb.Buffer } {
     const o: *ComObj = @ptrCast(@alignCast(res orelse return .{ .tex = null, .buf = null }));
-    if (o.kind == .texture2d) return .{ .tex = @ptrFromInt(o.payload), .buf = null };
+    if (isTexKind(o.kind)) return .{ .tex = @ptrFromInt(o.payload), .buf = null };
     if (o.kind == .buffer) return .{ .tex = null, .buf = @ptrFromInt(o.payload) };
     return .{ .tex = null, .buf = null };
 }
@@ -750,9 +870,13 @@ fn devCreateRTV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_RENDER_TAR
     if (desc) |d| {
         v.dxgi_fmt = d.Format;
         vd = .{ d.Format, d.ViewDimension, d.u0, d.u1, d.u2, 0 };
-        if (d.ViewDimension == 4 or d.ViewDimension == 5) { // TEXTURE2D / TEXTURE2DARRAY
-            v.first_mip = d.u0;
-            if (d.ViewDimension == 5) v.first_slice = d.u1;
+        switch (d.ViewDimension) {
+            // TEXTURE1D, TEXTURE1DARRAY, TEXTURE2D, TEXTURE2DARRAY, TEXTURE3D (u1 = FirstWSlice)
+            2, 3, 4, 5, 8 => {
+                v.first_mip = d.u0;
+                if (d.ViewDimension == 3 or d.ViewDimension == 5 or d.ViewDimension == 8) v.first_slice = d.u1;
+            },
+            else => {},
         }
     }
     const o = newCom(&view_vtbl, .rtv, @intFromPtr(v), g_device) orelse return E_FAIL;
@@ -907,6 +1031,34 @@ fn d3dStencilOpToGl(op: u32) glb.GLenum {
     };
 }
 
+/// newCom for objects whose GetDesc returns the creation desc verbatim.
+fn newComWithDesc(vtable: [*]const ?*const anyopaque, kind: ComObj.Kind, payload: usize, desc: []const u8) ?*ComObj {
+    const o = newCom(vtable, kind, payload, g_device) orelse return null;
+    const b = alloc.alloc(u8, desc.len) catch return o;
+    @memcpy(b, desc);
+    o.desc_blob = b.ptr;
+    o.desc_len = b.len;
+    return o;
+}
+
+fn stateGetDesc(raw: ?*anyopaque, out: ?*anyopaque) callconv(W) void {
+    const o: *ComObj = @ptrCast(@alignCast(raw orelse return));
+    const dst: [*]u8 = @ptrCast(out orelse return);
+    if (o.desc_blob) |b| @memcpy(dst[0..o.desc_len], b[0..o.desc_len]);
+}
+
+fn queryGetDataSize(raw: ?*anyopaque) callconv(W) u32 {
+    const o: *ComObj = @ptrCast(@alignCast(raw orelse return 0));
+    return switch (o.payload) { // D3D11_QUERY
+        0, 7 => 4, // EVENT, OCCLUSION_PREDICATE (BOOL)
+        1, 2 => 8, // OCCLUSION, TIMESTAMP
+        3 => 16, // TIMESTAMP_DISJOINT
+        4 => 88, // PIPELINE_STATISTICS
+        5, 6 => 16, // SO_STATISTICS, SO_OVERFLOW_PREDICATE (approx.)
+        else => 16,
+    };
+}
+
 fn devCreateBlendState(_: ?*anyopaque, desc: *const D3D11_BLEND_DESC, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
     const bs = alloc.create(glb.BlendState) catch return E_FAIL;
@@ -927,7 +1079,7 @@ fn devCreateBlendState(_: ?*anyopaque, desc: *const D3D11_BLEND_DESC, pp: ?*?*an
             .write_mask = r.RenderTargetWriteMask,
         };
     }
-    pp.?.* = newCom(&child_vtbl, .blend, @intFromPtr(bs), g_device);
+    pp.?.* = newComWithDesc(&state_vtbl, .blend, @intFromPtr(bs), std.mem.asBytes(desc));
     return S_OK;
 }
 
@@ -950,7 +1102,7 @@ fn devCreateDepthStencilState(_: ?*anyopaque, desc: *const D3D11_DEPTH_STENCIL_D
         .back_pass = d3dStencilOpToGl(desc.BackFace.StencilPassOp),
         .back_func = d3dCmpToGl(desc.BackFace.StencilFunc),
     };
-    pp.?.* = newCom(&child_vtbl, .depth_stencil, @intFromPtr(ds), g_device);
+    pp.?.* = newComWithDesc(&state_vtbl, .depth_stencil, @intFromPtr(ds), std.mem.asBytes(desc));
     return S_OK;
 }
 
@@ -964,7 +1116,7 @@ fn devCreateRasterizerState(_: ?*anyopaque, desc: *const D3D11_RASTERIZER_DESC, 
         .scissor_enable = (desc.ScissorEnable != 0),
         .depth_clip = (desc.DepthClipEnable != 0),
     };
-    pp.?.* = newCom(&child_vtbl, .rasterizer, @intFromPtr(rs), g_device);
+    pp.?.* = newComWithDesc(&state_vtbl, .rasterizer, @intFromPtr(rs), std.mem.asBytes(desc));
     return S_OK;
 }
 
@@ -973,14 +1125,15 @@ fn devCreateSamplerState(_: ?*anyopaque, desc: *const D3D11_SAMPLER_DESC, pp: ?*
     const sm = alloc.create(glb.Sampler) catch return E_FAIL;
     sm.* = .{};
     glb.createSampler(sm, desc.Filter, desc.AddressU, desc.AddressV, desc.AddressW, desc.MipLODBias, desc.MaxAnisotropy, desc.ComparisonFunc, desc.BorderColor, desc.MinLOD, desc.MaxLOD);
-    pp.?.* = newCom(&child_vtbl, .sampler, @intFromPtr(sm), g_device);
+    pp.?.* = newComWithDesc(&state_vtbl, .sampler, @intFromPtr(sm), std.mem.asBytes(desc));
     return S_OK;
 }
 
 fn devCreateQuery(_: ?*anyopaque, desc: ?*const [2]u32, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
     const qt: usize = if (desc) |d| d[0] else 0;
-    pp.?.* = newCom(&child_vtbl, .query, qt, g_device);
+    const qd: [2]u32 = if (desc) |d| d.* else .{ 0, 0 };
+    pp.?.* = newComWithDesc(&query_vtbl, .query, qt, std.mem.asBytes(&qd));
     return S_OK;
 }
 
@@ -1027,7 +1180,26 @@ fn childGetDevice(_: ?*anyopaque, pp: *?*anyopaque) callconv(W) void {
 
 fn resGetType(raw: ?*anyopaque, pType: *u32) callconv(W) void {
     const o: *ComObj = @ptrCast(@alignCast(raw orelse return));
-    pType.* = if (o.kind == .buffer) 1 else 3;
+    pType.* = switch (o.kind) {
+        .buffer => 1,
+        .texture1d => 2,
+        .texture3d => 4,
+        else => 3,
+    };
+}
+
+fn isTexKind(k: ComObj.Kind) bool {
+    return k == .texture2d or k == .texture1d or k == .texture3d;
+}
+
+fn tex1dGetDesc(raw: ?*anyopaque, pDesc: *D3D11_TEXTURE1D_DESC) callconv(W) void {
+    const o: *ComObj = @ptrCast(@alignCast(raw orelse return));
+    pDesc.* = o.desc1d;
+}
+
+fn tex3dGetDesc(raw: ?*anyopaque, pDesc: *D3D11_TEXTURE3D_DESC) callconv(W) void {
+    const o: *ComObj = @ptrCast(@alignCast(raw orelse return));
+    pDesc.* = o.desc3d;
 }
 
 fn bufGetDesc(raw: ?*anyopaque, pDesc: *D3D11_BUFFER_DESC) callconv(W) void {
@@ -1231,13 +1403,13 @@ fn ctxMap(_: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, map
         mapped.RowPitch = b.size;
         mapped.DepthPitch = b.size;
         return S_OK;
-    } else if (o.kind == .texture2d) {
+    } else if (isTexKind(o.kind)) {
         const t: *glb.Texture = @ptrFromInt(o.payload);
         traceFmt(t.dxgi_fmt, "map gl={d} sub={d} type={d} shadow={}", .{ t.gl_id, sub, map_type, t.shadow != null });
         if (t.shadow) |sh| {
             mapped.pData = sh.ptr;
             mapped.RowPitch = t.row_pitch;
-            mapped.DepthPitch = @intCast(sh.len);
+            mapped.DepthPitch = @intCast(sh.len / @max(1, t.depth));
             return S_OK;
         }
     }
@@ -1249,7 +1421,7 @@ fn ctxUnmap(_: ?*anyopaque, res: ?*anyopaque, sub: u32) callconv(W) void {
     if (o.kind == .buffer) {
         const b: *glb.Buffer = @ptrFromInt(o.payload);
         if (b.shadow) |sh| glb.uploadBuffer(b, 0, sh.ptr, b.size);
-    } else if (o.kind == .texture2d) {
+    } else if (isTexKind(o.kind)) {
         const t: *glb.Texture = @ptrFromInt(o.payload);
         if (t.usage != 3 and t.shadow != null) {
             glb.updateSubresourceTexture(t, sub, false, .{0} ** 6, t.shadow.?.ptr, t.row_pitch, @intCast(t.shadow.?.len));
@@ -1277,7 +1449,7 @@ fn ctxUpdateSubresource(_: ?*anyopaque, res: ?*anyopaque, sub: u32, box: ?*const
             }
             glb.uploadBuffer(b, 0, dptr, b.size);
         }
-    } else if (o.kind == .texture2d) {
+    } else if (isTexKind(o.kind)) {
         const t: *glb.Texture = @ptrFromInt(o.payload);
         const bx = if (box) |b| [6]u32{ b.left, b.top, b.front, b.right, b.bottom, b.back } else [_]u32{0} ** 6;
         traceFmt(t.dxgi_fmt, "update gl={d} sub={d} box={} [{d},{d})x[{d},{d}) pitch={d} nz={d}", .{
@@ -1390,6 +1562,20 @@ const child_vtbl = [_]?*const anyopaque{
     @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
 };
 
+/// ID3D11{Blend,DepthStencil,Rasterizer,Sampler}State: DeviceChild + GetDesc (7).
+const state_vtbl = [_]?*const anyopaque{
+    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&stateGetDesc),
+};
+
+/// ID3D11Query/Predicate: DeviceChild + GetDataSize (7) + GetDesc (8).
+const query_vtbl = [_]?*const anyopaque{
+    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&queryGetDataSize), @ptrCast(&stateGetDesc),
+};
+
 const buf_vtbl = [_]?*const anyopaque{
     @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
     @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
@@ -1404,6 +1590,20 @@ const tex2d_vtbl = [_]?*const anyopaque{
     @ptrCast(&tex2dGetDesc),
 };
 
+const tex1d_vtbl = [_]?*const anyopaque{
+    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&resGetType), @ptrCast(&stubVoid), @ptrCast(&stubRetZero),
+    @ptrCast(&tex1dGetDesc),
+};
+
+const tex3d_vtbl = [_]?*const anyopaque{
+    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&resGetType), @ptrCast(&stubVoid), @ptrCast(&stubRetZero),
+    @ptrCast(&tex3dGetDesc),
+};
+
 const view_vtbl = [_]?*const anyopaque{
     @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
     @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
@@ -1413,9 +1613,9 @@ const view_vtbl = [_]?*const anyopaque{
 const device_vtbl = [_]?*const anyopaque{
     @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease), // 0..2
     @ptrCast(&devCreateBuffer), // 3
-    notImplCreate("CreateTexture1D", 3), // 4
+    @ptrCast(&devCreateTexture1D), // 4
     @ptrCast(&devCreateTexture2D), // 5
-    notImplCreate("CreateTexture3D", 3), // 6
+    @ptrCast(&devCreateTexture3D), // 6
     @ptrCast(&devCreateSRV), // 7
     @ptrCast(&devCreateUAV), // 8
     @ptrCast(&devCreateRTV), // 9
@@ -1436,7 +1636,7 @@ const device_vtbl = [_]?*const anyopaque{
     @ptrCast(&devCreateQuery), // 24
     @ptrCast(&devCreateQuery), // 25 CreatePredicate
     notImplCreate("CreateCounter", 2), // 26
-    notImplCreate("CreateDeferredContext", 2), // 27
+    @ptrCast(&devCreateDeferredContext), // 27
     notImplCreate("OpenSharedResource", 3), // 28
     @ptrCast(&devCheckFormatSupport), // 29
     @ptrCast(&devCheckMultisample), // 30
@@ -1501,24 +1701,480 @@ const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&ctxUpdateSubresource), // 48
     @ptrCast(&stubVoid), // 49 CopyStructureCount
     @ptrCast(&ctxClearRTV), // 50
-    @ptrCast(&ctxClearDSV), // 51
-    @ptrCast(&stubVoid), // 52 ClearUAVUint
-    @ptrCast(&stubVoid), // 53 ClearUAVFloat
-    @ptrCast(&ctxResolveSubresource), // 54
-    @ptrCast(&ctxGenerateMips), // 55
-    @ptrCast(&stubVoid), // 56 SetResourceMinLOD
-    @ptrCast(&stubRetZero), // 57 GetResourceMinLOD
-    @ptrCast(&stubVoid), // 58 ExecuteCommandList
+    @ptrCast(&stubVoid), // 51 ClearUnorderedAccessViewUint
+    @ptrCast(&stubVoid), // 52 ClearUnorderedAccessViewFloat
+    @ptrCast(&ctxClearDSV), // 53
+    @ptrCast(&ctxGenerateMips), // 54
+    @ptrCast(&stubVoid), // 55 SetResourceMinLOD
+    @ptrCast(&stubRetZero), // 56 GetResourceMinLOD
+    @ptrCast(&ctxResolveSubresource), // 57
+    @ptrCast(&ctxExecuteCommandList), // 58
     @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), // 59..62 HS
     @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), // 63..66 DS
     @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), @ptrCast(&stubVoid), // 67..71 CS
-} ++ ([_]?*const anyopaque{@ptrCast(&stubVoid)} ** 35) ++ [_]?*const anyopaque{ // 72..106 Getters
-    @ptrCast(&ctxClearState), // 107
-    @ptrCast(&stubVoid), // 108 Flush
-    @ptrCast(&ctxGetType), // 109
-    @ptrCast(&stubRetZero), // 110 GetContextFlags
-    @ptrCast(&stubRetOk), // 111 FinishCommandList
+} ++ ([_]?*const anyopaque{@ptrCast(&stubVoid)} ** 38) ++ [_]?*const anyopaque{ // 72..109 Getters
+    @ptrCast(&ctxClearState), // 110
+    @ptrCast(&stubVoid), // 111 Flush
+    @ptrCast(&ctxGetType), // 112
+    @ptrCast(&stubRetZero), // 113 GetContextFlags
+    @ptrCast(&ctxFinishCommandListImmediate), // 114 FinishCommandList
 };
+
+comptime {
+    // ID3D11DeviceContext has 115 methods (d3d11.h); a short table makes the
+    // last calls run whatever sits after it in .rodata.
+    if (context_vtbl.len != 115) @compileError("ID3D11DeviceContext vtable must have 115 slots");
+}
+
+fn ctxFinishCommandListImmediate(_: ?*anyopaque, _: i32, pp: ?*?*anyopaque) callconv(W) i32 {
+    if (pp) |p| p.* = null;
+    return @bitCast(@as(u32, 0x887A0001)); // DXGI_ERROR_INVALID_CALL
+}
+
+// ---- Deferred contexts / command lists -------------------------------------
+//
+// A deferred context records calls; ExecuteCommandList replays them on the
+// immediate context. Recording never touches g_draw_state (worker threads
+// record while the main thread draws). Each command keeps a copy of its
+// arguments (pointer arrays, colours, boxes and upload bytes are deep-copied
+// into the recorder's arena) and holds a reference on every COM object it
+// names until the command list is released, like the D3D11 runtime does.
+
+const Cmd = struct {
+    run: *const fn (*const anyopaque) void,
+    args: *const anyopaque,
+};
+
+const MapRec = struct { res: usize, sub: u32, mem: []u8 };
+
+const Recorder = struct {
+    arena: std.heap.ArenaAllocator,
+    cmds: std.ArrayList(Cmd) = .empty,
+    refs: std.ArrayList(*anyopaque) = .empty,
+    maps: std.ArrayList(MapRec) = .empty,
+
+    fn a(r: *Recorder) std.mem.Allocator {
+        return r.arena.allocator();
+    }
+
+    fn ref(r: *Recorder, obj: ?*anyopaque) ?*anyopaque {
+        const o = obj orelse return null;
+        r.refs.append(r.a(), o) catch return o;
+        _ = comAddRef(o);
+        return o;
+    }
+
+    fn dup(r: *Recorder, comptime T: type, src: ?[*]const T, n: usize) ?[*]const T {
+        const s = src orelse return null;
+        const d = r.a().alloc(T, @max(1, n)) catch return null;
+        @memcpy(d[0..n], s[0..n]);
+        return d.ptr;
+    }
+
+    fn dupRefs(r: *Recorder, src: ?[*]const ?*anyopaque, n: usize) ?[*]const ?*anyopaque {
+        const d = r.dup(?*anyopaque, src, n) orelse return null;
+        for (d[0..n]) |o| _ = r.ref(o);
+        return d;
+    }
+
+    /// Drop everything recorded so far (refs released, arena reset).
+    fn reset(r: *Recorder) void {
+        for (r.refs.items) |o| _ = comRelease(o);
+        _ = r.arena.reset(.free_all);
+        r.cmds = .empty;
+        r.refs = .empty;
+        r.maps = .empty;
+    }
+};
+
+/// A finished command list owns the arena the commands were recorded into.
+const CmdList = struct {
+    arena: std.heap.ArenaAllocator,
+    cmds: []const Cmd,
+    refs: []const *anyopaque,
+};
+
+fn recOf(raw: ?*anyopaque) *Recorder {
+    const o: *ComObj = @ptrCast(@alignCast(raw.?));
+    return @ptrFromInt(o.payload);
+}
+
+/// Record a call to immediate-context method `f` with `args` (args[0] is the
+/// deferred context; replay substitutes the immediate one).
+fn push(r: *Recorder, comptime f: anytype, args: std.meta.ArgsTuple(@TypeOf(f))) void {
+    const T = @TypeOf(args);
+    const p = r.a().create(T) catch return;
+    p.* = args;
+    const thunk = struct {
+        fn run(raw: *const anyopaque) void {
+            var t = @as(*const T, @ptrCast(@alignCast(raw))).*;
+            t[0] = @ptrCast(g_context);
+            const R = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+            if (R == void) @call(.auto, f, t) else _ = @call(.auto, f, t);
+        }
+    };
+    r.cmds.append(r.a(), .{ .run = &thunk.run, .args = p }) catch return;
+}
+
+/// Set{CB,SRV,Samplers}(start, num, pp): copy + reference the object array.
+fn dSetArr(comptime f: anytype) *const anyopaque {
+    return @ptrCast(&struct {
+        fn w(raw: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+            const r = recOf(raw);
+            push(r, f, .{ raw, start, num, r.dupRefs(pp, num) });
+        }
+    }.w);
+}
+
+fn dSetShader(comptime f: anytype) *const anyopaque {
+    return @ptrCast(&struct {
+        fn w(raw: ?*anyopaque, sh: ?*anyopaque, _: ?*const anyopaque, _: u32) callconv(W) void {
+            const r = recOf(raw);
+            push(r, f, .{ raw, r.ref(sh), null, 0 });
+        }
+    }.w);
+}
+
+/// Methods whose only object argument is the first one after `this`.
+fn dObj1(comptime f: anytype) *const anyopaque {
+    const P = @typeInfo(@TypeOf(f)).@"fn".params;
+    return switch (P.len) {
+        2 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, o: ?*anyopaque) callconv(W) void {
+                const r = recOf(raw);
+                push(r, f, .{ raw, r.ref(o) });
+            }
+        }.w),
+        3 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, o: ?*anyopaque, x: P[2].type.?) callconv(W) void {
+                const r = recOf(raw);
+                push(r, f, .{ raw, r.ref(o), x });
+            }
+        }.w),
+        4 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, o: ?*anyopaque, x: P[2].type.?, y: P[3].type.?) callconv(W) void {
+                const r = recOf(raw);
+                push(r, f, .{ raw, r.ref(o), x, y });
+            }
+        }.w),
+        5 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, o: ?*anyopaque, x: P[2].type.?, y: P[3].type.?, z: P[4].type.?) callconv(W) void {
+                const r = recOf(raw);
+                push(r, f, .{ raw, r.ref(o), x, y, z });
+            }
+        }.w),
+        else => @compileError("dObj1: unsupported arity"),
+    };
+}
+
+/// Pure-value methods (draws, topology, ClearState).
+fn dVal(comptime f: anytype) *const anyopaque {
+    const P = @typeInfo(@TypeOf(f)).@"fn".params;
+    return switch (P.len) {
+        1 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque) callconv(W) void {
+                push(recOf(raw), f, .{raw});
+            }
+        }.w),
+        2 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, x1: P[1].type.?) callconv(W) void {
+                push(recOf(raw), f, .{ raw, x1 });
+            }
+        }.w),
+        3 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, x1: P[1].type.?, x2: P[2].type.?) callconv(W) void {
+                push(recOf(raw), f, .{ raw, x1, x2 });
+            }
+        }.w),
+        4 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, x1: P[1].type.?, x2: P[2].type.?, x3: P[3].type.?) callconv(W) void {
+                push(recOf(raw), f, .{ raw, x1, x2, x3 });
+            }
+        }.w),
+        5 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, x1: P[1].type.?, x2: P[2].type.?, x3: P[3].type.?, x4: P[4].type.?) callconv(W) void {
+                push(recOf(raw), f, .{ raw, x1, x2, x3, x4 });
+            }
+        }.w),
+        6 => @ptrCast(&struct {
+            fn w(raw: ?*anyopaque, x1: P[1].type.?, x2: P[2].type.?, x3: P[3].type.?, x4: P[4].type.?, x5: P[5].type.?) callconv(W) void {
+                push(recOf(raw), f, .{ raw, x1, x2, x3, x4, x5 });
+            }
+        }.w),
+        else => @compileError("dVal: unsupported arity"),
+    };
+}
+
+fn dIASetVertexBuffers(raw: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque, strides: ?[*]const u32, offsets: ?[*]const u32) callconv(W) void {
+    const r = recOf(raw);
+    push(r, ctxIASetVertexBuffers, .{ raw, start, num, r.dupRefs(pp, num), r.dup(u32, strides, num), r.dup(u32, offsets, num) });
+}
+
+fn dOMSetRenderTargets(raw: ?*anyopaque, num: u32, pp: ?[*]const ?*anyopaque, dsv: ?*anyopaque) callconv(W) void {
+    const r = recOf(raw);
+    push(r, ctxOMSetRenderTargets, .{ raw, num, r.dupRefs(pp, num), r.ref(dsv) });
+}
+
+fn dOMSetBlendState(raw: ?*anyopaque, bs: ?*anyopaque, factor: ?*const [4]f32, mask: u32) callconv(W) void {
+    const r = recOf(raw);
+    const fc: ?*const [4]f32 = if (r.dup([4]f32, if (factor) |f| @ptrCast(f) else null, 1)) |p| &p[0] else null;
+    push(r, ctxOMSetBlendState, .{ raw, r.ref(bs), fc, mask });
+}
+
+fn dRSSetViewports(raw: ?*anyopaque, num: u32, vps: ?[*]const D3D11_VIEWPORT) callconv(W) void {
+    const r = recOf(raw);
+    push(r, ctxRSSetViewports, .{ raw, num, r.dup(D3D11_VIEWPORT, vps, num) });
+}
+
+fn dRSSetScissors(raw: ?*anyopaque, num: u32, rects: ?[*]const RECT) callconv(W) void {
+    const r = recOf(raw);
+    push(r, ctxRSSetScissors, .{ raw, num, r.dup(RECT, rects, num) });
+}
+
+fn dClearRTV(raw: ?*anyopaque, rtv: ?*anyopaque, color: *const [4]f32) callconv(W) void {
+    const r = recOf(raw);
+    const c = r.dup([4]f32, @ptrCast(color), 1) orelse return;
+    push(r, ctxClearRTV, .{ raw, r.ref(rtv), &c[0] });
+}
+
+fn dCopySubresourceRegion(raw: ?*anyopaque, dst: ?*anyopaque, dsub: u32, dx: u32, dy: u32, dz: u32, src: ?*anyopaque, ssub: u32, box: ?*const D3D11_BOX) callconv(W) void {
+    const r = recOf(raw);
+    const b: ?*const D3D11_BOX = if (r.dup(D3D11_BOX, if (box) |p| @ptrCast(p) else null, 1)) |p| &p[0] else null;
+    push(r, ctxCopySubresourceRegion, .{ raw, r.ref(dst), dsub, dx, dy, dz, r.ref(src), ssub, b });
+}
+
+fn dCopyResource(raw: ?*anyopaque, dst: ?*anyopaque, src: ?*anyopaque) callconv(W) void {
+    const r = recOf(raw);
+    push(r, ctxCopyResource, .{ raw, r.ref(dst), r.ref(src) });
+}
+
+fn dResolveSubresource(raw: ?*anyopaque, dst: ?*anyopaque, dsub: u32, src: ?*anyopaque, ssub: u32, fmt: u32) callconv(W) void {
+    const r = recOf(raw);
+    push(r, ctxResolveSubresource, .{ raw, r.ref(dst), dsub, r.ref(src), ssub, fmt });
+}
+
+/// Bytes UpdateSubresource reads from `data` for this resource/box.
+fn updateSourceSize(o: *ComObj, sub: u32, box: ?*const D3D11_BOX, row_pitch: u32, depth_pitch: u32) usize {
+    if (o.kind == .buffer) {
+        if (box) |b| return b.right -| b.left;
+        return o.descbuf.ByteWidth;
+    }
+    if (!isTexKind(o.kind)) return 0;
+    const t: *glb.Texture = @ptrFromInt(o.payload);
+    const gf = glb.dxgiToGlFormat(t.dxgi_fmt);
+    const mip: u5 = @intCast(@min(31, sub % @max(1, t.mip_levels)));
+    const w: u32 = if (box) |b| b.right -| b.left else @max(1, t.width >> mip);
+    const h: u32 = if (box) |b| b.bottom -| b.top else @max(1, t.height >> mip);
+    const d: u32 = if (box) |b| b.back -| b.front else @max(1, t.depth >> mip);
+    if (w == 0 or h == 0 or d == 0) return 0;
+    const rows: usize = if (gf.compressed) (h + 3) / 4 else h;
+    const row_bytes: usize = if (gf.compressed) ((w + 3) / 4) * gf.block_bytes else w * @max(1, gf.bpp);
+    const rp: usize = if (row_pitch != 0) row_pitch else row_bytes;
+    const dp: usize = if (depth_pitch != 0) depth_pitch else rp * rows;
+    return (d - 1) * dp + (rows - 1) * rp + row_bytes;
+}
+
+fn dUpdateSubresource(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, box: ?*const D3D11_BOX, data: ?*const anyopaque, row_pitch: u32, depth_pitch: u32) callconv(W) void {
+    const r = recOf(raw);
+    const o: *ComObj = @ptrCast(@alignCast(res orelse return));
+    const src: [*]const u8 = @ptrCast(data orelse return);
+    const n = updateSourceSize(o, sub, box, row_pitch, depth_pitch);
+    if (n == 0) return;
+    const bytes = r.dup(u8, src, n) orelse return;
+    const b: ?*const D3D11_BOX = if (r.dup(D3D11_BOX, if (box) |p| @ptrCast(p) else null, 1)) |p| &p[0] else null;
+    push(r, ctxUpdateSubresource, .{ raw, r.ref(res), sub, b, @as(?*const anyopaque, @ptrCast(bytes)), row_pitch, depth_pitch });
+}
+
+/// Replay of a deferred Map/Unmap: write the recorded bytes through the
+/// immediate context's own Map so shadows and GL objects stay in sync.
+fn replayUpload(ctx: ?*anyopaque, res: ?*anyopaque, sub: u32, mem: [*]const u8, len: usize) callconv(W) void {
+    var m: D3D11_MAPPED_SUBRESOURCE = undefined;
+    if (ctxMap(ctx, res, sub, 4, 0, &m) != S_OK) return;
+    if (m.pData) |dst| @memcpy(@as([*]u8, @ptrCast(dst))[0..len], mem[0..len]);
+    ctxUnmap(ctx, res, sub);
+}
+
+fn mapSize(o: *ComObj) ?struct { len: usize, row: u32 } {
+    if (o.kind == .buffer) {
+        const b: *glb.Buffer = @ptrFromInt(o.payload);
+        return .{ .len = b.size, .row = b.size };
+    }
+    if (isTexKind(o.kind)) {
+        const t: *glb.Texture = @ptrFromInt(o.payload);
+        const sh = t.shadow orelse return null;
+        return .{ .len = sh.len, .row = t.row_pitch };
+    }
+    return null;
+}
+
+/// Deferred contexts may only Map with WRITE_DISCARD (4) or WRITE_NO_OVERWRITE
+/// (5). The app writes into recorder memory; Unmap records the upload. For
+/// NO_OVERWRITE the buffer starts from the latest bytes this list wrote (or
+/// the resource's current shadow) so untouched ranges survive the upload.
+fn dMap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, mapped: *D3D11_MAPPED_SUBRESOURCE) callconv(W) i32 {
+    const r = recOf(raw);
+    const o: *ComObj = @ptrCast(@alignCast(res orelse return E_INVALIDARG));
+    if (map_type != 4 and map_type != 5) return E_INVALIDARG;
+    const sz = mapSize(o) orelse return E_INVALIDARG;
+    const mem = r.a().alloc(u8, @max(1, sz.len)) catch return E_FAIL;
+    if (map_type == 5) {
+        var prev: ?[]const u8 = null;
+        var i = r.maps.items.len;
+        while (i > 0) : (i -= 1) {
+            const mr = r.maps.items[i - 1];
+            if (mr.res == @intFromPtr(res) and mr.sub == sub) {
+                prev = mr.mem;
+                break;
+            }
+        }
+        if (prev == null) {
+            if (o.kind == .buffer) {
+                const b: *glb.Buffer = @ptrFromInt(o.payload);
+                if (b.shadow) |sh| prev = sh;
+            } else {
+                const t: *glb.Texture = @ptrFromInt(o.payload);
+                prev = t.shadow;
+            }
+        }
+        if (prev) |p| @memcpy(mem[0..@min(mem.len, p.len)], p[0..@min(mem.len, p.len)]);
+    }
+    r.maps.append(r.a(), .{ .res = @intFromPtr(res), .sub = sub, .mem = mem }) catch return E_FAIL;
+    mapped.pData = mem.ptr;
+    mapped.RowPitch = sz.row;
+    mapped.DepthPitch = @intCast(sz.len);
+    return S_OK;
+}
+
+fn dUnmap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32) callconv(W) void {
+    const r = recOf(raw);
+    var i = r.maps.items.len;
+    while (i > 0) : (i -= 1) {
+        const mr = r.maps.items[i - 1];
+        if (mr.res == @intFromPtr(res) and mr.sub == sub) {
+            push(r, replayUpload, .{ raw, r.ref(res), sub, mr.mem.ptr, mr.mem.len });
+            return;
+        }
+    }
+}
+
+fn dExecuteCommandList(raw: ?*anyopaque, cl: ?*anyopaque, restore: i32) callconv(W) void {
+    const r = recOf(raw);
+    push(r, ctxExecuteCommandList, .{ raw, r.ref(cl), restore });
+}
+
+fn dGetType(_: ?*anyopaque) callconv(W) u32 {
+    return 1; // D3D11_DEVICE_CONTEXT_DEFERRED
+}
+
+fn dFinishCommandList(raw: ?*anyopaque, restore: i32, pp: ?*?*anyopaque) callconv(W) i32 {
+    const out = pp orelse return E_INVALIDARG;
+    out.* = null;
+    const r = recOf(raw);
+    if (restore != 0) {
+        const T = struct {
+            var told = std.atomic.Value(bool).init(false);
+        };
+        if (!T.told.swap(true, .monotonic)) std.debug.print("[WINS:D3D11] FinishCommandList(RestoreDeferredContextState=TRUE): deferred state is not carried over\n", .{});
+    }
+    const cl = alloc.create(CmdList) catch return E_FAIL;
+    // Hand the arena (and everything recorded into it) to the command list.
+    cl.* = .{ .arena = r.arena, .cmds = r.cmds.items, .refs = r.refs.items };
+    r.arena = std.heap.ArenaAllocator.init(alloc);
+    r.cmds = .empty;
+    r.refs = .empty;
+    r.maps = .empty;
+    const o = newCom(&cmdlist_vtbl, .cmdlist, @intFromPtr(cl), g_device) orelse {
+        destroyCmdList(cl);
+        return E_FAIL;
+    };
+    out.* = o;
+    return S_OK;
+}
+
+fn destroyCmdList(cl: *CmdList) void {
+    for (cl.refs) |o| _ = comRelease(o);
+    cl.arena.deinit();
+    alloc.destroy(cl);
+}
+
+/// Replays a command list on the immediate context. D3D11 runs a command
+/// list from the default state and afterwards either restores the immediate
+/// context's previous state or leaves it cleared.
+fn ctxExecuteCommandList(_: ?*anyopaque, cl_raw: ?*anyopaque, restore: i32) callconv(W) void {
+    const o: *ComObj = @ptrCast(@alignCast(cl_raw orelse return));
+    if (o.kind != .cmdlist) return;
+    const cl: *CmdList = @ptrFromInt(o.payload);
+    const saved = g_draw_state;
+    g_draw_state = .{};
+    for (cl.cmds) |c| c.run(c.args);
+    g_draw_state = if (restore != 0) saved else .{};
+}
+
+fn cmdlistGetContextFlags(_: ?*anyopaque) callconv(W) u32 {
+    return 0;
+}
+
+fn devCreateDeferredContext(_: ?*anyopaque, _: u32, pp: ?*?*anyopaque) callconv(W) i32 {
+    const out = pp orelse return E_INVALIDARG;
+    out.* = null;
+    const r = alloc.create(Recorder) catch return E_FAIL;
+    r.* = .{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    const o = newCom(&deferred_vtbl, .deferred_ctx, @intFromPtr(r), g_device) orelse {
+        alloc.destroy(r);
+        return E_FAIL;
+    };
+    out.* = o;
+    return S_OK;
+}
+
+const cmdlist_vtbl = [_]?*const anyopaque{
+    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&cmdlistGetContextFlags),
+};
+
+/// The immediate vtable with every state-touching slot swapped for a recorder.
+const deferred_vtbl = blk: {
+    var v = context_vtbl;
+    v[7] = dSetArr(ctxVSSetCB);
+    v[8] = dSetArr(ctxPSSetSRV);
+    v[9] = dSetShader(ctxPSSetShader);
+    v[10] = dSetArr(ctxPSSetSamplers);
+    v[11] = dSetShader(ctxVSSetShader);
+    v[12] = dVal(ctxDrawIndexed);
+    v[13] = dVal(ctxDraw);
+    v[14] = @ptrCast(&dMap);
+    v[15] = @ptrCast(&dUnmap);
+    v[16] = dSetArr(ctxPSSetCB);
+    v[17] = dObj1(ctxIASetInputLayout);
+    v[18] = @ptrCast(&dIASetVertexBuffers);
+    v[19] = dObj1(ctxIASetIndexBuffer);
+    v[20] = dVal(ctxDrawIndexedInstanced);
+    v[21] = dVal(ctxDrawInstanced);
+    v[24] = dVal(ctxIASetTopology);
+    v[25] = dSetArr(ctxVSSetSRV);
+    v[26] = dSetArr(ctxVSSetSamplers);
+    v[29] = @ptrCast(&stubRetOk); // GetData is invalid on a deferred context
+    v[33] = @ptrCast(&dOMSetRenderTargets);
+    v[35] = @ptrCast(&dOMSetBlendState);
+    v[36] = dObj1(ctxOMSetDepthStencilState);
+    v[43] = dObj1(ctxRSSetState);
+    v[44] = @ptrCast(&dRSSetViewports);
+    v[45] = @ptrCast(&dRSSetScissors);
+    v[46] = @ptrCast(&dCopySubresourceRegion);
+    v[47] = @ptrCast(&dCopyResource);
+    v[48] = @ptrCast(&dUpdateSubresource);
+    v[50] = @ptrCast(&dClearRTV);
+    v[53] = dObj1(ctxClearDSV);
+    v[54] = dObj1(ctxGenerateMips);
+    v[57] = @ptrCast(&dResolveSubresource);
+    v[58] = @ptrCast(&dExecuteCommandList);
+    v[110] = dVal(ctxClearState);
+    v[112] = @ptrCast(&dGetType);
+    v[114] = @ptrCast(&dFinishCommandList);
+    break :blk v;
+};
+
 
 // ---- DLL Export Entry Points ------------------------------------------------
 

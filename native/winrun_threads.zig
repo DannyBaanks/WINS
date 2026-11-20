@@ -936,6 +936,7 @@ fn trampoline(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
     while (o.suspend_count > 0) _ = waitCond(&Deadline.init(INFINITE));
     o.running = true;
     unlock();
+    if (comptime @import("builtin").link_libc) if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:thread] tid={d} start=0x{x} param=0x{x}\n", .{ tidNow(), @intFromPtr(o.start.?), @intFromPtr(o.param) });
     const code = o.start.?(o.param);
     finish(o, code);
     return null;

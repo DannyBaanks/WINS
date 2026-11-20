@@ -187,6 +187,11 @@ fn GetProcessHeap() callconv(W) usize {
     return HEAP_COOKIE;
 }
 
+/// The process heap handle (PEB.ProcessHeap must hold the same value).
+pub fn processHeapHandle() usize {
+    return HEAP_COOKIE;
+}
+
 /// Shared with winrun32.zig: a block is ours only if this magic is in front
 /// of it. A free that cannot find the magic must not unmap: the address may
 /// belong to the real Steam client.
@@ -2771,9 +2776,34 @@ fn ReadDirectoryChangesW(h: usize, buf: ?[*]u8, len: u32, sub: u32, filter: u32,
     return 0;
 }
 
+/// ReadProcessMemory: the current process ((HANDLE)-1 or OpenProcess(own pid))
+/// and other processes opened with OpenProcess (handle = 0x1000 + pid) are read
+/// with process_vm_readv, so an unmapped or PROT_NONE range fails with
+/// ERROR_PARTIAL_COPY (or ERROR_NOACCESS for nothing read) instead of faulting,
+/// as on Windows. Protectors read their own image this way.
 fn ReadProcessMemory(proc: usize, base: ?*const anyopaque, buf: ?[*]u8, sz: usize, num_read: ?*usize) callconv(W) u32 {
-    _ = proc; _ = base; _ = buf; _ = sz;
     if (num_read) |r| r.* = 0;
+    const self_pid: usize = @intCast(std.os.linux.getpid());
+    const pid: usize = if (proc == ~@as(usize, 0)) self_pid else if (proc > 0x1000 and proc < 0x1000 + (1 << 22)) proc - 0x1000 else {
+        setLastError(6); // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    const dst = buf orelse {
+        setLastError(998); // ERROR_NOACCESS
+        return 0;
+    };
+    if (sz == 0) return 1;
+    var local = [_]std.posix.iovec{.{ .base = dst, .len = sz }};
+    var remote = [_]std.posix.iovec_const{.{ .base = @ptrCast(base orelse {
+        setLastError(998);
+        return 0;
+    }), .len = sz }};
+    const got = std.os.linux.process_vm_readv(@intCast(pid), &local, &remote, 0);
+    const n: usize = if (std.os.linux.errno(got) == .SUCCESS) got else 0;
+    if (comptime @import("builtin").link_libc) if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:trace] ReadProcessMemory(pid={d}, 0x{x}, {d}) -> {d} bytes ret=0x{x}\n", .{ pid, @intFromPtr(base), sz, n, @returnAddress() });
+    if (num_read) |r| r.* = n;
+    if (n == sz) return 1;
+    setLastError(if (n == 0) 998 else 299); // ERROR_NOACCESS / ERROR_PARTIAL_COPY
     return 0;
 }
 
