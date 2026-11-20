@@ -39,6 +39,9 @@ pub const SigElem = struct {
 pub const TexBinding = struct {
     reg: u8,
     dim: TexDim,
+    /// Sampler register (s#) the shader samples this texture with; GL ties a
+    /// sampler object to the texture unit, D3D pairs them per instruction.
+    samp: u8,
 };
 
 pub const Translated = struct {
@@ -685,6 +688,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     var cb_sizes = [_]u32{0} ** 16;
     var cb_mask: u16 = 0;
     var tex_dims = [_]TexDim{.none} ** 16;
+    var tex_samp = [_]u8{0xFF} ** 16;
     var idx_temp_sizes = [_]u32{0} ** 8;
     var icb_vals: ?[]const u32 = null;
     var sv_pos_out_reg: ?u32 = null;
@@ -1000,7 +1004,12 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const cmask = sampleCoordMask(tdim);
                 // ld_ms carries a sample index; WINS backs MS resources with
                 // single-sample GL textures, so it reads sample 0 (lod 0).
-                if (op != .ld) _ = try decodeOperand(a, toks, &p);
+                if (op == .ld_ms) {
+                    _ = try decodeOperand(a, toks, &p);
+                } else if (op != .ld) {
+                    const smp = try decodeOperand(a, toks, &p);
+                    if (tex_samp[reg] == 0xFF) tex_samp[reg] = @intCast(@min(15, smp.indices[0].imm));
+                }
                 var extra_e: []const u8 = "";
                 if (op == .sample_l) {
                     const lod = try decodeOperand(a, toks, &p);
@@ -1187,8 +1196,9 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
                 const coord = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
-                _ = try decodeOperand(a, toks, &p); // sampler
+                const smp = try decodeOperand(a, toks, &p);
                 const reg: u8 = @intCast(@min(15, res.indices[0].imm));
+                if (tex_samp[reg] == 0xFF) tex_samp[reg] = @intCast(@min(15, smp.indices[0].imm));
                 const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ if (stage == .pixel) "p" else "v", reg });
                 const cexpr = try tex1dCoord(a, tex_dims[reg], try formatSrc(a, &coord, sampleCoordMask(tex_dims[reg]), .f, stage), .f);
                 var swbuf: [5]u8 = undefined;
@@ -1294,7 +1304,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d};\n", .{
                 tex_base + i, stype, prefix, i,
             });
-            try tlist.append(gpa, .{ .reg = @intCast(i), .dim = tex_dims[i] });
+            // Fetch-only textures keep their own index (no sampler needed).
+            try tlist.append(gpa, .{ .reg = @intCast(i), .dim = tex_dims[i], .samp = if (tex_samp[i] == 0xFF) @intCast(i) else tex_samp[i] });
         }
     }
 

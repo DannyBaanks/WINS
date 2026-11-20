@@ -420,6 +420,8 @@ pub fn dxgiToGlFormat(fmt: u32) GlTexFmt {
         82, 83, 84 => .{ .internal = 0x8DBD, .format = 0x8DBD, .ty = 0, .bpp = 0, .compressed = true, .block_bytes = 16, .is_depth = false, .is_stencil = false, .is_a8 = false }, // BC5
         87, 88, 90 => .{ .internal = 0x8058, .format = 0x80E1, .ty = 0x1401, .bpp = 4, .compressed = false, .block_bytes = 0, .is_depth = false, .is_stencil = false, .is_a8 = false }, // BGRA8
         91, 93 => .{ .internal = 0x8C43, .format = 0x80E1, .ty = 0x1401, .bpp = 4, .compressed = false, .block_bytes = 0, .is_depth = false, .is_stencil = false, .is_a8 = false }, // BGRA8_SRGB
+        94, 95 => .{ .internal = 0x8E8F, .format = 0x8E8F, .ty = 0, .bpp = 0, .compressed = true, .block_bytes = 16, .is_depth = false, .is_stencil = false, .is_a8 = false }, // BC6H_UF16
+        96 => .{ .internal = 0x8E8E, .format = 0x8E8E, .ty = 0, .bpp = 0, .compressed = true, .block_bytes = 16, .is_depth = false, .is_stencil = false, .is_a8 = false }, // BC6H_SF16
         97, 98 => .{ .internal = 0x8E8C, .format = 0x8E8C, .ty = 0, .bpp = 0, .compressed = true, .block_bytes = 16, .is_depth = false, .is_stencil = false, .is_a8 = false }, // BC7
         99 => .{ .internal = 0x8E8D, .format = 0x8E8D, .ty = 0, .bpp = 0, .compressed = true, .block_bytes = 16, .is_depth = false, .is_stencil = false, .is_a8 = false }, // BC7_SRGB
         else => .{ .internal = 0x8058, .format = 0x1908, .ty = 0x1401, .bpp = 4, .compressed = false, .block_bytes = 0, .is_depth = false, .is_stencil = false, .is_a8 = false },
@@ -1926,6 +1928,17 @@ fn glPrimTopology(t: u32) GLenum {
     };
 }
 
+/// WINS_D3D11_TRACE_FRAME=N: also trace every draw of present #N (with
+/// WINS_D3D11_TRACE_DRAWS).
+fn traceFrame() bool {
+    const C = struct { var init = false; var n: ?u32 = null; };
+    if (!C.init) {
+        C.init = true;
+        if (getenv("WINS_D3D11_TRACE_FRAME")) |z| C.n = std.fmt.parseInt(u32, std.mem.span(z), 10) catch null;
+    }
+    return if (C.n) |n| g_present_count == n else false;
+}
+
 fn bindTextureSlots(bindings: []const shader.TexBinding, base_unit: GLuint, srvs: *const [16]?*View, samps: *const [16]?*Sampler) void {
     for (bindings) |b| {
         const unit = base_unit + b.reg;
@@ -1939,7 +1952,7 @@ fn bindTextureSlots(bindings: []const shader.TexBinding, base_unit: GLuint, srvs
         } else {
             gl.glBindTexture(0x0DE1, 0);
         }
-        const sid: GLuint = if (samps[b.reg]) |smp| smp.gl_id else 0;
+        const sid: GLuint = if (samps[b.samp]) |smp| smp.gl_id else 0;
         gl.glBindSampler(unit, sid);
     }
 }
@@ -2118,7 +2131,7 @@ fn drawJob(raw: ?*anyopaque) void {
             std.debug.print("[WINS:D3D11:GL] draw glError=0x{x} draws={d}\n", .{ err, g_draw_count });
         }
     }
-    if (getenv("WINS_D3D11_TRACE_DRAWS") != null and (g_draw_count <= 36 or (g_present_count >= 4 and g_present_count <= 5))) {
+    if (getenv("WINS_D3D11_TRACE_DRAWS") != null and (g_draw_count <= 36 or (g_present_count >= 4 and g_present_count <= 5) or traceFrame())) {
         const rt0 = if (s.num_rtvs > 0 and s.rtv[0] != null and s.rtv[0].?.tex != null) s.rtv[0].?.tex.? else null;
         const ps0 = if (s.ps_srv[0] != null and s.ps_srv[0].?.tex != null) s.ps_srv[0].?.tex.? else null;
         var px: [4]u8 = .{ 0, 0, 0, 0 };
@@ -2143,6 +2156,37 @@ fn drawJob(raw: ?*anyopaque) void {
             if (ps0) |p| p.gl_id else 0, lp.prog,
             bl_en, bl_mask, ds_en, ds_fn, rs_cull, rs_sc, px[0], px[1], px[2], px[3],
         });
+        if (traceFrame()) if (s.blend) |bl| {
+            const r0 = bl.rt[0];
+            std.debug.print("    blend rt0 en={} src=0x{x}/0x{x} dst=0x{x}/0x{x} op=0x{x}/0x{x} mask=0x{x} factor=({d:.2},{d:.2},{d:.2},{d:.2}) indep={} rtfmt={d}\n", .{
+                r0.enable, r0.src_rgb, r0.src_a, r0.dst_rgb, r0.dst_a, r0.op_rgb, r0.op_a, r0.write_mask,
+                s.blend_factor[0], s.blend_factor[1], s.blend_factor[2], s.blend_factor[3], bl.independent,
+                if (rt0) |r| r.dxgi_fmt else 0,
+            });
+        };
+        if (traceFrame()) if (s.depth_stencil) |d| {
+            std.debug.print("    ds depth={}/{} func=0x{x} stencil={} rmask=0x{x} wmask=0x{x} front(func=0x{x} pass=0x{x} fail=0x{x}) ref={d}\n", .{
+                d.depth_enable, d.depth_write, d.depth_func, d.stencil_enable, d.stencil_read_mask, d.stencil_write_mask, d.front_func, d.front_pass, d.front_fail, s.stencil_ref,
+            });
+        };
+        // Traced frame: first indices of an indexed draw and their vertex bytes.
+        if (traceFrame() and j.kind == .indexed) blk: {
+            const ib = s.ib orelse break :blk;
+            const ish = ib.shadow orelse break :blk;
+            const vb = s.vb[0] orelse break :blk;
+            const vsh = vb.shadow orelse break :blk;
+            const is32 = s.ib_format == 42;
+            const ib_bytes: usize = if (is32) 4 else 2;
+            var q: usize = 0;
+            while (q < @min(@as(u32, if (getenv("WINS_D3D11_TRACE_ALLIDX") != null) 4096 else 6), j.count)) : (q += 1) {
+                const at = @as(usize, s.ib_offset) + (@as(usize, j.start_index) + q) * ib_bytes;
+                if (at + ib_bytes > ish.len) break;
+                const idx: usize = if (is32) std.mem.readInt(u32, ish[at..][0..4], .little) else std.mem.readInt(u16, ish[at..][0..2], .little);
+                const v_at = @as(usize, s.vb_offset[0]) + (idx + @as(usize, @bitCast(@as(isize, j.base_vertex)))) * s.vb_stride[0];
+                if (v_at + 16 > vsh.len) break;
+                std.debug.print("    idx[{d}]={d} v@{d}: {x}\n", .{ q, idx, v_at, vsh[v_at..][0..@min(16, s.vb_stride[0])] });
+            }
+        }
         if (g_draw_count == 20 or g_draw_count == 22 or g_draw_count == 25 or g_draw_count == 34) {
             if (s.num_viewports > 0) {
                 const v0 = s.viewports[0];

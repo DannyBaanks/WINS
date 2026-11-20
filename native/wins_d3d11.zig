@@ -1595,6 +1595,10 @@ fn ctxUpdateSubresource(_: ?*anyopaque, res: ?*anyopaque, sub: u32, box: ?*const
             t.gl_id, sub, box != null, bx[0], bx[3], bx[1], bx[4], row_pitch,
             if (traceFmtOn(t.dxgi_fmt)) nonzeroBytes(dptr, @as(usize, row_pitch) * (if (box != null) bx[4] -| bx[1] else t.height)) else 0,
         });
+        if (t.dxgi_fmt == 41 and traceFmtOn(41) and row_pitch >= 4100) {
+            const f: [*]align(1) const f32 = @ptrCast(dptr);
+            traceFmt(41, "  r32f[0,1,256,512,1024] = {d:.4} {d:.4} {d:.4} {d:.4} {d:.4}", .{ f[0], f[1], f[256], f[512], f[1024] });
+        }
         glb.updateSubresourceTexture(t, sub, box != null, bx, dptr, row_pitch, depth_pitch);
     }
 }
@@ -1907,7 +1911,9 @@ const Cmd = struct {
     args: *const anyopaque,
 };
 
-const MapRec = struct { res: usize, sub: u32, mem: []u8 };
+/// A deferred Map in flight. `base` (NO_OVERWRITE only) is the content the
+/// mapping started from, so Unmap can upload just the bytes the app changed.
+const MapRec = struct { res: usize, sub: u32, mem: []u8, base: ?[]const u8 = null };
 
 const Recorder = struct {
     arena: std.heap.ArenaAllocator,
@@ -2181,6 +2187,31 @@ fn replayUpload(ctx: ?*anyopaque, res: ?*anyopaque, sub: u32, mem: [*]const u8, 
     ctxUnmap(ctx, res, sub);
 }
 
+/// Replay of a deferred NO_OVERWRITE Map of a buffer: only [off, off+len) was
+/// written by the app, so only that range reaches the shadow and GL. Writing
+/// the whole recorded copy back would clobber what other command lists put in
+/// the same ring buffer meanwhile (Scaleform vertices in DS3).
+fn replayUploadRange(_: ?*anyopaque, res: ?*anyopaque, mem: [*]const u8, off: usize, len: usize) callconv(W) void {
+    const o: *ComObj = @ptrCast(@alignCast(res orelse return));
+    if (o.kind != .buffer or len == 0) return;
+    const b: *glb.Buffer = @ptrFromInt(o.payload);
+    if (off >= b.size) return;
+    glb.uploadBuffer(b, @intCast(off), mem + off, @intCast(@min(len, b.size - off)));
+}
+
+/// First and one-past-last differing byte of two equal-length slices.
+fn diffRange(a: []const u8, b: []const u8) ?struct { lo: usize, hi: usize } {
+    const n = @min(a.len, b.len);
+    var lo: usize = 0;
+    while (lo + 8 <= n and std.mem.readInt(u64, a[lo..][0..8], .little) == std.mem.readInt(u64, b[lo..][0..8], .little)) lo += 8;
+    while (lo < n and a[lo] == b[lo]) lo += 1;
+    if (lo == n) return null;
+    var hi: usize = n;
+    while (hi >= lo + 8 and std.mem.readInt(u64, a[hi - 8 ..][0..8], .little) == std.mem.readInt(u64, b[hi - 8 ..][0..8], .little)) hi -= 8;
+    while (hi > lo and a[hi - 1] == b[hi - 1]) hi -= 1;
+    return .{ .lo = lo, .hi = hi };
+}
+
 fn mapSize(o: *ComObj) ?struct { len: usize, row: u32 } {
     if (o.kind == .buffer) {
         const b: *glb.Buffer = @ptrFromInt(o.payload);
@@ -2204,6 +2235,7 @@ fn dMap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, map
     if (map_type != 4 and map_type != 5) return E_INVALIDARG;
     const sz = mapSize(o) orelse return E_INVALIDARG;
     const mem = r.a().alloc(u8, @max(1, sz.len)) catch return E_FAIL;
+    var base: ?[]const u8 = null;
     if (map_type == 5) {
         var prev: ?[]const u8 = null;
         var i = r.maps.items.len;
@@ -2224,8 +2256,9 @@ fn dMap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, map
             }
         }
         if (prev) |p| @memcpy(mem[0..@min(mem.len, p.len)], p[0..@min(mem.len, p.len)]);
+        if (o.kind == .buffer) base = r.a().dupe(u8, mem) catch null;
     }
-    r.maps.append(r.a(), .{ .res = @intFromPtr(res), .sub = sub, .mem = mem }) catch return E_FAIL;
+    r.maps.append(r.a(), .{ .res = @intFromPtr(res), .sub = sub, .mem = mem, .base = base }) catch return E_FAIL;
     mapped.pData = mem.ptr;
     mapped.RowPitch = sz.row;
     mapped.DepthPitch = @intCast(sz.len);
@@ -2238,6 +2271,12 @@ fn dUnmap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32) callconv(W) void {
     while (i > 0) : (i -= 1) {
         const mr = r.maps.items[i - 1];
         if (mr.res == @intFromPtr(res) and mr.sub == sub) {
+            if (mr.base) |base| {
+                // NO_OVERWRITE on a buffer: upload only what the app changed.
+                const d = diffRange(base, mr.mem) orelse return;
+                push(r, replayUploadRange, .{ raw, r.ref(res), mr.mem.ptr, d.lo, d.hi - d.lo });
+                return;
+            }
             push(r, replayUpload, .{ raw, r.ref(res), sub, mr.mem.ptr, mr.mem.len });
             return;
         }
