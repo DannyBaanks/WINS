@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "wins_ds3"
+    {
+      "install_path" "."
+      "display_name" "WINS (Dark Souls III)"
+      "from_oslist" "windows"
+      "to_oslist" "linux"
+    }
+  }
+}
