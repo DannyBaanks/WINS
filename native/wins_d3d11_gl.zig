@@ -66,7 +66,32 @@ const Xlib = struct {
     XVisualIDFromVisual: *const fn (?*anyopaque) callconv(.c) c_ulong,
     XFree: *const fn (?*anyopaque) callconv(.c) c_int,
     XSync: *const fn (?*anyopaque, c_int) callconv(.c) c_int,
+    XSetErrorHandler: *const fn (?*const fn (?*anyopaque, *const XErrorEvent) callconv(.c) c_int) callconv(.c) ?*anyopaque,
 };
+
+const XErrorEvent = extern struct {
+    type: c_int,
+    display: ?*anyopaque,
+    resourceid: c_ulong,
+    serial: c_ulong,
+    error_code: u8,
+    request_code: u8,
+    minor_code: u8,
+};
+
+/// X window whose drawable went away (BadDrawable/BadWindow): stop presenting to it.
+var g_lost_window = std.atomic.Value(c_ulong).init(0);
+var g_x_error_count = std.atomic.Value(u32).init(0);
+
+/// Xlib's default error handler calls exit(): a window the game (or the user via the
+/// WM close button) destroyed while the render thread still swaps to it killed the whole
+/// process. Log, remember the dead drawable, and keep going.
+fn xErrorHandler(_: ?*anyopaque, e: *const XErrorEvent) callconv(.c) c_int {
+    const n = g_x_error_count.fetchAdd(1, .monotonic);
+    if (e.error_code == 9 or e.error_code == 3) g_lost_window.store(e.resourceid, .release); // BadDrawable / BadWindow
+    if (n < 8) std.debug.print("[WINS:D3D11:GL] X error {d} (request {d}.{d}) on 0x{x} ignored\n", .{ e.error_code, e.request_code, e.minor_code, e.resourceid });
+    return 0;
+}
 
 const Glx = struct {
     glXGetFBConfigs: *const fn (?*anyopaque, c_int, *c_int) callconv(.c) ?[*]?*anyopaque,
@@ -688,6 +713,7 @@ fn openGlxInitial() bool {
         std.debug.print("[WINS:D3D11:GL] XOpenDisplay failed on render thread\n", .{});
         return false;
     };
+    _ = xlib.XSetErrorHandler(&xErrorHandler);
     const root = xlib.XDefaultRootWindow(dpy);
     const dummy = xlib.XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0);
     if (dummy == 0) return false;
@@ -2774,6 +2800,7 @@ fn presentJob(raw: ?*anyopaque) void {
     gl.glBlitFramebuffer(0, 0, @intCast(t.width), @intCast(t.height), 0, @intCast(dst_h), @intCast(dst_w), 0, 0x4000, 0x2601);
     gl.glBindFramebuffer(0x8CA8, 0);
 
+    if (g_lost_window.load(.acquire) == g_gl_window) return; // window destroyed: nothing to swap to
     if (p_swap_interval) |si| si(g_gl_display, g_gl_window, @intCast(@min(1, j.sync_interval)));
     glx.glXSwapBuffers(g_gl_display, g_gl_window);
 }
