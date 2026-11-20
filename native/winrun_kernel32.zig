@@ -1097,13 +1097,20 @@ fn GetStartupInfoW(si: ?[*]u8) callconv(W) void {
 }
 
 fn FlushFileBuffers(h: usize) callconv(W) u32 {
-    _ = h;
+    if (fdFromHandle(h)) |fd| _ = linux.fsync(fd);
     return 1;
 }
 
 fn SetEndOfFile(h: usize) callconv(W) u32 {
-    _ = h;
-    return 1;
+    const fd = fdFromHandle(h) orelse {
+        setLastError(6);
+        return 0;
+    };
+    const pos = hostLseek(fd, 0, 1) orelse return 0; // SEEK_CUR
+    const e = linux.errno(linux.ftruncate(fd, pos));
+    if (e == .SUCCESS) return 1;
+    setLastError(win32ErrorFromErrno(e));
+    return 0;
 }
 
 /// std's linux.lseek is 64-bit only: it bitcasts the i64 offset straight into
@@ -1668,13 +1675,24 @@ fn narrowToTranslatedPath(name: ?[*:0]const u8, out: *[1024]u8) ?[:0]const u8 {
     return translateWinPath(std.mem.span(name.?), out);
 }
 
+var file_trace_state: i8 = -1;
+fn fileTrace(comptime fmt: []const u8, args: anytype) void {
+    if (file_trace_state < 0) file_trace_state = if (std.c.getenv("WINS_FILE_TRACE") != null) 1 else 0;
+    if (file_trace_state == 1) std.debug.print("[WINS:File] " ++ fmt ++ "\n", args);
+}
+
+/// Dispositions: 1 CREATE_NEW, 2 CREATE_ALWAYS, 3 OPEN_EXISTING, 4 OPEN_ALWAYS,
+/// 5 TRUNCATE_EXISTING. Like Windows, CREATE_ALWAYS/OPEN_ALWAYS on an existing
+/// file succeed with last error ERROR_ALREADY_EXISTS, and failures set it too.
 fn CreateFileW(name: ?[*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disp: u32, flags: u32, template: usize) callconv(W) usize {
     _ = share;
     _ = sa;
-    _ = flags;
     _ = template;
     var path_buf: [1024]u8 = undefined;
-    const host_path = wideToTranslatedPath(name, &path_buf) orelse return INVALID_HANDLE;
+    const host_path = wideToTranslatedPath(name, &path_buf) orelse {
+        setLastError(3);
+        return INVALID_HANDLE;
+    };
 
     var open_flags = linux.O{};
     if (access & 0x40000000 != 0 and access & 0x80000000 != 0) {
@@ -1684,15 +1702,29 @@ fn CreateFileW(name: ?[*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, 
     } else {
         open_flags.ACCMODE = .RDONLY;
     }
-    if (disp == 2) {
-        open_flags.CREAT = true;
-        open_flags.TRUNC = true;
-    } else if (disp == 4) {
-        open_flags.CREAT = true;
+    const existed = linux.errno(linux.faccessat(linux.AT.FDCWD, host_path.ptr, 0, 0)) == .SUCCESS;
+    switch (disp) {
+        1 => {
+            open_flags.CREAT = true;
+            open_flags.EXCL = true;
+        },
+        2 => {
+            open_flags.CREAT = true;
+            open_flags.TRUNC = true;
+        },
+        4 => open_flags.CREAT = true,
+        5 => open_flags.TRUNC = true,
+        else => {},
     }
 
     const rc = linux.open(host_path.ptr, open_flags, 0o666);
-    if (linux.errno(rc) != .SUCCESS) return INVALID_HANDLE;
+    const e = linux.errno(rc);
+    fileTrace("CreateFileW {s} access 0x{x} disp {d} flags 0x{x} -> {s}", .{ host_path, access, disp, flags, @tagName(e) });
+    if (e != .SUCCESS) {
+        setLastError(if (e == .EXIST) 80 else win32ErrorFromErrno(e)); // ERROR_FILE_EXISTS for CREATE_NEW
+        return INVALID_HANDLE;
+    }
+    setLastError(if (existed and (disp == 2 or disp == 4)) 183 else 0);
     return @as(usize, @intCast(rc)) + 0x1000;
 }
 
@@ -1727,8 +1759,11 @@ fn CreateFileA(name: ?[*:0]const u8, access: u32, share: u32, sa: ?*anyopaque, d
 fn DeleteFileW(name: ?[*:0]const u16) callconv(W) u32 {
     var path_buf: [1024]u8 = undefined;
     const host_path = wideToTranslatedPath(name, &path_buf) orelse return 0;
-    const rc = linux.unlink(host_path.ptr);
-    return if (linux.errno(rc) == .SUCCESS) 1 else 0;
+    const e = linux.errno(linux.unlink(host_path.ptr));
+    fileTrace("DeleteFileW {s} -> {s}", .{ host_path, @tagName(e) });
+    if (e == .SUCCESS) return 1;
+    setLastError(win32ErrorFromErrno(e));
+    return 0;
 }
 
 fn DeleteFileA(name: ?[*:0]const u8) callconv(W) u32 {
@@ -3032,13 +3067,35 @@ fn MulDiv(nNumber: i32, nNumerator: i32, nDenominator: i32) callconv(W) i32 {
 }
 
 fn MoveFileW(from: ?[*:0]const u16, to: ?[*:0]const u16) callconv(W) u32 {
-    _ = from; _ = to;
-    return 1;
+    return MoveFileExW(from, to, 0);
 }
 
+/// MOVEFILE_REPLACE_EXISTING (1) lets rename(2) overwrite; without it an existing
+/// target fails with ERROR_ALREADY_EXISTS like Windows. A null target
+/// (MOVEFILE_DELAY_UNTIL_REBOOT deletion) is accepted and ignored.
 fn MoveFileExW(from: ?[*:0]const u16, to: ?[*:0]const u16, flags: u32) callconv(W) u32 {
-    _ = from; _ = to; _ = flags;
-    return 1;
+    var from_buf: [1024]u8 = undefined;
+    var to_buf: [1024]u8 = undefined;
+    const src = wideToTranslatedPath(from, &from_buf) orelse {
+        setLastError(2);
+        return 0;
+    };
+    if (to == null) return 1;
+    const dst = wideToTranslatedPath(to, &to_buf) orelse {
+        setLastError(3);
+        return 0;
+    };
+    if (flags & 1 == 0) {
+        if (linux.errno(linux.faccessat(linux.AT.FDCWD, dst.ptr, 0, 0)) == .SUCCESS) {
+            setLastError(183); // ERROR_ALREADY_EXISTS
+            return 0;
+        }
+    }
+    const e = linux.errno(linux.rename(src.ptr, dst.ptr));
+    fileTrace("MoveFileExW {s} -> {s} flags 0x{x}: {s}", .{ src, dst, flags, @tagName(e) });
+    if (e == .SUCCESS) return 1;
+    setLastError(win32ErrorFromErrno(e));
+    return 0;
 }
 
 fn GetWindowsDirectoryW(buf: ?[*]u16, sz: u32) callconv(W) u32 {
@@ -3535,9 +3592,20 @@ fn ReplaceFileW(lpReplacedFileName: ?*const u16, lpReplacementFileName: ?*const 
     return 1;
 }
 
+/// File I/O here completes synchronously; ReadFile/WriteFile store the NTSTATUS in
+/// OVERLAPPED.Internal and the byte count in InternalHigh, as Windows does.
+const OverlappedHead = extern struct { Internal: usize, InternalHigh: usize };
 fn GetOverlappedResult(hFile: usize, lpOverlapped: ?*anyopaque, lpNumberOfBytesTransferred: ?*u32, bWait: i32) callconv(W) i32 {
-    _ = hFile; _ = lpOverlapped; _ = bWait;
-    if (lpNumberOfBytesTransferred) |p| p.* = 0;
+    _ = hFile; _ = bWait;
+    const ov: *const OverlappedHead = @ptrCast(@alignCast(lpOverlapped orelse {
+        setLastError(87);
+        return 0;
+    }));
+    if (lpNumberOfBytesTransferred) |p| p.* = @truncate(ov.InternalHigh);
+    if (ov.Internal != 0) {
+        setLastError(if (ov.Internal == 0xC0000011) 38 else 31); // EOF -> ERROR_HANDLE_EOF
+        return 0;
+    }
     return 1;
 }
 

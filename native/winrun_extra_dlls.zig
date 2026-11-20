@@ -878,6 +878,15 @@ test "process token handle and elevation query reflect effective uid" {
 // ---------------------------------------------------------------------------
 
 var wsa_last_error: i32 = 0;
+var ws2_trace_state: i8 = -1;
+var ws2_trace_count = std.atomic.Value(u32).init(0);
+var ws2_wait_count = std.atomic.Value(u32).init(0);
+fn ws2Trace(comptime fmt: []const u8, args: anytype) void {
+    if (ws2_trace_state < 0) ws2_trace_state = if (std.c.getenv("WINS_WS2_TRACE") != null) 1 else 0;
+    if (ws2_trace_state != 1) return;
+    if (ws2_trace_count.fetchAdd(1, .monotonic) > 400) return;
+    std.debug.print("[WINS:Ws2_32] " ++ fmt ++ "\n", args);
+}
 var inet_ntoa_buf: [32:0]u8 = undefined;
 
 fn WSAStartup(version_req: u16, wsa_data: ?[*]u8) callconv(W) i32 {
@@ -902,9 +911,9 @@ fn WSASetLastError(err: i32) callconv(W) void {
 }
 
 fn WSASocketA(af: i32, sock_type: i32, protocol: i32, proto_info: ?*anyopaque, g: u32, flags: u32) callconv(W) usize {
+    ws2Trace("socket(af {d}, type {d}, proto {d}, flags 0x{x})", .{ af, sock_type, protocol, flags });
     _ = proto_info;
     _ = g;
-    _ = flags;
     const rc = linux.socket(@intCast(af), @intCast(sock_type), @intCast(protocol));
     if (linux.errno(rc) != .SUCCESS) {
         wsa_last_error = 10047;
@@ -924,6 +933,7 @@ fn shutdown(s: usize, how: i32) callconv(W) i32 {
 }
 
 fn bind(s: usize, name: ?*const anyopaque, namelen: i32) callconv(W) i32 {
+    ws2Trace("bind(s {d}, len {d})", .{ s, namelen });
     if (name == null or namelen <= 0) return -1;
     const rc = linux.bind(@intCast(s & 0x7fffffff), @ptrCast(@alignCast(name.?)), @intCast(namelen));
     return if (linux.errno(rc) == .SUCCESS) 0 else -1;
@@ -945,6 +955,7 @@ fn accept(s: usize, addr: ?*anyopaque, addrlen: ?*i32) callconv(W) usize {
 }
 
 fn connect(s: usize, name: ?*const anyopaque, namelen: i32) callconv(W) i32 {
+    ws2Trace("connect(s {d}, len {d})", .{ s, namelen });
     if (name == null or namelen <= 0) return -1;
     const rc = linux.connect(@intCast(s & 0x7fffffff), @ptrCast(@alignCast(name.?)), @intCast(namelen));
     return if (linux.errno(rc) == .SUCCESS) 0 else -1;
@@ -1024,8 +1035,7 @@ fn inet_ntoa(in_addr: u32) callconv(W) [*:0]const u8 {
 }
 
 fn getaddrinfo(node: ?[*:0]const u8, service: ?[*:0]const u8, hints: ?*const anyopaque, res: ?*?*anyopaque) callconv(W) i32 {
-    _ = node;
-    _ = service;
+    ws2Trace("getaddrinfo({s}, {s})", .{ if (node) |n| std.mem.span(n) else "(null)", if (service) |v| std.mem.span(v) else "(null)" });
     _ = hints;
     if (res) |r| r.* = null;
     return 11001; // WSAHOST_NOT_FOUND
@@ -1052,14 +1062,12 @@ fn gethostbyaddr(addr: ?*const anyopaque, len: i32, addr_type: i32) callconv(W) 
 }
 
 fn WSAEventSelect(s: usize, hEventObject: usize, lNetworkEvents: i32) callconv(W) i32 {
-    _ = s;
-    _ = hEventObject;
-    _ = lNetworkEvents;
+    ws2Trace("WSAEventSelect(s {d}, ev 0x{x}, mask 0x{x})", .{ s, hEventObject, lNetworkEvents });
     return 0;
 }
 
 fn WSAEnumNetworkEvents(s: usize, hEventObject: usize, lpNetworkEvents: ?[*]u8) callconv(W) i32 {
-    _ = s;
+    ws2Trace("WSAEnumNetworkEvents(s {d})", .{s});
     _ = hEventObject;
     if (lpNetworkEvents) |p| @memset(p[0..44], 0);
     return 0;
@@ -1072,7 +1080,7 @@ fn __WSAFDIsSet(fd: usize, set: ?*const anyopaque) callconv(W) i32 {
 }
 
 fn ws2_select(nfds: i32, readfds: ?*anyopaque, writefds: ?*anyopaque, exceptfds: ?*anyopaque, timeout: ?*const anyopaque) callconv(W) i32 {
-    _ = nfds;
+    ws2Trace("select(nfds {d})", .{nfds});
     _ = readfds;
     _ = writefds;
     _ = exceptfds;
@@ -1095,7 +1103,9 @@ fn WSAResetEvent(h: usize) callconv(W) i32 {
 }
 
 fn WSAWaitForMultipleEvents(count: u32, handles: ?*const usize, wait_all: i32, ms: u32, alertable: i32) callconv(W) u32 {
-    _ = count; _ = handles; _ = wait_all; _ = ms; _ = alertable;
+    const nwait = ws2_wait_count.fetchAdd(1, .monotonic);
+    if (nwait < 3 or nwait % 1000 == 0) ws2Trace("WSAWaitForMultipleEvents(n {d}, ms {d}) #{d}", .{ count, ms, nwait });
+    _ = handles; _ = wait_all; _ = alertable;
     return 0;
 }
 
@@ -1113,6 +1123,7 @@ fn send(s: usize, buf: ?[*]const u8, len: i32, flags: i32) callconv(W) i32 {
 }
 
 fn sendto(s: usize, buf: ?[*]const u8, len: i32, flags: i32, to: ?*const anyopaque, tolen: i32) callconv(W) i32 {
+    ws2Trace("sendto(s {d}, len {d})", .{ s, len });
     if (buf == null or len <= 0) return 0;
     const sa: ?*const linux.sockaddr = if (to) |p| @ptrCast(@alignCast(p)) else null;
     const rc = linux.sendto(@intCast(s & 0x7fffffff), buf.?, @intCast(len), @intCast(flags), sa, @intCast(@max(tolen, 0)));
@@ -1151,7 +1162,8 @@ fn getsockopt(s: usize, level: i32, optname: i32, optval: ?[*]u8, optlen: ?*i32)
 }
 
 fn ioctlsocket(s: usize, cmd: i32, argp: ?*u32) callconv(W) i32 {
-    _ = s; _ = cmd; _ = argp;
+    ws2Trace("ioctlsocket(s {d}, cmd 0x{x})", .{ s, @as(u32, @bitCast(cmd)) });
+    _ = argp;
     return 0;
 }
 
@@ -1192,7 +1204,7 @@ fn WSASetEvent(hEvent: usize) callconv(W) i32 {
 }
 
 fn gethostbyname(name: ?[*:0]const u8) callconv(W) ?*anyopaque {
-    _ = name;
+    ws2Trace("gethostbyname({s})", .{if (name) |n| std.mem.span(n) else "(null)"});
     return null;
 }
 

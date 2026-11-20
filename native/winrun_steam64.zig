@@ -94,6 +94,25 @@ fn callbackLayout(callback: i32) CallbackLayout {
         1307 => .remote_file_share,
         1331 => .remote_write_complete,
         1332 => .remote_read_complete,
+        // Same field shape as UserStatsReceived_t / UserStatsStored_t, so the same conversion:
+        143 => .user_stats_received, // ValidateAuthTicketResponse_t: CSteamID, EAuthSessionResponse, CSteamID
+        304 => .user_stats_stored, // PersonaStateChange_t: uint64 steamID, int flags (Linux 12, Windows 16)
+        // Only 1/4-byte fields, or 8-byte fields already 8-aligned with a size that is a
+        // multiple of 8: identical bytes under Linux pack(4) and Windows pack(8).
+        101, // SteamServersConnected_t (empty)
+        102, // SteamServerConnectFailure_t: EResult, bool
+        103, // SteamServersDisconnected_t: EResult
+        117, // IPCFailure_t: uint8
+        125, // LicensesUpdated_t (empty)
+        154, // EncryptedAppTicketResponse_t: EResult
+        163, // GetAuthSessionTicketResponse_t: HAuthTicket, EResult
+        331, // GameOverlayActivated_t: uint8, bool, AppId_t
+        701, // IPCountry_t (empty)
+        702, // LowBatteryPower_t: uint8
+        703, // SteamAPICallCompleted_t: SteamAPICall_t, int, uint32 (16 both)
+        704, // SteamShutdown_t (empty)
+        5001, // SteamParentalSettingsChanged_t (empty)
+        => .same,
         else => .unsupported,
     };
 }
@@ -352,6 +371,19 @@ fn traceInterface(source: []const u8, version: []const u8) void {
     if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] {s} requested {s}\n", .{ source, version });
 }
 
+var steam_trace_state: i8 = -1;
+var steam_seen: [16][max_slots]bool = @splat(@splat(false));
+/// WINS_STEAM_TRACE: one line the first time each interface method is called, so a
+/// late new call (after a menu step) stands out.
+fn steamFirstCallTrace(adapter: *const Adapter, slot: usize, a1: usize, a2: usize, a3: usize, result: usize) void {
+    if (steam_trace_state < 0) steam_trace_state = if (std.c.getenv("WINS_STEAM_TRACE") != null) 1 else 0;
+    if (steam_trace_state != 1) return;
+    const k = @intFromEnum(adapter.kind) & 15;
+    if (slot >= max_slots or steam_seen[k][slot]) return;
+    steam_seen[k][slot] = true;
+    std.debug.print("[WINS:SteamCall] {s}{d}[{d}](0x{x}, 0x{x}, 0x{x}) -> 0x{x}\n", .{ @tagName(adapter.kind), adapter.version, slot, a1, a2, a3, result });
+}
+
 fn dispatch(slot: usize, this: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) usize {
     if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] enter slot {d} this=0x{x}\n", .{ slot, this });
     if (this == 0) return 0;
@@ -376,6 +408,7 @@ fn dispatch(slot: usize, this: usize, a1: usize, a2: usize, a3: usize, a4: usize
     const result = method(adapter.real, a1, a2, a3, a4, a5, a6, a7, a8);
     @import("winrun_seh64.zig").maybeArmStep(@intCast(0x10000 + slot));
     if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] {s}{d}[{d}](0x{x}, 0x{x}, 0x{x}) -> 0x{x}\n", .{ @tagName(adapter.kind), adapter.version, slot, a1, a2, a3, result });
+    steamFirstCallTrace(adapter, slot, a1, a2, a3, result);
     if (adapter.kind != .client) return result;
     if (!isClientGetter(slot)) return result;
     const version_ptr = if (slot == 9) a2 else a3;
@@ -638,7 +671,8 @@ fn steamBGetCallbackWin(pipe: u32, out: ?*CallbackMsg) callconv(W) bool {
     if (!got) return false;
     const msg = out.?.*;
     if (callbackLayout(msg.callback) == .unsupported) {
-        std.debug.print("[WINS:SteamABI64] dropped unsupported callback id={d}\n", .{msg.callback});
+        // Ids >= 1000000 are steamclient-internal (k_iClient*): no game registers them.
+        if (msg.callback < 1_000_000) std.debug.print("[WINS:SteamABI64] dropped unsupported callback id={d}\n", .{msg.callback});
         if (g_free_last_callback) |free| free(pipe);
         return false;
     }
