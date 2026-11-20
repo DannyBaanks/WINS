@@ -14,6 +14,12 @@ pub const Error = error{ Malformed, Unsupported, OutOfMemory };
 
 pub const Stage = enum { vertex, pixel, other };
 
+/// D3D11 SRV slots per stage (t0..t127). DS3 samples t31+ in some shaders.
+pub const MAX_TEX = 128;
+/// GL texture units per stage: each declared t# gets the next unit (NVIDIA
+/// allows 32 samplers per stage), PS from 0, VS from GL_UNITS.
+pub const GL_UNITS = 32;
+
 pub const TexDim = enum(u8) {
     none = 0,
     buf = 1,
@@ -38,6 +44,8 @@ pub const SigElem = struct {
 
 pub const TexBinding = struct {
     reg: u8,
+    /// GL texture unit the GLSL sampler is bound to (compacted, see GL_UNITS).
+    unit: u8 = 0,
     dim: TexDim,
     /// Sampler register (s#) the shader samples this texture with; GL ties a
     /// sampler object to the texture unit, D3D pairs them per instruction.
@@ -687,8 +695,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     var n_temps: u32 = 0;
     var cb_sizes = [_]u32{0} ** 16;
     var cb_mask: u16 = 0;
-    var tex_dims = [_]TexDim{.none} ** 16;
-    var tex_samp = [_]u8{0xFF} ** 16;
+    var tex_dims = [_]TexDim{.none} ** MAX_TEX;
+    var tex_samp = [_]u8{0xFF} ** MAX_TEX;
     var idx_temp_sizes = [_]u32{0} ** 8;
     var icb_vals: ?[]const u32 = null;
     var sv_pos_out_reg: ?u32 = null;
@@ -756,7 +764,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             .dcl_resource => {
                 const dim_raw: u8 = @intCast((itok >> 11) & 0x1F);
                 const rop = try decodeOperand(a, toks, &p);
-                if (rop.indices[0].imm < 16) {
+                if (rop.indices[0].imm < MAX_TEX) {
                     tex_dims[rop.indices[0].imm] = @enumFromInt(dim_raw);
                 }
                 continue;
@@ -999,7 +1007,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
                 const coord = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
-                const reg: u8 = @intCast(@min(15, res.indices[0].imm));
+                const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
                 const tdim = tex_dims[reg];
                 const cmask = sampleCoordMask(tdim);
                 // ld_ms carries a sample index; WINS backs MS resources with
@@ -1172,7 +1180,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
                 const mip = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
-                const reg: u8 = @intCast(@min(15, res.indices[0].imm));
+                const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
                 const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ if (stage == .pixel) "p" else "v", reg });
                 const l = try formatSrc(a, &mip, 1, .i, stage);
                 const iv = switch (tex_dims[reg]) {
@@ -1197,7 +1205,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const coord = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
                 const smp = try decodeOperand(a, toks, &p);
-                const reg: u8 = @intCast(@min(15, res.indices[0].imm));
+                const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
                 if (tex_samp[reg] == 0xFF) tex_samp[reg] = @intCast(@min(15, smp.indices[0].imm));
                 const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ if (stage == .pixel) "p" else "v", reg });
                 const cexpr = try tex1dCoord(a, tex_dims[reg], try formatSrc(a, &coord, sampleCoordMask(tex_dims[reg]), .f, stage), .f);
@@ -1297,15 +1305,20 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     }
 
     var tlist: std.ArrayList(TexBinding) = .empty;
-    const tex_base: u32 = if (stage == .pixel) 0 else 16;
-    for (0..16) |i| {
+    const tex_base: u32 = if (stage == .pixel) 0 else GL_UNITS;
+    var n_units: u32 = 0;
+    for (0..MAX_TEX) |i| {
         if (tex_dims[i] != .none) {
+            if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
+            const unit = tex_base + n_units;
+            n_units += 1;
             const stype = samplerType(tex_dims[i]);
             try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d};\n", .{
-                tex_base + i, stype, prefix, i,
+                unit, stype, prefix, i,
             });
-            // Fetch-only textures keep their own index (no sampler needed).
-            try tlist.append(gpa, .{ .reg = @intCast(i), .dim = tex_dims[i], .samp = if (tex_samp[i] == 0xFF) @intCast(i) else tex_samp[i] });
+            // Fetch-only textures keep their own index (no sampler needed; s# < 16).
+            const samp: u8 = if (tex_samp[i] == 0xFF) @intCast(@min(15, i)) else tex_samp[i];
+            try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
         }
     }
 
@@ -1337,6 +1350,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             try appendFmt(&hdr, a, "layout(location = {d}) in vec4 vi{d};\n", .{ in_e.reg, in_e.reg });
         }
         for (outputs) |out_e| {
+            // SV_Depth / SV_Coverage have no register (0xFFFFFFFF): oDepth -> gl_FragDepth.
+            if (out_e.reg >= 64) continue;
             if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
             try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
         }
@@ -1362,6 +1377,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             }
         }
         for (outputs) |out_e| {
+            // SV_Depth / SV_Coverage have no register (0xFFFFFFFF): oDepth -> gl_FragDepth.
+            if (out_e.reg >= 64) continue;
             if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
             try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
         }

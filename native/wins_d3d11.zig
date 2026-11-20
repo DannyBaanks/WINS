@@ -1438,7 +1438,7 @@ fn ctxPSSetCB(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) c
 fn ctxPSSetSRV(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
     for (0..num) |i| {
         const s = start + i;
-        if (s >= 16) break;
+        if (s >= glb.MAX_SRV) break;
         const raw = if (pp) |arr| arr[i] else null;
         g_draw_state.ps_srv[s] = if (raw) |r| @ptrFromInt(@as(*ComObj, @ptrCast(@alignCast(r))).payload) else null;
     }
@@ -1447,7 +1447,7 @@ fn ctxPSSetSRV(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) 
 fn ctxVSSetSRV(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
     for (0..num) |i| {
         const s = start + i;
-        if (s >= 16) break;
+        if (s >= glb.MAX_SRV) break;
         const raw = if (pp) |arr| arr[i] else null;
         g_draw_state.vs_srv[s] = if (raw) |r| @ptrFromInt(@as(*ComObj, @ptrCast(@alignCast(r))).payload) else null;
     }

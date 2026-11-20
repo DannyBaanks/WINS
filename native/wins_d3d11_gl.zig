@@ -303,8 +303,12 @@ pub const InputLayout = struct {
     elems: [16]InputElem = [_]InputElem{.{}} ** 16,
 };
 
+pub const MAX_SRV = shader.MAX_TEX;
+
 pub const Shader = struct {
     is_pixel: bool = false,
+    /// Unique per createShader: program cache key (heap addresses get reused).
+    uid: u64 = 0,
     bytecode: []u8 = &.{},
     inputs: []shader.SigElem = &.{},
     outputs: []shader.SigElem = &.{},
@@ -352,8 +356,8 @@ pub const DrawState = struct {
     ps_cb_off: [16]u32 = [_]u32{0} ** 16,
     ps_cb_sz: [16]u32 = [_]u32{0} ** 16,
 
-    vs_srv: [16]?*View = [_]?*View{null} ** 16,
-    ps_srv: [16]?*View = [_]?*View{null} ** 16,
+    vs_srv: [MAX_SRV]?*View = [_]?*View{null} ** MAX_SRV,
+    ps_srv: [MAX_SRV]?*View = [_]?*View{null} ** MAX_SRV,
     vs_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
     ps_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
 
@@ -760,6 +764,7 @@ const LinkedProg = struct {
 };
 
 var g_progs: std.AutoHashMapUnmanaged(ProgKey, LinkedProg) = .{};
+var g_shader_uid = std.atomic.Value(u64).init(0);
 
 const FboKey = struct {
     rtvs: [8]GLuint,
@@ -792,10 +797,37 @@ fn compileGlShader(kind: GLenum, src: [:0]const u8, label: []const u8) GLuint {
     return sh;
 }
 
+/// A failed translate/compile/link is cached too (prog = 0): retrying it on every
+/// draw recompiled the same broken GLSL ~80k times and wrote a 600 MB log.
 fn getOrLinkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
-    const ps_addr: u64 = if (ps) |p| @intFromPtr(p) else 0;
-    const key: ProgKey = .{ .vs = @intFromPtr(vs), .ps = ps_addr };
+    const ps_uid: u64 = if (ps) |p| p.uid else 0;
+    const key: ProgKey = .{ .vs = vs.uid, .ps = ps_uid };
     if (g_progs.get(key)) |hit| return hit;
+    const res = linkProgram(vs, ps);
+    if (res.prog == 0) {
+        g_progs.put(alloc, key, res) catch {};
+        dumpFailedBytecode(vs, ps);
+    }
+    return res;
+}
+
+/// WINS_D3D11_CAPTURE=<dir>: each failed program leaves its VS/PS DXBC there
+/// (fail<N>_vs.dxbc / fail<N>_ps.dxbc) so the translator can be fixed offline.
+fn dumpFailedBytecode(vs: *Shader, ps: ?*Shader) void {
+    const dir = getenv("WINS_D3D11_CAPTURE") orelse return;
+    const S = struct { var n: u32 = 0; };
+    S.n += 1;
+    if (S.n > 64) return;
+    var buf: [1024]u8 = undefined;
+    if (std.fmt.bufPrintZ(&buf, "{s}/fail{d:0>3}_vs.dxbc", .{ std.mem.span(dir), S.n })) |path| writeFileZ(path, vs.bytecode) else |_| {}
+    if (ps) |p| {
+        if (std.fmt.bufPrintZ(&buf, "{s}/fail{d:0>3}_ps.dxbc", .{ std.mem.span(dir), S.n })) |path| writeFileZ(path, p.bytecode) else |_| {}
+    }
+}
+
+fn linkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
+    const ps_uid: u64 = if (ps) |p| p.uid else 0;
+    const key: ProgKey = .{ .vs = vs.uid, .ps = ps_uid };
 
     var tv = shader.translateWithVaryings(alloc, vs.bytecode, null) catch |e| {
         std.debug.print("[WINS:D3D11:GL] VS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
@@ -1686,6 +1718,7 @@ pub fn destroySampler(s: *Sampler) void {
 
 pub fn createShader(sh: *Shader, bytes: []const u8, is_pixel: bool) bool {
     sh.is_pixel = is_pixel;
+    sh.uid = g_shader_uid.fetchAdd(1, .monotonic) + 1;
     sh.bytecode = alloc.dupe(u8, bytes) catch return false;
     {
         // Rare progress line: titles that stream thousands of shaders at boot.
@@ -2017,9 +2050,9 @@ fn traceFrame() bool {
     return if (C.n) |n| g_present_count == n else false;
 }
 
-fn bindTextureSlots(bindings: []const shader.TexBinding, base_unit: GLuint, srvs: *const [16]?*View, samps: *const [16]?*Sampler) void {
+fn bindTextureSlots(bindings: []const shader.TexBinding, srvs: *const [MAX_SRV]?*View, samps: *const [16]?*Sampler) void {
     for (bindings) |b| {
-        const unit = base_unit + b.reg;
+        const unit: GLuint = b.unit;
         gl.glActiveTexture(0x84C0 + unit);
         if (srvs[b.reg]) |rv| {
             if (rv.tex) |t| {
@@ -2145,8 +2178,8 @@ fn drawJob(raw: ?*anyopaque) void {
     }
 
     // Textures & Samplers
-    bindTextureSlots(lp.ps_tex_bindings, 0, &s.ps_srv, &s.ps_samp);
-    bindTextureSlots(lp.vs_tex_bindings, 16, &s.vs_srv, &s.vs_samp);
+    bindTextureSlots(lp.ps_tex_bindings, &s.ps_srv, &s.ps_samp);
+    bindTextureSlots(lp.vs_tex_bindings, &s.vs_srv, &s.vs_samp);
 
     // Input Layout + Vertex Buffers on Default VAO
     var new_mask: u32 = 0;
