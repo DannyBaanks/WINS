@@ -1402,6 +1402,23 @@ fn AreFileApisANSI() callconv(W) u32 {
     return 1;
 }
 
+/// Logical CPUs this process may run on (sched_getaffinity), clamped to one
+/// processor group (1..64). DS3 sizes its per-worker D3D11 deferred-context
+/// array from this and its render-job pool always takes 6 of them: the old
+/// hardcoded 4 left the pool reading past the array end (garbage contexts).
+pub fn cpuCount() u32 {
+    var set: linux.cpu_set_t = undefined;
+    @memset(std.mem.asBytes(&set), 0);
+    const rc = linux.syscall3(.sched_getaffinity, 0, @sizeOf(linux.cpu_set_t), @intFromPtr(&set));
+    if (linux.errno(rc) != .SUCCESS) return 4;
+    var n: u32 = 0;
+    for (set) |w| n += @popCount(w);
+    return std.math.clamp(n, 1, 64);
+}
+fn cpuMask(n: u32) u64 {
+    return if (n >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(n)) - 1;
+}
+
 fn GetSystemInfo(si: ?[*]u8) callconv(W) void {
     if (si) |p| {
         @memset(p[0..48], 0);
@@ -1409,8 +1426,9 @@ fn GetSystemInfo(si: ?[*]u8) callconv(W) void {
         std.mem.writeInt(u32, p[4..8], 4096, .little); // dwPageSize
         std.mem.writeInt(u64, p[8..16], 0x10000, .little); // lpMinimumApplicationAddress
         std.mem.writeInt(u64, p[16..24], 0x00007FFFFFFEFFFF, .little); // lpMaximumApplicationAddress
-        std.mem.writeInt(u64, p[24..32], 0xF, .little); // dwActiveProcessorMask
-        std.mem.writeInt(u32, p[32..36], 4, .little); // dwNumberOfProcessors
+        const n = cpuCount();
+        std.mem.writeInt(u64, p[24..32], cpuMask(n), .little); // dwActiveProcessorMask
+        std.mem.writeInt(u32, p[32..36], n, .little); // dwNumberOfProcessors
         std.mem.writeInt(u32, p[36..40], 8664, .little); // PROCESSOR_AMD_X8664
         std.mem.writeInt(u32, p[40..44], 65536, .little); // dwAllocationGranularity
         std.mem.writeInt(u16, p[44..46], 6, .little); // wProcessorLevel
@@ -1423,7 +1441,9 @@ fn GetLogicalProcessorInformation(buf: ?[*]u8, ret_len: ?*u32) callconv(W) i32 {
         setLastError(87);
         return 0;
     };
-    const need: u32 = 6 * 32; // 4 RelationProcessorCore + 1 RelationNumaNode + 1 RelationProcessorPackage (x64 = 32B each)
+    // n RelationProcessorCore (one logical each) + 1 RelationNumaNode + 1 RelationProcessorPackage (x64 = 32 B each)
+    const n = cpuCount();
+    const need: u32 = (n + 2) * 32;
     const avail = rl.*;
     rl.* = need;
     if (buf == null or avail < need) {
@@ -1432,17 +1452,17 @@ fn GetLogicalProcessorInformation(buf: ?[*]u8, ret_len: ?*u32) callconv(W) i32 {
     }
     const p = buf.?;
     @memset(p[0..need], 0);
-    for (0..4) |i| {
+    for (0..n) |i| {
         const off = i * 32;
         std.mem.writeInt(u64, p[off..][0..8], @as(u64, 1) << @intCast(i), .little);
         std.mem.writeInt(u32, p[off + 8 ..][0..4], 0, .little); // RelationProcessorCore
     }
-    // RelationNumaNode (Relationship = 1)
-    std.mem.writeInt(u64, p[128..][0..8], 0xF, .little);
-    std.mem.writeInt(u32, p[136..][0..4], 1, .little);
-    // RelationProcessorPackage (Relationship = 3)
-    std.mem.writeInt(u64, p[160..][0..8], 0xF, .little);
-    std.mem.writeInt(u32, p[168..][0..4], 3, .little);
+    const numa = n * 32;
+    std.mem.writeInt(u64, p[numa..][0..8], cpuMask(n), .little);
+    std.mem.writeInt(u32, p[numa + 8 ..][0..4], 1, .little); // RelationNumaNode
+    const pkg = numa + 32;
+    std.mem.writeInt(u64, p[pkg..][0..8], cpuMask(n), .little);
+    std.mem.writeInt(u32, p[pkg + 8 ..][0..4], 3, .little); // RelationProcessorPackage
     return 1;
 }
 
@@ -2823,8 +2843,9 @@ fn GetModuleFileNameA(mod: usize, buf: ?[*]u8, sz: u32) callconv(W) u32 {
 
 fn GetProcessAffinityMask(proc: usize, proc_mask: ?*usize, sys_mask: ?*usize) callconv(W) u32 {
     _ = proc;
-    if (proc_mask) |p| p.* = 1;
-    if (sys_mask) |s| s.* = 1;
+    const m: usize = cpuMask(cpuCount());
+    if (proc_mask) |p| p.* = m;
+    if (sys_mask) |s| s.* = m;
     return 1;
 }
 
