@@ -844,6 +844,12 @@ extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern fn fwrite(ptr: [*]const u8, size: usize, n: usize, f: *anyopaque) usize;
 extern fn fclose(f: *anyopaque) c_int;
 
+fn writeFileZ(path: [:0]const u8, data: []const u8) void {
+    const f = fopen(path.ptr, "wb") orelse return;
+    _ = fwrite(data.ptr, 1, data.len, f);
+    _ = fclose(f);
+}
+
 fn dumpFile(dir: []const u8, prog: GLuint, suffix: []const u8, data: []const u8) void {
     var path_buf: [1024]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/p{d:0>4}_{s}", .{ dir, prog, suffix }) catch return;
@@ -983,7 +989,7 @@ fn traceProgConstants(s: *const DrawState, prog: GLuint, fw: u32, fh: u32) void 
             cbVec(s.vs_cb[slot], s.vs_cb_off[slot], reg)
         else
             cbVec(s.ps_cb[slot], s.ps_cb_off[slot], reg);
-        std.debug.print("    {s} = ({d:.4}, {d:.4}, {d:.4}, {d:.4})\n", .{ spec, v[0], v[1], v[2], v[3] });
+        std.debug.print("    {s} = ({e:.4}, {e:.4}, {e:.4}, {e:.4})\n", .{ spec, v[0], v[1], v[2], v[3] });
     }
 }
 
@@ -1288,6 +1294,56 @@ fn uploadMipSlice2D(target: GLenum, level: u32, w: u32, h: u32, gf: GlTexFmt, pt
     }
 }
 
+/// WINS_D3D11_DUMP_TEX=<w>x<h> (+ WINS_D3D11_DUMP_DIR): writes the first 16
+/// initialised 2D textures of that size (or min<N>: either side >= N; cap 160), mip 0 read back as RGBA8 (GL
+/// decompresses BC*), to tex<gl>_<fmt>.ppm with alpha as tex<gl>_a.pgm.
+fn dumpTex2D(t: *const Texture) void {
+    const C = struct { var init = false; var w: u32 = 0; var h: u32 = 0; var n: u32 = 0; var min: u32 = 0; };
+    if (!C.init) {
+        C.init = true;
+        if (getenv("WINS_D3D11_DUMP_TEX")) |z| {
+            const zs = std.mem.span(z);
+            if (std.mem.startsWith(u8, zs, "min")) { // min<N>: every texture with width or height >= N
+                C.min = std.fmt.parseInt(u32, zs[3..], 10) catch 0;
+            }
+            var it = std.mem.tokenizeScalar(u8, zs, 'x');
+            C.w = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch 0;
+            C.h = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch 0;
+        }
+    }
+    const hit = if (C.min != 0) (t.width >= C.min or t.height >= C.min) else (C.w != 0 and t.width == C.w and t.height == C.h);
+    if (!hit or C.n >= 160) return;
+    const dir = getenv("WINS_D3D11_DUMP_DIR") orelse return;
+    C.n += 1;
+    const npx = @as(usize, t.width) * t.height;
+    const px = alloc.alloc(u8, npx * 4) catch return;
+    defer alloc.free(px);
+    gl.glPixelStorei(0x0D05, 1); // PACK_ALIGNMENT
+    gl.glGetTexImage(0x0DE1, 0, 0x1908, 0x1401, px.ptr);
+    const rgb = alloc.alloc(u8, npx * 3 + 32) catch return;
+    defer alloc.free(rgb);
+    const al = alloc.alloc(u8, npx + 32) catch return;
+    defer alloc.free(al);
+    var ha: [32]u8 = undefined;
+    const h1 = std.fmt.bufPrint(&ha, "P6\n{d} {d}\n255\n", .{ t.width, t.height }) catch return;
+    @memcpy(rgb[0..h1.len], h1);
+    var hb: [32]u8 = undefined;
+    const h2 = std.fmt.bufPrint(&hb, "P5\n{d} {d}\n255\n", .{ t.width, t.height }) catch return;
+    @memcpy(al[0..h2.len], h2);
+    var nz: usize = 0;
+    for (0..npx) |i| {
+        rgb[h1.len + i * 3 ..][0..3].* = px[i * 4 ..][0..3].*;
+        al[h2.len + i] = px[i * 4 + 3];
+        nz += @intFromBool(px[i * 4 + 3] != 0);
+    }
+    var nb: [256]u8 = undefined;
+    const n1 = std.fmt.bufPrintZ(&nb, "{s}/tex{d}_{d}.ppm", .{ std.mem.span(dir), t.gl_id, t.dxgi_fmt }) catch return;
+    writeFileZ(n1, rgb[0 .. h1.len + npx * 3]);
+    const n2 = std.fmt.bufPrintZ(&nb, "{s}/tex{d}_a.pgm", .{ std.mem.span(dir), t.gl_id }) catch return;
+    writeFileZ(n2, al[0 .. h2.len + npx]);
+    std.debug.print("[WINS:D3D11:GL] dumped tex gl={d} {d}x{d} fmt={d} alpha_nonzero={d}/{d}\n", .{ t.gl_id, t.width, t.height, t.dxgi_fmt, nz, npx });
+}
+
 fn createTexture2DJob(raw: ?*anyopaque) void {
     const j: *TexCreateJob = @ptrCast(@alignCast(raw.?));
     const t = j.t;
@@ -1355,6 +1411,7 @@ fn createTexture2DJob(raw: ?*anyopaque) void {
             mw = @max(1, mw >> 1);
             mh = @max(1, mh >> 1);
         }
+        if (j.init_ptrs != null) dumpTex2D(t);
     } else if (t.target == 0x8513) { // Cubemap
         for (0..6) |face| {
             var mw = t.width;

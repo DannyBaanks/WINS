@@ -1509,7 +1509,135 @@ var wp_all = false; // WINS_WATCH_ADDR: log every read of the page
 var wp_all_n: usize = 0;
 var bp_mode = false; // WINS_BREAK_RVA: execution breakpoint (page PROT_READ)
 
+/// WINS_BREAK_PEEK="r14:0x50,rsp+0x20:0x10,@r14+0x10:0x40" (@ = dereference first) -- at a WINS_BREAK_RVA hit, hex
+/// dump <len> bytes at register(+off) (and r10..r15/rsp/rbp always).
+fn bpPeek(g: [*]const u64) void {
+    std.debug.print("  r10=0x{x} r11=0x{x} r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x} rbp=0x{x} rsp=0x{x}\n", .{ g[2], g[3], g[4], g[5], g[6], g[7], g[10], g[15] });
+    const spec_z = std.c.getenv("WINS_BREAK_PEEK") orelse return;
+    const names = [_][]const u8{ "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rdi", "rsi", "rbp", "rbx", "rdx", "rax", "rcx", "rsp" };
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(spec_z), ',');
+    while (it.next()) |spec| {
+        const colon = std.mem.indexOfScalar(u8, spec, ':') orelse continue;
+        const lhs = spec[0..colon];
+        const len = @min(@as(usize, 256), std.fmt.parseInt(usize, spec[colon + 1 ..], 0) catch continue);
+        var deref = false;
+        var expr = lhs;
+        if (expr.len > 0 and expr[0] == '@') { deref = true; expr = expr[1..]; }
+        const plus = std.mem.indexOfAny(u8, expr, "+-");
+        const reg = if (plus) |pi| expr[0..pi] else expr;
+        const mag = if (plus) |pi| (std.fmt.parseInt(usize, expr[pi + 1 ..], 0) catch 0) else 0;
+        const off: usize = if (plus != null and expr[plus.?] == '-') 0 -% mag else mag;
+        var base: ?u64 = null;
+        for (names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, reg)) base = g[i];
+        }
+        var addr = (base orelse continue) +% off;
+        if (deref) {
+            if (addr < 0x10000 or addr & 7 != 0) continue;
+            addr = @as(*const u64, @ptrFromInt(addr)).*;
+        }
+        if (addr < 0x10000) {
+            std.debug.print("  peek {s} = 0x{x} (not a pointer)\n", .{ spec, addr });
+            continue;
+        }
+        std.debug.print("  peek {s} @0x{x}:", .{ spec, addr });
+        var q: usize = 0;
+        while (q < len) : (q += 8) {
+            if (q % 32 == 0) std.debug.print("\n   +{x:0>3}:", .{q});
+            std.debug.print(" {x:0>16}", .{@as(*align(1) const u64, @ptrFromInt(addr + q)).*});
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
+/// WINS_BREAK_SW=<rva>[,<rva>...] (up to 8): software breakpoints (ud2) armed at
+/// the first Present (after SteamStub decrypted .text). Each hit prints
+/// registers + WINS_BREAK_PEEK, restores the bytes, single-steps and re-arms;
+/// each one disarms after WINS_BREAK_SW_MAX hits (default 20). Unlike
+/// WINS_BREAK_RVA it costs nothing on the rest of the page.
+const SwBp = struct { addr: usize = 0, rva: usize = 0, orig: [2]u8 = .{ 0, 0 }, armed: bool = false, hits: u32 = 0 };
+var sw_bps: [8]SwBp = [_]SwBp{.{}} ** 8;
+var sw_n: usize = 0;
+var sw_armed_once = std.atomic.Value(bool).init(false);
+var sw_rearm_tid = std.atomic.Value(u32).init(0);
+var sw_rearm_idx: usize = 0;
+var sw_max: u32 = 20;
+
+fn swPatch(b: *SwBp, on: bool) void {
+    const p: [*]u8 = @ptrFromInt(b.addr);
+    if (on) {
+        p[0] = 0x0F;
+        p[1] = 0x0B;
+    } else {
+        p[0] = b.orig[0];
+        p[1] = b.orig[1];
+    }
+}
+
+fn swArmHook(n: u32) bool {
+    if (n >= 0x10000 or sw_n == 0 or sw_armed_once.load(.acquire)) return false;
+    for (sw_bps[0..sw_n]) |*b| {
+        const page = b.addr & ~@as(usize, 4095);
+        _ = linux.mprotect(@ptrFromInt(page), 8192, .{ .READ = true, .WRITE = true, .EXEC = true });
+        const p: [*]const u8 = @ptrFromInt(b.addr);
+        b.orig = .{ p[0], p[1] };
+        b.armed = true;
+        swPatch(b, true);
+        std.debug.print("winload64: software breakpoint armed at rva 0x{x} (orig {x:0>2} {x:0>2}) on Present #{d}\n", .{ b.rva, b.orig[0], b.orig[1], n });
+    }
+    sw_armed_once.store(true, .release);
+    return false;
+}
+
+/// Returns true when the signal belonged to a software breakpoint.
+fn swOnSignal(sig: linux.SIG, info: *const linux.siginfo_t, g: [*]u64) bool {
+    if (sw_n == 0) return false;
+    const tid: u32 = @intCast(linux.gettid());
+    if (sig == .ILL) {
+        for (sw_bps[0..sw_n], 0..) |*b, i| {
+            if (!b.armed or g[16] != b.addr) continue;
+            b.hits += 1;
+            std.debug.print("winload64: SWBREAK rva=0x{x} hit {d} tid={d}\n  rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} r8=0x{x} r9=0x{x}\n", .{
+                b.rva, b.hits, tid, g[13], g[11], g[14], g[12], g[9], g[8], g[0], g[1],
+            });
+            bpPeek(g);
+            swPatch(b, false);
+            if (b.hits >= sw_max) {
+                b.armed = false;
+                std.debug.print("winload64: software breakpoint rva 0x{x} disarmed after {d} hits\n", .{ b.rva, b.hits });
+                return true;
+            }
+            sw_rearm_idx = i;
+            sw_rearm_tid.store(tid, .release);
+            g[17] |= 0x100; // TF: step the original instruction, then re-arm
+            return true;
+        }
+        return false;
+    }
+    if (sig == .TRAP and info.code == 2 and sw_rearm_tid.load(.acquire) == tid) {
+        sw_rearm_tid.store(0, .release);
+        const b = &sw_bps[sw_rearm_idx];
+        if (b.armed) swPatch(b, true);
+        if (step_left == 0) g[17] &= ~@as(u64, 0x100);
+        return true;
+    }
+    return false;
+}
+
 fn wpInstall(root_base: usize) void {
+    if (std.c.getenv("WINS_BREAK_SW")) |bv| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(bv), ',');
+        while (it.next()) |tok| {
+            if (sw_n >= sw_bps.len) break;
+            const rva = std.fmt.parseInt(usize, tok, 0) catch continue;
+            sw_bps[sw_n] = .{ .addr = root_base + rva, .rva = rva };
+            sw_n += 1;
+        }
+        if (std.c.getenv("WINS_BREAK_SW_MAX")) |m| sw_max = std.fmt.parseInt(u32, std.mem.span(m), 10) catch sw_max;
+        if (seh64.arm_hook == null) seh64.arm_hook = &swArmHook;
+        std.debug.print("winload64: {d} software breakpoint(s) pending\n", .{sw_n});
+        return;
+    }
     if (std.c.getenv("WINS_BREAK_RVA")) |bv| {
         const rva = std.fmt.parseInt(usize, std.mem.span(bv), 0) catch return;
         wp_addr = root_base + rva;
@@ -1632,6 +1760,7 @@ var watch_n: usize = 0;
 
 fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
     const g: [*]u64 = @ptrFromInt(@intFromPtr(ctx.?) + 40); // ucontext.uc_mcontext.gregs
+    if (swOnSignal(sig, info, g)) return;
     if (sig == .TRAP and info.code == 2 and wp_reprotect.load(.acquire) == linux.gettid()) {
         _ = linux.mprotect(@ptrFromInt(wp_page), 4096, if (bp_mode) .{ .READ = true } else .{});
         wp_reprotect.store(0, .release);
@@ -1661,9 +1790,17 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
                     }
                 }
             }
-            step_left = 3_000_000;
-            step_n = 0;
-            step_tid = linux.gettid();
+            if (wp_hits <= 3 or wp_hits % 1000 == 0) bpPeek(g);
+            if (std.c.getenv("WINS_BREAK_NOSTEP") == null) {
+                step_left = 3_000_000;
+                step_n = 0;
+                step_tid = linux.gettid();
+            } else {
+                // Step over just the breakpoint instruction, then re-arm.
+                step_left = 1;
+                step_n = 0;
+                step_tid = linux.gettid();
+            }
         }
         const is_write = (g[19] & 2) != 0;
         if (!bp_mode and !exec and is_write) {

@@ -636,9 +636,30 @@ fn IsValidCodePage(cp: u32) callconv(W) u32 {
     return 1;
 }
 
+/// CPINFO { UINT MaxCharSize; BYTE DefaultChar[2]; BYTE LeadByte[12]; }.
+/// MaxCharSize must be real: the MSVC CRT derives MB_CUR_MAX from it and
+/// mbtowc(n = 0) fails, so a zeroed CPINFO broke every "%hS" in DS3 (its
+/// Scaleform image URLs all came out as L"S").
 fn GetCPInfo(cp: u32, lpInfo: ?[*]u8) callconv(W) u32 {
-    _ = cp;
-    if (lpInfo) |p| @memset(p[0..18], 0);
+    const p = lpInfo orelse return 0;
+    @memset(p[0..18], 0);
+    const real = switch (cp) {
+        0, 1, 2, 3 => GetACP(), // CP_ACP, CP_OEMCP, CP_MACCP, CP_THREAD_ACP
+        else => cp,
+    };
+    const max: u32 = switch (real) {
+        65001 => 4, // UTF-8
+        65000 => 5, // UTF-7
+        932, 936, 949, 950, 1361 => 2, // DBCS
+        else => 1,
+    };
+    std.mem.writeInt(u32, p[0..4], max, .little);
+    p[4] = '?';
+    switch (real) { // DBCS lead-byte ranges, terminated by a zero pair
+        932 => { p[6] = 0x81; p[7] = 0x9F; p[8] = 0xE0; p[9] = 0xFC; },
+        936, 949, 950 => { p[6] = 0x81; p[7] = 0xFE; },
+        else => {},
+    }
     return 1;
 }
 
@@ -742,13 +763,27 @@ fn CompareStringW(lcid: u32, flags: u32, s1: ?[*]const u16, cch1: i32, s2: ?[*]c
 
 fn LCMapStringW(lcid: u32, flags: u32, src: ?[*]const u16, cch_src: i32, dest: ?[*]u16, cch_dest: i32) callconv(W) i32 {
     _ = lcid;
-    _ = flags;
-    if (cch_src <= 0 or src == null) return 0;
-    const n: usize = @intCast(cch_src);
-    if (cch_dest == 0 or dest == null) return cch_src;
-    const copy_n = @min(n, @as(usize, @intCast(cch_dest)));
-    @memcpy(dest.?[0..copy_n], src.?[0..copy_n]);
-    return @intCast(copy_n);
+    const in = src orelse return 0;
+    if (cch_src == 0) return 0;
+    const n: usize = if (cch_src > 0) @intCast(cch_src) else blk: {
+        var k: usize = 0;
+        while (in[k] != 0) k += 1;
+        break :blk k + 1;
+    };
+    if (cch_dest == 0 or dest == null) return @intCast(n);
+    if (@as(usize, @intCast(cch_dest)) < n) return 0; // ERROR_INSUFFICIENT_BUFFER
+    const LOWER: u32 = 0x100;
+    const UPPER: u32 = 0x200;
+    for (0..n) |i| {
+        var c = in[i];
+        if (flags & UPPER != 0) {
+            if ((c >= 'a' and c <= 'z') or (c >= 0xE0 and c <= 0xFE and c != 0xF7)) c -= 0x20;
+        } else if (flags & LOWER != 0) {
+            if ((c >= 'A' and c <= 'Z') or (c >= 0xC0 and c <= 0xDE and c != 0xD7)) c += 0x20;
+        }
+        dest.?[i] = c;
+    }
+    return @intCast(n);
 }
 
 fn MultiByteToWideChar(cp: u32, flags: u32, mb: ?[*]const u8, cb_mb: i32, wc: ?[*]u16, cch_wc: i32) callconv(W) i32 {
@@ -795,12 +830,53 @@ fn WideCharToMultiByte(cp: u32, flags: u32, wc: ?[*]const u16, cch_wc: i32, mb: 
     return @intCast(out_i);
 }
 
+/// CT_CTYPE1 classes for one UTF-16 unit (ASCII + Latin-1; other letters as
+/// C1_ALPHA). The MSVC CRT builds its ctype tables from this.
+fn ctype1(c: u16) u16 {
+    const UPPER: u16 = 0x1;
+    const LOWER: u16 = 0x2;
+    const DIGIT: u16 = 0x4;
+    const SPACE: u16 = 0x8;
+    const PUNCT: u16 = 0x10;
+    const CNTRL: u16 = 0x20;
+    const BLANK: u16 = 0x40;
+    const XDIGIT: u16 = 0x80;
+    const ALPHA: u16 = 0x100;
+    const DEFINED: u16 = 0x200;
+    var t: u16 = DEFINED;
+    switch (c) {
+        'A'...'Z' => t |= UPPER | ALPHA | (if (c <= 'F') XDIGIT else 0),
+        'a'...'z' => t |= LOWER | ALPHA | (if (c <= 'f') XDIGIT else 0),
+        '0'...'9' => t |= DIGIT | XDIGIT,
+        ' ' => t |= SPACE | BLANK,
+        '\t' => t |= SPACE | BLANK | CNTRL,
+        0x0A, 0x0B, 0x0C, 0x0D => t |= SPACE | CNTRL,
+        0x00...0x08, 0x0E...0x1F, 0x7F...0x9F => t |= CNTRL,
+        0xA0 => t |= SPACE | BLANK,
+        0xC0...0xD6, 0xD8...0xDE => t |= UPPER | ALPHA,
+        0xDF...0xF6, 0xF8...0xFF => t |= LOWER | ALPHA,
+        0x21...0x2F, 0x3A...0x40, 0x5B...0x60, 0x7B...0x7E, 0xA1...0xBF, 0xD7, 0xF7 => t |= PUNCT,
+        else => t |= ALPHA,
+    }
+    return t;
+}
+
 fn GetStringTypeW(flags: u32, src: ?[*]const u16, cch: i32, chartype: ?[*]u16) callconv(W) u32 {
-    _ = flags;
-    _ = src;
-    if (chartype != null and cch > 0) {
-        @memset(chartype.?[0..@intCast(cch)], 0);
-        return 1;
+    const in = src orelse return 0;
+    const out = chartype orelse return 0;
+    const n: usize = if (cch >= 0) @intCast(cch) else blk: {
+        var k: usize = 0;
+        while (in[k] != 0) k += 1;
+        break :blk k + 1;
+    };
+    for (0..n) |i| {
+        const c = in[i];
+        out[i] = switch (flags) {
+            1 => ctype1(c), // CT_CTYPE1
+            2 => if (c < 0x80) (if (c >= '0' and c <= '9') @as(u16, 3) else if (ctype1(c) & 0x100 != 0) @as(u16, 1) else if (c == ' ') @as(u16, 10) else @as(u16, 0)) else 1, // CT_CTYPE2: L1 / EN / WS
+            4 => if (ctype1(c) & 0x100 != 0) @as(u16, 0x8000) else 0, // CT_CTYPE3: C3_ALPHA
+            else => 0,
+        };
     }
     return 1;
 }
@@ -1285,12 +1361,34 @@ fn rebuildEnvironmentBlocks() void {
     };
 }
 
+/// WINS_DEBUGSTR=1: print the game's OutputDebugString text (first 400 lines).
+var g_dbgstr_n = std.atomic.Value(u32).init(0);
+fn dbgStrOn() bool {
+    const C = struct { var init = false; var on = false; };
+    if (!C.init) {
+        C.init = true;
+        C.on = std.c.getenv("WINS_DEBUGSTR") != null;
+    }
+    return C.on and g_dbgstr_n.fetchAdd(1, .monotonic) < 400;
+}
+
 fn OutputDebugStringA(str: ?[*:0]const u8) callconv(W) void {
-    _ = str;
+    const z = str orelse return;
+    if (!dbgStrOn()) return;
+    std.debug.print("[GAME_DEBUG] {s}\n", .{std.mem.trimEnd(u8, std.mem.sliceTo(z, 0), "\r\n")});
 }
 
 fn OutputDebugStringW(str: ?[*:0]const u16) callconv(W) void {
-    _ = str;
+    const z = str orelse return;
+    if (!dbgStrOn()) return;
+    var buf: [1024]u8 = undefined;
+    var n: usize = 0;
+    for (std.mem.sliceTo(z, 0)) |c| {
+        if (n >= buf.len) break;
+        buf[n] = if (c < 0x80) @intCast(c) else '?';
+        n += 1;
+    }
+    std.debug.print("[GAME_DEBUG] {s}\n", .{std.mem.trimEnd(u8, buf[0..n], "\r\n")});
 }
 
 fn AreFileApisANSI() callconv(W) u32 {
