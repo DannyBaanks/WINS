@@ -1058,6 +1058,11 @@ pub fn getThreadContext(h: usize, lp_ctx: ?*anyopaque) bool {
 
     const existing_flags = std.mem.readInt(u32, out_ptr[0x30..][0..4], .little);
     std.mem.writeInt(u32, out_ptr[0x30..][0..4], existing_flags | 0x10000F, .little);
+    // Dr0-Dr3, Dr6, Dr7 (0x48..0x78): no hardware breakpoints are ever set
+    // here, so they read as zero. Left untouched they held the caller's stack
+    // garbage, and DS3's Arxan guards (GetThreadContext, then Dr0/Dr1 != 0)
+    // took that for a debugger and steered into their crash-later path.
+    @memset(out_ptr[0x48..0x78], 0);
     if (is_self and !paused) {
         const sp = @frameAddress();
         std.mem.writeInt(u64, out_ptr[0x78 + 4 * 8 ..][0..8], sp, .little); // Rsp

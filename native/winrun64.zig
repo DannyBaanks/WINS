@@ -1189,7 +1189,14 @@ fn VirtualProtect(addr: ?*anyopaque, size: usize, prot: u32, old: ?*u32) callcon
     }
     // Outside our regions (image sections, stacks): honour it, report RW as the old value.
     if (old) |o| o.* = 0x04;
-    return @intFromBool(linux.errno(linux.mprotect(@ptrFromInt(start), end - start, linuxProt(prot))) == .SUCCESS);
+    const ok = linux.errno(linux.mprotect(@ptrFromInt(start), end - start, linuxProt(prot))) == .SUCCESS;
+    if (wp_page != 0 and wp_page >= start and wp_page < end) {
+        // Diagnostic watchpoint page: keep it closed, say who reprotected it.
+        var wb: [128]u8 = undefined;
+        std.debug.print("winload64: VirtualProtect(0x{x}, 0x{x}, 0x{x}) covers the watch page, from {s}\n", .{ a, size, prot, where(&wb, @returnAddress()) });
+        _ = linux.mprotect(@ptrFromInt(wp_page), 4096, if (bp_mode) .{ .READ = true } else .{});
+    }
+    return @intFromBool(ok);
 }
 
 /// MEMORY_BASIC_INFORMATION (x64, 48 bytes).
@@ -1498,6 +1505,8 @@ var wp_page: usize = 0;
 var wp_reprotect = std.atomic.Value(u32).init(0); // tid that must re-close the page
 var wp_hits: usize = 0;
 
+var wp_all = false; // WINS_WATCH_ADDR: log every read of the page
+var wp_all_n: usize = 0;
 var bp_mode = false; // WINS_BREAK_RVA: execution breakpoint (page PROT_READ)
 
 fn wpInstall(root_base: usize) void {
@@ -1510,9 +1519,15 @@ fn wpInstall(root_base: usize) void {
         std.debug.print("winload64: execution breakpoint on 0x{x} (page 0x{x})\n", .{ wp_addr, wp_page });
         return;
     }
-    const v = std.c.getenv("WINS_WATCH_RVA") orelse return;
-    const rva = std.fmt.parseInt(usize, std.mem.span(v), 0) catch return;
-    wp_addr = root_base + rva;
+    if (std.c.getenv("WINS_WATCH_ADDR")) |av| {
+        // Absolute address (outside images, e.g. the process heap header): log every access to its page.
+        wp_addr = std.fmt.parseInt(usize, std.mem.span(av), 0) catch return;
+        wp_all = true;
+    } else {
+        const v = std.c.getenv("WINS_WATCH_RVA") orelse return;
+        const rva = std.fmt.parseInt(usize, std.mem.span(v), 0) catch return;
+        wp_addr = root_base + rva;
+    }
     wp_page = wp_addr & ~@as(usize, 4095);
     _ = linux.mprotect(@ptrFromInt(wp_page), 4096, .{});
     std.debug.print("winload64: read watchpoint on 0x{x} (page 0x{x})\n", .{ wp_addr, wp_page });
@@ -1635,7 +1650,17 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
             step_n = 0;
             step_tid = linux.gettid();
         }
-        if (!bp_mode and !exec and wp_hits < 64) {
+        const is_write = (g[19] & 2) != 0;
+        if (!bp_mode and !exec and is_write) {
+            var wb3: [128]u8 = undefined;
+            std.debug.print("winload64: WATCH page WRITE 0x{x} (+0x{x}) by {s} tid={d}\n", .{ fault, fault - wp_page, where(&wb3, g[16]), linux.gettid() });
+        }
+        if (wp_all and !exec and !is_write and wp_all_n < 400) {
+            wp_all_n += 1;
+            var wb4: [128]u8 = undefined;
+            std.debug.print("winload64: WATCH read +0x{x} by {s} tid={d}\n", .{ fault - wp_page, where(&wb4, g[16]), linux.gettid() });
+        }
+        if (!bp_mode and !wp_all and !exec and !is_write and wp_hits < 64 and fault + 32 > wp_addr and fault < wp_addr + 32) {
             var wb2: [128]u8 = undefined;
             std.debug.print("winload64: WATCH page data access 0x{x} (+0x{x}) by {s} tid={d}\n", .{ fault, fault - wp_page, where(&wb2, g[16]), linux.gettid() });
         }
@@ -1773,6 +1798,20 @@ fn onCrash(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callc
         var i = step_n - show;
         while (i < step_n) : (i += 1) std.debug.print("    {s} rsp=0x{x}\n", .{ where(&b2, step_ring[i % step_ring.len]), step_rsp[i % step_ring.len] });
     }
+    if (std.c.getenv("WINS_CRASH_PEEK")) |pv| if (crash_images.len > 0) {
+        // WINS_CRASH_PEEK=<rva>[:<len>],...: hex dump of root-image bytes.
+        var it = std.mem.splitScalar(u8, std.mem.span(pv), ',');
+        while (it.next()) |item| {
+            const colon = std.mem.indexOfScalar(u8, item, ':');
+            const rva = std.fmt.parseInt(usize, item[0 .. colon orelse item.len], 0) catch continue;
+            const len = if (colon) |c| (std.fmt.parseInt(usize, item[c + 1 ..], 0) catch 16) else 16;
+            const im = crash_images[0];
+            if (rva + len > im.img.len) continue;
+            std.debug.print("  peek +0x{x}:", .{rva});
+            for (im.img[rva .. rva + len]) |b| std.debug.print(" {x:0>2}", .{b});
+            std.debug.print("\n", .{});
+        }
+    };
     if (std.c.getenv("WINS_CRASH_STACK") != null) {
         // Which mapping holds rip (and is it executable)?
         const mfd = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
@@ -2591,6 +2630,14 @@ pub fn main(init: std.process.Init) !void {
     std.mem.writeInt(usize, peb[0x30..][0..8], k32.processHeapHandle(), .little); // ProcessHeap (== GetProcessHeap())
     mapProcessHeapHeader(k32.processHeapHandle());
     std.mem.writeInt(usize, peb[0x20..][0..8], @intFromPtr(params.ptr), .little); // ProcessParameters
+    // OS version, as RtlGetVersion/GetVersionEx report it (Windows 10 22H2).
+    // Left at zero, DS3's Arxan picked the pre-Vista HEAP layout (Flags +0x14,
+    // ForceFlags +0x18), read a non-zero pointer there and took its tamper path.
+    std.mem.writeInt(u32, peb[0x118..][0..4], 10, .little); // OSMajorVersion
+    std.mem.writeInt(u32, peb[0x11c..][0..4], 0, .little); // OSMinorVersion
+    std.mem.writeInt(u16, peb[0x120..][0..2], 19045, .little); // OSBuildNumber
+    std.mem.writeInt(u16, peb[0x122..][0..2], 0, .little); // OSCSDVersion
+    std.mem.writeInt(u32, peb[0x124..][0..4], 2, .little); // OSPlatformId = VER_PLATFORM_WIN32_NT
     if (linux.errno(linux.syscall2(.arch_prctl, 0x1001, @intFromPtr(teb.ptr))) != .SUCCESS) die(.map_failed, "arch_prctl(ARCH_SET_GS) failed", .{});
     k32.teb_tls_enabled = true;
 
