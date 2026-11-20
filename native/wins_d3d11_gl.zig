@@ -465,8 +465,29 @@ pub fn inputFormatToGl(fmt: u32) InputFmtInfo {
         54 => .{ .components = 1, .gl_type = 0x140B, .normalized = false, .is_int = false, .byte_size = 2 },
         56 => .{ .components = 1, .gl_type = 0x1403, .normalized = true, .is_int = false, .byte_size = 2 },
         61 => .{ .components = 1, .gl_type = 0x1401, .normalized = true, .is_int = false, .byte_size = 1 },
-        87 => .{ .components = 0x80E1, .gl_type = 0x1401, .normalized = true, .is_int = false, .byte_size = 4 }, // GL_BGRA
-        else => .{ .components = 4, .gl_type = 0x1406, .normalized = false, .is_int = false, .byte_size = 16 },
+        24 => .{ .components = 4, .gl_type = 0x8368, .normalized = true, .is_int = false, .byte_size = 4 }, // R10G10B10A2_UNORM
+        29 => .{ .components = 4, .gl_type = 0x1401, .normalized = true, .is_int = false, .byte_size = 4 }, // R8G8B8A8_UNORM_SRGB
+        36 => .{ .components = 2, .gl_type = 0x1403, .normalized = false, .is_int = true, .byte_size = 4 }, // R16G16_UINT
+        37 => .{ .components = 2, .gl_type = 0x1402, .normalized = true, .is_int = false, .byte_size = 4 }, // R16G16_SNORM
+        38 => .{ .components = 2, .gl_type = 0x1402, .normalized = false, .is_int = true, .byte_size = 4 }, // R16G16_SINT
+        50 => .{ .components = 2, .gl_type = 0x1401, .normalized = false, .is_int = true, .byte_size = 2 }, // R8G8_UINT
+        51 => .{ .components = 2, .gl_type = 0x1400, .normalized = true, .is_int = false, .byte_size = 2 }, // R8G8_SNORM
+        52 => .{ .components = 2, .gl_type = 0x1400, .normalized = false, .is_int = true, .byte_size = 2 }, // R8G8_SINT
+        57 => .{ .components = 1, .gl_type = 0x1403, .normalized = false, .is_int = true, .byte_size = 2 }, // R16_UINT
+        58 => .{ .components = 1, .gl_type = 0x1402, .normalized = true, .is_int = false, .byte_size = 2 }, // R16_SNORM
+        59 => .{ .components = 1, .gl_type = 0x1402, .normalized = false, .is_int = true, .byte_size = 2 }, // R16_SINT
+        62 => .{ .components = 1, .gl_type = 0x1401, .normalized = false, .is_int = true, .byte_size = 1 }, // R8_UINT
+        63 => .{ .components = 1, .gl_type = 0x1400, .normalized = true, .is_int = false, .byte_size = 1 }, // R8_SNORM
+        64 => .{ .components = 1, .gl_type = 0x1400, .normalized = false, .is_int = true, .byte_size = 1 }, // R8_SINT
+        87, 88 => .{ .components = 0x80E1, .gl_type = 0x1401, .normalized = true, .is_int = false, .byte_size = 4 }, // GL_BGRA (B8G8R8A8/X8)
+        else => blk: {
+            const S = struct { var seen: [128]bool = @splat(false); };
+            if (fmt < 128 and !S.seen[fmt]) {
+                S.seen[fmt] = true;
+                std.debug.print("[WINS:D3D11] input layout: DXGI format {d} not mapped (treated as RGBA32F)\n", .{fmt});
+            }
+            break :blk .{ .components = 4, .gl_type = 0x1406, .normalized = false, .is_int = false, .byte_size = 16 };
+        },
     };
 }
 
@@ -2037,12 +2058,14 @@ fn drawJob(raw: ?*anyopaque) void {
     // Rasterizer
     if (s.rasterizer) |rs| {
         gl.glPolygonMode(0x0408, if (rs.wireframe) 0x1B01 else 0x1B02);
+        // Winding is set even with culling off: two-sided stencil (front vs back ops)
+        // depends on it, and a stale value from the previous draw flips the faces.
+        gl.glFrontFace(if (rs.front_ccw) 0x0901 else 0x0900); // GL_UPPER_LEFT keeps CW = D3D default!
         if (rs.cull_mode == 1) {
             gl.glDisable(0x0B44);
         } else {
             gl.glEnable(0x0B44);
             gl.glCullFace(if (rs.cull_mode == 2) 0x0404 else 0x0405);
-            gl.glFrontFace(if (rs.front_ccw) 0x0901 else 0x0900); // GL_UPPER_LEFT keeps CW = D3D default!
         }
         if (rs.scissor_enable and s.num_scissors > 0) {
             const sc = s.scissors[0];
@@ -2221,9 +2244,35 @@ fn drawJob(raw: ?*anyopaque) void {
                 if (rt0) |r| r.dxgi_fmt else 0,
             });
         };
+        if (traceFrame() and s.dsv != null) {
+            var grid: [15]u8 = undefined;
+            for (0..3) |gy| for (0..5) |gx| {
+                var sv: [4]u8 = .{ 0, 0, 0, 0 };
+                gl.glReadPixels(@intCast(fb_dim.w * (2 * gx + 1) / 10), @intCast(fb_dim.h * (2 * gy + 1) / 6), 1, 1, 0x1901, 0x1401, &sv); // STENCIL_INDEX
+                grid[gy * 5 + gx] = sv[0];
+            };
+            const dfmt: u32 = if (s.dsv.?.tex) |t| t.dxgi_fmt else 0;
+            std.debug.print("    stencil grid={any} dsv_fmt={d} view_fmt={d} glErr=0x{x}\n", .{ grid, dfmt, s.dsv.?.dxgi_fmt, gl.glGetError() });
+            // 48x27 map: stencil digit, or '#' where the colour RT is bright (>96).
+            var y: usize = 0;
+            while (y < 27) : (y += 1) {
+                var line: [48]u8 = undefined;
+                for (0..48) |x| {
+                    const px_x: GLint = @intCast(fb_dim.w * (2 * x + 1) / 96);
+                    const px_y: GLint = @intCast(fb_dim.h * (2 * y + 1) / 54);
+                    var st: [4]u8 = .{ 0, 0, 0, 0 };
+                    var col: [4]u8 = .{ 0, 0, 0, 0 };
+                    gl.glReadPixels(px_x, px_y, 1, 1, 0x1901, 0x1401, &st);
+                    gl.glReadPixels(px_x, px_y, 1, 1, 0x1908, 0x1401, &col);
+                    const lum = (@as(u32, col[0]) + col[1] + col[2]) / 3;
+                    line[x] = if (lum > 96) '#' else if (st[0] > 0) @as(u8, '0') + @min(st[0], 9) else '.';
+                }
+                std.debug.print("    |{s}|\n", .{line});
+            }
+        }
         if (traceFrame()) if (s.depth_stencil) |d| {
-            std.debug.print("    ds depth={}/{} func=0x{x} stencil={} rmask=0x{x} wmask=0x{x} front(func=0x{x} pass=0x{x} fail=0x{x}) ref={d}\n", .{
-                d.depth_enable, d.depth_write, d.depth_func, d.stencil_enable, d.stencil_read_mask, d.stencil_write_mask, d.front_func, d.front_pass, d.front_fail, s.stencil_ref,
+            std.debug.print("    ds depth={}/{} func=0x{x} stencil={} rmask=0x{x} wmask=0x{x} front(func=0x{x} pass=0x{x} fail=0x{x}) back(func=0x{x} pass=0x{x} fail=0x{x}) ref={d}\n", .{
+                d.depth_enable, d.depth_write, d.depth_func, d.stencil_enable, d.stencil_read_mask, d.stencil_write_mask, d.front_func, d.front_pass, d.front_fail, d.back_func, d.back_pass, d.back_fail, s.stencil_ref,
             });
         };
         // Traced frame: first indices of an indexed draw and their vertex bytes.

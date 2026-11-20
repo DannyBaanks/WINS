@@ -1324,6 +1324,16 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 try appendFmt(&sv_init, a, "    vi{d} = vec4({s}, 0.0, 0.0, 0.0);\n", .{ in_e.reg, b });
                 continue;
             }
+            // ISGN component type 1 = UINT32, 2 = SINT32: the attribute arrives through
+            // glVertexAttribIPointer, which a float input would read as undefined values.
+            // Declare it integer and keep the bits in the vec4 the body works on.
+            if (in_e.comp_type == 1 or in_e.comp_type == 2) {
+                const ity: []const u8 = if (in_e.comp_type == 1) "uvec4" else "ivec4";
+                const cast: []const u8 = if (in_e.comp_type == 1) "uintBitsToFloat" else "intBitsToFloat";
+                try appendFmt(&hdr, a, "layout(location = {d}) in {s} vi{d}_int;\nvec4 vi{d};\n", .{ in_e.reg, ity, in_e.reg, in_e.reg });
+                try appendFmt(&sv_init, a, "    vi{d} = {s}(vi{d}_int);\n", .{ in_e.reg, cast, in_e.reg });
+                continue;
+            }
             try appendFmt(&hdr, a, "layout(location = {d}) in vec4 vi{d};\n", .{ in_e.reg, in_e.reg });
         }
         for (outputs) |out_e| {
@@ -1388,9 +1398,10 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     };
 }
 
-test "translate minimal SM4 vertex DXBC to GLSL 420 core" {
-    // Build minimal DXBC with ISGN (1 elem), OSGN (1 SV_Position elem), and SHDR (mov o0, v0; ret)
-    var buf: [256]u8 = [_]u8{0} ** 256;
+/// Minimal VS DXBC: ISGN (1 elem of component type `in_comp_type`), OSGN (1
+/// SV_Position elem), SHDR (mov o0, v0; ret).
+fn minimalVsDxbc(buf: *[256]u8, in_comp_type: u32) []const u8 {
+    @memset(buf, 0);
     @memcpy(buf[0..4], "DXBC");
     std.mem.writeInt(u32, buf[20..24], 1, .little);
     std.mem.writeInt(u32, buf[28..32], 3, .little); // 3 chunks
@@ -1402,7 +1413,7 @@ test "translate minimal SM4 vertex DXBC to GLSL 420 core" {
     std.mem.writeInt(u32, buf[isgn_off + 8 ..][0..4], 1, .little);
     std.mem.writeInt(u32, buf[isgn_off + 12 ..][0..4], 8, .little);
     std.mem.writeInt(u32, buf[isgn_off + 16 ..][0..4], 32, .little); // name_off = 32
-    std.mem.writeInt(u32, buf[isgn_off + 28 ..][0..4], 3, .little); // float
+    std.mem.writeInt(u32, buf[isgn_off + 28 ..][0..4], in_comp_type, .little); // 1 uint, 2 sint, 3 float
     buf[isgn_off + 36] = 0xF;
     @memcpy(buf[isgn_off + 40 ..][0..8], "POSITION");
     buf[isgn_off + 47] = 0;
@@ -1437,11 +1448,32 @@ test "translate minimal SM4 vertex DXBC to GLSL 420 core" {
     std.mem.writeInt(u32, buf[shdr_off + 32 ..][0..4], 0, .little);
     // ret (62=0x3e), len=1
     std.mem.writeInt(u32, buf[shdr_off + 36 ..][0..4], (1 << 24) | 0x3e, .little);
+    return buf[0 .. shdr_off + 40];
+}
 
-    var tr = try translate(std.testing.allocator, buf[0 .. shdr_off + 40]);
+test "translate minimal SM4 vertex DXBC to GLSL 420 core" {
+    var buf: [256]u8 = undefined;
+    var tr = try translate(std.testing.allocator, minimalVsDxbc(&buf, 3));
     defer tr.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "vo0.xyzw = vi0.xyzw;") != null);
     try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "gl_Position = vo0;") != null);
+    // Control: a float input stays a plain float attribute.
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "layout(location = 0) in vec4 vi0;") != null);
+}
+
+test "integer vertex inputs are declared integer and keep their bits" {
+    // Scaleform's batch index is R8_UINT/uint in the signature; read as a float
+    // attribute through glVertexAttribIPointer it was undefined and text vanished.
+    var buf: [256]u8 = undefined;
+    var tu = try translate(std.testing.allocator, minimalVsDxbc(&buf, 1));
+    defer tu.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, tu.glsl, "layout(location = 0) in uvec4 vi0_int;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tu.glsl, "vi0 = uintBitsToFloat(vi0_int);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tu.glsl, "in vec4 vi0;") == null);
+    var ts = try translate(std.testing.allocator, minimalVsDxbc(&buf, 2));
+    defer ts.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, ts.glsl, "layout(location = 0) in ivec4 vi0_int;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts.glsl, "vi0 = intBitsToFloat(vi0_int);") != null);
 }
 
 /// True the first time `reg` is seen (registers >= 64 are always emitted).
