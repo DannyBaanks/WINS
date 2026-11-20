@@ -12,7 +12,12 @@ const std = @import("std");
 
 pub const Error = error{ Malformed, Unsupported, OutOfMemory };
 
-pub const Stage = enum { vertex, pixel, other };
+pub const Stage = enum { vertex, pixel, compute, other };
+
+/// GLSL name prefix of a stage's resources (p = pixel, v = vertex, c = compute).
+pub fn stagePrefix(stage: Stage) []const u8 {
+    return switch (stage) { .pixel => "p", .compute => "c", else => "v" };
+}
 
 /// D3D11 SRV slots per stage (t0..t127). DS3 samples t31+ in some shaders.
 pub const MAX_TEX = 128;
@@ -52,6 +57,29 @@ pub const TexBinding = struct {
     samp: u8,
 };
 
+/// D3D11 UAV slots (u0..u7 at feature level 11.0).
+pub const MAX_UAV = 8;
+
+/// What a shader storage block stands for: a raw/structured SRV (t#), a
+/// raw/structured UAV (u#) or the hidden append/consume counter of a UAV.
+pub const BufKind = enum(u8) { srv, uav, counter };
+
+pub const BufBinding = struct {
+    kind: BufKind,
+    reg: u8,
+    /// GL_SHADER_STORAGE_BUFFER binding point.
+    binding: u8,
+};
+
+/// A typed UAV (RWTexture*/RWBuffer<T>) declared as a GLSL image.
+pub const ImgBinding = struct {
+    reg: u8,
+    unit: u8,
+    dim: TexDim,
+    /// Atomics on it: the image is declared r32ui/r32i and must be bound so.
+    atomic: bool,
+};
+
 pub const Translated = struct {
     glsl: [:0]u8,
     stage: Stage,
@@ -59,14 +87,137 @@ pub const Translated = struct {
     outputs: []SigElem,
     cb_mask: u16,
     tex_bindings: []TexBinding,
+    buf_bindings: []BufBinding = &.{},
+    img_bindings: []ImgBinding = &.{},
 
     pub fn deinit(self: *Translated, a: std.mem.Allocator) void {
         a.free(self.glsl);
         a.free(self.inputs);
         a.free(self.outputs);
         a.free(self.tex_bindings);
+        a.free(self.buf_bindings);
+        a.free(self.img_bindings);
     }
 };
+
+/// Buffer-like resources a shader declares (SM5 raw/structured/typed UAV, tgsm).
+const MemKind = enum(u8) { none, raw, structured, typed };
+
+const MemDecl = struct {
+    kind: MemKind = .none,
+    stride: u32 = 0,
+    /// tgsm: total 32-bit words.
+    words: u32 = 0,
+    dim: TexDim = .none,
+    /// Typed UAV return type.
+    ty: NumType = .f,
+    counter: bool = false,
+    atomic: bool = false,
+};
+
+/// Per-translation resource tables filled by the dcl_* instructions.
+const Mem = struct {
+    srv: [MAX_TEX]MemDecl = [_]MemDecl{.{}} ** MAX_TEX,
+    uav: [MAX_UAV]MemDecl = [_]MemDecl{.{}} ** MAX_UAV,
+    tgsm: [32]MemDecl = [_]MemDecl{.{}} ** 32,
+};
+
+/// GLSL array behind a memory operand (t# raw/structured, u#, g#).
+fn memArray(a: std.mem.Allocator, op: *const Operand, stage: Stage) ![]const u8 {
+    const reg = op.indices[0].imm;
+    return switch (op.op_type) {
+        7 => std.fmt.allocPrint(a, "{s}t{d}_d", .{ stagePrefix(stage), reg }),
+        30 => std.fmt.allocPrint(a, "{s}u{d}_d", .{ stagePrefix(stage), reg }),
+        31 => std.fmt.allocPrint(a, "g{d}", .{reg}),
+        else => setErr("memory op on a non-buffer operand"),
+    };
+}
+
+/// `uint <tmp> = word index` of a raw (byte offset) or structured (element
+/// index + byte offset into the element) access. Computed once into a temp so a
+/// destination that overlaps the address registers cannot clobber it.
+fn emitMemAddr(a: std.mem.Allocator, body: *std.ArrayList(u8), tmp: []const u8, idx: ?Operand, off: *const Operand, stride: u32, stage: Stage) !void {
+    const off_e = try formatSrc(a, off, 1, .u, stage);
+    if (idx) |si| {
+        const idx_e = try formatSrc(a, &si, 1, .u, stage);
+        try appendFmt(body, a, "    uint {s} = ({s} * {d}u + {s}) >> 2u;\n", .{ tmp, idx_e, stride, off_e });
+    } else {
+        try appendFmt(body, a, "    uint {s} = {s} >> 2u;\n", .{ tmp, off_e });
+    }
+}
+
+/// Two-destination ops (imul/umul hi+lo, udiv quotient+remainder): compute
+/// every needed component into temps `wt<k>a/b` first, since a destination may
+/// alias a source. `stmt` returns a GLSL block that sets `A` and `B` from the
+/// two scalar sources (it is rewritten to the temps' components).
+fn emitTwoDst(
+    a: std.mem.Allocator,
+    body: *std.ArrayList(u8),
+    k: usize,
+    d0: *const Operand,
+    d1: *const Operand,
+    s0: *const Operand,
+    s1: *const Operand,
+    ty: NumType,
+    stage: Stage,
+    comptime stmt: fn (std.mem.Allocator, []const u8, []const u8, [2][]const u8) anyerror![]const u8,
+    extra: [2][]const u8,
+) !void {
+    const m = (if (d0.op_type != 13) d0.mask else 0) | (if (d1.op_type != 13) d1.mask else 0);
+    if (m == 0) return;
+    const vt = if (ty == .u) "uvec4" else "ivec4";
+    try appendFmt(body, a, "    {s} wt{d}a = {s}(0), wt{d}b = {s}(0);\n", .{ vt, k, vt, k, vt });
+    inline for (0..4) |c| {
+        const bit: u8 = @as(u8, 1) << @intCast(c);
+        if ((m & bit) != 0) {
+            const blk = try stmt(a, try formatSrc(a, s0, bit, ty, stage), try formatSrc(a, s1, bit, ty, stage), extra);
+            const ra = try std.fmt.allocPrint(a, "wt{d}a.{c}", .{ k, swzChar(c) });
+            const rb = try std.fmt.allocPrint(a, "wt{d}b.{c}", .{ k, swzChar(c) });
+            const s_a = try std.mem.replaceOwned(u8, a, blk, " A =", try std.fmt.allocPrint(a, " {s} =", .{ra}));
+            const s_b = try std.mem.replaceOwned(u8, a, s_a, " B =", try std.fmt.allocPrint(a, " {s} =", .{rb}));
+            try appendFmt(body, a, "    {s}\n", .{s_b});
+        }
+    }
+    var mb: [5]u8 = undefined;
+    if (d0.op_type != 13) try assignDst(a, body, d0, try std.fmt.allocPrint(a, "wt{d}a.{s}", .{ k, maskStr(d0.mask, &mb) }), ty, stage);
+    if (d1.op_type != 13) try assignDst(a, body, d1, try std.fmt.allocPrint(a, "wt{d}b.{s}", .{ k, maskStr(d1.mask, &mb) }), ty, stage);
+}
+
+fn memDecl(m: *Mem, op: *const Operand) ?*MemDecl {
+    const reg = op.indices[0].imm;
+    return switch (op.op_type) {
+        7 => if (reg < MAX_TEX) &m.srv[reg] else null,
+        30 => if (reg < MAX_UAV) &m.uav[reg] else null,
+        31 => if (reg < m.tgsm.len) &m.tgsm[reg] else null,
+        else => null,
+    };
+}
+
+/// Integer image coordinate of a typed UAV of `dim`.
+fn imgCoord(a: std.mem.Allocator, src: *const Operand, dim: TexDim, stage: Stage) ![]const u8 {
+    return switch (dim) {
+        .buf, .tex1d => formatSrc(a, src, 0x1, .i, stage),
+        .tex2d, .tex1d_array, .tex2dms => formatSrc(a, src, 0x3, .i, stage),
+        else => formatSrc(a, src, 0x7, .i, stage),
+    };
+}
+
+fn imgType(d: MemDecl) []const u8 {
+    return switch (d.ty) {
+        .u => switch (d.dim) { .buf => "uimageBuffer", .tex1d, .tex1d_array => "uimage1DArray", .tex2d_array => "uimage2DArray", .tex3d => "uimage3D", else => "uimage2D" },
+        .i => switch (d.dim) { .buf => "iimageBuffer", .tex1d, .tex1d_array => "iimage1DArray", .tex2d_array => "iimage2DArray", .tex3d => "iimage3D", else => "iimage2D" },
+        .f => switch (d.dim) { .buf => "imageBuffer", .tex1d, .tex1d_array => "image1DArray", .tex2d_array => "image2DArray", .tex3d => "image3D", else => "image2D" },
+    };
+}
+
+/// Return type of a typed resource declaration token (x component decides).
+fn retType(tok: u32) NumType {
+    return switch (tok & 0xF) {
+        3 => .i, // SINT
+        4 => .u, // UINT
+        else => .f,
+    };
+}
 
 pub var last_error: []const u8 = "";
 /// Opcodes already reported as unhandled (bit per opcode; the last word also
@@ -359,17 +510,23 @@ fn formatBaseVar(a: std.mem.Allocator, op: *const Operand, stage: Stage) ![]cons
         2 => std.fmt.allocPrint(a, "vo{s}", .{try formatIndex(a, op.indices[0])}),
         3 => std.fmt.allocPrint(a, "x{d}[{s}]", .{ op.indices[0].imm, try formatIndex(a, op.indices[1]) }),
         8 => blk: {
-            const prefix = if (stage == .pixel) "pcb" else "vcb";
-            break :blk std.fmt.allocPrint(a, "{s}{d}[{s}]", .{ prefix, op.indices[0].imm, try formatIndex(a, op.indices[1]) });
+            const prefix = stagePrefix(stage);
+            break :blk std.fmt.allocPrint(a, "{s}cb{d}[{s}]", .{ prefix, op.indices[0].imm, try formatIndex(a, op.indices[1]) });
         },
         9 => blk: {
-            const prefix = if (stage == .pixel) "picb" else "vicb";
-            break :blk std.fmt.allocPrint(a, "{s}[{s}]", .{ prefix, try formatIndex(a, op.indices[0]) });
+            const prefix = stagePrefix(stage);
+            break :blk std.fmt.allocPrint(a, "{s}icb[{s}]", .{ prefix, try formatIndex(a, op.indices[0]) });
         },
         11 => try a.dupe(u8, "vec4(uintBitsToFloat(uint(gl_PrimitiveID)), 0.0, 0.0, 0.0)"),
         12 => try a.dupe(u8, "oDepth"),
         13 => try a.dupe(u8, "dummyNull"),
         35 => try a.dupe(u8, "vec4(uintBitsToFloat(uint(gl_SampleMaskIn[0])), 0.0, 0.0, 0.0)"),
+        // Compute system values (vThreadID, vThreadGroupID, vThreadIDInGroup,
+        // vThreadIDInGroupFlattened) hold integer bits like every register.
+        32 => try a.dupe(u8, "uintBitsToFloat(uvec4(gl_GlobalInvocationID, 0u))"),
+        33 => try a.dupe(u8, "uintBitsToFloat(uvec4(gl_WorkGroupID, 0u))"),
+        34 => try a.dupe(u8, "uintBitsToFloat(uvec4(gl_LocalInvocationID, 0u))"),
+        36 => try a.dupe(u8, "uintBitsToFloat(uvec4(gl_LocalInvocationIndex, 0u, 0u, 0u))"),
         else => try std.fmt.allocPrint(a, "vec4(0.0) /*op_type={d}*/", .{op.op_type}),
     };
 }
@@ -564,12 +721,13 @@ const SbOp = enum(u16) {
     @"switch" = 76,
     sincos = 77,
     udiv = 78,
-    uge = 79,
-    ult = 80,
-    umad = 81,
-    umax = 82,
-    umin = 83,
-    umul = 84,
+    // D3D10_SB_OPCODE order (vkd3d sm4 0x4f..0x54): ULT, UGE, UMUL, UMAD, UMAX, UMIN.
+    ult = 79,
+    uge = 80,
+    umul = 81,
+    umad = 82,
+    umax = 83,
+    umin = 84,
     ushr = 85,
     utof = 86,
     xor = 87,
@@ -615,10 +773,42 @@ const SbOp = enum(u16) {
     bfi = 140,
     bfrev = 141,
     swapc = 142,
+    dcl_thread_group = 155,
+    dcl_uav_typed = 156,
+    dcl_uav_raw = 157,
+    dcl_uav_structured = 158,
+    dcl_tgsm_raw = 159,
+    dcl_tgsm_structured = 160,
     dcl_resource_raw = 161,
     dcl_resource_structured = 162,
+    ld_uav_typed = 163,
+    store_uav_typed = 164,
     ld_raw = 165,
+    store_raw = 166,
     ld_structured = 167,
+    store_structured = 168,
+    atomic_and = 169,
+    atomic_or = 170,
+    atomic_xor = 171,
+    atomic_cmp_store = 172,
+    atomic_iadd = 173,
+    atomic_imax = 174,
+    atomic_imin = 175,
+    atomic_umax = 176,
+    atomic_umin = 177,
+    imm_atomic_alloc = 178,
+    imm_atomic_consume = 179,
+    imm_atomic_iadd = 180,
+    imm_atomic_and = 181,
+    imm_atomic_or = 182,
+    imm_atomic_xor = 183,
+    imm_atomic_exch = 184,
+    imm_atomic_cmp_exch = 185,
+    imm_atomic_imax = 186,
+    imm_atomic_imin = 187,
+    imm_atomic_umax = 188,
+    imm_atomic_umin = 189,
+    sync = 190,
     _,
 };
 
@@ -683,6 +873,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     const stage: Stage = switch (ptype_raw) {
         0 => .pixel,
         1 => .vertex,
+        5 => .compute,
         else => .other,
     };
     if (stage == .other) return setErr("unsupported shader stage");
@@ -701,6 +892,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     var icb_vals: ?[]const u32 = null;
     var sv_pos_out_reg: ?u32 = null;
     var sv_pos_in_reg: ?u32 = null;
+    var mem: Mem = .{};
+    var local_size = [3]u32{ 1, 1, 1 };
 
     if (stage == .vertex) {
         for (outputs) |o| {
@@ -986,22 +1179,25 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const ty: NumType = if (op == .umul) .u else .i;
                 const s0 = try decodeOperand(a, toks, &p);
                 const s1 = try decodeOperand(a, toks, &p);
-                const m = if (dlo.op_type != 13) dlo.mask else dhi.mask;
-                const a0 = try formatSrc(a, &s0, m, ty, stage);
-                const a1 = try formatSrc(a, &s1, m, ty, stage);
-                if (dlo.op_type != 13) try assignDst(a, &body, &dlo, try std.fmt.allocPrint(a, "({s} * {s})", .{ a0, a1 }), ty, stage);
-                if (dhi.op_type != 13) try assignDst(a, &body, &dhi, try std.fmt.allocPrint(a, "({s} ^ {s})", .{ a0, a1 }), ty, stage);
+                const tn = if (ty == .u) "uint" else "int";
+                const fname = if (ty == .u) "umulExtended" else "imulExtended";
+                try emitTwoDst(a, &body, k, &dhi, &dlo, &s0, &s1, ty, stage, struct {
+                    fn f(al: std.mem.Allocator, x: []const u8, y: []const u8, args: [2][]const u8) ![]const u8 {
+                        return std.fmt.allocPrint(al, "{{ {s} h, l; {s}({s}, {s}, h, l); A = h; B = l; }}", .{ args[0], args[1], x, y });
+                    }
+                }.f, .{ tn, fname });
             },
             .udiv => {
                 var dq = try decodeOperand(a, toks, &p);
                 var dr = try decodeOperand(a, toks, &p);
                 const s0 = try decodeOperand(a, toks, &p);
                 const s1 = try decodeOperand(a, toks, &p);
-                const m = if (dq.op_type != 13) dq.mask else dr.mask;
-                const a0 = try formatSrc(a, &s0, m, .u, stage);
-                const a1 = try formatSrc(a, &s1, m, .u, stage);
-                if (dq.op_type != 13) try assignDst(a, &body, &dq, try std.fmt.allocPrint(a, "({s} / {s})", .{ a0, a1 }), .u, stage);
-                if (dr.op_type != 13) try assignDst(a, &body, &dr, try std.fmt.allocPrint(a, "({s} % {s})", .{ a0, a1 }), .u, stage);
+                // D3D: division by zero gives 0xFFFFFFFF for both results.
+                try emitTwoDst(a, &body, k, &dq, &dr, &s0, &s1, .u, stage, struct {
+                    fn f(al: std.mem.Allocator, x: []const u8, y: []const u8, _: [2][]const u8) ![]const u8 {
+                        return std.fmt.allocPrint(al, "{{ uint n = {s}, d = {s}; A = (d == 0u) ? 0xFFFFFFFFu : n / d; B = (d == 0u) ? 0xFFFFFFFFu : n % d; }}", .{ x, y });
+                    }
+                }.f, .{ "", "" });
             },
             .sample, .sample_c, .sample_c_lz, .sample_l, .sample_d, .sample_b, .ld, .ld_ms => {
                 var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
@@ -1031,7 +1227,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                     const bias = try decodeOperand(a, toks, &p);
                     extra_e = try formatSrc(a, &bias, 1, .f, stage);
                 }
-                const cname = if (stage == .pixel) "ptex" else "vtex";
+                const cname = try std.fmt.allocPrint(a, "{s}tex", .{stagePrefix(stage)});
                 const call_expr = if (op == .ld or op == .ld_ms) blk: {
                     const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, fetchCoordMask(tdim), .i, stage), .i);
                     if (tdim == .buf) break :blk try std.fmt.allocPrint(a, "texelFetch({s}{d}, {s})", .{ cname, reg, cexpr });
@@ -1181,7 +1377,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const mip = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
                 const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
-                const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ if (stage == .pixel) "p" else "v", reg });
+                const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ stagePrefix(stage), reg });
                 const l = try formatSrc(a, &mip, 1, .i, stage);
                 const iv = switch (tex_dims[reg]) {
                     .tex1d => try std.fmt.allocPrint(a, "ivec4(textureSize({s}, {s}).x, 0, 0, textureQueryLevels({s}))", .{ tname, l, tname }),
@@ -1207,7 +1403,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const smp = try decodeOperand(a, toks, &p);
                 const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
                 if (tex_samp[reg] == 0xFF) tex_samp[reg] = @intCast(@min(15, smp.indices[0].imm));
-                const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ if (stage == .pixel) "p" else "v", reg });
+                const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ stagePrefix(stage), reg });
                 const cexpr = try tex1dCoord(a, tex_dims[reg], try formatSrc(a, &coord, sampleCoordMask(tex_dims[reg]), .f, stage), .f);
                 var swbuf: [5]u8 = undefined;
                 if (op == .gather4) {
@@ -1219,10 +1415,190 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                     try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}.{s}", .{ call, swzForMask(res.swz, dst.mask, &swbuf) }), .f, stage);
                 }
             },
-            .dcl_resource_raw, .dcl_resource_structured => continue,
-            .bufinfo, .ld_structured, .ld_raw, .sample_pos, .sample_info => {
-                // Raw/structured buffers need SSBO plumbing WINS does not have yet:
-                // the destination reads as zero, reported once like an unhandled op.
+            .dcl_thread_group => {
+                if (p + 2 < next_k) local_size = .{ @max(1, toks[p]), @max(1, toks[p + 1]), @max(1, toks[p + 2]) };
+                continue;
+            },
+            .dcl_resource_raw, .dcl_resource_structured, .dcl_uav_raw, .dcl_uav_structured, .dcl_uav_typed => {
+                const rop = try decodeOperand(a, toks, &p);
+                const d = memDecl(&mem, &rop) orelse continue;
+                switch (op) {
+                    .dcl_resource_raw, .dcl_uav_raw => d.kind = .raw,
+                    .dcl_resource_structured, .dcl_uav_structured => {
+                        d.kind = .structured;
+                        d.stride = if (p < next_k) toks[p] else 4;
+                        // D3D11_SB_UAV_HAS_ORDER_PRESERVING_COUNTER
+                        if (op == .dcl_uav_structured and ((itok >> 23) & 1) != 0) d.counter = true;
+                    },
+                    else => {
+                        d.kind = .typed;
+                        d.dim = @enumFromInt(@as(u8, @intCast((itok >> 11) & 0x1F)));
+                        if (p < next_k) d.ty = retType(toks[p]);
+                    },
+                }
+                continue;
+            },
+            .dcl_tgsm_raw, .dcl_tgsm_structured => {
+                const gop = try decodeOperand(a, toks, &p);
+                const d = memDecl(&mem, &gop) orelse continue;
+                if (op == .dcl_tgsm_raw) {
+                    d.kind = .raw;
+                    d.words = if (p < next_k) (toks[p] + 3) / 4 else 1;
+                } else {
+                    d.kind = .structured;
+                    d.stride = if (p < next_k) toks[p] else 4;
+                    const cnt: u32 = if (p + 1 < next_k) toks[p + 1] else 1;
+                    d.words = (d.stride * cnt + 3) / 4;
+                }
+                continue;
+            },
+            .ld_structured, .ld_raw => {
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = false;
+                const s_idx: ?Operand = if (op == .ld_structured) try decodeOperand(a, toks, &p) else null;
+                const s_off = try decodeOperand(a, toks, &p);
+                const res = try decodeOperand(a, toks, &p);
+                const d = memDecl(&mem, &res) orelse return setErr("ld_raw/structured on an unknown resource");
+                const arr = try memArray(a, &res, stage);
+                const tmp = try std.fmt.allocPrint(a, "wt{d}", .{k});
+                try emitMemAddr(a, &body, tmp, s_idx, &s_off, d.stride, stage);
+                inline for (0..4) |c| {
+                    const bit: u8 = @as(u8, 1) << @intCast(c);
+                    if ((dst.mask & bit) != 0) {
+                        var sd = dst; sd.mask = bit;
+                        try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "{s}[{s} + {d}u]", .{ arr, tmp, res.swz[c] }), .u, stage);
+                    }
+                }
+            },
+            .store_structured, .store_raw => {
+                const dst = try decodeOperand(a, toks, &p);
+                const s_idx: ?Operand = if (op == .store_structured) try decodeOperand(a, toks, &p) else null;
+                const s_off = try decodeOperand(a, toks, &p);
+                const val = try decodeOperand(a, toks, &p);
+                const d = memDecl(&mem, &dst) orelse return setErr("store_raw/structured on an unknown resource");
+                const arr = try memArray(a, &dst, stage);
+                const tmp = try std.fmt.allocPrint(a, "wt{d}", .{k});
+                try emitMemAddr(a, &body, tmp, s_idx, &s_off, d.stride, stage);
+                // The write mask is x, xy, xyz or xyzw: component c lands at word c.
+                inline for (0..4) |c| {
+                    const bit: u8 = @as(u8, 1) << @intCast(c);
+                    if ((dst.mask & bit) != 0) {
+                        try appendFmt(&body, a, "    {s}[{s} + {d}u] = {s};\n", .{ arr, tmp, c, try formatSrc(a, &val, bit, .u, stage) });
+                    }
+                }
+            },
+            .ld_uav_typed => {
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = false;
+                const coord = try decodeOperand(a, toks, &p);
+                const res = try decodeOperand(a, toks, &p);
+                const d = memDecl(&mem, &res) orelse return setErr("ld_uav_typed on an unknown UAV");
+                var swbuf: [5]u8 = undefined;
+                const call = try std.fmt.allocPrint(a, "imageLoad({s}img{d}, {s})", .{ stagePrefix(stage), res.indices[0].imm, try imgCoord(a, &coord, d.dim, stage) });
+                try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}.{s}", .{ call, swzForMask(res.swz, dst.mask, &swbuf) }), d.ty, stage);
+            },
+            .store_uav_typed => {
+                const dst = try decodeOperand(a, toks, &p);
+                const coord = try decodeOperand(a, toks, &p);
+                const val = try decodeOperand(a, toks, &p);
+                const d = memDecl(&mem, &dst) orelse return setErr("store_uav_typed on an unknown UAV");
+                try appendFmt(&body, a, "    imageStore({s}img{d}, {s}, {s});\n", .{ stagePrefix(stage), dst.indices[0].imm, try imgCoord(a, &coord, d.dim, stage), try formatSrc(a, &val, 0xF, d.ty, stage) });
+            },
+            .atomic_and, .atomic_or, .atomic_xor, .atomic_cmp_store, .atomic_iadd, .atomic_imax, .atomic_imin, .atomic_umax, .atomic_umin,
+            .imm_atomic_iadd, .imm_atomic_and, .imm_atomic_or, .imm_atomic_xor, .imm_atomic_exch, .imm_atomic_cmp_exch,
+            .imm_atomic_imax, .imm_atomic_imin, .imm_atomic_umax, .imm_atomic_umin => {
+                const is_imm = @intFromEnum(op) >= @intFromEnum(SbOp.imm_atomic_iadd);
+                var out: ?Operand = null;
+                if (is_imm) {
+                    out = try decodeOperand(a, toks, &p);
+                    out.?.sat = false;
+                }
+                const res = try decodeOperand(a, toks, &p);
+                const addr = try decodeOperand(a, toks, &p);
+                const s0 = try decodeOperand(a, toks, &p);
+                const two = (op == .atomic_cmp_store or op == .imm_atomic_cmp_exch);
+                const s1: ?Operand = if (two) try decodeOperand(a, toks, &p) else null;
+                const d = memDecl(&mem, &res) orelse return setErr("atomic on an unknown resource");
+                const fname: []const u8 = switch (op) {
+                    .atomic_and, .imm_atomic_and => "And",
+                    .atomic_or, .imm_atomic_or => "Or",
+                    .atomic_xor, .imm_atomic_xor => "Xor",
+                    .atomic_iadd, .imm_atomic_iadd => "Add",
+                    .atomic_imax, .imm_atomic_imax, .atomic_umax, .imm_atomic_umax => "Max",
+                    .atomic_imin, .imm_atomic_imin, .atomic_umin, .imm_atomic_umin => "Min",
+                    .imm_atomic_exch => "Exchange",
+                    else => "CompSwap",
+                };
+                const signed_op = switch (op) {
+                    .atomic_imax, .imm_atomic_imax, .atomic_imin, .imm_atomic_imin => true,
+                    else => false,
+                };
+                // Buffer and tgsm words are uint; the signed min/max of HLSL on them
+                // would need a CAS loop (none in the titles seen so far).
+                if (signed_op and d.kind != .typed) reportUnhandled(@intFromEnum(op), stage, "signed atomic min/max done unsigned");
+                var call: []const u8 = undefined;
+                const vty: NumType = if (d.kind == .typed) (if (d.ty == .i) .i else .u) else .u;
+                const v0 = try formatSrc(a, &s0, 1, vty, stage);
+                const v1: []const u8 = if (s1) |o| try formatSrc(a, &o, 1, vty, stage) else "";
+                const vargs = if (two) try std.fmt.allocPrint(a, "{s}, {s}", .{ v0, v1 }) else v0;
+                if (d.kind == .typed) {
+                    d.atomic = true;
+                    call = try std.fmt.allocPrint(a, "imageAtomic{s}({s}img{d}, {s}, {s})", .{ fname, stagePrefix(stage), res.indices[0].imm, try imgCoord(a, &addr, d.dim, stage), vargs });
+                } else {
+                    const arr = try memArray(a, &res, stage);
+                    const tmp = try std.fmt.allocPrint(a, "wt{d}", .{k});
+                    if (d.kind == .structured) {
+                        var ai = addr; ai.swz = .{ addr.swz[0], addr.swz[0], addr.swz[0], addr.swz[0] };
+                        var ao = addr; ao.swz = .{ addr.swz[1], addr.swz[1], addr.swz[1], addr.swz[1] };
+                        try emitMemAddr(a, &body, tmp, ai, &ao, d.stride, stage);
+                    } else {
+                        try emitMemAddr(a, &body, tmp, null, &addr, d.stride, stage);
+                    }
+                    call = try std.fmt.allocPrint(a, "atomic{s}({s}[{s}], {s})", .{ fname, arr, tmp, vargs });
+                }
+                if (out) |o| {
+                    try assignDst(a, &body, &o, try std.fmt.allocPrint(a, "{s}({s})", .{ typePrefix(maskCount(o.mask), vty), call }), vty, stage);
+                } else {
+                    try appendFmt(&body, a, "    {s};\n", .{call});
+                }
+            },
+            .imm_atomic_alloc, .imm_atomic_consume => {
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = false;
+                const res = try decodeOperand(a, toks, &p);
+                const reg = res.indices[0].imm;
+                if (reg < MAX_UAV) mem.uav[reg].counter = true;
+                const call = if (op == .imm_atomic_alloc)
+                    try std.fmt.allocPrint(a, "atomicAdd({s}u{d}_n, 1u)", .{ stagePrefix(stage), reg })
+                else
+                    try std.fmt.allocPrint(a, "(atomicAdd({s}u{d}_n, 0xFFFFFFFFu) - 1u)", .{ stagePrefix(stage), reg });
+                try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}({s})", .{ typePrefix(maskCount(dst.mask), .u), call }), .u, stage);
+            },
+            .sync => {
+                const flags = (itok >> 11) & 0xF;
+                if ((flags & 2) != 0) try body.appendSlice(a, "    memoryBarrierShared();\n");
+                if ((flags & 0xC) != 0) try body.appendSlice(a, "    memoryBarrierBuffer();\n    memoryBarrierImage();\n");
+                if ((flags & 1) != 0) try body.appendSlice(a, "    barrier();\n");
+            },
+            .bufinfo => {
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = false;
+                const res = try decodeOperand(a, toks, &p);
+                const reg = res.indices[0].imm;
+                const pre = stagePrefix(stage);
+                const n: []const u8 = blk: {
+                    if (memDecl(&mem, &res)) |d| switch (d.kind) {
+                        .structured => break :blk try std.fmt.allocPrint(a, "(uint({s}.length()) * 4u / {d}u)", .{ try memArray(a, &res, stage), @max(1, d.stride) }),
+                        .raw => break :blk try std.fmt.allocPrint(a, "(uint({s}.length()) * 4u)", .{try memArray(a, &res, stage)}),
+                        .typed => break :blk try std.fmt.allocPrint(a, "uint(imageSize({s}img{d}))", .{ pre, reg }),
+                        .none => {},
+                    };
+                    if (res.op_type == 7 and reg < MAX_TEX and tex_dims[reg] == .buf) break :blk try std.fmt.allocPrint(a, "uint(textureSize({s}tex{d}))", .{ pre, reg });
+                    break :blk "0u";
+                };
+                try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}({s})", .{ typePrefix(maskCount(dst.mask), .u), n }), .u, stage);
+            },
+            .sample_pos, .sample_info => {
                 const dst = try decodeOperand(a, toks, &p);
                 try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}(0u)", .{typePrefix(maskCount(dst.mask), .u)}), .u, stage);
                 reportUnhandled(@intFromEnum(op), stage, "approximated as 0");
@@ -1275,8 +1651,17 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
         }
     }
     var hdr: std.ArrayList(u8) = .empty;
-    try hdr.appendSlice(a, "#version 420 core\n#extension GL_ARB_texture_query_levels : enable\n");
-    const prefix = if (stage == .pixel) "p" else "v";
+    // Compute and SM5 memory (SSBOs, images) need GLSL 4.30; formatted image
+    // loads (typed UAV reads without a format qualifier) are an NVIDIA/Mesa EXT.
+    var uses_mem = stage == .compute;
+    for (mem.srv) |d| uses_mem = uses_mem or d.kind != .none;
+    for (mem.uav) |d| uses_mem = uses_mem or d.kind != .none or d.counter;
+    if (uses_mem) {
+        try hdr.appendSlice(a, "#version 430 core\n#extension GL_ARB_texture_query_levels : enable\n#extension GL_EXT_shader_image_load_formatted : enable\n");
+    } else {
+        try hdr.appendSlice(a, "#version 420 core\n#extension GL_ARB_texture_query_levels : enable\n");
+    }
+    const prefix = stagePrefix(stage);
     const cb_base: u32 = if (stage == .pixel) 16 else 0;
     for (0..16) |i| {
         if ((cb_mask & (@as(u16, 1) << @intCast(i))) != 0) {
@@ -1305,7 +1690,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     }
 
     var tlist: std.ArrayList(TexBinding) = .empty;
-    const tex_base: u32 = if (stage == .pixel) 0 else GL_UNITS;
+    const tex_base: u32 = if (stage == .vertex) GL_UNITS else 0;
     var n_units: u32 = 0;
     for (0..MAX_TEX) |i| {
         if (tex_dims[i] != .none) {
@@ -1320,6 +1705,51 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             const samp: u8 = if (tex_samp[i] == 0xFF) @intCast(@min(15, i)) else tex_samp[i];
             try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
         }
+    }
+
+    // SM5 memory: raw/structured t#/u# are std430 uint arrays (one storage block
+    // each, bindings compacted per stage: VS/CS from 0, PS from 16), append /
+    // consume counters a one-word block, typed UAVs images, tgsm shared arrays.
+    var blist: std.ArrayList(BufBinding) = .empty;
+    var ilist: std.ArrayList(ImgBinding) = .empty;
+    const ssbo_base: u32 = if (stage == .pixel) 16 else 0;
+    var n_ssbo: u32 = 0;
+    for (mem.srv, 0..) |d, i| {
+        if (d.kind != .raw and d.kind != .structured) continue;
+        const b = ssbo_base + n_ssbo;
+        n_ssbo += 1;
+        try appendFmt(&hdr, a, "layout(std430, binding = {d}) readonly buffer {s}t{d}B {{ uint {s}t{d}_d[]; }};\n", .{ b, prefix, i, prefix, i });
+        try blist.append(gpa, .{ .kind = .srv, .reg = @intCast(i), .binding = @intCast(b) });
+    }
+    for (mem.uav, 0..) |d, i| {
+        switch (d.kind) {
+            .raw, .structured => {
+                const b = ssbo_base + n_ssbo;
+                n_ssbo += 1;
+                try appendFmt(&hdr, a, "layout(std430, binding = {d}) coherent buffer {s}u{d}B {{ uint {s}u{d}_d[]; }};\n", .{ b, prefix, i, prefix, i });
+                try blist.append(gpa, .{ .kind = .uav, .reg = @intCast(i), .binding = @intCast(b) });
+            },
+            .typed => {
+                const unit: u32 = @intCast(ilist.items.len);
+                const fmt_q: []const u8 = if (d.atomic) (if (d.ty == .i) "r32i, " else "r32ui, ") else "";
+                try appendFmt(&hdr, a, "layout({s}binding = {d}) uniform coherent {s} {s}img{d};\n", .{ fmt_q, unit, imgType(d), prefix, i });
+                try ilist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = d.dim, .atomic = d.atomic });
+            },
+            .none => {},
+        }
+        if (d.counter) {
+            const b = ssbo_base + n_ssbo;
+            n_ssbo += 1;
+            try appendFmt(&hdr, a, "layout(std430, binding = {d}) coherent buffer {s}u{d}C {{ uint {s}u{d}_n; }};\n", .{ b, prefix, i, prefix, i });
+            try blist.append(gpa, .{ .kind = .counter, .reg = @intCast(i), .binding = @intCast(b) });
+        }
+    }
+    for (mem.tgsm, 0..) |d, i| {
+        if (d.kind == .none) continue;
+        try appendFmt(&hdr, a, "shared uint g{d}[{d}];\n", .{ i, @max(1, d.words) });
+    }
+    if (stage == .compute) {
+        try appendFmt(&hdr, a, "layout(local_size_x = {d}, local_size_y = {d}, local_size_z = {d}) in;\n", .{ local_size[0], local_size[1], local_size[2] });
     }
 
     // A DXBC signature may pack several elements into one register (TEXCOORD0.xy +
@@ -1412,6 +1842,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
         .outputs = outputs,
         .cb_mask = cb_mask,
         .tex_bindings = try tlist.toOwnedSlice(gpa),
+        .buf_bindings = try blist.toOwnedSlice(gpa),
+        .img_bindings = try ilist.toOwnedSlice(gpa),
     };
 }
 

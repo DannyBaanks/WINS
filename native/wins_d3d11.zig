@@ -826,6 +826,8 @@ fn devCreateBuffer(_: ?*anyopaque, desc: *const D3D11_BUFFER_DESC, init_data: ?*
         .bind_flags = desc.BindFlags,
         .usage = desc.Usage,
         .cpu_access = desc.CPUAccessFlags,
+        .stride = desc.StructureByteStride,
+        .misc = desc.MiscFlags,
     };
     const p_mem: ?[*]const u8 = if (init_data) |id| (if (id.pSysMem) |m| @ptrCast(m) else null) else null;
     glb.createBuffer(b, p_mem);
@@ -996,6 +998,13 @@ fn devCreateSRV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_SHADER_RES
             v.first_mip = d.u0;
             v.num_mips = d.u1;
         }
+        // BUFFER (1) / BUFFEREX (11): FirstElement, NumElements (+ Flags, 1 = RAW).
+        if (r.buf) |b| if (d.ViewDimension == 1 or d.ViewDimension == 11) {
+            const raw = d.ViewDimension == 11 and (d.u2 & 1) != 0;
+            const elem = bufferElemBytes(b, d.Format, raw);
+            v.buf_off = d.u0 *% elem;
+            v.buf_size = d.u1 *% elem;
+        };
     }
     const o = newCom(&view_vtbl, .srv, @intFromPtr(v), g_device) orelse return E_FAIL;
     if (res) |ro| {
@@ -1009,16 +1018,54 @@ fn devCreateSRV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_SHADER_RES
     return S_OK;
 }
 
-fn devCreateUAV(_: ?*anyopaque, res: ?*anyopaque, _: ?*const anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
+/// Bytes per element of a buffer view: the structure stride for a structured
+/// buffer, 4 for a raw view, else the typed format's size.
+fn bufferElemBytes(b: *const glb.Buffer, fmt: u32, raw: bool) u32 {
+    if (raw) return 4;
+    if (fmt == 0 and b.stride > 0) return b.stride;
+    if ((b.misc & 0x40) != 0 and b.stride > 0) return b.stride;
+    return switch (fmt) {
+        1, 2, 3, 4 => 16,
+        5, 6, 7, 8 => 12,
+        9...22 => 8,
+        23...47 => 4,
+        48...59 => 2,
+        60...65 => 1,
+        else => 4,
+    };
+}
+
+const D3D11_UAV_DESC = extern struct { Format: u32, ViewDimension: u32, u0: u32, u1: u32, u2: u32 };
+
+fn devCreateUAV(_: ?*anyopaque, res: ?*anyopaque, desc_raw: ?*const anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
     const r = extractResTexture(res);
     const v = alloc.create(glb.View) catch return E_FAIL;
-    v.* = .{ .tex = r.tex, .buf = r.buf };
+    v.* = .{ .tex = r.tex, .buf = r.buf, .uav_dim = if (r.buf != null) 1 else 4 };
+    if (r.tex) |t| v.dxgi_fmt = t.dxgi_fmt;
+    var vd: [6]u32 = .{ v.dxgi_fmt, v.uav_dim, 0, 0, 0, 0 };
+    if (desc_raw) |dr| {
+        const d: *const D3D11_UAV_DESC = @ptrCast(@alignCast(dr));
+        vd = .{ d.Format, d.ViewDimension, d.u0, d.u1, d.u2, 0 };
+        if (d.Format != 0) v.dxgi_fmt = d.Format;
+        v.uav_dim = d.ViewDimension;
+        switch (d.ViewDimension) {
+            1 => if (r.buf) |b| { // BUFFER: FirstElement, NumElements, Flags
+                v.uav_flags = d.u2;
+                const elem = bufferElemBytes(b, d.Format, (d.u2 & 1) != 0);
+                v.buf_off = d.u0 *% elem;
+                v.buf_size = d.u1 *% elem;
+            },
+            2, 3, 4, 5, 8 => v.first_mip = d.u0, // MipSlice first in every texture dim
+            else => {},
+        }
+    }
     const o = newCom(&view_vtbl, .uav, @intFromPtr(v), g_device) orelse return E_FAIL;
     if (res) |ro| {
         o.view_res = @ptrCast(@alignCast(ro));
         _ = comAddRef(ro);
     }
+    o.view_desc = vd;
     pp.?.* = o;
     return S_OK;
 }
@@ -1138,6 +1185,19 @@ fn devCreatePixelShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*any
     sh.* = .{};
     _ = glb.createShader(sh, bc[0..bc_len], true);
     pp.?.* = newCom(&child_vtbl, .ps, @intFromPtr(sh), g_device);
+    return S_OK;
+}
+
+fn devCreateComputeShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
+    if (pp == null) return S_FALSE;
+    const sh = alloc.create(glb.Shader) catch return E_FAIL;
+    sh.* = .{};
+    _ = glb.createComputeShader(sh, bc[0..bc_len]);
+    if (std.c.getenv("WINS_D3D11_DUMP_DIR")) |dz| {
+        const n = dummy_shader_n.fetchAdd(1, .monotonic);
+        glb.dumpFile(std.mem.span(dz), 900000 + n, "cs.dxbc", bc[0..bc_len]);
+    }
+    pp.?.* = newCom(&child_vtbl, .vs, @intFromPtr(sh), g_device);
     return S_OK;
 }
 
@@ -1827,6 +1887,63 @@ fn ctxGetData(_: ?*anyopaque, q: ?*anyopaque, data: ?*anyopaque, sz: u32, _: u32
     return S_OK;
 }
 
+fn payloadOf(comptime T: type, raw: ?*anyopaque) ?*T {
+    const r = raw orelse return null;
+    const p = @as(*ComObj, @ptrCast(@alignCast(r))).payload;
+    return if (p == 0) null else @ptrFromInt(p);
+}
+
+fn ctxCSSetSRV(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= glb.MAX_SRV) break;
+        g_draw_state.cs_srv[s] = payloadOf(glb.View, if (pp) |arr| arr[i] else null);
+    }
+}
+
+fn ctxCSSetUAV(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque, counts: ?[*]const u32) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= g_draw_state.cs_uav.len) break;
+        const v = payloadOf(glb.View, if (pp) |arr| arr[i] else null);
+        g_draw_state.cs_uav[s] = v;
+        // An initial count of -1 keeps the current counter value.
+        if (v) |view| if (counts) |c| if (c[i] != 0xFFFFFFFF and (view.uav_flags & 6) != 0) {
+            view.counter_set = c[i];
+        };
+    }
+}
+
+fn ctxCSSetShader(_: ?*anyopaque, sh: ?*anyopaque, _: ?*const anyopaque, _: u32) callconv(W) void {
+    g_draw_state.cs = payloadOf(glb.Shader, sh);
+}
+
+fn ctxCSSetSamplers(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= 16) break;
+        g_draw_state.cs_samp[s] = payloadOf(glb.Sampler, if (pp) |arr| arr[i] else null);
+    }
+}
+
+fn ctxCSSetCB(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= 16) break;
+        g_draw_state.cs_cb[s] = payloadOf(glb.Buffer, if (pp) |arr| arr[i] else null);
+        g_draw_state.cs_cb_off[s] = 0;
+        g_draw_state.cs_cb_sz[s] = 0;
+    }
+}
+
+fn ctxGSSetShader(_: ?*anyopaque, sh: ?*anyopaque, _: ?*const anyopaque, _: u32) callconv(W) void {
+    g_draw_state.gs_active = sh != null;
+}
+
+fn ctxDispatch(_: ?*anyopaque, x: u32, y: u32, z: u32) callconv(W) void {
+    glb.dispatch(&g_draw_state, x, y, z);
+}
+
 fn ctxClearState(_: ?*anyopaque) callconv(W) void {
     g_draw_state = .{};
     g_bound = .{};
@@ -1943,7 +2060,7 @@ const device_vtbl = [_]?*const anyopaque{
     @ptrCast(&devCreatePixelShader), // 15
     @ptrCast(&devCreateDummyShader), // 16 HS
     @ptrCast(&devCreateDummyShader), // 17 DS
-    @ptrCast(&devCreateDummyShader), // 18 CS
+    @ptrCast(&devCreateComputeShader), // 18 CS
     notImplCreate("CreateClassLinkage", 1), // 19
     @ptrCast(&devCreateBlendState), // 20
     @ptrCast(&devCreateDepthStencilState), // 21
@@ -2001,7 +2118,7 @@ const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&ctxDrawIndexedInstanced), // 20
     @ptrCast(&ctxDrawInstanced), // 21
     iStub(22), // 22 GSSetConstantBuffers
-    iStub(23), // 23 GSSetShader
+    @ptrCast(&ctxGSSetShader), // 23
     @ptrCast(&ctxIASetTopology), // 24
     @ptrCast(&ctxVSSetSRV), // 25
     @ptrCast(&ctxVSSetSamplers), // 26
@@ -2019,7 +2136,7 @@ const context_vtbl = [_]?*const anyopaque{
     iStub(38), // 38 DrawAuto
     iStub(39), // 39 DrawIndexedInstancedIndirect
     iStub(40), // 40 DrawInstancedIndirect
-    iStub(41), // 41 Dispatch
+    @ptrCast(&ctxDispatch), // 41
     iStub(42), // 42 DispatchIndirect
     @ptrCast(&ctxRSSetState), // 43
     @ptrCast(&ctxRSSetViewports), // 44
@@ -2039,7 +2156,11 @@ const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&ctxExecuteCommandList), // 58
     iStub(59), iStub(60), iStub(61), iStub(62), // 59..62 HS
     iStub(63), iStub(64), iStub(65), iStub(66), // 63..66 DS
-    iStub(67), iStub(68), iStub(69), iStub(70), iStub(71), // 67..71 CS
+    @ptrCast(&ctxCSSetSRV), // 67
+    @ptrCast(&ctxCSSetUAV), // 68
+    @ptrCast(&ctxCSSetShader), // 69
+    @ptrCast(&ctxCSSetSamplers), // 70
+    @ptrCast(&ctxCSSetCB), // 71
 } ++ getterStubs: {
     var g: [38]?*const anyopaque = undefined;
     for (&g, 72..) |*e, i| e.* = iStub(i);
@@ -2249,6 +2370,11 @@ fn dVal(comptime f: anytype) *const anyopaque {
 fn dIASetVertexBuffers(raw: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque, strides: ?[*]const u32, offsets: ?[*]const u32) callconv(W) void {
     const r = recOf(raw);
     push(r, ctxIASetVertexBuffers, .{ raw, start, num, r.dupRefs(pp, num), r.dup(u32, strides, num), r.dup(u32, offsets, num) });
+}
+
+fn dCSSetUAV(raw: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque, counts: ?[*]const u32) callconv(W) void {
+    const r = recOf(raw);
+    push(r, ctxCSSetUAV, .{ raw, start, num, r.dupRefs(pp, num), r.dup(u32, counts, num) });
 }
 
 fn dOMSetRenderTargets(raw: ?*anyopaque, num: u32, pp: ?[*]const ?*anyopaque, dsv: ?*anyopaque) callconv(W) void {
@@ -2600,6 +2726,13 @@ const deferred_vtbl = blk: {
     v[54] = dObj1(ctxGenerateMips);
     v[57] = @ptrCast(&dResolveSubresource);
     v[58] = @ptrCast(&dExecuteCommandList);
+    v[23] = dSetShader(ctxGSSetShader);
+    v[41] = dVal(ctxDispatch);
+    v[67] = dSetArr(ctxCSSetSRV);
+    v[68] = @ptrCast(&dCSSetUAV);
+    v[69] = dSetShader(ctxCSSetShader);
+    v[70] = dSetArr(ctxCSSetSamplers);
+    v[71] = dSetArr(ctxCSSetCB);
     v[110] = dVal(ctxClearState);
     v[112] = @ptrCast(&dGetType);
     v[114] = @ptrCast(&dFinishCommandList);

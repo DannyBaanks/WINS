@@ -179,6 +179,12 @@ const Gl = struct {
     glCheckFramebufferStatus: *const fn (GLenum) callconv(.c) GLenum,
     glDrawBuffers: *const fn (GLsizei, [*]const GLenum) callconv(.c) void,
     glBlitFramebuffer: *const fn (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, c_uint, GLenum) callconv(.c) void,
+
+    // Compute / SM5 memory (GL 4.3)
+    glDispatchCompute: *const fn (GLuint, GLuint, GLuint) callconv(.c) void,
+    glMemoryBarrier: *const fn (c_uint) callconv(.c) void,
+    glBindImageTexture: *const fn (GLuint, GLuint, GLint, u8, GLint, GLenum, GLenum) callconv(.c) void,
+    glTexBufferRange: *const fn (GLenum, GLenum, GLuint, GLintptr, GLsizeiptr) callconv(.c) void,
 };
 
 const FnClipControl = *const fn (GLenum, GLenum) callconv(.c) void;
@@ -204,6 +210,9 @@ var g_copy_fbo_draw: GLuint = 0;
 pub const Buffer = struct {
     gl_id: GLuint = 0,
     size: u32 = 0,
+    /// D3D11_BUFFER_DESC StructureByteStride / MiscFlags (0x20 raw, 0x40 structured).
+    stride: u32 = 0,
+    misc: u32 = 0,
     bind_flags: u32 = 0,
     usage: u32 = 0,
     cpu_access: u32 = 0,
@@ -238,6 +247,17 @@ pub const View = struct {
     num_mips: u32 = 1,
     first_slice: u32 = 0,
     num_slices: u32 = 1,
+    /// Buffer views: byte range of the viewed elements.
+    buf_off: u32 = 0,
+    buf_size: u32 = 0,
+    /// UAV: D3D11_UAV_DIMENSION (0 = not a UAV) and buffer flags (1 raw, 2 append, 4 counter).
+    uav_dim: u32 = 0,
+    uav_flags: u32 = 0,
+    /// Typed buffer view as a GL buffer texture (created on first bind).
+    gl_tbo: GLuint = 0,
+    /// Append/consume counter (one uint GL buffer) and a pending initial count.
+    counter: GLuint = 0,
+    counter_set: ?u32 = null,
 };
 
 pub const Sampler = struct {
@@ -307,6 +327,13 @@ pub const MAX_SRV = shader.MAX_TEX;
 
 pub const Shader = struct {
     is_pixel: bool = false,
+    is_compute: bool = false,
+    /// Compute: linked program (0 = not yet / failed) and its resource bindings.
+    cs_linked: bool = false,
+    cs_prog: GLuint = 0,
+    cs_tex: []const shader.TexBinding = &.{},
+    cs_buf: []const shader.BufBinding = &.{},
+    cs_img: []const shader.ImgBinding = &.{},
     /// Unique per createShader: program cache key (heap addresses get reused).
     uid: u64 = 0,
     bytecode: []u8 = &.{},
@@ -360,6 +387,17 @@ pub const DrawState = struct {
     ps_srv: [MAX_SRV]?*View = [_]?*View{null} ** MAX_SRV,
     vs_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
     ps_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
+
+    /// A geometry shader is bound (GS is not translated: such draws are skipped).
+    gs_active: bool = false,
+
+    cs: ?*Shader = null,
+    cs_cb: [16]?*Buffer = [_]?*Buffer{null} ** 16,
+    cs_cb_off: [16]u32 = [_]u32{0} ** 16,
+    cs_cb_sz: [16]u32 = [_]u32{0} ** 16,
+    cs_srv: [MAX_SRV]?*View = [_]?*View{null} ** MAX_SRV,
+    cs_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
+    cs_uav: [shader.MAX_UAV]?*View = [_]?*View{null} ** shader.MAX_UAV,
 
     rtv: [8]?*View = [_]?*View{null} ** 8,
     num_rtvs: u32 = 0,
@@ -761,6 +799,8 @@ const LinkedProg = struct {
     prog: GLuint = 0,
     ps_tex_bindings: []const shader.TexBinding = &.{},
     vs_tex_bindings: []const shader.TexBinding = &.{},
+    ps_buf_bindings: []const shader.BufBinding = &.{},
+    vs_buf_bindings: []const shader.BufBinding = &.{},
 };
 
 var g_progs: std.AutoHashMapUnmanaged(ProgKey, LinkedProg) = .{};
@@ -840,6 +880,7 @@ fn linkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
 
     var gl_ps: GLuint = 0;
     var ps_tex: []const shader.TexBinding = &.{};
+    var ps_buf: []const shader.BufBinding = &.{};
     const trace_glsl = (getenv("WINS_D3D11_TRACE_DRAWS") != null);
     if (trace_glsl) {
         const S = struct { var n: u32 = 0; };
@@ -862,6 +903,7 @@ fn linkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
         }
         gl_ps = compileGlShader(0x8B30, tp.glsl, "PS");
         ps_tex = alloc.dupe(shader.TexBinding, tp.tex_bindings) catch &.{};
+        ps_buf = alloc.dupe(shader.BufBinding, tp.buf_bindings) catch &.{};
         tp.deinit(alloc);
         if (gl_ps == 0) return .{};
     } else {
@@ -887,7 +929,8 @@ fn linkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
     }
 
     const vs_tex = alloc.dupe(shader.TexBinding, tv.tex_bindings) catch &.{};
-    const res: LinkedProg = .{ .prog = prog, .ps_tex_bindings = ps_tex, .vs_tex_bindings = vs_tex };
+    const vs_buf = alloc.dupe(shader.BufBinding, tv.buf_bindings) catch &.{};
+    const res: LinkedProg = .{ .prog = prog, .ps_tex_bindings = ps_tex, .vs_tex_bindings = vs_tex, .ps_buf_bindings = ps_buf, .vs_buf_bindings = vs_buf };
     dumpProgram(prog, vs, ps, tv.glsl);
     g_progs.put(alloc, key, res) catch {};
     return res;
@@ -2057,6 +2100,8 @@ fn bindTextureSlots(bindings: []const shader.TexBinding, srvs: *const [MAX_SRV]?
         if (srvs[b.reg]) |rv| {
             if (rv.tex) |t| {
                 gl.glBindTexture(t.target, t.gl_id);
+            } else if (rv.buf != null and b.dim == .buf) {
+                gl.glBindTexture(0x8C2A, bufferTexture(rv)); // GL_TEXTURE_BUFFER
             } else {
                 gl.glBindTexture(0x0DE1, 0);
             }
@@ -2066,6 +2111,238 @@ fn bindTextureSlots(bindings: []const shader.TexBinding, srvs: *const [MAX_SRV]?
         const sid: GLuint = if (samps[b.samp]) |smp| smp.gl_id else 0;
         gl.glBindSampler(unit, sid);
     }
+}
+
+// ---- SM5 memory: buffer textures, storage blocks, images, compute -----------
+
+/// GL sized internal format for a typed buffer view (texture buffer / image
+/// buffer); integer formats included, unlike the texture table.
+fn bufferViewFormat(fmt: u32) GLenum {
+    return switch (fmt) {
+        2 => 0x8814, // RGBA32F
+        3 => 0x8D70, // RGBA32UI
+        4 => 0x8D82, // RGBA32I
+        6 => 0x8815, // RGB32F
+        7 => 0x8D71, // RGB32UI
+        8 => 0x8D83, // RGB32I
+        10 => 0x881A, // RGBA16F
+        11 => 0x805B, // RGBA16
+        12 => 0x8D76, // RGBA16UI
+        14 => 0x8D88, // RGBA16I
+        16 => 0x8230, // RG32F
+        17 => 0x823C, // RG32UI
+        18 => 0x823B, // RG32I
+        28 => 0x8058, // RGBA8
+        30 => 0x8D7C, // RGBA8UI
+        32 => 0x8D8E, // RGBA8I
+        34 => 0x822F, // RG16F
+        36 => 0x823A, // RG16UI
+        38 => 0x8239, // RG16I
+        41 => 0x822E, // R32F
+        42 => 0x8236, // R32UI
+        43 => 0x8235, // R32I
+        54 => 0x822D, // R16F
+        57 => 0x8234, // R16UI
+        59 => 0x8233, // R16I
+        61 => 0x8229, // R8
+        62 => 0x8232, // R8UI
+        64 => 0x8231, // R8I
+        else => 0x8236, // raw / unknown: R32UI words
+    };
+}
+
+/// The GL buffer texture of a typed buffer view, created on first use.
+fn bufferTexture(v: *View) GLuint {
+    if (v.gl_tbo != 0) return v.gl_tbo;
+    const b = v.buf orelse return 0;
+    gl.glGenTextures(1, &v.gl_tbo);
+    gl.glBindTexture(0x8C2A, v.gl_tbo);
+    const size = if (v.buf_size > 0) @min(v.buf_size, b.size -| v.buf_off) else b.size -| v.buf_off;
+    gl.glTexBufferRange(0x8C2A, bufferViewFormat(v.dxgi_fmt), b.gl_id, @intCast(v.buf_off), @intCast(@max(4, size)));
+    return v.gl_tbo;
+}
+
+var g_ssbo_align: u32 = 0;
+var g_zero_buf: GLuint = 0;
+
+/// Bound to storage blocks whose t#/u# slot is empty: unbound SSBO access is
+/// undefined in GL, D3D reads zeros.
+fn zeroBuffer() GLuint {
+    if (g_zero_buf == 0) {
+        gl.glGenBuffers(1, &g_zero_buf);
+        gl.glBindBuffer(0x90D2, g_zero_buf);
+        const z = alloc.alloc(u8, 65536) catch return 0;
+        defer alloc.free(z);
+        @memset(z, 0);
+        gl.glBufferData(0x90D2, 65536, z.ptr, 0x88E4);
+        gl.glBindBuffer(0x90D2, 0);
+    }
+    return g_zero_buf;
+}
+
+fn counterBuffer(v: *View) GLuint {
+    if (v.counter == 0) {
+        gl.glGenBuffers(1, &v.counter);
+        gl.glBindBuffer(0x90D2, v.counter);
+        const zero: u32 = 0;
+        gl.glBufferData(0x90D2, 4, &zero, 0x88E8);
+        gl.glBindBuffer(0x90D2, 0);
+    }
+    if (v.counter_set) |n| {
+        gl.glBindBuffer(0x90D2, v.counter);
+        gl.glBufferSubData(0x90D2, 0, 4, &n);
+        gl.glBindBuffer(0x90D2, 0);
+        v.counter_set = null;
+    }
+    return v.counter;
+}
+
+fn bindSsbo(binding: GLuint, v: ?*View) void {
+    const GL_SSBO: GLenum = 0x90D2;
+    const view = v orelse return gl.glBindBufferBase(GL_SSBO, binding, zeroBuffer());
+    const b = view.buf orelse return gl.glBindBufferBase(GL_SSBO, binding, zeroBuffer());
+    if (g_ssbo_align == 0) {
+        var al: GLint = 0;
+        gl.glGetIntegerv(0x90DF, &al); // GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT
+        g_ssbo_align = @intCast(@max(1, al));
+    }
+    const size = if (view.buf_size > 0) @min(view.buf_size, b.size -| view.buf_off) else b.size -| view.buf_off;
+    if (view.buf_off == 0 and size == b.size) {
+        gl.glBindBufferBase(GL_SSBO, binding, b.gl_id);
+    } else if (view.buf_off % g_ssbo_align == 0 and size > 0) {
+        gl.glBindBufferRange(GL_SSBO, binding, b.gl_id, @intCast(view.buf_off), @intCast(size));
+    } else {
+        // Unaligned first element: the shader would index from the buffer start.
+        const S = struct { var told = false; };
+        if (!S.told) {
+            S.told = true;
+            std.debug.print("[WINS:D3D11:GL] buffer view offset {d} not {d}-aligned: bound from 0\n", .{ view.buf_off, g_ssbo_align });
+        }
+        gl.glBindBufferBase(GL_SSBO, binding, b.gl_id);
+    }
+}
+
+fn bindBufSlots(bindings: []const shader.BufBinding, srvs: *const [MAX_SRV]?*View, uavs: ?*const [shader.MAX_UAV]?*View) void {
+    for (bindings) |b| {
+        switch (b.kind) {
+            .srv => bindSsbo(b.binding, srvs[b.reg]),
+            .uav => bindSsbo(b.binding, if (uavs) |u| u[b.reg] else null),
+            .counter => {
+                const v = if (uavs) |u| u[b.reg] else null;
+                if (v) |view| {
+                    gl.glBindBufferBase(0x90D2, b.binding, counterBuffer(view));
+                } else gl.glBindBufferBase(0x90D2, b.binding, zeroBuffer());
+            },
+        }
+    }
+}
+
+/// Image-compatible internal format for a texture bound as a typed UAV.
+fn imageFormat(internal: GLint) GLenum {
+    return switch (internal) {
+        0x8C43 => 0x8058, // SRGB8_ALPHA8 -> RGBA8
+        else => @intCast(internal),
+    };
+}
+
+fn bindImageSlots(bindings: []const shader.ImgBinding, uavs: *const [shader.MAX_UAV]?*View) void {
+    const GL_READ_WRITE: GLenum = 0x88BA;
+    for (bindings) |ib| {
+        const v = uavs[ib.reg] orelse {
+            gl.glBindImageTexture(ib.unit, 0, 0, 0, 0, GL_READ_WRITE, 0x8058);
+            continue;
+        };
+        if (v.tex) |t| {
+            const fmt: GLenum = if (ib.atomic) 0x8236 else imageFormat(dxgiToGlFormat(t.dxgi_fmt).internal);
+            // 2D array, 3D, 1D array, cube, cube array bind every layer.
+            const layered: u8 = switch (t.target) { 0x8C1A, 0x806F, 0x8C18, 0x9009, 0x8513 => 1, else => 0 };
+            gl.glBindImageTexture(ib.unit, t.gl_id, @intCast(v.first_mip), layered, 0, GL_READ_WRITE, fmt);
+        } else if (v.buf != null) {
+            const fmt: GLenum = if (ib.atomic) 0x8236 else bufferViewFormat(v.dxgi_fmt);
+            gl.glBindImageTexture(ib.unit, bufferTexture(v), 0, 0, 0, GL_READ_WRITE, fmt);
+        }
+    }
+}
+
+pub fn createComputeShader(sh: *Shader, bytes: []const u8) bool {
+    sh.is_compute = true;
+    sh.uid = g_shader_uid.fetchAdd(1, .monotonic) + 1;
+    sh.bytecode = alloc.dupe(u8, bytes) catch return false;
+    return true;
+}
+
+/// Translate + compile + link a compute shader once (a failure is remembered).
+fn linkCompute(sh: *Shader) void {
+    if (sh.cs_linked) return;
+    sh.cs_linked = true;
+    var tr = shader.translate(alloc, sh.bytecode) catch |e| {
+        std.debug.print("[WINS:D3D11:GL] CS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
+        return;
+    };
+    defer tr.deinit(alloc);
+    const cs = compileGlShader(0x91B9, tr.glsl, "CS"); // GL_COMPUTE_SHADER
+    if (cs == 0) return;
+    defer gl.glDeleteShader(cs);
+    const prog = gl.glCreateProgram();
+    gl.glAttachShader(prog, cs);
+    gl.glLinkProgram(prog);
+    var ok: GLint = 0;
+    gl.glGetProgramiv(prog, 0x8B82, &ok);
+    if (ok == 0) {
+        var log_buf: [2048]u8 = undefined;
+        var n: GLsizei = 0;
+        gl.glGetProgramInfoLog(prog, log_buf.len, &n, &log_buf);
+        std.debug.print("[WINS:D3D11:GL] CS link FAIL:\n{s}\n", .{log_buf[0..@intCast(@max(0, n))]});
+        gl.glDeleteProgram(prog);
+        return;
+    }
+    sh.cs_prog = prog;
+    sh.cs_tex = alloc.dupe(shader.TexBinding, tr.tex_bindings) catch &.{};
+    sh.cs_buf = alloc.dupe(shader.BufBinding, tr.buf_bindings) catch &.{};
+    sh.cs_img = alloc.dupe(shader.ImgBinding, tr.img_bindings) catch &.{};
+    if (getenv("WINS_D3D11_DUMP_DIR")) |dz| dumpFile(std.mem.span(dz), prog, "cs.glsl", tr.glsl);
+}
+
+const DispatchJob = struct { s: *DrawState, x: u32, y: u32, z: u32 };
+pub var g_dispatch_count: u32 = 0;
+
+fn dispatchJob(raw: ?*anyopaque) void {
+    const j: *DispatchJob = @ptrCast(@alignCast(raw.?));
+    const s = j.s;
+    const cs = s.cs orelse return;
+    linkCompute(cs);
+    if (cs.cs_prog == 0) return;
+    g_dispatch_count += 1;
+    gl.glUseProgram(cs.cs_prog);
+    for (0..16) |i| {
+        const cb = s.cs_cb[i] orelse continue;
+        const off = s.cs_cb_off[i] * 16;
+        const sz = if (s.cs_cb_sz[i] > 0) @min(cb.size -| off, s.cs_cb_sz[i] * 16) else (cb.size -| off);
+        if (off > 0 and sz > 0) {
+            gl.glBindBufferRange(0x8A11, @intCast(i), cb.gl_id, @intCast(off), @intCast(sz));
+        } else {
+            gl.glBindBufferBase(0x8A11, @intCast(i), cb.gl_id);
+        }
+    }
+    bindTextureSlots(cs.cs_tex, &s.cs_srv, &s.cs_samp);
+    bindBufSlots(cs.cs_buf, &s.cs_srv, &s.cs_uav);
+    bindImageSlots(cs.cs_img, &s.cs_uav);
+    gl.glDispatchCompute(j.x, j.y, j.z);
+    // D3D11 orders every Dispatch against what follows; GL needs explicit barriers.
+    gl.glMemoryBarrier(0xFFFFFFFF);
+    if (g_err_logged < 32) {
+        const e = gl.glGetError();
+        if (e != 0) {
+            g_err_logged += 1;
+            std.debug.print("[WINS:D3D11:GL] Dispatch({d},{d},{d}) glError 0x{x}\n", .{ j.x, j.y, j.z, e });
+        }
+    }
+}
+
+pub fn dispatch(s: *DrawState, x: u32, y: u32, z: u32) void {
+    if (x == 0 or y == 0 or z == 0) return;
+    var j: DispatchJob = .{ .s = s, .x = x, .y = y, .z = z };
+    run(&dispatchJob, &j);
 }
 
 fn drawJob(raw: ?*anyopaque) void {
@@ -2180,6 +2457,9 @@ fn drawJob(raw: ?*anyopaque) void {
     // Textures & Samplers
     bindTextureSlots(lp.ps_tex_bindings, &s.ps_srv, &s.ps_samp);
     bindTextureSlots(lp.vs_tex_bindings, &s.vs_srv, &s.vs_samp);
+    // Raw/structured SRVs (UAVs in VS/PS are not bound yet: OMSetRenderTargetsAndUAVs)
+    bindBufSlots(lp.ps_buf_bindings, &s.ps_srv, null);
+    bindBufSlots(lp.vs_buf_bindings, &s.vs_srv, null);
 
     // Input Layout + Vertex Buffers on Default VAO
     var new_mask: u32 = 0;
@@ -2390,7 +2670,18 @@ fn drawJob(raw: ?*anyopaque) void {
     }
 }
 
+pub var g_skipped_stage_draws: u32 = 0;
+
 pub fn draw(s: *const DrawState, kind: DrawKind, count: u32, inst_count: u32, start_vertex: u32, start_index: u32, base_vertex: i32, start_instance: u32) void {
+    // Tessellation (patch-list topologies 33..64) and geometry shaders are not
+    // translated: the VS output is not clip-space geometry then, so drawing it
+    // as triangles only scribbles over the targets. Skip those draws.
+    if (s.topology >= 33 or s.gs_active) {
+        g_skipped_stage_draws += 1;
+        if (g_skipped_stage_draws == 1 or g_skipped_stage_draws % 10000 == 0)
+            std.debug.print("[WINS:D3D11:GL] {d} draws skipped (tessellation/GS not translated)\n", .{g_skipped_stage_draws});
+        return;
+    }
     g_draw_count += 1;
     var j: DrawJob = .{
         .s = s, .kind = kind, .count = count, .inst_count = inst_count,
