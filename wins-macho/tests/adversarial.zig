@@ -478,3 +478,47 @@ test "abi: darwin setjmp/longjmp, qsort_r (bsd arg order), xsi strerror_r, sigse
     try std.testing.expectEqual(@as(c_int, 1), shims.shim_sigismember(&mask, 15));
     try std.testing.expectEqual(@as(c_int, 0), shims.shim_sigismember(&mask, 2));
 }
+
+var test_shared_weak_freed: usize = 0;
+fn testSharedOnZeroWeak(self: *wins_macho.libcxx.SharedWeakCount) callconv(.c) void {
+    _ = self;
+    test_shared_weak_freed += 1;
+}
+
+test "libcxx: Darwin ABI v1 std::string SSO/long, shared_weak_count, mutex+cv, system_clock" {
+    const libcxx = wins_macho.libcxx;
+
+    // 1. Short SSO string (<= 22 bytes)
+    var s: libcxx.LibcxxString = .{ .raw = .{0} ** 24 };
+    _ = libcxx.shim_string_assign_cstr(&s, "wins-macho");
+    try std.testing.expect(!s.isLong());
+    try std.testing.expectEqualStrings("wins-macho", s.slice());
+
+    // 2. Long heap string (> 22 bytes) + substring ctor
+    _ = libcxx.shim_string_assign_cstr(&s, "0123456789abcdefghijklmnopqrstuvwxyz");
+    try std.testing.expect(s.isLong());
+    try std.testing.expectEqualStrings("0123456789abcdefghijklmnopqrstuvwxyz", s.slice());
+
+    var sub: libcxx.LibcxxString = .{ .raw = .{0} ** 24 };
+    libcxx.shim_string_ctor_substr(&sub, &s, 10, 6, null);
+    try std.testing.expect(!sub.isLong());
+    try std.testing.expectEqualStrings("abcdef", sub.slice());
+    libcxx.shim_string_dtor(&sub);
+    libcxx.shim_string_dtor(&s);
+
+    // 3. __shared_weak_count atomic weak release calls vtable[4]
+    test_shared_weak_freed = 0;
+    const vt = [5]usize{ 0, 0, 0, 0, @intFromPtr(&testSharedOnZeroWeak) };
+    var swc = libcxx.SharedWeakCount{
+        .vtable = &vt,
+        .shared_owners = -1,
+        .shared_weak_owners = 1,
+    };
+    libcxx.shim_shared_weak_count_release_weak(&swc);
+    try std.testing.expectEqual(@as(usize, 0), test_shared_weak_freed);
+    libcxx.shim_shared_weak_count_release_weak(&swc);
+    try std.testing.expectEqual(@as(usize, 1), test_shared_weak_freed);
+
+    // 4. system_clock::now() returns positive epoch microseconds
+    try std.testing.expect(libcxx.shim_system_clock_now() > 1_700_000_000_000_000);
+}

@@ -13,6 +13,7 @@ pub const objc = @import("darwin/objc.zig");
 pub const foundation = @import("darwin/foundation.zig");
 pub const swift = @import("darwin/swift.zig");
 pub const dispatch = @import("darwin/dispatch.zig");
+pub const libcxx = @import("darwin/libcxx.zig");
 pub const trace = @import("runtime/trace.zig");
 pub const signals = @import("runtime/signals.zig");
 pub const evidence = @import("runtime/evidence.zig");

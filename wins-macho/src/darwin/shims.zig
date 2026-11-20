@@ -5,6 +5,7 @@ const objc_shim = @import("objc.zig");
 const foundation = @import("foundation.zig");
 const swift_shim = @import("swift.zig");
 const dispatch_shim = @import("dispatch.zig");
+const libcxx = @import("libcxx.zig");
 const c_pwd = @cImport({
     @cInclude("pwd.h");
 });
@@ -653,25 +654,42 @@ fn shim_getpid() callconv(.c) c_int {
     return getpid();
 }
 
+const MachoAtexitEntry = struct {
+    fn_noarg: ?*const fn () callconv(.c) void = null,
+    fn_cxa: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    arg: ?*anyopaque = null,
+};
+
 var macho_atexit_mutex: [64]u8 align(8) = .{0} ** 64;
-var macho_atexit_fns: std.ArrayListUnmanaged(*const fn () callconv(.c) void) = .empty;
+var macho_atexit_fns: std.ArrayListUnmanaged(MachoAtexitEntry) = .empty;
 
 fn shim_atexit(func: ?*const fn () callconv(.c) void) callconv(.c) c_int {
     record("_atexit");
     const f = func orelse return -1;
     _ = pthread_mutex_lock(&macho_atexit_mutex);
     defer _ = pthread_mutex_unlock(&macho_atexit_mutex);
-    macho_atexit_fns.append(std.heap.c_allocator, f) catch return -1;
+    macho_atexit_fns.append(std.heap.c_allocator, .{ .fn_noarg = f }) catch return -1;
+    return 0;
+}
+
+pub fn shim_cxa_atexit(func: ?*const fn (?*anyopaque) callconv(.c) void, arg: ?*anyopaque, dso_handle: ?*anyopaque) callconv(.c) c_int {
+    _ = dso_handle;
+    record("___cxa_atexit");
+    const f = func orelse return -1;
+    _ = pthread_mutex_lock(&macho_atexit_mutex);
+    defer _ = pthread_mutex_unlock(&macho_atexit_mutex);
+    macho_atexit_fns.append(std.heap.c_allocator, .{ .fn_cxa = f, .arg = arg }) catch return -1;
     return 0;
 }
 
 pub fn runMachoAtexitHandlers() void {
     while (true) {
         _ = pthread_mutex_lock(&macho_atexit_mutex);
-        const f_opt = macho_atexit_fns.pop();
+        const e_opt = macho_atexit_fns.pop();
         _ = pthread_mutex_unlock(&macho_atexit_mutex);
-        const f = f_opt orelse break;
-        f();
+        const e = e_opt orelse break;
+        if (e.fn_noarg) |f| f();
+        if (e.fn_cxa) |f| f(e.arg);
     }
 }
 
@@ -739,27 +757,30 @@ fn shim_pthread_mutex_init(mutex: *anyopaque, attr: ?*const anyopaque) callconv(
 
 var darwin_static_mutex_init_lock: [64]u8 align(8) = .{0} ** 64;
 
-fn shim_pthread_mutex_lock(mutex: *anyopaque) callconv(.c) c_int {
+pub fn shim_pthread_mutex_lock(mutex: *anyopaque) callconv(.c) c_int {
     record("_pthread_mutex_lock");
     // Handle Darwin static PTHREAD_MUTEX_INITIALIZER (0x32AAABA7) race-free
     const sig_ptr: *u32 = @ptrCast(@alignCast(mutex));
     if (@atomicLoad(u32, sig_ptr, .acquire) == 0x32AAABA7) {
         _ = pthread_mutex_lock(&darwin_static_mutex_init_lock);
         if (@atomicLoad(u32, sig_ptr, .monotonic) == 0x32AAABA7) {
-            @as(*[64]u8, @ptrCast(mutex)).* = .{0} ** 64;
-            _ = pthread_mutex_init(mutex, null);
+            var tmp: [64]u8 align(8) = .{0} ** 64;
+            _ = pthread_mutex_init(&tmp, null);
+            const dst: *[64]u8 = @ptrCast(mutex);
+            @memcpy(dst[4..64], tmp[4..64]);
+            @atomicStore(u32, sig_ptr, std.mem.readInt(u32, tmp[0..4], .little), .release);
         }
         _ = pthread_mutex_unlock(&darwin_static_mutex_init_lock);
     }
     return pthread_mutex_lock(mutex);
 }
 
-fn shim_pthread_mutex_unlock(mutex: *anyopaque) callconv(.c) c_int {
+pub fn shim_pthread_mutex_unlock(mutex: *anyopaque) callconv(.c) c_int {
     record("_pthread_mutex_unlock");
     return pthread_mutex_unlock(mutex);
 }
 
-fn shim_pthread_mutex_destroy(mutex: *anyopaque) callconv(.c) c_int {
+pub fn shim_pthread_mutex_destroy(mutex: *anyopaque) callconv(.c) c_int {
     record("_pthread_mutex_destroy");
     return pthread_mutex_destroy(mutex);
 }
@@ -1082,6 +1103,28 @@ fn shim_pthread_getspecific(key: usize) callconv(.c) ?*anyopaque {
 
 fn shim_pthread_setspecific(key: usize, value: ?*const anyopaque) callconv(.c) c_int {
     return pthread_setspecific(@truncate(key), value);
+}
+
+fn shim_pthread_mach_thread_np(tid: usize) callconv(.c) u32 {
+    record("_pthread_mach_thread_np");
+    const h: u32 = @truncate(tid ^ (tid >> 32));
+    return if (h == 0) 1 else h;
+}
+
+fn shim_aligned_alloc(alignment: usize, size: usize) callconv(.c) ?*anyopaque {
+    record("_aligned_alloc");
+    if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
+        __errno_location().* = 22; // EINVAL
+        return null;
+    }
+    const eff_align = @max(alignment, @sizeOf(usize));
+    var ptr: ?*anyopaque = null;
+    const rc = posix_memalign(&ptr, eff_align, @max(size, 1));
+    if (rc != 0) {
+        __errno_location().* = rc;
+        return null;
+    }
+    return ptr;
 }
 
 fn shim_pathconf(path: [*:0]const u8, darwin_name: c_int) callconv(.c) c_long {
@@ -1498,37 +1541,41 @@ fn ensureCondInit(cond: *anyopaque) void {
     if (@atomicLoad(u32, sig_ptr, .acquire) == 0x3CB0B1BB) {
         _ = pthread_mutex_lock(&darwin_static_cond_init_lock);
         if (@atomicLoad(u32, sig_ptr, .monotonic) == 0x3CB0B1BB) {
-            @as(*[64]u8, @ptrCast(cond)).* = .{0} ** 64;
-            _ = pthread_cond_init(cond, null);
+            // Both Darwin pthread_cond_t and Linux glibc pthread_cond_t are 48 bytes.
+            var tmp: [48]u8 align(8) = .{0} ** 48;
+            _ = pthread_cond_init(&tmp, null);
+            const dst: *[48]u8 = @ptrCast(cond);
+            @memcpy(dst[4..48], tmp[4..48]);
+            @atomicStore(u32, sig_ptr, std.mem.readInt(u32, tmp[0..4], .little), .release);
         }
         _ = pthread_mutex_unlock(&darwin_static_cond_init_lock);
     }
 }
 
-fn shim_pthread_cond_init(cond: *anyopaque, attr: ?*const anyopaque) callconv(.c) c_int {
+pub fn shim_pthread_cond_init(cond: *anyopaque, attr: ?*const anyopaque) callconv(.c) c_int {
     _ = attr;
     record("_pthread_cond_init");
     return pthread_cond_init(cond, null);
 }
 
-fn shim_pthread_cond_destroy(cond: *anyopaque) callconv(.c) c_int {
+pub fn shim_pthread_cond_destroy(cond: *anyopaque) callconv(.c) c_int {
     record("_pthread_cond_destroy");
     return pthread_cond_destroy(cond);
 }
 
-fn shim_pthread_cond_wait(cond: *anyopaque, mutex: *anyopaque) callconv(.c) c_int {
+pub fn shim_pthread_cond_wait(cond: *anyopaque, mutex: *anyopaque) callconv(.c) c_int {
     record("_pthread_cond_wait");
     ensureCondInit(cond);
     return pthread_cond_wait(cond, mutex);
 }
 
-fn shim_pthread_cond_signal(cond: *anyopaque) callconv(.c) c_int {
+pub fn shim_pthread_cond_signal(cond: *anyopaque) callconv(.c) c_int {
     record("_pthread_cond_signal");
     ensureCondInit(cond);
     return pthread_cond_signal(cond);
 }
 
-fn shim_pthread_cond_broadcast(cond: *anyopaque) callconv(.c) c_int {
+pub fn shim_pthread_cond_broadcast(cond: *anyopaque) callconv(.c) c_int {
     record("_pthread_cond_broadcast");
     ensureCondInit(cond);
     return pthread_cond_broadcast(cond);
@@ -1887,6 +1934,7 @@ fn shim_dyld_stub_binder() callconv(.c) noreturn {
 pub fn lookup(symbol: []const u8) ?ShimEntry {
     initGlobals();
     foundation.ensureInitialized();
+    libcxx.ensureInitialized();
     const table = [_]ShimEntry{
         .{ .darwin_symbol = "_write", .linux_equiv = "libc:write", .status = .THIN_SHIM, .address = @intFromPtr(&shim_write) },
         .{ .darwin_symbol = "_read", .linux_equiv = "libc:read", .status = .THIN_SHIM, .address = @intFromPtr(&shim_read) },
@@ -1981,6 +2029,67 @@ pub fn lookup(symbol: []const u8) ?ShimEntry {
         .{ .darwin_symbol = "_memmem", .linux_equiv = "libc:memmem", .status = .NATIVE_MAPPING, .address = @intFromPtr(&memmem) },
         .{ .darwin_symbol = "_dirname", .linux_equiv = "libc:dirname", .status = .NATIVE_MAPPING, .address = @intFromPtr(&dirname) },
         .{ .darwin_symbol = "_atexit", .linux_equiv = "runtime:macho_atexit", .status = .REIMPLEMENTED, .address = @intFromPtr(&shim_atexit) },
+        .{ .darwin_symbol = "___cxa_atexit", .linux_equiv = "runtime:macho_cxa_atexit", .status = .REIMPLEMENTED, .address = @intFromPtr(&shim_cxa_atexit) },
+        .{ .darwin_symbol = "__Znwm", .linux_equiv = "libcxx:operator_new", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_operator_new) },
+        .{ .darwin_symbol = "__Znam", .linux_equiv = "libcxx:operator_new_array", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_operator_new_array) },
+        .{ .darwin_symbol = "__ZdlPv", .linux_equiv = "libcxx:operator_delete", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_operator_delete) },
+        .{ .darwin_symbol = "__ZdaPv", .linux_equiv = "libcxx:operator_delete_array", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_operator_delete_array) },
+        .{ .darwin_symbol = "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev", .linux_equiv = "libcxx:string_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_string_dtor) },
+        .{ .darwin_symbol = "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc", .linux_equiv = "libcxx:string_assign", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_string_assign_cstr) },
+        .{ .darwin_symbol = "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_mmRKS4_", .linux_equiv = "libcxx:string_substr_ctor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_string_ctor_substr) },
+        .{ .darwin_symbol = "__ZNSt3__15mutex4lockEv", .linux_equiv = "libcxx:mutex_lock", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_mutex_lock) },
+        .{ .darwin_symbol = "__ZNSt3__15mutex6unlockEv", .linux_equiv = "libcxx:mutex_unlock", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_mutex_unlock) },
+        .{ .darwin_symbol = "__ZNSt3__15mutexD1Ev", .linux_equiv = "libcxx:mutex_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_mutex_dtor) },
+        .{ .darwin_symbol = "__ZNSt3__118condition_variable4waitERNS_11unique_lockINS_5mutexEEE", .linux_equiv = "libcxx:cv_wait", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_cv_wait) },
+        .{ .darwin_symbol = "__ZNSt3__118condition_variable10notify_oneEv", .linux_equiv = "libcxx:cv_notify_one", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_cv_notify_one) },
+        .{ .darwin_symbol = "__ZNSt3__118condition_variable10notify_allEv", .linux_equiv = "libcxx:cv_notify_all", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_cv_notify_all) },
+        .{ .darwin_symbol = "__ZNSt3__118condition_variableD1Ev", .linux_equiv = "libcxx:cv_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_cv_dtor) },
+        .{ .darwin_symbol = "__ZNSt3__16thread4joinEv", .linux_equiv = "libcxx:thread_join", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_thread_join) },
+        .{ .darwin_symbol = "__ZNSt3__16threadD1Ev", .linux_equiv = "libcxx:thread_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_thread_dtor) },
+        .{ .darwin_symbol = "__ZNSt3__16thread20hardware_concurrencyEv", .linux_equiv = "libcxx:thread_hw_concurrency", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_thread_hardware_concurrency) },
+        .{ .darwin_symbol = "__ZNSt3__115__thread_structC1Ev", .linux_equiv = "libcxx:thread_struct_ctor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_thread_struct_ctor) },
+        .{ .darwin_symbol = "__ZNSt3__115__thread_structD1Ev", .linux_equiv = "libcxx:thread_struct_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_thread_struct_dtor) },
+        .{ .darwin_symbol = "__ZNSt3__119__thread_local_dataEv", .linux_equiv = "libcxx:thread_local_data", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_thread_local_data) },
+        .{ .darwin_symbol = "__ZNSt3__119__shared_weak_count14__release_weakEv", .linux_equiv = "libcxx:shared_weak_release", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_shared_weak_count_release_weak) },
+        .{ .darwin_symbol = "__ZNSt3__119__shared_weak_countD2Ev", .linux_equiv = "libcxx:shared_weak_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_shared_weak_count_dtor) },
+        .{ .darwin_symbol = "__ZNKSt3__119__shared_weak_count13__get_deleterERKSt9type_info", .linux_equiv = "libcxx:shared_weak_get_deleter", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_shared_weak_count_get_deleter) },
+        .{ .darwin_symbol = "__ZNSt3__16chrono12system_clock3nowEv", .linux_equiv = "libcxx:system_clock_now", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_system_clock_now) },
+        .{ .darwin_symbol = "__ZNSt3__115system_categoryEv", .linux_equiv = "libcxx:system_category", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_system_category) },
+        .{ .darwin_symbol = "__ZNSt3__116generic_categoryEv", .linux_equiv = "libcxx:generic_category", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_generic_category) },
+        .{ .darwin_symbol = "__ZNSt3__120__throw_system_errorEiPKc", .linux_equiv = "libcxx:throw_system_error", .status = .THIN_SHIM, .address = @intFromPtr(&libcxx.shim_throw_system_error) },
+        .{ .darwin_symbol = "__ZSt9terminatev", .linux_equiv = "libcxx:terminate", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_terminate) },
+        .{ .darwin_symbol = "__ZNSt9exceptionD2Ev", .linux_equiv = "libcxx:exception_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_exception_dtor) },
+        .{ .darwin_symbol = "__ZNKSt9exception4whatEv", .linux_equiv = "libcxx:exception_what", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_exception_what) },
+        .{ .darwin_symbol = "__ZNSt11logic_errorC2EPKc", .linux_equiv = "libcxx:logic_error_ctor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_logic_error_ctor) },
+        .{ .darwin_symbol = "__ZNSt12out_of_rangeD1Ev", .linux_equiv = "libcxx:out_of_range_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_exception_dtor) },
+        .{ .darwin_symbol = "__ZNSt12length_errorD1Ev", .linux_equiv = "libcxx:length_error_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_exception_dtor) },
+        .{ .darwin_symbol = "__ZNSt20bad_array_new_lengthC1Ev", .linux_equiv = "libcxx:bad_array_new_length_ctor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_bad_array_new_length_ctor) },
+        .{ .darwin_symbol = "__ZNSt20bad_array_new_lengthD1Ev", .linux_equiv = "libcxx:bad_array_new_length_dtor", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_exception_dtor) },
+        .{ .darwin_symbol = "__ZTVSt12out_of_range", .linux_equiv = "libcxx:vtable_out_of_range", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.vtable_out_of_range) },
+        .{ .darwin_symbol = "__ZTVSt12length_error", .linux_equiv = "libcxx:vtable_length_error", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.vtable_length_error) },
+        .{ .darwin_symbol = "__ZTVN10__cxxabiv117__class_type_infoE", .linux_equiv = "libcxx:vtable_class_ti", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.vtable_class_type_info) },
+        .{ .darwin_symbol = "__ZTVN10__cxxabiv120__si_class_type_infoE", .linux_equiv = "libcxx:vtable_si_class_ti", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.vtable_si_class_type_info) },
+        .{ .darwin_symbol = "__ZTISt9exception", .linux_equiv = "libcxx:ti_exception", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.ti_exception) },
+        .{ .darwin_symbol = "__ZTINSt3__119__shared_weak_countE", .linux_equiv = "libcxx:ti_shared_weak_count", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.ti_shared_weak_count) },
+        .{ .darwin_symbol = "__ZTISt12out_of_range", .linux_equiv = "libcxx:ti_out_of_range", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.ti_out_of_range) },
+        .{ .darwin_symbol = "__ZTISt12length_error", .linux_equiv = "libcxx:ti_length_error", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.ti_length_error) },
+        .{ .darwin_symbol = "__ZTISt20bad_array_new_length", .linux_equiv = "libcxx:ti_bad_array_new_length", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.ti_bad_array_new_length) },
+        .{ .darwin_symbol = "___cxa_allocate_exception", .linux_equiv = "libcxxabi:cxa_alloc_exc", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_cxa_allocate_exception) },
+        .{ .darwin_symbol = "___cxa_free_exception", .linux_equiv = "libcxxabi:cxa_free_exc", .status = .REIMPLEMENTED, .address = @intFromPtr(&libcxx.shim_cxa_free_exception) },
+        .{ .darwin_symbol = "___cxa_throw", .linux_equiv = "libcxxabi:cxa_throw_abort", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_cxa_throw) },
+        .{ .darwin_symbol = "___cxa_begin_catch", .linux_equiv = "libcxxabi:cxa_begin_catch", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_cxa_begin_catch) },
+        .{ .darwin_symbol = "___cxa_end_catch", .linux_equiv = "libcxxabi:cxa_end_catch", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_cxa_end_catch) },
+        .{ .darwin_symbol = "___cxa_rethrow", .linux_equiv = "libcxxabi:cxa_rethrow_abort", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_cxa_rethrow) },
+        .{ .darwin_symbol = "___gxx_personality_v0", .linux_equiv = "libcxxabi:personality_stub", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_gxx_personality_v0) },
+        .{ .darwin_symbol = "__Unwind_Resume", .linux_equiv = "libunwind:resume_abort", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_unwind_resume) },
+        .{ .darwin_symbol = "__Unwind_RaiseException", .linux_equiv = "libunwind:raise_stub", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_unwind_raise_exception) },
+        .{ .darwin_symbol = "__Unwind_GetIP", .linux_equiv = "libunwind:get_ip_stub", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_unwind_get_ip) },
+        .{ .darwin_symbol = "__Unwind_SetIP", .linux_equiv = "libunwind:set_ip_stub", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_unwind_set_ip) },
+        .{ .darwin_symbol = "__Unwind_SetGR", .linux_equiv = "libunwind:set_gr_stub", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_unwind_set_gr) },
+        .{ .darwin_symbol = "__Unwind_GetLanguageSpecificData", .linux_equiv = "libunwind:get_lsda_stub", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_unwind_get_lsda) },
+        .{ .darwin_symbol = "__Unwind_GetRegionStart", .linux_equiv = "libunwind:get_region_stub", .status = .STUB_FOR_PROBE_ONLY, .address = @intFromPtr(&libcxx.shim_unwind_get_region_start) },
+        .{ .darwin_symbol = "_aligned_alloc", .linux_equiv = "libc:posix_memalign", .status = .THIN_SHIM, .address = @intFromPtr(&shim_aligned_alloc) },
+        .{ .darwin_symbol = "_pthread_mach_thread_np", .linux_equiv = "reimplemented:mach_thread_id", .status = .REIMPLEMENTED, .address = @intFromPtr(&shim_pthread_mach_thread_np) },
         .{ .darwin_symbol = "_fchmod", .linux_equiv = "libc:fchmod", .status = .NATIVE_MAPPING, .address = @intFromPtr(&fchmod) },
         .{ .darwin_symbol = "_fchown", .linux_equiv = "libc:fchown", .status = .NATIVE_MAPPING, .address = @intFromPtr(&fchown) },
         .{ .darwin_symbol = "_utime", .linux_equiv = "libc:utime", .status = .NATIVE_MAPPING, .address = @intFromPtr(&utime) },

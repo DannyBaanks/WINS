@@ -138,6 +138,7 @@ pub fn runTarget(allocator: std.mem.Allocator, io: std.Io, opts: RunOptions) !c_
     };
 
     tracer.record(.TRANSFER_CONTROL, "rip=0x{x} seccomp_trap={}", .{ entry_addr, seccomp_ok });
+    dyld.runInitializers(ctx.argc, ctx.argv, ctx.envp, ctx.apple);
     const rc = entry.transferControl(ctx);
     shims.runMachoAtexitHandlers();
     tracer.record(.EXIT, "return_code={d}", .{rc});

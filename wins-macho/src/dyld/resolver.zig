@@ -302,6 +302,48 @@ pub const DyldContext = struct {
         }
     }
 
+    pub fn runInitializers(
+        self: *const DyldContext,
+        argc: c_int,
+        argv: [*c]const [*c]const u8,
+        envp: [*c]const [*c]const u8,
+        apple: [*c]const [*c]const u8,
+    ) void {
+        const InitFn = *const fn (c_int, [*c]const [*c]const u8, [*c]const [*c]const u8, [*c]const [*c]const u8, ?*const anyopaque) callconv(.c) void;
+        // Run dylib initializers first, then main executable (reverse load order)
+        var idx: usize = self.images.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const img = &self.images.items[idx];
+            for (img.parsed.segments) |seg| {
+                for (seg.sections) |sec| {
+                    const sname = sec.name();
+                    if (std.mem.eql(u8, sname, "__mod_init_func") and sec.size >= @sizeOf(usize)) {
+                        const base = img.vmToActual(sec.addr);
+                        const count: usize = @intCast(sec.size / @sizeOf(usize));
+                        const ptrs: [*]const usize = @ptrFromInt(base);
+                        for (0..count) |i| {
+                            if (ptrs[i] != 0) {
+                                const f: InitFn = @ptrFromInt(ptrs[i]);
+                                f(argc, argv, envp, apple, null);
+                            }
+                        }
+                    } else if (std.mem.eql(u8, sname, "__init_offsets") and sec.size >= @sizeOf(u32)) {
+                        const base = img.vmToActual(sec.addr);
+                        const count: usize = @intCast(sec.size / @sizeOf(u32));
+                        const offs: [*]const u32 = @ptrFromInt(base);
+                        for (0..count) |i| {
+                            if (offs[i] != 0) {
+                                const f: InitFn = @ptrFromInt(img.actual_base + @as(usize, offs[i]));
+                                f(argc, argv, envp, apple, null);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn applyFixupsAndBind(self: *DyldContext) !void {
         for (self.images.items, 0..) |*img, img_idx| {
             // 1. LC_DYLD_INFO_ONLY rebases & binds

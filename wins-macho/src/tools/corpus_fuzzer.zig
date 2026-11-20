@@ -9,6 +9,7 @@
 const std = @import("std");
 const wins_macho = @import("wins_macho");
 const parser = wins_macho.parser;
+const exports = wins_macho.exports;
 const fixups = wins_macho.fixups;
 const shims = wins_macho.shims;
 const types = wins_macho.types;
@@ -222,12 +223,29 @@ fn analyzeBinary(
     var resolved_stubs: usize = 0;
     var missing: usize = 0;
 
+    const self_trie: ?[]const u8 = if (parsed.exports_trie) |et|
+        parsed.sliceRange(et.dataoff, et.datasize) catch null
+    else if (parsed.dyld_info) |di|
+        (if (di.export_size > 0) parsed.sliceRange(di.export_off, di.export_size) catch null else null)
+    else
+        null;
+
     var it = seen.iterator();
     while (it.next()) |entry| {
         const sym = entry.key_ptr.*;
         const ord = entry.value_ptr.*;
         // Ignore self / main-exe bindings
         if (ord == types.BIND_SPECIAL_DYLIB_SELF or ord == types.BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE) continue;
+        // Flat/weak bindings satisfied by the image's own exports trie (e.g. C++ weak RTTI/lambdas)
+        if (ord == types.BIND_SPECIAL_DYLIB_FLAT_LOOKUP or ord == types.BIND_SPECIAL_DYLIB_WEAK_LOOKUP) {
+            if (self_trie) |trie| {
+                if (exports.lookupExport(trie, sym) != null) {
+                    total += 1;
+                    resolved_real += 1;
+                    continue;
+                }
+            }
+        }
 
         var provider_name: []const u8 = "flat_namespace";
         var is_local_dylib = false;
