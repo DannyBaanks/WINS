@@ -87,8 +87,10 @@ const WM_NCACTIVATE: u32 = 0x0086;
 const WM_NCDESTROY: u32 = 0x0082;
 
 const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
+const WS_POPUP: u32 = 0x80000000;
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
+const WS_CAPTION: u32 = 0x00C00000;
 const WM_NCCREATE: u32 = 0x0081;
 const WM_NCCALCSIZE: u32 = 0x0083;
 const WM_KEYDOWN: u32 = 0x0100;
@@ -98,9 +100,16 @@ const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_SYSKEYUP: u32 = 0x0105;
 const WM_SYSCHAR: u32 = 0x0106;
 const WM_INPUT: u32 = 0x00FF;
+const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
-const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_XBUTTONDOWN: u32 = 0x020B;
+const WM_XBUTTONUP: u32 = 0x020C;
 const WM_GETTEXT: u32 = 0x000D;
 const WM_GETTEXTLENGTH: u32 = 0x000E;
 const WM_SETTEXT: u32 = 0x000C;
@@ -129,6 +138,7 @@ const WinObj = struct {
     visible: bool = false,
     needs_paint: bool = false,
     has_gl: bool = false,
+    fullscreen: bool = false,
     hinstance: usize = 0,
     hmenu: usize = 0,
     userdata: isize = 0,
@@ -1000,7 +1010,13 @@ fn createWindowExW(ex_style: u32, class: ?[*:0]const u16, title: ?[*:0]const u16
 
 fn getClientRect(window: usize, rect: ?*Rect) callconv(W) i32 {
     const r = rect orelse return 0;
-    const w = findWin(window) orelse return 0;
+    const w = findWin(window) orelse {
+        if (window == 0 or window == 0x10000) {
+            r.* = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+            return 1;
+        }
+        return 0;
+    };
     if (w.x11_win != 0) {
         if (connection) |conn| {
             if (conn.geometry(w.x11_win)) |geom| {
@@ -1011,6 +1027,38 @@ fn getClientRect(window: usize, rect: ?*Rect) callconv(W) i32 {
     }
     r.* = .{ .left = 0, .top = 0, .right = w.width, .bottom = w.height };
     return 1;
+}
+
+fn isFullscreenPopupStyle(style: u32, width: i32, height: i32) bool {
+    return (style & WS_CHILD) == 0 and (style & WS_POPUP) != 0 and (style & WS_CAPTION) == 0 and width >= 640 and height >= 480;
+}
+
+pub fn setWindowFullscreen(hwnd: usize, fullscreen: bool, width: u32, height: u32) void {
+    const w = findWin(hwnd) orelse return;
+    w.fullscreen = fullscreen;
+    const nw: i32 = @intCast(@max(1, width));
+    const nh: i32 = @intCast(@max(1, height));
+    const size_changed = (w.width != nw or w.height != nh);
+    if (fullscreen) {
+        w.x = 0;
+        w.y = 0;
+    }
+    w.width = nw;
+    w.height = nh;
+    ensureX11Window(w);
+    if (w.x11_win != 0) {
+        if (connection) |conn| {
+            conn.moveResize(w.x11_win, w.x, w.y, @intCast(nw), @intCast(nh));
+            conn.setFullscreen(w.x11_win, fullscreen);
+            if (w.visible) conn.map(w.x11_win);
+            if (g_cursor_count.load(.monotonic) < 0) conn.setCursorVisible(w.x11_win, false);
+            conn.flush();
+        }
+    }
+    if (size_changed) {
+        const lp: usize = (@as(usize, @intCast(nh)) << 16) | @as(usize, @intCast(nw & 0xffff));
+        _ = pushMsg(.{ .hwnd = hwnd, .message = WM_SIZE, .wParam = 0, .lParam = lp, .time = 0, .pt = .{ .x = 0, .y = 0 } });
+    }
 }
 
 fn destroyWindow(window: usize) callconv(W) i32 {
@@ -1046,6 +1094,13 @@ fn ensureX11Window(w: *WinObj) void {
             var tbuf: [256]u8 = undefined;
             const tn = encodeTitleUtf8(w.title[0..w.title_len], &tbuf);
             if (tn > 0) conn.setTitle(x11_win, @ptrCast(&tbuf));
+            if (w.fullscreen or isFullscreenPopupStyle(w.style, w.width, w.height)) {
+                w.fullscreen = true;
+                conn.setFullscreen(x11_win, true);
+            }
+            if (g_cursor_count.load(.monotonic) < 0) {
+                conn.setCursorVisible(x11_win, false);
+            }
             if (std.c.getenv("WINS_TRACE") != null) {
                 std.debug.print("[WINS:USER32] Created X11 window 0x{x} for hwnd=0x{x} ({d}x{d})\n", .{
                     x11_win, w.hwnd, w.width, w.height,
@@ -1096,6 +1151,13 @@ fn showWindow(window: usize, cmd_show: i32) callconv(W) i32 {
         if (w.x11_win != 0) {
             if (connection) |conn| {
                 conn.map(w.x11_win);
+                if (w.fullscreen or isFullscreenPopupStyle(w.style, w.width, w.height)) {
+                    w.fullscreen = true;
+                    conn.setFullscreen(w.x11_win, true);
+                }
+                if (g_cursor_count.load(.monotonic) < 0) {
+                    conn.setCursorVisible(w.x11_win, false);
+                }
                 conn.flush();
             }
         }
@@ -1527,6 +1589,23 @@ var g_last_mouse_y: i32 = 0;
 var g_dinput_last_x: i32 = 0;
 var g_dinput_last_y: i32 = 0;
 var g_have_dinput_last = false;
+var g_cursor_x: i32 = 960;
+var g_cursor_y: i32 = 540;
+var g_warp_target_x: i32 = -1;
+var g_warp_target_y: i32 = -1;
+var g_warp_pending = false;
+
+fn mouseKeyStateMask() usize {
+    var mk: usize = 0;
+    if (kbd.getKeyState(0x01) < 0) mk |= 0x0001; // MK_LBUTTON
+    if (kbd.getKeyState(0x02) < 0) mk |= 0x0002; // MK_RBUTTON
+    if (kbd.getKeyState(kbd.VK_SHIFT) < 0) mk |= 0x0004; // MK_SHIFT
+    if (kbd.getKeyState(kbd.VK_CONTROL) < 0) mk |= 0x0008; // MK_CONTROL
+    if (kbd.getKeyState(0x04) < 0) mk |= 0x0010; // MK_MBUTTON
+    if (kbd.getKeyState(0x05) < 0) mk |= 0x0020; // MK_XBUTTON1
+    if (kbd.getKeyState(0x06) < 0) mk |= 0x0040; // MK_XBUTTON2
+    return mk;
+}
 
 /// One X11 key event -> Win32: VK in wParam, VK-state table (shared with
 /// GetKeyState/GetAsyncKeyState via winrun_directx.feedKeyState), WM_INPUT
@@ -1549,14 +1628,31 @@ fn postKeyEvent(w: *WinObj, conn: *const x11.Connection, ke: *const x11.XKeyEven
 }
 
 /// Post a RawInput mouse packet (if registered) + WM_INPUT, and the classic
-/// WM_LBUTTON*/WM_MOUSEMOVE message.
+/// WM_*BUTTON*/WM_MOUSEWHEEL messages, plus VK mouse button state.
 fn postMouseButton(w: *WinObj, be: *const x11.XButtonEvent, down: bool) void {
+    const sp = winScreenPos(w.hwnd);
+    g_cursor_x = sp.x + be.x;
+    g_cursor_y = sp.y + be.y;
+    const vk: u8 = switch (be.button) {
+        1 => 0x01, // VK_LBUTTON
+        2 => 0x04, // VK_MBUTTON
+        3 => 0x02, // VK_RBUTTON
+        8 => 0x05, // VK_XBUTTON1
+        9 => 0x06, // VK_XBUTTON2
+        else => 0,
+    };
+    if (vk != 0) {
+        kbd.feedKey(vk, down);
+        dxmod.feedKeyState(vk, down);
+    }
     const ri_flags: u16 = switch (be.button) {
         1 => if (down) dxmod.RI_MOUSE_LEFT_BUTTON_DOWN else dxmod.RI_MOUSE_LEFT_BUTTON_UP,
         2 => if (down) dxmod.RI_MOUSE_MIDDLE_BUTTON_DOWN else dxmod.RI_MOUSE_MIDDLE_BUTTON_UP,
         3 => if (down) dxmod.RI_MOUSE_RIGHT_BUTTON_DOWN else dxmod.RI_MOUSE_RIGHT_BUTTON_UP,
+        4, 5 => if (down) 0x0400 else 0, // RI_MOUSE_WHEEL
         else => 0,
     };
+    const ri_wheel: i16 = if (be.button == 4 and down) 120 else if (be.button == 5 and down) -120 else 0;
     switch (be.button) {
         1 => dinput.mouseButton(0, down),
         2 => dinput.mouseButton(2, down),
@@ -1570,12 +1666,27 @@ fn postMouseButton(w: *WinObj, be: *const x11.XButtonEvent, down: bool) void {
     const lp: usize = (@as(usize, @intCast(@max(0, be.y))) << 16) | @as(usize, @intCast(@max(0, be.x) & 0xffff));
     if (ri_flags != 0) {
         if (dxmod.getRegisteredRawInputTarget(1, 2)) |hwnd| { // usage page 1, usage 2 = mouse
-            const h = dxmod.pushRawMouseEvent(0, 0, ri_flags, 0);
-            _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = be.x, .y = be.y } });
+            const h = dxmod.pushRawMouseEvent(0, 0, ri_flags, @bitCast(ri_wheel));
+            _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
         }
     }
-    if (be.button == 1) {
-        _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_LBUTTONDOWN else WM_LBUTTONUP, .wParam = if (down) 1 else 0, .lParam = lp, .time = 0, .pt = .{ .x = be.x, .y = be.y } });
+    const mk = mouseKeyStateMask();
+    switch (be.button) {
+        1 => _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_LBUTTONDOWN else WM_LBUTTONUP, .wParam = mk, .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } }),
+        2 => _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_MBUTTONDOWN else WM_MBUTTONUP, .wParam = mk, .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } }),
+        3 => _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_RBUTTONDOWN else WM_RBUTTONUP, .wParam = mk, .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } }),
+        4, 5 => if (down) {
+            const delta: i16 = if (be.button == 4) 120 else -120;
+            const wp: usize = (@as(usize, @as(u16, @bitCast(delta))) << 16) | (mk & 0xffff);
+            const slp: usize = (@as(usize, @as(u16, @bitCast(@as(i16, @truncate(g_cursor_y))))) << 16) | @as(usize, @as(u16, @bitCast(@as(i16, @truncate(g_cursor_x)))));
+            _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_MOUSEWHEEL, .wParam = wp, .lParam = slp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
+        },
+        8, 9 => {
+            const xbtn: usize = if (be.button == 8) 0x0001 else 0x0002;
+            const wp: usize = (xbtn << 16) | (mk & 0xffff);
+            _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_XBUTTONDOWN else WM_XBUTTONUP, .wParam = wp, .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
+        },
+        else => {},
     }
 }
 
@@ -1626,19 +1737,50 @@ fn pumpX11Events(wait_ms: i32) void {
             5 => postMouseButton(w, @ptrCast(&ev), false), // ButtonRelease
             6 => { // MotionNotify -> WM_MOUSEMOVE (+ raw mouse if registered)
                 const me: *const x11.XButtonEvent = @ptrCast(&ev); // same prefix layout as XMotionEvent
-                const lp: usize = (@as(usize, @intCast(@max(0, me.y))) << 16) | @as(usize, @intCast(@max(0, me.x) & 0xffff));
-                _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_MOUSEMOVE, .wParam = 0, .lParam = lp, .time = 0, .pt = .{ .x = me.x, .y = me.y } });
-                if (g_have_dinput_last) dinput.mouseMove(me.x - g_dinput_last_x, me.y - g_dinput_last_y);
-                g_dinput_last_x = me.x;
-                g_dinput_last_y = me.y;
-                g_have_dinput_last = true;
-                if (dxmod.getRegisteredRawInputTarget(1, 2)) |hwnd| {
-                    const rx = me.x - g_last_mouse_x;
-                    const ry = me.y - g_last_mouse_y;
+                const sp = winScreenPos(w.hwnd);
+                g_cursor_x = sp.x + me.x;
+                g_cursor_y = sp.y + me.y;
+                const is_warp = g_warp_pending and (@abs(me.x - g_warp_target_x) <= 2 and @abs(me.y - g_warp_target_y) <= 2);
+                if (is_warp) {
+                    g_warp_pending = false;
+                    g_dinput_last_x = me.x;
+                    g_dinput_last_y = me.y;
                     g_last_mouse_x = me.x;
                     g_last_mouse_y = me.y;
-                    const h = dxmod.pushRawMouseEvent(rx, ry, 0, 0);
-                    _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = me.x, .y = me.y } });
+                    g_have_dinput_last = true;
+                } else {
+                    if (g_warp_pending and (@abs(me.x - g_dinput_last_x) > 300 or @abs(me.y - g_dinput_last_y) > 250)) {
+                        g_warp_pending = false;
+                        g_dinput_last_x = g_warp_target_x;
+                        g_dinput_last_y = g_warp_target_y;
+                        g_last_mouse_x = g_warp_target_x;
+                        g_last_mouse_y = g_warp_target_y;
+                    }
+                    const lp: usize = (@as(usize, @intCast(@max(0, me.y))) << 16) | @as(usize, @intCast(@max(0, me.x) & 0xffff));
+                    _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_MOUSEMOVE, .wParam = mouseKeyStateMask(), .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
+                    if (g_have_dinput_last) dinput.mouseMove(me.x - g_dinput_last_x, me.y - g_dinput_last_y);
+                    g_dinput_last_x = me.x;
+                    g_dinput_last_y = me.y;
+                    g_have_dinput_last = true;
+                    if (dxmod.getRegisteredRawInputTarget(1, 2)) |hwnd| {
+                        const rx = me.x - g_last_mouse_x;
+                        const ry = me.y - g_last_mouse_y;
+                        g_last_mouse_x = me.x;
+                        g_last_mouse_y = me.y;
+                        const h = dxmod.pushRawMouseEvent(rx, ry, 0, 0);
+                        _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
+                    }
+                    if (g_cursor_count.load(.monotonic) < 0 and !g_focus_lost and w.width >= 200 and w.height >= 200) {
+                        const margin: i32 = 64;
+                        if (me.x < margin or me.y < margin or me.x >= w.width - margin or me.y >= w.height - margin) {
+                            const cx = @divTrunc(w.width, 2);
+                            const cy = @divTrunc(w.height, 2);
+                            g_warp_target_x = cx;
+                            g_warp_target_y = cy;
+                            g_warp_pending = true;
+                            conn.warpPointer(w.x11_win, cx, cy);
+                        }
+                    }
                 }
             },
             9 => { // FocusIn
@@ -1880,6 +2022,13 @@ fn SetWindowPos(hwnd: usize, hwndInsertAfter: usize, x: i32, y: i32, cx: i32, cy
             }
             if ((uFlags & SWP_SHOWWINDOW) != 0 or w.visible) {
                 conn.map(w.x11_win);
+                if (w.fullscreen or isFullscreenPopupStyle(w.style, w.width, w.height)) {
+                    w.fullscreen = true;
+                    conn.setFullscreen(w.x11_win, true);
+                }
+                if (g_cursor_count.load(.monotonic) < 0) {
+                    conn.setCursorVisible(w.x11_win, false);
+                }
             } else if ((uFlags & SWP_HIDEWINDOW) != 0) {
                 conn.unmap(w.x11_win);
             }
@@ -1900,7 +2049,7 @@ fn GetWindowRect(hwnd: usize, lpRect: ?*Rect) callconv(W) i32 {
         r.* = .{ .left = sp.x, .top = sp.y, .right = sp.x + w.width, .bottom = sp.y + w.height };
         return 1;
     }
-    r.* = .{ .left = 0, .top = 0, .right = 1024, .bottom = 720 };
+    r.* = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
     return 1;
 }
 
@@ -1984,7 +2133,7 @@ fn SystemParametersInfoW(uiAction: u32, uiParam: u32, pvParam: ?*anyopaque, fWin
     if (uiAction == 0x0030) { // SPI_GETWORKAREA
         if (pvParam) |p| {
             const rc: *Rect = @ptrCast(@alignCast(p));
-            rc.* = .{ .left = 0, .top = 0, .right = 1024, .bottom = 720 };
+            rc.* = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
         }
     }
     return 1;
@@ -2015,8 +2164,8 @@ fn GetDeviceCaps(hdc: usize, nIndex: i32) callconv(W) i32 {
     _ = hdc;
     return switch (nIndex) {
         2 => 1, // TECHNOLOGY = DT_RASDISPLAY
-        8 => 1280, // HORZRES
-        10 => 900, // VERTRES
+        8 => 1920, // HORZRES
+        10 => 1080, // VERTRES
         12 => 32, // BITSPIXEL
         14 => 1, // PLANES
         38 => 0x7E99, // RASTERCAPS
@@ -2097,10 +2246,17 @@ pub fn ensureGlSurfaceForHwnd(hwnd: usize) ?GlSurface {
     if (findWin(hwnd)) |w| {
         w.has_gl = true;
         if (w.x11_win == 0) {
-            const ww: u32 = @intCast(@max(1, w.width));
-            const hh: u32 = @intCast(@max(1, w.height));
-            w.x11_win = conn.createUnmapped(w.x, w.y, ww, hh) catch 0;
-            if (w.x11_win != 0 and w.visible) conn.map(w.x11_win);
+            if (w.width <= 0) w.width = 1920;
+            if (w.height <= 0) w.height = 1080;
+            ensureX11Window(w);
+            if (w.x11_win != 0 and w.visible) {
+                conn.map(w.x11_win);
+                if (w.fullscreen or isFullscreenPopupStyle(w.style, w.width, w.height)) {
+                    w.fullscreen = true;
+                    conn.setFullscreen(w.x11_win, true);
+                }
+                conn.flush();
+            }
         }
         if (w.x11_win != 0) {
             return .{
@@ -2122,7 +2278,7 @@ pub fn getWindowClientSize(hwnd: usize) struct { w: u32, h: u32 } {
     if (findWin(hwnd)) |w| {
         return .{ .w = @intCast(@max(1, w.width)), .h = @intCast(@max(1, w.height)) };
     }
-    return .{ .w = 1280, .h = 720 };
+    return .{ .w = 1920, .h = 1080 };
 }
 
 pub fn ensureGlSurfaceForDc(hdc: usize) ?GlSurface {
@@ -2957,6 +3113,10 @@ fn GetActiveWindow() callconv(W) usize {
     return activeTopLevel();
 }
 
+fn GetForegroundWindow() callconv(W) usize {
+    return activeTopLevel();
+}
+
 fn GetAncestor(hwnd: usize, gaFlags: u32) callconv(W) usize {
     _ = gaFlags;
     return hwnd;
@@ -2996,8 +3156,8 @@ fn GetCapture() callconv(W) usize {
 fn GetCursorPos(lpPoint: ?*anyopaque) callconv(W) i32 {
     if (lpPoint) |p| {
         const pt: *Point = @ptrCast(@alignCast(p));
-        pt.x = 640;
-        pt.y = 360;
+        pt.x = g_cursor_x;
+        pt.y = g_cursor_y;
     }
     return 1;
 }
@@ -3070,7 +3230,16 @@ fn SetWindowLongPtrW(hwnd: usize, nIndex: i32, dwNewLong: isize) callconv(W) isi
         GWLP_WNDPROC => w.wndproc = if (dwNewLong != 0) @ptrFromInt(@as(usize, @bitCast(dwNewLong))) else null,
         GWLP_HINSTANCE => w.hinstance = @bitCast(dwNewLong),
         GWLP_HWNDPARENT => w.parent = @bitCast(dwNewLong),
-        GWL_STYLE => w.style = @truncate(@as(usize, @bitCast(dwNewLong))),
+        GWL_STYLE => {
+            w.style = @truncate(@as(usize, @bitCast(dwNewLong)));
+            if ((w.style & WS_CHILD) == 0 and w.x11_win != 0) {
+                const want_fs = isFullscreenPopupStyle(w.style, w.width, w.height);
+                if (want_fs != w.fullscreen) {
+                    w.fullscreen = want_fs;
+                    if (connection) |conn| conn.setFullscreen(w.x11_win, want_fs);
+                }
+            }
+        },
         GWL_EXSTYLE => w.ex_style = @truncate(@as(usize, @bitCast(dwNewLong))),
         GWLP_USERDATA => w.userdata = dwNewLong,
         GWLP_ID => w.id = dwNewLong,
@@ -3190,11 +3359,35 @@ fn SetCursor(hCursor: usize) callconv(W) usize {
 var g_cursor_count = std.atomic.Value(i32).init(0);
 
 fn ShowCursor(bShow: i32) callconv(W) i32 {
-    return if (bShow != 0) g_cursor_count.fetchAdd(1, .monotonic) + 1 else g_cursor_count.fetchSub(1, .monotonic) - 1;
+    const new_val = if (bShow != 0) g_cursor_count.fetchAdd(1, .monotonic) + 1 else g_cursor_count.fetchSub(1, .monotonic) - 1;
+    if (connection) |conn| {
+        const hwnd = activeTopLevel();
+        if (findWin(hwnd)) |w| {
+            if (w.x11_win != 0) conn.setCursorVisible(w.x11_win, new_val >= 0);
+        }
+    }
+    return new_val;
 }
 
 fn SetCursorPos(x: i32, y: i32) callconv(W) i32 {
-    _ = x; _ = y;
+    g_cursor_x = x;
+    g_cursor_y = y;
+    if (!g_focus_lost) {
+        if (connection) |conn| {
+            const hwnd = activeTopLevel();
+            if (findWin(hwnd)) |w| {
+                if (w.x11_win != 0) {
+                    const sp = winScreenPos(hwnd);
+                    const cx = x - sp.x;
+                    const cy = y - sp.y;
+                    g_warp_target_x = cx;
+                    g_warp_target_y = cy;
+                    g_warp_pending = true;
+                    conn.warpPointer(w.x11_win, cx, cy);
+                }
+            }
+        }
+    }
     return 1;
 }
 
@@ -3270,7 +3463,9 @@ fn GetAsyncKeyState(vKey: i32) callconv(W) i16 {
 }
 
 fn GetMessagePos() callconv(W) u32 {
-    return 0;
+    const x: u16 = @bitCast(@as(i16, @truncate(g_cursor_x)));
+    const y: u16 = @bitCast(@as(i16, @truncate(g_cursor_y)));
+    return (@as(u32, y) << 16) | @as(u32, x);
 }
 
 fn GetMessageExtraInfo() callconv(W) isize {
@@ -3328,15 +3523,18 @@ fn wsprintfA(lpOut: ?[*]u8, lpFmt: ?[*:0]const u8) callconv(W) i32 {
 
 const DisplayModeSpec = struct { w: u32, h: u32, hz: u32 };
 const display_modes = [_]DisplayModeSpec{
-    .{ .w = 1280, .h = 720, .hz = 60 },
-    .{ .w = 1920, .h = 1080, .hz = 60 },
     .{ .w = 800, .h = 600, .hz = 60 },
+    .{ .w = 1024, .h = 576, .hz = 60 },
+    .{ .w = 1280, .h = 720, .hz = 60 },
+    .{ .w = 1366, .h = 768, .hz = 60 },
+    .{ .w = 1600, .h = 900, .hz = 60 },
+    .{ .w = 1920, .h = 1080, .hz = 60 },
 };
 
 fn EnumDisplaySettingsA(lpszDeviceName: ?[*:0]const u8, iModeNum: u32, lpDevMode: ?*anyopaque) callconv(W) i32 {
     _ = lpszDeviceName;
     const raw: [*]u8 = @ptrCast(lpDevMode orelse return 0);
-    const idx: usize = if (iModeNum >= 0xFFFFFFFE) 0 else if (iModeNum < display_modes.len) iModeNum else return 0;
+    const idx: usize = if (iModeNum >= 0xFFFFFFFE) (display_modes.len - 1) else if (iModeNum < display_modes.len) iModeNum else return 0;
     const m = display_modes[idx];
     const sz = std.mem.readInt(u16, raw[36..38], .little);
     const clear_len: usize = @max(@as(usize, 156), @min(@as(usize, 256), sz));
@@ -3355,7 +3553,7 @@ fn EnumDisplaySettingsA(lpszDeviceName: ?[*:0]const u8, iModeNum: u32, lpDevMode
 fn EnumDisplaySettingsW(lpszDeviceName: ?*const u16, iModeNum: u32, lpDevMode: ?*anyopaque) callconv(W) i32 {
     _ = lpszDeviceName;
     const raw: [*]u8 = @ptrCast(lpDevMode orelse return 0);
-    const idx: usize = if (iModeNum >= 0xFFFFFFFE) 0 else if (iModeNum < display_modes.len) iModeNum else return 0;
+    const idx: usize = if (iModeNum >= 0xFFFFFFFE) (display_modes.len - 1) else if (iModeNum < display_modes.len) iModeNum else return 0;
     const m = display_modes[idx];
     const sz = std.mem.readInt(u16, raw[68..70], .little);
     const clear_len: usize = @max(@as(usize, 220), @min(@as(usize, 320), sz));
@@ -3384,7 +3582,7 @@ fn EnumDisplayMonitors(hdc: usize, lprcClip: ?*const anyopaque, lpfnEnum: ?*anyo
     _ = lprcClip;
     if (lpfnEnum) |f| {
         const cb: MonitorEnumProc = @ptrCast(@alignCast(f));
-        const rc: MonitorRect = .{ .left = 0, .top = 0, .right = 1280, .bottom = 720 };
+        const rc: MonitorRect = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
         _ = cb(0x10001, hdc, &rc, dwData);
     }
     return 1;
@@ -4580,8 +4778,7 @@ fn GetDoubleClickTime() callconv(W) u32 {
 }
 
 fn SystemParametersInfoA(uiAction: u32, uiParam: u32, pvParam: ?*anyopaque, fWinIni: u32) callconv(W) i32 {
-    _ = uiAction; _ = uiParam; _ = pvParam; _ = fWinIni;
-    return 1;
+    return SystemParametersInfoW(uiAction, uiParam, pvParam, fWinIni);
 }
 
 fn WaitForInputIdle(hProcess: usize, dwMilliseconds: u32) callconv(W) u32 {
@@ -4636,6 +4833,7 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "ClipCursor")) return @intFromPtr(&ClipCursor);
     if (std.mem.eql(u8, name, "SetFocus")) return @intFromPtr(&SetFocus);
     if (std.mem.eql(u8, name, "SetForegroundWindow")) return @intFromPtr(&SetForegroundWindow);
+    if (std.mem.eql(u8, name, "GetForegroundWindow")) return @intFromPtr(&GetForegroundWindow);
     if (std.mem.eql(u8, name, "TrackMouseEvent")) return @intFromPtr(&TrackMouseEvent);
     if (std.mem.eql(u8, name, "UnregisterClassW")) return @intFromPtr(&UnregisterClassW);
     if (std.mem.eql(u8, name, "ValidateRect")) return @intFromPtr(&ValidateRect);

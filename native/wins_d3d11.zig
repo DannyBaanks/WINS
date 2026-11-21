@@ -651,10 +651,13 @@ fn facEnumAdapters(_: ?*anyopaque, idx: u32, pp: *?*anyopaque) callconv(W) i32 {
 
 fn facCreateSwapChain(_: ?*anyopaque, pDev: ?*anyopaque, pDesc: *const DXGI_SWAP_CHAIN_DESC, ppSc: *?*anyopaque) callconv(W) i32 {
     _ = pDev;
-    const w = if (pDesc.BufferDesc.Width > 0) pDesc.BufferDesc.Width else 1280;
-    const h = if (pDesc.BufferDesc.Height > 0) pDesc.BufferDesc.Height else 720;
+    const w = if (pDesc.BufferDesc.Width > 0) pDesc.BufferDesc.Width else 1920;
+    const h = if (pDesc.BufferDesc.Height > 0) pDesc.BufferDesc.Height else 1080;
     const fmt = if (pDesc.BufferDesc.Format != 0) pDesc.BufferDesc.Format else 28;
-    trace("CreateSwapChain hwnd=0x{x} {d}x{d} fmt={d}", .{ pDesc.OutputWindow, w, h, fmt });
+    trace("CreateSwapChain hwnd=0x{x} {d}x{d} fmt={d} windowed={d}", .{ pDesc.OutputWindow, w, h, fmt, pDesc.Windowed });
+    if (pDesc.OutputWindow != 0) {
+        gui.setWindowFullscreen(pDesc.OutputWindow, pDesc.Windowed == 0, w, h);
+    }
     _ = glb.init(pDesc.OutputWindow, w, h);
 
     const bb_tex = alloc.create(glb.Texture) catch return E_FAIL;
@@ -732,9 +735,12 @@ fn outGetDesc(_: ?*anyopaque, pDesc: *DXGI_OUTPUT_DESC) callconv(W) i32 {
 }
 
 const g_modes = [_]DXGI_MODE_DESC{
-    .{ .Width = 1280, .Height = 720, .RefreshRate = .{ .Numerator = 60, .Denominator = 1 }, .Format = 28, .ScanlineOrdering = 0, .Scaling = 0 },
-    .{ .Width = 1920, .Height = 1080, .RefreshRate = .{ .Numerator = 60, .Denominator = 1 }, .Format = 28, .ScanlineOrdering = 0, .Scaling = 0 },
     .{ .Width = 800, .Height = 600, .RefreshRate = .{ .Numerator = 60, .Denominator = 1 }, .Format = 28, .ScanlineOrdering = 0, .Scaling = 0 },
+    .{ .Width = 1024, .Height = 576, .RefreshRate = .{ .Numerator = 60, .Denominator = 1 }, .Format = 28, .ScanlineOrdering = 0, .Scaling = 0 },
+    .{ .Width = 1280, .Height = 720, .RefreshRate = .{ .Numerator = 60, .Denominator = 1 }, .Format = 28, .ScanlineOrdering = 0, .Scaling = 0 },
+    .{ .Width = 1366, .Height = 768, .RefreshRate = .{ .Numerator = 60, .Denominator = 1 }, .Format = 28, .ScanlineOrdering = 0, .Scaling = 0 },
+    .{ .Width = 1600, .Height = 900, .RefreshRate = .{ .Numerator = 60, .Denominator = 1 }, .Format = 28, .ScanlineOrdering = 0, .Scaling = 0 },
+    .{ .Width = 1920, .Height = 1080, .RefreshRate = .{ .Numerator = 60, .Denominator = 1 }, .Format = 28, .ScanlineOrdering = 0, .Scaling = 0 },
 };
 
 fn outGetDisplayModeList(_: ?*anyopaque, fmt: u32, _: u32, pNum: *u32, pDesc: ?[*]DXGI_MODE_DESC) callconv(W) i32 {
@@ -753,8 +759,8 @@ fn outGetDisplayModeList(_: ?*anyopaque, fmt: u32, _: u32, pNum: *u32, pDesc: ?[
 
 fn outFindClosestMode(_: ?*anyopaque, match: *const DXGI_MODE_DESC, closest: *DXGI_MODE_DESC, _: ?*anyopaque) callconv(W) i32 {
     closest.* = match.*;
-    if (closest.Width == 0) closest.Width = 1280;
-    if (closest.Height == 0) closest.Height = 720;
+    if (closest.Width == 0) closest.Width = 1920;
+    if (closest.Height == 0) closest.Height = 1080;
     if (closest.RefreshRate.Numerator == 0) closest.RefreshRate = .{ .Numerator = 60, .Denominator = 1 };
     if (closest.Format == 0) closest.Format = 28;
     return S_OK;
@@ -813,6 +819,58 @@ fn scResizeBuffers(raw: ?*anyopaque, _: u32, w: u32, h: u32, fmt: u32, _: u32) c
     bb_obj.desc2d.Width = nw;
     bb_obj.desc2d.Height = nh;
     glb.resizeSwapchainBackbuffer(bb_tex, nw, nh);
+    return S_OK;
+}
+
+fn scSetFullscreenState(raw: ?*anyopaque, fullscreen: i32, _: ?*anyopaque) callconv(W) i32 {
+    const sc: *ComObj = @ptrCast(@alignCast(raw orelse return E_INVALIDARG));
+    const fs = fullscreen != 0;
+    sc.swap_desc.Windowed = if (fs) 0 else 1;
+    if (sc.swap_desc.OutputWindow != 0) {
+        gui.setWindowFullscreen(
+            sc.swap_desc.OutputWindow,
+            fs,
+            @max(1, sc.swap_desc.BufferDesc.Width),
+            @max(1, sc.swap_desc.BufferDesc.Height),
+        );
+    }
+    return S_OK;
+}
+
+fn scGetFullscreenState(raw: ?*anyopaque, pFullscreen: ?*i32, ppTarget: ?*?*anyopaque) callconv(W) i32 {
+    const sc: *ComObj = @ptrCast(@alignCast(raw orelse return E_INVALIDARG));
+    const fs: i32 = if (sc.swap_desc.Windowed == 0) 1 else 0;
+    if (pFullscreen) |pf| pf.* = fs;
+    if (ppTarget) |pt| {
+        if (fs != 0) {
+            const out = getSingletonOutput();
+            _ = comAddRef(out);
+            pt.* = out;
+        } else {
+            pt.* = null;
+        }
+    }
+    return S_OK;
+}
+
+fn scResizeTarget(raw: ?*anyopaque, pNewTargetParameters: ?*const DXGI_MODE_DESC) callconv(W) i32 {
+    const sc: *ComObj = @ptrCast(@alignCast(raw orelse return E_INVALIDARG));
+    const mode = pNewTargetParameters orelse return E_INVALIDARG;
+    const nw = if (mode.Width > 0) mode.Width else @max(1, sc.swap_desc.BufferDesc.Width);
+    const nh = if (mode.Height > 0) mode.Height else @max(1, sc.swap_desc.BufferDesc.Height);
+    sc.swap_desc.BufferDesc.Width = nw;
+    sc.swap_desc.BufferDesc.Height = nh;
+    if (sc.swap_desc.OutputWindow != 0) {
+        gui.setWindowFullscreen(sc.swap_desc.OutputWindow, sc.swap_desc.Windowed == 0, nw, nh);
+    }
+    return S_OK;
+}
+
+fn scGetContainingOutput(_: ?*anyopaque, ppOutput: ?*?*anyopaque) callconv(W) i32 {
+    const pp = ppOutput orelse return E_INVALIDARG;
+    const out = getSingletonOutput();
+    _ = comAddRef(out);
+    pp.* = out;
     return S_OK;
 }
 
@@ -1985,8 +2043,8 @@ const swapchain_vtbl = [_]?*const anyopaque{
     @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
     @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData), @ptrCast(&dxgiGetParent),
     @ptrCast(&scGetDevice), @ptrCast(&scPresent), @ptrCast(&scGetBuffer),
-    @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&scGetDesc),
-    @ptrCast(&scResizeBuffers), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&scSetFullscreenState), @ptrCast(&scGetFullscreenState), @ptrCast(&scGetDesc),
+    @ptrCast(&scResizeBuffers), @ptrCast(&scResizeTarget), @ptrCast(&scGetContainingOutput),
     @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
 };
 

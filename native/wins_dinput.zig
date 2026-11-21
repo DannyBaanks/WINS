@@ -465,7 +465,7 @@ fn dev_GetProperty(this: *anyopaque, prop: usize, ph: ?[*]u32) callconv(W) i32 {
     const h = ph orelse return E_POINTER;
     switch (prop) {
         DIPROP_BUFFERSIZE => h[4] = @intCast(d.buffer.len),
-        DIPROP_AXISMODE => h[4] = @intFromBool(d.absolute),
+        DIPROP_AXISMODE => h[4] = if (d.absolute) 0 else 1, // DIPROPAXISMODE_ABS=0, DIPROPAXISMODE_REL=1
         DIPROP_RANGE => {
             h[4] = @bitCast(d.range_min);
             h[5] = @bitCast(d.range_max);
@@ -496,7 +496,7 @@ fn dev_SetProperty(this: *anyopaque, prop: usize, ph: ?[*]const u32) callconv(W)
             unlock();
             if (old.len != 0) std.heap.page_allocator.free(old);
         },
-        DIPROP_AXISMODE => d.absolute = h[4] == 1,
+        DIPROP_AXISMODE => d.absolute = h[4] == 0, // DIPROPAXISMODE_ABS=0, DIPROPAXISMODE_REL=1
         DIPROP_RANGE => {
             const rmin: i32 = @bitCast(h[4]);
             const rmax: i32 = @bitCast(h[5]);
@@ -1232,4 +1232,18 @@ test "fast tap latching: key and mouse button taps between GetDeviceState calls 
     try std.testing.expectEqual(@as(u8, 0x80), mstate[12]);
     try std.testing.expectEqual(DI_OK, dev_GetDeviceState(m, 20, &mstate));
     try std.testing.expectEqual(@as(u8, 0), mstate[12]);
+
+    // DIPROP_AXISMODE: DIPROPAXISMODE_REL (1) must keep relative deltas; DIPROPAXISMODE_ABS (0) switches to absolute.
+    const rel_prop = [_]u32{ 20, 16, 0, 0, 1 };
+    try std.testing.expectEqual(DI_OK, dev_SetProperty(m, DIPROP_AXISMODE, &rel_prop));
+    var got_prop = [_]u32{ 20, 16, 0, 0, 99 };
+    try std.testing.expectEqual(DI_OK, dev_GetProperty(m, DIPROP_AXISMODE, &got_prop));
+    try std.testing.expectEqual(@as(u32, 1), got_prop[4]);
+    mouseMove(15, -7);
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(m, 20, &mstate));
+    try std.testing.expectEqual(@as(i32, 15), std.mem.readInt(i32, mstate[0..4], .little));
+    try std.testing.expectEqual(@as(i32, -7), std.mem.readInt(i32, mstate[4..8], .little));
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(m, 20, &mstate));
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, mstate[0..4], .little));
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, mstate[4..8], .little));
 }
