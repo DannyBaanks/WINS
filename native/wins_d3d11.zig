@@ -1911,6 +1911,18 @@ fn ctxClearDSV(_: ?*anyopaque, dsv: ?*anyopaque, flags: u32, depth: f32, stencil
     glb.clearDsv(v, flags, depth, stencil);
 }
 
+fn ctxClearUAVUint(_: ?*anyopaque, uav: ?*anyopaque, vals: ?*const [4]u32) callconv(W) void {
+    const v = payloadOf(glb.View, uav) orelse return;
+    const c = if (vals) |p| p.* else [4]u32{ 0, 0, 0, 0 };
+    glb.clearUav(v, c, false);
+}
+
+fn ctxClearUAVFloat(_: ?*anyopaque, uav: ?*anyopaque, vals: ?*const [4]f32) callconv(W) void {
+    const v = payloadOf(glb.View, uav) orelse return;
+    const c: [4]u32 = if (vals) |p| @bitCast(p.*) else .{ 0, 0, 0, 0 };
+    glb.clearUav(v, c, true);
+}
+
 fn ctxCopyResource(_: ?*anyopaque, dst: ?*anyopaque, src: ?*anyopaque) callconv(W) void {
     const d = extractResTexture(dst);
     const s = extractResTexture(src);
@@ -1945,7 +1957,7 @@ fn ctxGetData(_: ?*anyopaque, q: ?*anyopaque, data: ?*anyopaque, sz: u32, _: u32
         const qt = if (q) |r| @as(*ComObj, @ptrCast(@alignCast(r))).payload else 0;
         switch (qt) {
             1 => if (sz >= 8) { // D3D11_QUERY_OCCLUSION: UINT64 sample count
-                std.mem.writeInt(u64, bytes[0..8], 1_000_000, .little);
+                std.mem.writeInt(u64, bytes[0..8], 1, .little);
             },
             2 => if (sz >= 8) { // D3D11_QUERY_TIMESTAMP: UINT64 ticks
                 std.mem.writeInt(u64, bytes[0..8], 1000, .little);
@@ -2017,6 +2029,21 @@ fn ctxGSSetShader(_: ?*anyopaque, sh: ?*anyopaque, _: ?*const anyopaque, _: u32)
 
 fn ctxDispatch(_: ?*anyopaque, x: u32, y: u32, z: u32) callconv(W) void {
     glb.dispatch(&g_draw_state, x, y, z);
+}
+
+fn ctxDispatchIndirect(_: ?*anyopaque, buf: ?*anyopaque, off: u32) callconv(W) void {
+    const b = payloadOf(glb.Buffer, buf) orelse return;
+    glb.dispatchIndirect(&g_draw_state, b, off);
+}
+
+fn ctxDrawIndexedInstancedIndirect(_: ?*anyopaque, buf: ?*anyopaque, off: u32) callconv(W) void {
+    const b = payloadOf(glb.Buffer, buf) orelse return;
+    glb.drawIndirect(&g_draw_state, true, b, off);
+}
+
+fn ctxDrawInstancedIndirect(_: ?*anyopaque, buf: ?*anyopaque, off: u32) callconv(W) void {
+    const b = payloadOf(glb.Buffer, buf) orelse return;
+    glb.drawIndirect(&g_draw_state, false, b, off);
 }
 
 fn ctxClearState(_: ?*anyopaque) callconv(W) void {
@@ -2209,10 +2236,10 @@ const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&ctxOMSetDepthStencilState), // 36
     iStub(37), // 37 SOSetTargets
     iStub(38), // 38 DrawAuto
-    iStub(39), // 39 DrawIndexedInstancedIndirect
-    iStub(40), // 40 DrawInstancedIndirect
+    @ptrCast(&ctxDrawIndexedInstancedIndirect), // 39 DrawIndexedInstancedIndirect
+    @ptrCast(&ctxDrawInstancedIndirect), // 40 DrawInstancedIndirect
     @ptrCast(&ctxDispatch), // 41
-    iStub(42), // 42 DispatchIndirect
+    @ptrCast(&ctxDispatchIndirect), // 42 DispatchIndirect
     @ptrCast(&ctxRSSetState), // 43
     @ptrCast(&ctxRSSetViewports), // 44
     @ptrCast(&ctxRSSetScissors), // 45
@@ -2221,8 +2248,8 @@ const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&ctxUpdateSubresource), // 48
     iStub(49), // 49 CopyStructureCount
     @ptrCast(&ctxClearRTV), // 50
-    iStub(51), // 51 ClearUnorderedAccessViewUint
-    iStub(52), // 52 ClearUnorderedAccessViewFloat
+    @ptrCast(&ctxClearUAVUint), // 51 ClearUnorderedAccessViewUint
+    @ptrCast(&ctxClearUAVFloat), // 52 ClearUnorderedAccessViewFloat
     @ptrCast(&ctxClearDSV), // 53
     @ptrCast(&ctxGenerateMips), // 54
     iStub(55), // 55 SetResourceMinLOD
@@ -2516,6 +2543,18 @@ fn dClearRTV(raw: ?*anyopaque, rtv: ?*anyopaque, color: *const [4]f32) callconv(
     push(r, ctxClearRTV, .{ raw, r.ref(rtv), &c[0] });
 }
 
+fn dClearUAVUint(raw: ?*anyopaque, uav: ?*anyopaque, vals: ?*const [4]u32) callconv(W) void {
+    const r = recOf(raw);
+    const c = r.dup([4]u32, if (vals) |p| @ptrCast(p) else null, 1);
+    push(r, ctxClearUAVUint, .{ raw, r.ref(uav), if (c) |p| &p[0] else null });
+}
+
+fn dClearUAVFloat(raw: ?*anyopaque, uav: ?*anyopaque, vals: ?*const [4]f32) callconv(W) void {
+    const r = recOf(raw);
+    const c = r.dup([4]f32, if (vals) |p| @ptrCast(p) else null, 1);
+    push(r, ctxClearUAVFloat, .{ raw, r.ref(uav), if (c) |p| &p[0] else null });
+}
+
 fn dCopySubresourceRegion(raw: ?*anyopaque, dst: ?*anyopaque, dsub: u32, dx: u32, dy: u32, dz: u32, src: ?*anyopaque, ssub: u32, box: ?*const D3D11_BOX) callconv(W) void {
     const r = recOf(raw);
     const b: ?*const D3D11_BOX = if (r.dup(D3D11_BOX, if (box) |p| @ptrCast(p) else null, 1)) |p| &p[0] else null;
@@ -2584,43 +2623,37 @@ fn replayUploadSpan(_: ?*anyopaque, res: ?*anyopaque, data: [*]const u8, off: us
     glb.uploadBuffer(b, @intCast(off), data, @intCast(@min(len, b.size - off)));
 }
 
-/// Deterministic 32-bit canary for 4-byte word index `idx4`. Both 16-bit halves
-/// lie in [0x4001, 0x7FFF] with bit 0 set, avoiding 0, -1, 1.0f, -1.0f, NaN, and
-/// small integers while varying per offset.
-inline fn canaryWord(idx4: usize) u32 {
-    const x = (@as(u64, idx4) +% 1) *% 0x9E3779B97F4A7C15;
-    return @as(u32, @truncate((x >> 32) & 0x3FFE3FFE)) | 0x40014001;
+/// Deterministic 16-bit canary for 2-byte half-word index `idx2`. Lies in
+/// [0x4001, 0x7BFD] with bit 0 set (never 0, 0xFFFF, 1.0f/f16, or f16 Inf/NaN).
+inline fn canaryHalf(idx2: usize) u16 {
+    const x = (@as(u64, idx2) +% 1) *% 0x9E3779B97F4A7C15;
+    return @as(u16, @truncate((x >> 48) & 0x3BFE)) | 0x4001;
 }
 
 fn fillCanary(buf: []u8, lo: usize, hi: usize) void {
     if (lo >= hi or lo >= buf.len) return;
     const end = @min(hi, buf.len);
-    const w_lo = lo / 4;
-    const w_hi = (end + 3) / 4;
-    var w = w_lo;
-    while (w < w_hi) : (w += 1) {
-        const cw = canaryWord(w);
-        const off = w * 4;
-        if (off + 4 <= buf.len) {
-            std.mem.writeInt(u32, buf[off..][0..4], cw, .little);
+    const h_lo = lo / 2;
+    const h_hi = (end + 1) / 2;
+    var h = h_lo;
+    while (h < h_hi) : (h += 1) {
+        const ch = canaryHalf(h);
+        const off = h * 2;
+        if (off + 2 <= buf.len) {
+            std.mem.writeInt(u16, buf[off..][0..2], ch, .little);
         } else {
-            const cb = std.mem.asBytes(&cw);
-            for (off..buf.len) |b_idx| buf[b_idx] = cb[b_idx - off];
+            buf[off] = @truncate(ch);
         }
     }
 }
 
-fn isWordDirty(buf: []const u8, w: usize) bool {
-    const cw = canaryWord(w);
-    const off = w * 4;
-    if (off + 4 <= buf.len) {
-        return std.mem.readInt(u32, buf[off..][0..4], .little) != cw;
+fn isHalfDirty(buf: []const u8, h: usize) bool {
+    const ch = canaryHalf(h);
+    const off = h * 2;
+    if (off + 2 <= buf.len) {
+        return std.mem.readInt(u16, buf[off..][0..2], .little) != ch;
     }
-    const cb = std.mem.asBytes(&cw);
-    for (off..buf.len) |b_idx| {
-        if (buf[b_idx] != cb[b_idx - off]) return true;
-    }
-    return false;
+    return buf[off] != @as(u8, @truncate(ch));
 }
 
 fn mapSize(o: *ComObj) ?struct { len: usize, row: u32 } {
@@ -2637,8 +2670,9 @@ fn mapSize(o: *ComObj) ?struct { len: usize, row: u32 } {
 }
 
 /// Deferred contexts may only Map with WRITE_DISCARD (4) or WRITE_NO_OVERWRITE
-/// (5). Buffer mappings use a canary-filled scratch buffer so Unmap can upload
-/// only the dirty byte spans without reading `b.shadow` on worker threads.
+/// (5). WRITE_DISCARD zeroes the allocation and uploads the whole buffer so no
+/// stale registers or canary values survive in unwritten fields. WRITE_NO_OVERWRITE
+/// on a buffer uses a 16-bit canary scratch buffer to upload only the dirty spans.
 fn dMap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, mapped: *D3D11_MAPPED_SUBRESOURCE) callconv(W) i32 {
     const r = recOf(raw);
     const o: *ComObj = @ptrCast(@alignCast(res orelse return E_INVALIDARG));
@@ -2646,7 +2680,7 @@ fn dMap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, map
     const sz = mapSize(o) orelse return E_INVALIDARG;
     const alloc_len = @max(1, sz.len);
 
-    if (o.kind == .buffer) {
+    if (o.kind == .buffer and map_type == 5) {
         var mem: []u8 = undefined;
         var uses_scratch = false;
         if (!r.scratch_in_use) {
@@ -2681,7 +2715,7 @@ fn dMap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, map
     }
 
     const mem = r.a().alignedAlloc(u8, .@"16", alloc_len) catch return E_FAIL;
-    if (map_type == 5) {
+    if (map_type == 5 and isTexKind(o.kind)) {
         const t: *glb.Texture = @ptrFromInt(o.payload);
         if (t.shadow) |p| {
             @memcpy(mem[0..@min(mem.len, p.len)], p[0..@min(mem.len, p.len)]);
@@ -2712,33 +2746,33 @@ fn dUnmap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32) callconv(W) void {
                 return;
             }
             const n = mr.mem.len;
-            const total_words = (n + 3) / 4;
-            const max_gap_words: usize = 16; // merge untouched struct padding gaps <= 64 bytes
-            var w: usize = 0;
-            while (w < total_words) {
-                if (!isWordDirty(mr.mem, w)) {
-                    w += 1;
+            const total_halves = (n + 1) / 2;
+            const max_gap_halves: usize = 32; // merge untouched struct padding gaps <= 64 bytes
+            var h: usize = 0;
+            while (h < total_halves) {
+                if (!isHalfDirty(mr.mem, h)) {
+                    h += 1;
                     continue;
                 }
-                const span_lo = w * 4;
-                var last_dirty_w = w;
-                w += 1;
-                while (w < total_words) {
-                    if (isWordDirty(mr.mem, w)) {
-                        if (w > last_dirty_w + 1) {
-                            const gap_lo = (last_dirty_w + 1) * 4;
-                            const gap_hi = @min(n, w * 4);
+                const span_lo = h * 2;
+                var last_dirty_h = h;
+                h += 1;
+                while (h < total_halves) {
+                    if (isHalfDirty(mr.mem, h)) {
+                        if (h > last_dirty_h + 1) {
+                            const gap_lo = (last_dirty_h + 1) * 2;
+                            const gap_hi = @min(n, h * 2);
                             @memset(mr.mem[gap_lo..gap_hi], 0);
                         }
-                        last_dirty_w = w;
-                        w += 1;
-                    } else if (w - last_dirty_w <= max_gap_words) {
-                        w += 1;
+                        last_dirty_h = h;
+                        h += 1;
+                    } else if (h - last_dirty_h <= max_gap_halves) {
+                        h += 1;
                     } else {
                         break;
                     }
                 }
-                const span_hi = @min(n, (last_dirty_w + 1) * 4);
+                const span_hi = @min(n, (last_dirty_h + 1) * 2);
                 const span_len = span_hi - span_lo;
                 if (r.dup(u8, mr.mem[span_lo..span_hi].ptr, span_len)) |copy_ptr| {
                     push(r, replayUploadSpan, .{ raw, r.ref(res), copy_ptr, span_lo, span_len });
@@ -2896,12 +2930,17 @@ const deferred_vtbl = blk: {
     v[47] = @ptrCast(&dCopyResource);
     v[48] = @ptrCast(&dUpdateSubresource);
     v[50] = @ptrCast(&dClearRTV);
+    v[51] = @ptrCast(&dClearUAVUint);
+    v[52] = @ptrCast(&dClearUAVFloat);
     v[53] = dObj1(ctxClearDSV);
     v[54] = dObj1(ctxGenerateMips);
     v[57] = @ptrCast(&dResolveSubresource);
     v[58] = @ptrCast(&dExecuteCommandList);
     v[23] = dSetShader(ctxGSSetShader);
+    v[39] = dObj1(ctxDrawIndexedInstancedIndirect);
+    v[40] = dObj1(ctxDrawInstancedIndirect);
     v[41] = dVal(ctxDispatch);
+    v[42] = dObj1(ctxDispatchIndirect);
     v[67] = dSetArr(ctxCSSetSRV);
     v[68] = @ptrCast(&dCSSetUAV);
     v[69] = dSetShader(ctxCSSetShader);

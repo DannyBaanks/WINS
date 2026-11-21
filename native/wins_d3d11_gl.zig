@@ -197,6 +197,8 @@ const Gl = struct {
     glDrawArraysInstanced: *const fn (GLenum, GLint, GLsizei, GLsizei) callconv(.c) void,
     glDrawElementsInstanced: *const fn (GLenum, GLsizei, GLenum, ?*const anyopaque, GLsizei) callconv(.c) void,
     glDrawElementsInstancedBaseVertex: *const fn (GLenum, GLsizei, GLenum, ?*const anyopaque, GLsizei, GLint) callconv(.c) void,
+    glDrawArraysIndirect: *const fn (GLenum, ?*const anyopaque) callconv(.c) void,
+    glDrawElementsIndirect: *const fn (GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
 
     glGenFramebuffers: *const fn (GLsizei, *GLuint) callconv(.c) void,
     glDeleteFramebuffers: *const fn (GLsizei, *const GLuint) callconv(.c) void,
@@ -209,6 +211,7 @@ const Gl = struct {
 
     // Compute / SM5 memory (GL 4.3)
     glDispatchCompute: *const fn (GLuint, GLuint, GLuint) callconv(.c) void,
+    glDispatchComputeIndirect: *const fn (GLintptr) callconv(.c) void,
     glMemoryBarrier: *const fn (c_uint) callconv(.c) void,
     glBindImageTexture: *const fn (GLuint, GLuint, GLint, u8, GLint, GLenum, GLenum) callconv(.c) void,
     glTexBufferRange: *const fn (GLenum, GLenum, GLuint, GLintptr, GLsizeiptr) callconv(.c) void,
@@ -217,6 +220,7 @@ const Gl = struct {
 const FnClipControl = *const fn (GLenum, GLenum) callconv(.c) void;
 const FnCopyImageSubData = *const fn (GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei) callconv(.c) void;
 const FnSwapIntervalEXT = *const fn (?*anyopaque, c_ulong, c_int) callconv(.c) void;
+const FnClearTexImage = *const fn (GLuint, GLint, GLenum, GLenum, ?*const anyopaque) callconv(.c) void;
 
 var gl: Gl = undefined;
 var xlib: Xlib = undefined;
@@ -224,6 +228,7 @@ var glx: Glx = undefined;
 var p_clip_control: ?FnClipControl = null;
 var p_copy_image: ?FnCopyImageSubData = null;
 var p_swap_interval: ?FnSwapIntervalEXT = null;
+var p_clear_tex_image: ?FnClearTexImage = null;
 var g_gl_display: ?*anyopaque = null;
 var g_gl_ctx: ?*anyopaque = null;
 var g_gl_dummy_win: c_ulong = 0;
@@ -376,6 +381,8 @@ pub const DrawKind = enum {
     indexed,
     arrays_instanced,
     indexed_instanced,
+    arrays_indirect,
+    indexed_indirect,
 };
 
 pub const Viewport = struct {
@@ -633,6 +640,7 @@ fn loadGl() bool {
     if (glx.glXGetProcAddressARB("glClipControl")) |s| p_clip_control = @ptrCast(@alignCast(s));
     if (glx.glXGetProcAddressARB("glCopyImageSubData")) |s| p_copy_image = @ptrCast(@alignCast(s));
     if (glx.glXGetProcAddressARB("glXSwapIntervalEXT")) |s| p_swap_interval = @ptrCast(@alignCast(s));
+    if (glx.glXGetProcAddressARB("glClearTexImage")) |s| p_clear_tex_image = @ptrCast(@alignCast(s));
     return true;
 }
 
@@ -1883,6 +1891,53 @@ pub fn clearDsv(dsv: *View, flags: u32, depth: f32, stencil: u8) void {
     run(&clearDsvJob, &j);
 }
 
+const ClearUavJob = struct { uav: *View, vals: [4]u32, is_float: bool };
+
+fn clearUavJob(raw: ?*anyopaque) void {
+    const j: *ClearUavJob = @ptrCast(@alignCast(raw.?));
+    const v = j.uav;
+    const is_zero = (j.vals[0] == 0 and j.vals[1] == 0 and j.vals[2] == 0 and j.vals[3] == 0);
+    if (v.buf) |b| {
+        if (b.gl_id == 0 or b.size == 0) return;
+        const off: usize = @min(v.buf_off, b.size);
+        const len: usize = if (v.buf_size > 0) @min(v.buf_size, b.size - @as(u32, @intCast(off))) else (b.size - @as(u32, @intCast(off)));
+        if (len == 0) return;
+        if (b.shadow) |sh| {
+            const slice = sh[off .. off + len];
+            if (is_zero) {
+                @memset(slice, 0);
+            } else {
+                var k: usize = 0;
+                while (k + 4 <= slice.len) : (k += 4) {
+                    std.mem.writeInt(u32, slice[k..][0..4], j.vals[0], .little);
+                }
+            }
+            const target = glTargetForBuffer(b.bind_flags);
+            gl.glBindBuffer(target, b.gl_id);
+            gl.glBufferSubData(target, @intCast(off), @intCast(len), slice.ptr);
+            gl.glBindBuffer(target, 0);
+        }
+    } else if (v.tex) |t| {
+        if (t.gl_id == 0) return;
+        if (p_clear_tex_image) |cti| {
+            const gf = dxgiToGlFormat(t.dxgi_fmt);
+            if (!gf.compressed) {
+                if (is_zero) {
+                    cti(t.gl_id, @intCast(v.first_mip), gf.format, gf.ty, null);
+                } else {
+                    const ty: GLenum = if (j.is_float) 0x1406 else gf.ty;
+                    cti(t.gl_id, @intCast(v.first_mip), gf.format, ty, @ptrCast(&j.vals));
+                }
+            }
+        }
+    }
+}
+
+pub fn clearUav(uav: *View, vals: [4]u32, is_float: bool) void {
+    var j: ClearUavJob = .{ .uav = uav, .vals = vals, .is_float = is_float };
+    run(&clearUavJob, &j);
+}
+
 const CopyJob = struct {
     dst: *Texture,
     dst_sub: u32,
@@ -2092,6 +2147,8 @@ const DrawJob = struct {
     start_index: u32,
     base_vertex: i32,
     start_instance: u32,
+    indirect_buf: ?*Buffer = null,
+    indirect_off: u32 = 0,
 };
 
 var g_active_attribs: u32 = 0;
@@ -2334,7 +2391,14 @@ fn linkCompute(sh: *Shader) void {
     if (getenv("WINS_D3D11_DUMP_DIR")) |dz| dumpFile(std.mem.span(dz), prog, "cs.glsl", tr.glsl);
 }
 
-const DispatchJob = struct { s: *DrawState, x: u32, y: u32, z: u32 };
+const DispatchJob = struct {
+    s: *DrawState,
+    x: u32 = 0,
+    y: u32 = 0,
+    z: u32 = 0,
+    indirect_buf: ?*Buffer = null,
+    indirect_off: u32 = 0,
+};
 pub var g_dispatch_count: u32 = 0;
 
 fn dispatchJob(raw: ?*anyopaque) void {
@@ -2358,7 +2422,14 @@ fn dispatchJob(raw: ?*anyopaque) void {
     bindTextureSlots(cs.cs_tex, &s.cs_srv, &s.cs_samp);
     bindBufSlots(cs.cs_buf, &s.cs_srv, &s.cs_uav);
     bindImageSlots(cs.cs_img, &s.cs_uav);
-    gl.glDispatchCompute(j.x, j.y, j.z);
+    if (j.indirect_buf) |ib| {
+        if (ib.gl_id == 0) return;
+        gl.glBindBuffer(0x90EE, ib.gl_id); // GL_DISPATCH_INDIRECT_BUFFER
+        gl.glDispatchComputeIndirect(@intCast(j.indirect_off));
+        gl.glBindBuffer(0x90EE, 0);
+    } else {
+        gl.glDispatchCompute(j.x, j.y, j.z);
+    }
     // D3D11 orders every Dispatch against what follows; GL needs explicit barriers.
     gl.glMemoryBarrier(0xFFFFFFFF);
     if (g_err_logged < 32) {
@@ -2373,6 +2444,11 @@ fn dispatchJob(raw: ?*anyopaque) void {
 pub fn dispatch(s: *DrawState, x: u32, y: u32, z: u32) void {
     if (x == 0 or y == 0 or z == 0) return;
     var j: DispatchJob = .{ .s = s, .x = x, .y = y, .z = z };
+    run(&dispatchJob, &j);
+}
+
+pub fn dispatchIndirect(s: *DrawState, buf: *Buffer, off: u32) void {
+    var j: DispatchJob = .{ .s = s, .indirect_buf = buf, .indirect_off = off };
     run(&dispatchJob, &j);
 }
 
@@ -2542,6 +2618,12 @@ fn drawJob(raw: ?*anyopaque) void {
         gl.glDrawArrays(mode, @intCast(j.start_vertex), @intCast(j.count));
     } else if (j.kind == .arrays_instanced) {
         gl.glDrawArraysInstanced(mode, @intCast(j.start_vertex), @intCast(j.count), @intCast(j.inst_count));
+    } else if (j.kind == .arrays_indirect) {
+        const ab = j.indirect_buf orelse return;
+        if (ab.gl_id == 0) return;
+        gl.glBindBuffer(0x8F3F, ab.gl_id); // GL_DRAW_INDIRECT_BUFFER
+        gl.glDrawArraysIndirect(mode, @ptrFromInt(@as(usize, j.indirect_off)));
+        gl.glBindBuffer(0x8F3F, 0);
     } else {
         const ib = s.ib orelse return;
         gl.glBindBuffer(0x8893, ib.gl_id);
@@ -2549,7 +2631,13 @@ fn drawJob(raw: ?*anyopaque) void {
         const idx_ty: GLenum = if (is_u32) 0x1405 else 0x1403;
         const idx_bytes: usize = if (is_u32) 4 else 2;
         const ib_ptr: ?*const anyopaque = @ptrFromInt(@as(usize, s.ib_offset) + @as(usize, j.start_index) * idx_bytes);
-        if (j.kind == .indexed) {
+        if (j.kind == .indexed_indirect) {
+            const ab = j.indirect_buf orelse return;
+            if (ab.gl_id == 0) return;
+            gl.glBindBuffer(0x8F3F, ab.gl_id); // GL_DRAW_INDIRECT_BUFFER
+            gl.glDrawElementsIndirect(mode, idx_ty, @ptrFromInt(@as(usize, j.indirect_off)));
+            gl.glBindBuffer(0x8F3F, 0);
+        } else if (j.kind == .indexed) {
             if (j.base_vertex != 0) {
                 gl.glDrawElementsBaseVertex(mode, @intCast(j.count), idx_ty, ib_ptr, j.base_vertex);
             } else {
@@ -2734,6 +2822,27 @@ pub fn draw(s: *const DrawState, kind: DrawKind, count: u32, inst_count: u32, st
         .s = s, .kind = kind, .count = count, .inst_count = inst_count,
         .start_vertex = start_vertex, .start_index = start_index,
         .base_vertex = base_vertex, .start_instance = start_instance,
+    };
+    run(&drawJob, &j);
+}
+
+pub fn drawIndirect(s: *const DrawState, indexed: bool, buf: *Buffer, off: u32) void {
+    if (s.topology >= 33 or s.gs_active) {
+        g_skipped_stage_draws += 1;
+        return;
+    }
+    g_draw_count += 1;
+    var j: DrawJob = .{
+        .s = s,
+        .kind = if (indexed) .indexed_indirect else .arrays_indirect,
+        .count = 0,
+        .inst_count = 0,
+        .start_vertex = 0,
+        .start_index = 0,
+        .base_vertex = 0,
+        .start_instance = 0,
+        .indirect_buf = buf,
+        .indirect_off = off,
     };
     run(&drawJob, &j);
 }
