@@ -139,6 +139,8 @@ const WinObj = struct {
     needs_paint: bool = false,
     has_gl: bool = false,
     fullscreen: bool = false,
+    x11_mapped: bool = false,
+    x11_fs_applied: bool = false,
     hinstance: usize = 0,
     hmenu: usize = 0,
     userdata: isize = 0,
@@ -1035,11 +1037,12 @@ fn isFullscreenPopupStyle(style: u32, width: i32, height: i32) bool {
 
 pub fn setWindowFullscreen(hwnd: usize, fullscreen: bool, width: u32, height: u32) void {
     const w = findWin(hwnd) orelse return;
-    w.fullscreen = fullscreen;
     const nw: i32 = @intCast(@max(1, width));
     const nh: i32 = @intCast(@max(1, height));
+    const eff_fs = fullscreen or w.fullscreen or (nw >= 1920 and nh >= 1080);
+    w.fullscreen = eff_fs;
     const size_changed = (w.width != nw or w.height != nh);
-    if (fullscreen) {
+    if (eff_fs) {
         w.x = 0;
         w.y = 0;
     }
@@ -1048,9 +1051,17 @@ pub fn setWindowFullscreen(hwnd: usize, fullscreen: bool, width: u32, height: u3
     ensureX11Window(w);
     if (w.x11_win != 0) {
         if (connection) |conn| {
-            conn.moveResize(w.x11_win, w.x, w.y, @intCast(nw), @intCast(nh));
-            conn.setFullscreen(w.x11_win, fullscreen);
-            if (w.visible) conn.map(w.x11_win);
+            if (size_changed or !w.x11_mapped) {
+                conn.moveResize(w.x11_win, w.x, w.y, @intCast(nw), @intCast(nh));
+            }
+            if (w.visible and !w.x11_mapped) {
+                conn.map(w.x11_win);
+                w.x11_mapped = true;
+            }
+            if (w.x11_mapped and eff_fs != w.x11_fs_applied) {
+                conn.setFullscreen(w.x11_win, eff_fs);
+                w.x11_fs_applied = eff_fs;
+            }
             if (g_cursor_count.load(.monotonic) < 0) conn.setCursorVisible(w.x11_win, false);
             conn.flush();
         }
@@ -1096,7 +1107,6 @@ fn ensureX11Window(w: *WinObj) void {
             if (tn > 0) conn.setTitle(x11_win, @ptrCast(&tbuf));
             if (w.fullscreen or isFullscreenPopupStyle(w.style, w.width, w.height)) {
                 w.fullscreen = true;
-                conn.setFullscreen(x11_win, true);
             }
             if (g_cursor_count.load(.monotonic) < 0) {
                 conn.setCursorVisible(x11_win, false);
@@ -1150,10 +1160,16 @@ fn showWindow(window: usize, cmd_show: i32) callconv(W) i32 {
         ensureX11Window(w);
         if (w.x11_win != 0) {
             if (connection) |conn| {
-                conn.map(w.x11_win);
+                if (!w.x11_mapped) {
+                    conn.map(w.x11_win);
+                    w.x11_mapped = true;
+                }
                 if (w.fullscreen or isFullscreenPopupStyle(w.style, w.width, w.height)) {
                     w.fullscreen = true;
-                    conn.setFullscreen(w.x11_win, true);
+                    if (!w.x11_fs_applied) {
+                        conn.setFullscreen(w.x11_win, true);
+                        w.x11_fs_applied = true;
+                    }
                 }
                 if (g_cursor_count.load(.monotonic) < 0) {
                     conn.setCursorVisible(w.x11_win, false);
@@ -1169,12 +1185,14 @@ fn showWindow(window: usize, cmd_show: i32) callconv(W) i32 {
         // SW_SHOWMINNOACTIVE = 8/4/7 do not).
         if ((w.style & WS_CHILD) == 0 and w.parent == 0 and was_visible == 0 and g_activated_hwnd == 0 and !g_focus_lost and cmd_show != 4 and cmd_show != 7 and cmd_show != 8)
             setActivation(window, true, true);
-    } else {
+    } else if (!w.fullscreen and !w.has_gl) {
         w.visible = false;
         w.style &= ~WS_VISIBLE;
         if (w.x11_win != 0) {
             if (connection) |conn| {
                 conn.unmap(w.x11_win);
+                w.x11_mapped = false;
+                w.x11_fs_applied = false;
                 conn.flush();
             }
         }
@@ -1720,7 +1738,7 @@ fn pumpX11Events(wait_ms: i32) void {
             },
             22 => { // ConfigureNotify
                 const ce: *const x11.XConfigureEvent = @ptrCast(&ev);
-                if (ce.width > 0 and ce.height > 0 and (ce.width != w.width or ce.height != w.height)) {
+                if (!w.fullscreen and ce.width > 0 and ce.height > 0 and (ce.width != w.width or ce.height != w.height)) {
                     w.width = ce.width;
                     w.height = ce.height;
                     const lp: usize = (@as(usize, @intCast(ce.height)) << 16) | @as(usize, @intCast(ce.width & 0xffff));
@@ -1789,11 +1807,13 @@ fn pumpX11Events(wait_ms: i32) void {
                 dinput.focus(true);
                 setActivation(w.hwnd, true, false);
             },
-            10 => { // FocusOut: Windows releases every key of a background window
+            10 => { // FocusOut: release keys, but keep fullscreen GL games activated so they do not self-minimize
                 if (g_focus_hwnd == w.hwnd or g_focus_hwnd == 0) {
                     g_focus_hwnd = 0;
                     g_focus_lost = true;
-                    setActivation(w.hwnd, false, false);
+                    if (!w.fullscreen and !w.has_gl) {
+                        setActivation(w.hwnd, false, false);
+                    }
                 }
                 dinput.focus(false);
                 g_have_dinput_last = false;
@@ -2017,20 +2037,28 @@ fn SetWindowPos(hwnd: usize, hwndInsertAfter: usize, x: i32, y: i32, cx: i32, cy
     ensureX11Window(w);
     if (w.x11_win != 0) {
         if (connection) |conn| {
-            if ((uFlags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE)) {
-                conn.moveResize(w.x11_win, w.x, w.y, @intCast(@max(1, w.width)), @intCast(@max(1, w.height)));
+            if ((uFlags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE) and (!w.fullscreen or size_changed)) {
+                conn.moveResize(w.x11_win, if (w.fullscreen) 0 else w.x, if (w.fullscreen) 0 else w.y, @intCast(@max(1, w.width)), @intCast(@max(1, w.height)));
             }
             if ((uFlags & SWP_SHOWWINDOW) != 0 or w.visible) {
-                conn.map(w.x11_win);
+                if (!w.x11_mapped) {
+                    conn.map(w.x11_win);
+                    w.x11_mapped = true;
+                }
                 if (w.fullscreen or isFullscreenPopupStyle(w.style, w.width, w.height)) {
                     w.fullscreen = true;
-                    conn.setFullscreen(w.x11_win, true);
+                    if (!w.x11_fs_applied) {
+                        conn.setFullscreen(w.x11_win, true);
+                        w.x11_fs_applied = true;
+                    }
                 }
                 if (g_cursor_count.load(.monotonic) < 0) {
                     conn.setCursorVisible(w.x11_win, false);
                 }
-            } else if ((uFlags & SWP_HIDEWINDOW) != 0) {
+            } else if ((uFlags & SWP_HIDEWINDOW) != 0 and !w.fullscreen and !w.has_gl) {
                 conn.unmap(w.x11_win);
+                w.x11_mapped = false;
+                w.x11_fs_applied = false;
             }
             conn.flush();
         }
@@ -3233,10 +3261,10 @@ fn SetWindowLongPtrW(hwnd: usize, nIndex: i32, dwNewLong: isize) callconv(W) isi
         GWL_STYLE => {
             w.style = @truncate(@as(usize, @bitCast(dwNewLong)));
             if ((w.style & WS_CHILD) == 0 and w.x11_win != 0) {
-                const want_fs = isFullscreenPopupStyle(w.style, w.width, w.height);
-                if (want_fs != w.fullscreen) {
-                    w.fullscreen = want_fs;
-                    if (connection) |conn| conn.setFullscreen(w.x11_win, want_fs);
+                const want_fs = w.fullscreen or isFullscreenPopupStyle(w.style, w.width, w.height);
+                if (want_fs and !w.fullscreen) {
+                    w.fullscreen = true;
+                    if (connection) |conn| conn.setFullscreen(w.x11_win, true);
                 }
             }
         },

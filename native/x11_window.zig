@@ -277,16 +277,7 @@ pub const Connection = struct {
         if (window == 0) return;
         const wm_state = XInternAtom(self.display, "_NET_WM_STATE", 0);
         const wm_fs = XInternAtom(self.display, "_NET_WM_STATE_FULLSCREEN", 0);
-        const xa_atom: Atom = 4; // XA_ATOM
         if (wm_state == 0 or wm_fs == 0) return;
-        self.setDecorations(window, !fullscreen);
-        if (fullscreen) {
-            const atoms = [1]Atom{wm_fs};
-            _ = XChangeProperty(self.display, window, wm_state, xa_atom, 32, 0, @ptrCast(&atoms), 1);
-        } else {
-            const empty = [1]Atom{0};
-            _ = XChangeProperty(self.display, window, wm_state, xa_atom, 32, 0, @ptrCast(&empty), 0);
-        }
         var ev: XEvent = std.mem.zeroes(XEvent);
         const cm: *XClientMessageEvent = @ptrCast(&ev);
         cm.type = 33; // ClientMessage
