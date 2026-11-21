@@ -6,11 +6,14 @@ const fixups = @import("../macho/fixups.zig");
 const image = @import("../loader/image.zig");
 const mapper = @import("../loader/mapper.zig");
 const shims = @import("../darwin/shims.zig");
+const objc = @import("../darwin/objc.zig");
+const unwind = @import("../darwin/unwind.zig");
 const rpath = @import("rpath.zig");
 
 pub const DepKind = enum {
     LOCAL_MACHO,
     DARWIN_SHIM,
+    LINUX_NATIVE_LIB,
     WEAK_MISSING,
 };
 
@@ -42,6 +45,7 @@ pub const DyldContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     executable_path: []const u8,
+    lib_dirs: []const []const u8 = &.{},
     images: std.ArrayList(image.MappedImage),
     owned_raw_buffers: std.ArrayList([]u8),
     owned_paths: std.ArrayList([]const u8),
@@ -72,6 +76,7 @@ pub const DyldContext = struct {
     }
 
     pub fn deinit(self: *DyldContext) void {
+        unwind.clearImages();
         for (self.images.items) |*img| img.deinit();
         self.images.deinit(self.allocator);
         for (self.owned_raw_buffers.items) |buf| self.allocator.free(buf);
@@ -118,6 +123,16 @@ pub const DyldContext = struct {
             errdefer self.allocator.free(ord_map);
 
             for (dylibs, 0..) |d, di| {
+                if (shims.nativeLinuxLibraryForDylib(d.name)) |so_name| {
+                    ord_map[di] = .{ .kind = .LINUX_NATIVE_LIB, .image_index = null, .name = d.name };
+                    try self.deps.append(self.allocator, .{
+                        .requested_name = d.name,
+                        .resolved_path = std.mem.span(so_name),
+                        .kind = .LINUX_NATIVE_LIB,
+                        .image_index = null,
+                    });
+                    continue;
+                }
                 if (shims.isDarwinSystemDylib(d.name)) {
                     ord_map[di] = .{ .kind = .DARWIN_SHIM, .image_index = null, .name = d.name };
                     try self.deps.append(self.allocator, .{
@@ -137,13 +152,26 @@ pub const DyldContext = struct {
                     try all_rpaths.appendSlice(self.allocator, self.images.items[0].parsed.rpaths);
                 }
 
-                const resolved_opt = try rpath.expandLoadPath(
+                var resolved_opt = try rpath.expandLoadPath(
                     self.allocator,
                     d.name,
                     self.executable_path,
                     img_path,
                     all_rpaths.items,
                 );
+                if (resolved_opt == null and self.lib_dirs.len > 0) {
+                    const base = std.fs.path.basename(d.name);
+                    for (self.lib_dirs) |ldir| {
+                        const cand = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ ldir, base });
+                        const c_cand = try self.allocator.dupeZ(u8, cand);
+                        defer self.allocator.free(c_cand);
+                        if (std.c.access(c_cand.ptr, 0) == 0) {
+                            resolved_opt = cand;
+                            break;
+                        }
+                        self.allocator.free(cand);
+                    }
+                }
 
                 if (resolved_opt) |resolved_path| {
                     try self.owned_paths.append(self.allocator, resolved_path);
@@ -191,7 +219,9 @@ pub const DyldContext = struct {
         }
     }
 
-    fn lookupInImageExports(img: *const image.MappedImage, symbol: []const u8) ?usize {
+    fn lookupInImageExports(self: *const DyldContext, img_idx: usize, symbol: []const u8, depth: usize) ?usize {
+        if (depth >= 16) return null;
+        const img = &self.images.items[img_idx];
         const trie_slice: ?[]const u8 = if (img.parsed.exports_trie) |et|
             img.parsed.sliceRange(et.dataoff, et.datasize) catch null
         else if (img.parsed.dyld_info) |di|
@@ -201,10 +231,119 @@ pub const DyldContext = struct {
 
         if (trie_slice) |trie| {
             if (exports.lookupExport(trie, symbol)) |exp| {
+                if ((exp.flags & exports.EXPORT_SYMBOL_FLAGS_REEXPORT) != 0) {
+                    const ord = exp.other;
+                    const ord_map = self.ordinal_maps.items[img_idx];
+                    if (ord > 0 and ord - 1 < ord_map.len) {
+                        const dep = ord_map[@intCast(ord - 1)];
+                        const target_sym = exp.import_name orelse symbol;
+                        switch (dep.kind) {
+                            .LOCAL_MACHO => return self.lookupInImageExports(dep.image_index.?, target_sym, depth + 1),
+                            .DARWIN_SHIM => if (shims.lookup(target_sym)) |sh| return sh.address,
+                            .LINUX_NATIVE_LIB => return shims.lookupNativeLibrarySymbol(dep.name, target_sym),
+                            .WEAK_MISSING => return null,
+                        }
+                    }
+                    return null;
+                }
+                if ((exp.flags & exports.EXPORT_SYMBOL_FLAGS_KIND_MASK) == exports.EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE) {
+                    return @intCast(exp.address_offset);
+                }
                 return img.actual_base + @as(usize, @intCast(exp.address_offset));
             }
         }
         return null;
+    }
+
+    fn initializeMachoTlv(img: *const image.MappedImage) void {
+        var init_data: ?[*]const u8 = null;
+        var init_size: usize = 0;
+        var bss_size: usize = 0;
+        var vars_addr: usize = 0;
+        var vars_size: usize = 0;
+
+        for (img.parsed.segments) |seg| {
+            for (seg.sections) |sec| {
+                const sname = sec.name();
+                if (std.mem.eql(u8, sname, "__thread_data")) {
+                    init_data = @ptrFromInt(img.vmToActual(sec.addr));
+                    init_size = @intCast(sec.size);
+                } else if (std.mem.eql(u8, sname, "__thread_bss")) {
+                    bss_size = @intCast(sec.size);
+                } else if (std.mem.eql(u8, sname, "__thread_vars")) {
+                    vars_addr = img.vmToActual(sec.addr);
+                    vars_size = @intCast(sec.size);
+                }
+            }
+        }
+        if (vars_addr == 0 or vars_size < @sizeOf(shims.TlvDescriptor)) return;
+        const tpl_key = shims.registerTlvImage(init_data, init_size, init_size + bss_size);
+        const count = vars_size / @sizeOf(shims.TlvDescriptor);
+        const descs: [*]shims.TlvDescriptor = @ptrFromInt(vars_addr);
+        for (0..count) |i| {
+            descs[i].thunk = &shims.shim_tlv_get_addr;
+            descs[i].key = tpl_key;
+        }
+    }
+
+    fn registerMachoObjcClasses(img: *const image.MappedImage) void {
+        for (img.parsed.segments) |seg| {
+            for (seg.sections) |sec| {
+                if (std.mem.eql(u8, sec.name(), "__objc_classlist") and sec.size >= @sizeOf(usize)) {
+                    const base = img.vmToActual(sec.addr);
+                    const count: usize = @intCast(sec.size / @sizeOf(usize));
+                    const list: [*]const usize = @ptrFromInt(base);
+                    for (0..count) |i| {
+                        const cls_addr = list[i];
+                        if (cls_addr != 0 and (cls_addr & 0x7) == 0) {
+                            objc.registerClass(@ptrFromInt(cls_addr));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn runInitializers(
+        self: *const DyldContext,
+        argc: c_int,
+        argv: [*c]const [*c]const u8,
+        envp: [*c]const [*c]const u8,
+        apple: [*c]const [*c]const u8,
+    ) void {
+        const InitFn = *const fn (c_int, [*c]const [*c]const u8, [*c]const [*c]const u8, [*c]const [*c]const u8, ?*const anyopaque) callconv(.c) void;
+        // Run dylib initializers first, then main executable (reverse load order)
+        var idx: usize = self.images.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const img = &self.images.items[idx];
+            for (img.parsed.segments) |seg| {
+                for (seg.sections) |sec| {
+                    const sname = sec.name();
+                    if (std.mem.eql(u8, sname, "__mod_init_func") and sec.size >= @sizeOf(usize)) {
+                        const base = img.vmToActual(sec.addr);
+                        const count: usize = @intCast(sec.size / @sizeOf(usize));
+                        const ptrs: [*]const usize = @ptrFromInt(base);
+                        for (0..count) |i| {
+                            if (ptrs[i] != 0) {
+                                const f: InitFn = @ptrFromInt(ptrs[i]);
+                                f(argc, argv, envp, apple, null);
+                            }
+                        }
+                    } else if (std.mem.eql(u8, sname, "__init_offsets") and sec.size >= @sizeOf(u32)) {
+                        const base = img.vmToActual(sec.addr);
+                        const count: usize = @intCast(sec.size / @sizeOf(u32));
+                        const offs: [*]const u32 = @ptrFromInt(base);
+                        for (0..count) |i| {
+                            if (offs[i] != 0) {
+                                const f: InitFn = @ptrFromInt(img.actual_base + @as(usize, offs[i]));
+                                f(argc, argv, envp, apple, null);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn applyFixupsAndBind(self: *DyldContext) !void {
@@ -248,9 +387,52 @@ pub const DyldContext = struct {
             }
         }
 
-        // Restore final segment protections (never leave segments globally RWX)
+        // Initialize Mach-O TLS (__thread_vars) while __DATA is writable, then
+        // restore final segment protections (never leave segments globally RWX)
+        // and register Objective-C classes + Mach-O compact unwind sections.
         for (self.images.items) |*img| {
+            initializeMachoTlv(img);
             try mapper.finalizeProtections(img);
+            registerMachoObjcClasses(img);
+            registerMachoUnwind(img);
+        }
+    }
+
+    fn registerMachoUnwind(img: *const image.MappedImage) void {
+        var text_start: usize = 0;
+        var text_end: usize = 0;
+        var unwind_info_addr: usize = 0;
+        var unwind_info_size: usize = 0;
+        var eh_frame_addr: usize = 0;
+        var eh_frame_size: usize = 0;
+
+        for (img.parsed.segments) |seg| {
+            if (std.mem.eql(u8, seg.cmd.name(), "__TEXT")) {
+                text_start = img.vmToActual(seg.cmd.vmaddr);
+                text_end = text_start + @as(usize, @intCast(seg.cmd.vmsize));
+            }
+            for (seg.sections) |sec| {
+                const sname = sec.name();
+                if (std.mem.eql(u8, sname, "__unwind_info") and sec.size > 0) {
+                    unwind_info_addr = img.vmToActual(sec.addr);
+                    unwind_info_size = @intCast(sec.size);
+                } else if (std.mem.eql(u8, sname, "__eh_frame") and sec.size > 0) {
+                    eh_frame_addr = img.vmToActual(sec.addr);
+                    eh_frame_size = @intCast(sec.size);
+                }
+            }
+        }
+
+        if (text_start != 0 and (unwind_info_addr != 0 or eh_frame_addr != 0)) {
+            unwind.registerImage(.{
+                .dso_base = text_start,
+                .text_start = text_start,
+                .text_end = text_end,
+                .unwind_info_addr = unwind_info_addr,
+                .unwind_info_size = unwind_info_size,
+                .eh_frame_addr = eh_frame_addr,
+                .eh_frame_size = eh_frame_size,
+            });
         }
     }
 
@@ -346,12 +528,12 @@ pub const DyldContext = struct {
         var linux_equiv: []const u8 = "-";
 
         if (dylib_ordinal == types.BIND_SPECIAL_DYLIB_SELF) {
-            resolved_addr = lookupInImageExports(img, symbol);
+            resolved_addr = self.lookupInImageExports(img_idx, symbol, 0);
             provider_name = img.path;
             status = .NATIVE_MAPPING;
             linux_equiv = "macho:self";
         } else if (dylib_ordinal == types.BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE) {
-            resolved_addr = lookupInImageExports(&self.images.items[0], symbol);
+            resolved_addr = self.lookupInImageExports(0, symbol, 0);
             provider_name = self.images.items[0].path;
             status = .NATIVE_MAPPING;
             linux_equiv = "macho:main";
@@ -362,8 +544,8 @@ pub const DyldContext = struct {
                 status = sh.status;
                 linux_equiv = sh.linux_equiv;
             } else {
-                for (self.images.items) |*loaded| {
-                    if (lookupInImageExports(loaded, symbol)) |addr| {
+                for (self.images.items, 0..) |*loaded, li| {
+                    if (self.lookupInImageExports(li, symbol, 0)) |addr| {
                         resolved_addr = addr;
                         provider_name = loaded.path;
                         status = .NATIVE_MAPPING;
@@ -383,9 +565,15 @@ pub const DyldContext = struct {
                         linux_equiv = sh.linux_equiv;
                     }
                 },
+                .LINUX_NATIVE_LIB => {
+                    if (shims.lookupNativeLibrarySymbol(dep.name, symbol)) |addr| {
+                        resolved_addr = addr;
+                        status = .NATIVE_MAPPING;
+                        linux_equiv = std.mem.span(shims.nativeLinuxLibraryForDylib(dep.name).?);
+                    }
+                },
                 .LOCAL_MACHO => {
-                    const target_img = &self.images.items[dep.image_index.?];
-                    resolved_addr = lookupInImageExports(target_img, symbol);
+                    resolved_addr = self.lookupInImageExports(dep.image_index.?, symbol, 0);
                     status = .NATIVE_MAPPING;
                     linux_equiv = "macho:export_trie";
                 },

@@ -13,6 +13,8 @@ pub const RunOptions = struct {
     target_args: []const []const u8,
     run_id: []const u8,
     inspect_only: bool = false,
+    write_evidence: bool = true,
+    lib_dirs: []const []const u8 = &.{},
 };
 
 fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -43,9 +45,13 @@ pub fn runTarget(allocator: std.mem.Allocator, io: std.Io, opts: RunOptions) !c_
 
     const evidence_dir = try std.fmt.allocPrint(allocator, "evidence/{s}", .{opts.run_id});
     defer allocator.free(evidence_dir);
-    evidence.ensureDir("evidence");
-    evidence.ensureDir(evidence_dir);
-    signals.active_evidence_dir = evidence_dir;
+    if (opts.write_evidence) {
+        evidence.ensureDir("evidence");
+        evidence.ensureDir(evidence_dir);
+        signals.active_evidence_dir = evidence_dir;
+    } else {
+        signals.active_evidence_dir = null;
+    }
     signals.active_target_path = opts.target_path;
     shims.active_executable_path = opts.target_path;
     defer {
@@ -71,20 +77,25 @@ pub fn runTarget(allocator: std.mem.Allocator, io: std.Io, opts: RunOptions) !c_
     tracer.record(.ENTRYPOINT_RESOLVED, "entryoff=0x{x} entry_address=0x{x}", .{ entryoff, entry_addr });
 
     var dyld = resolver.DyldContext.init(allocator, io, opts.target_path);
+    dyld.lib_dirs = opts.lib_dirs;
     defer dyld.deinit();
 
     try dyld.loadGraph(mapped);
     tracer.record(.DYLIB_GRAPH_READY, "images={d} deps={d}", .{ dyld.images.items.len, dyld.deps.items.len });
 
     dyld.applyFixupsAndBind() catch |err| {
-        evidence.writeRunEvidence(allocator, evidence_dir, opts.target_path, raw, &dyld, &tracer, null, false);
+        if (opts.write_evidence) {
+            evidence.writeRunEvidence(allocator, evidence_dir, opts.target_path, raw, &dyld, &tracer, null, false);
+        }
         return err;
     };
     tracer.record(.FIXUPS_APPLIED, "images={d}", .{dyld.images.items.len});
     tracer.record(.IMPORTS_RESOLVED, "symbols={d}", .{dyld.resolved_symbols.items.len});
 
     if (opts.inspect_only) {
-        evidence.writeRunEvidence(allocator, evidence_dir, opts.target_path, raw, &dyld, &tracer, 0, false);
+        if (opts.write_evidence) {
+            evidence.writeRunEvidence(allocator, evidence_dir, opts.target_path, raw, &dyld, &tracer, 0, false);
+        }
         return 0;
     }
 
@@ -127,9 +138,13 @@ pub fn runTarget(allocator: std.mem.Allocator, io: std.Io, opts: RunOptions) !c_
     };
 
     tracer.record(.TRANSFER_CONTROL, "rip=0x{x} seccomp_trap={}", .{ entry_addr, seccomp_ok });
+    dyld.runInitializers(ctx.argc, ctx.argv, ctx.envp, ctx.apple);
     const rc = entry.transferControl(ctx);
+    shims.runMachoAtexitHandlers();
     tracer.record(.EXIT, "return_code={d}", .{rc});
 
-    evidence.writeRunEvidence(allocator, evidence_dir, opts.target_path, raw, &dyld, &tracer, rc, seccomp_ok);
+    if (opts.write_evidence) {
+        evidence.writeRunEvidence(allocator, evidence_dir, opts.target_path, raw, &dyld, &tracer, rc, seccomp_ok);
+    }
     return rc;
 }

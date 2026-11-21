@@ -3,6 +3,8 @@ const trace = @import("../runtime/trace.zig");
 const c_stat = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("dirent.h");
+    @cInclude("fcntl.h");
+    @cInclude("unistd.h");
 });
 
 // Exact Darwin x86_64 struct stat (64-bit inode, 144 bytes)
@@ -96,7 +98,7 @@ pub const DarwinDirent64 = extern struct {
     d_name: [1024]u8,
 };
 
-var tls_darwin_dirent: DarwinDirent64 = undefined;
+threadlocal var tls_darwin_dirent: DarwinDirent64 = undefined;
 
 pub fn shim_opendir(name: [*:0]const u8) callconv(.c) ?*c_stat.DIR {
     if (trace.active_tracer) |t| t.recordExternalCall("_opendir$INODE64");
@@ -125,4 +127,30 @@ pub fn shim_closedir(dirp: ?*c_stat.DIR) callconv(.c) c_int {
     if (trace.active_tracer) |t| t.recordExternalCall("_closedir");
     const d = dirp orelse return -1;
     return c_stat.closedir(d);
+}
+
+pub fn shim_fdopendir(fd: c_int) callconv(.c) ?*c_stat.DIR {
+    if (trace.active_tracer) |t| t.recordExternalCall("_fdopendir$INODE64");
+    return c_stat.fdopendir(fd);
+}
+
+fn mapDarwinAtFd(dirfd: c_int) c_int {
+    // Darwin AT_FDCWD == -2, Linux AT_FDCWD == -100
+    return if (dirfd == -2) -100 else dirfd;
+}
+
+pub fn shim_fstatat(dirfd: c_int, path: [*:0]const u8, buf: *DarwinStat64, darwin_flag: c_int) callconv(.c) c_int {
+    if (trace.active_tracer) |t| t.recordExternalCall("_fstatat$INODE64");
+    var lx_flag: c_int = 0;
+    if ((darwin_flag & 0x0020) != 0) lx_flag |= 0x0100; // AT_SYMLINK_NOFOLLOW
+    var lx: c_stat.struct_stat = undefined;
+    const rc = c_stat.fstatat(mapDarwinAtFd(dirfd), path, &lx, lx_flag);
+    if (rc != 0) return -1;
+    translateLinuxStatToDarwin(&lx, buf);
+    return 0;
+}
+
+pub fn shim_readlinkat(dirfd: c_int, path: [*:0]const u8, buf: [*]u8, bufsiz: usize) callconv(.c) isize {
+    if (trace.active_tracer) |t| t.recordExternalCall("_readlinkat");
+    return c_stat.readlinkat(mapDarwinAtFd(dirfd), path, buf, bufsiz);
 }

@@ -8,6 +8,7 @@ extern "c" fn memcpy(dst: *anyopaque, src: *const anyopaque, n: usize) *anyopaqu
 extern "c" fn free(ptr: ?*anyopaque) void;
 extern "c" fn clock_gettime(clk_id: c_int, tp: *std.c.timespec) c_int;
 extern "c" fn nanosleep(req: *const std.c.timespec, rem: ?*std.c.timespec) c_int;
+extern "c" fn sched_yield() c_int;
 
 extern "c" fn pthread_create(thread: *usize, attr: ?*const anyopaque, start_routine: *const anyopaque, arg: ?*anyopaque) c_int;
 extern "c" fn pthread_detach(thread: usize) c_int;
@@ -45,6 +46,7 @@ pub const BlockLiteral = extern struct {
     descriptor: ?*const BlockDescriptor,
 };
 
+const BLOCK_REFCOUNT_MASK: c_int = 0xFFFE;
 const BLOCK_IS_NOESCAPE: c_int = 1 << 23;
 const BLOCK_HAS_COPY_DISPOSE: c_int = 1 << 25;
 const BLOCK_IS_GLOBAL: c_int = 1 << 28;
@@ -60,7 +62,8 @@ pub fn shim_Block_copy(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
     const blk: *BlockLiteral = @ptrCast(@alignCast(ptr));
     if ((blk.flags & BLOCK_IS_GLOBAL) != 0) return ptr;
     if ((blk.flags & BLOCK_NEEDS_FREE) != 0) {
-        // Already heap-allocated; bump refcount in low bits (simplified: keep alive)
+        // Already heap-allocated: atomically increment refcount (+2 in low 16 bits)
+        _ = @atomicRmw(c_int, &blk.flags, .Add, 2, .acq_rel);
         return ptr;
     }
     const size: usize = if (blk.descriptor) |d| @max(d.size, @sizeOf(BlockLiteral)) else @sizeOf(BlockLiteral);
@@ -68,7 +71,7 @@ pub fn shim_Block_copy(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
     _ = memcpy(copy, ptr, size);
     const copy_blk: *BlockLiteral = @ptrCast(@alignCast(copy));
     copy_blk.isa = @intFromPtr(&NSConcreteMallocBlock);
-    copy_blk.flags = (blk.flags & ~BLOCK_IS_NOESCAPE) | BLOCK_NEEDS_FREE | 2;
+    copy_blk.flags = (blk.flags & ~(BLOCK_IS_NOESCAPE | BLOCK_REFCOUNT_MASK)) | BLOCK_NEEDS_FREE | 2;
     if ((blk.flags & BLOCK_HAS_COPY_DISPOSE) != 0) {
         if (blk.descriptor) |d| {
             if (d.copy_helper) |helper| helper(copy, ptr);
@@ -83,6 +86,8 @@ pub fn shim_Block_release(arg: ?*anyopaque) callconv(.c) void {
     const blk: *BlockLiteral = @ptrCast(@alignCast(ptr));
     if ((blk.flags & BLOCK_IS_GLOBAL) != 0) return;
     if ((blk.flags & BLOCK_NEEDS_FREE) == 0) return;
+    const prev = @atomicRmw(c_int, &blk.flags, .Sub, 2, .acq_rel);
+    if ((prev & BLOCK_REFCOUNT_MASK) > 2) return;
     if ((blk.flags & BLOCK_HAS_COPY_DISPOSE) != 0) {
         if (blk.descriptor) |d| {
             if (d.dispose_helper) |helper| helper(ptr);
@@ -116,10 +121,12 @@ pub fn shim_Block_object_assign(dest: *?*anyopaque, src: ?*anyopaque, flags: c_i
             _ = memcpy(copy_raw, @ptrCast(byref), sz);
             const copy: *BlockByref = @ptrCast(@alignCast(copy_raw));
             copy.forwarding = copy;
-            copy.flags = (byref.flags & ~@as(c_int, 0xffff)) | BLOCK_BYREF_NEEDS_FREE | 2;
+            // Refcount 4 = 2 (stack frame forwarding ref) + 2 (this heap block ref)
+            copy.flags = (byref.flags & ~@as(c_int, 0xffff)) | BLOCK_BYREF_NEEDS_FREE | 4;
             byref.forwarding = copy;
             dest.* = copy_raw;
         } else {
+            _ = @atomicRmw(c_int, &byref.flags, .Add, 2, .acq_rel);
             dest.* = @ptrCast(byref);
         }
     } else if (kind == BLOCK_FIELD_IS_BLOCK) {
@@ -137,7 +144,10 @@ pub fn shim_Block_object_dispose(obj: ?*anyopaque, flags: c_int) callconv(.c) vo
         var byref: *BlockByref = @ptrCast(@alignCast(ptr));
         byref = byref.forwarding;
         if ((byref.flags & BLOCK_BYREF_NEEDS_FREE) != 0) {
-            // Keep alive if still referenced by original stack frame/other blocks
+            const prev = @atomicRmw(c_int, &byref.flags, .Sub, 2, .acq_rel);
+            if ((prev & BLOCK_REFCOUNT_MASK) <= 2) {
+                free(@ptrCast(byref));
+            }
         }
     } else if (kind == BLOCK_FIELD_IS_BLOCK) {
         shim_Block_release(ptr);
@@ -431,8 +441,13 @@ pub fn shim_dispatch_apply_f(iterations: usize, queue: ?*DispatchQueue, context:
 pub fn shim_dispatch_once_f(predicate: *isize, context: ?*anyopaque, work: *const fn (?*anyopaque) callconv(.c) void) callconv(.c) void {
     if (trace.active_tracer) |t| t.recordExternalCall("_dispatch_once_f");
     if (@atomicLoad(isize, predicate, .acquire) == -1) return;
-    if (@cmpxchgStrong(isize, predicate, 0, -1, .seq_cst, .acquire) == null) {
+    if (@cmpxchgStrong(isize, predicate, 0, 1, .acq_rel, .acquire) == null) {
         work(context);
+        @atomicStore(isize, predicate, -1, .release);
+        return;
+    }
+    while (@atomicLoad(isize, predicate, .acquire) != -1) {
+        _ = sched_yield();
     }
 }
 
@@ -440,8 +455,13 @@ pub fn shim_dispatch_once(predicate: *isize, block: ?*anyopaque) callconv(.c) vo
     if (trace.active_tracer) |t| t.recordExternalCall("_dispatch_once");
     const blk: *BlockLiteral = @ptrCast(@alignCast(block orelse return));
     if (@atomicLoad(isize, predicate, .acquire) == -1) return;
-    if (@cmpxchgStrong(isize, predicate, 0, -1, .seq_cst, .acquire) == null) {
+    if (@cmpxchgStrong(isize, predicate, 0, 1, .acq_rel, .acquire) == null) {
         blk.invoke(@ptrCast(blk));
+        @atomicStore(isize, predicate, -1, .release);
+        return;
+    }
+    while (@atomicLoad(isize, predicate, .acquire) != -1) {
+        _ = sched_yield();
     }
 }
 
@@ -601,6 +621,7 @@ pub const DispatchSemaphore = extern struct {
     magic: u32,
     refcount: usize,
     value: isize,
+    waiters: usize,
     mutex: MutexBuf align(8),
     cond: CondBuf align(8),
 };
@@ -615,6 +636,7 @@ pub fn shim_dispatch_semaphore_create(value: isize) callconv(.c) ?*DispatchSemap
     s.magic = SEM_MAGIC;
     s.refcount = 1;
     s.value = value;
+    s.waiters = 0;
     _ = pthread_mutex_init(&s.mutex, null);
     _ = pthread_cond_init(&s.cond, null);
     return s;
@@ -632,6 +654,8 @@ pub fn shim_dispatch_semaphore_wait(sem: ?*DispatchSemaphore, timeout: u64) call
     }
     if (timeout == DISPATCH_TIME_NOW) return 1;
     if (timeout == DISPATCH_TIME_FOREVER) {
+        s.waiters += 1;
+        defer s.waiters -= 1;
         while (s.value <= 0) {
             _ = pthread_cond_wait(&s.cond, &s.mutex);
         }
@@ -641,6 +665,8 @@ pub fn shim_dispatch_semaphore_wait(sem: ?*DispatchSemaphore, timeout: u64) call
 
     var ts: std.c.timespec = undefined;
     nsToAbsTimespec(timeout, &ts);
+    s.waiters += 1;
+    defer s.waiters -= 1;
     while (s.value <= 0) {
         const rc = pthread_cond_timedwait(&s.cond, &s.mutex, &ts);
         if (rc != 0) break;
@@ -657,8 +683,8 @@ pub fn shim_dispatch_semaphore_signal(sem: ?*DispatchSemaphore) callconv(.c) isi
     const s = sem orelse return 0;
     _ = pthread_mutex_lock(&s.mutex);
     s.value += 1;
-    const woken: isize = if (s.value <= 0) 1 else 0;
-    _ = pthread_cond_signal(&s.cond);
+    const woken: isize = if (s.waiters > 0) 1 else 0;
+    if (woken != 0) _ = pthread_cond_signal(&s.cond);
     _ = pthread_mutex_unlock(&s.mutex);
     return woken;
 }
@@ -672,9 +698,9 @@ pub fn shim_dispatch_retain(obj: ?*anyopaque) callconv(.c) void {
     const ptr = obj orelse return;
     const magic = @as(*const u32, @ptrCast(@alignCast(ptr))).*;
     switch (magic) {
-        QUEUE_MAGIC => @as(*DispatchQueue, @ptrCast(@alignCast(ptr))).refcount +|= 1,
-        GROUP_MAGIC => @as(*DispatchGroup, @ptrCast(@alignCast(ptr))).refcount +|= 1,
-        SEM_MAGIC => @as(*DispatchSemaphore, @ptrCast(@alignCast(ptr))).refcount +|= 1,
+        QUEUE_MAGIC => _ = @atomicRmw(usize, &@as(*DispatchQueue, @ptrCast(@alignCast(ptr))).refcount, .Add, 1, .monotonic),
+        GROUP_MAGIC => _ = @atomicRmw(usize, &@as(*DispatchGroup, @ptrCast(@alignCast(ptr))).refcount, .Add, 1, .monotonic),
+        SEM_MAGIC => _ = @atomicRmw(usize, &@as(*DispatchSemaphore, @ptrCast(@alignCast(ptr))).refcount, .Add, 1, .monotonic),
         else => {},
     }
 }
@@ -687,10 +713,7 @@ pub fn shim_dispatch_release(obj: ?*anyopaque) callconv(.c) void {
         QUEUE_MAGIC => {
             const q: *DispatchQueue = @ptrCast(@alignCast(ptr));
             if (q.is_static) return;
-            if (q.refcount > 1) {
-                q.refcount -= 1;
-                return;
-            }
+            if (@atomicRmw(usize, &q.refcount, .Sub, 1, .acq_rel) > 1) return;
             if (q.worker_started and q.worker_tid != 0) {
                 _ = pthread_mutex_lock(&q.mutex);
                 q.stopped = true;
@@ -704,20 +727,14 @@ pub fn shim_dispatch_release(obj: ?*anyopaque) callconv(.c) void {
         },
         GROUP_MAGIC => {
             const g: *DispatchGroup = @ptrCast(@alignCast(ptr));
-            if (g.refcount > 1) {
-                g.refcount -= 1;
-                return;
-            }
+            if (@atomicRmw(usize, &g.refcount, .Sub, 1, .acq_rel) > 1) return;
             _ = pthread_mutex_destroy(&g.mutex);
             _ = pthread_cond_destroy(&g.cond);
             free(ptr);
         },
         SEM_MAGIC => {
             const s: *DispatchSemaphore = @ptrCast(@alignCast(ptr));
-            if (s.refcount > 1) {
-                s.refcount -= 1;
-                return;
-            }
+            if (@atomicRmw(usize, &s.refcount, .Sub, 1, .acq_rel) > 1) return;
             _ = pthread_mutex_destroy(&s.mutex);
             _ = pthread_cond_destroy(&s.cond);
             free(ptr);

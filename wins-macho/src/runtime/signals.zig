@@ -36,6 +36,7 @@ pub fn handleDarwinSyscallOrCrash(sig: std.os.linux.SIG, info: *const std.posix.
         const REG_RAX = 13;
         const REG_RSP = 15;
         const REG_RIP = 16;
+        const REG_EFL = 17;
         const uc: *c_uctx.ucontext_t = @ptrCast(@alignCast(raw));
         rip = @bitCast(uc.uc_mcontext.gregs[REG_RIP]);
         rsp = @bitCast(uc.uc_mcontext.gregs[REG_RSP]);
@@ -47,9 +48,16 @@ pub fn handleDarwinSyscallOrCrash(sig: std.os.linux.SIG, info: *const std.posix.
         if (sig == linux.SIG.SYS) {
             // Check Darwin BSD syscall (0x2000000 | num) or Mach trap (0x1000000 | num)
             if (rax == 0x2000004) {
-                // Darwin BSD SYS_write(fd, buf, count)
+                // Darwin BSD SYS_write(fd, buf, count): CF=1 + positive errno on error, CF=0 on success
                 const res = linux.write(@intCast(rdi), @ptrFromInt(rsi), rdx);
-                uc.uc_mcontext.gregs[REG_RAX] = @bitCast(res);
+                const sres: isize = @bitCast(res);
+                if (sres < 0 and sres >= -4095) {
+                    uc.uc_mcontext.gregs[REG_RAX] = @intCast(-sres);
+                    uc.uc_mcontext.gregs[REG_EFL] |= 1; // Set CF
+                } else {
+                    uc.uc_mcontext.gregs[REG_RAX] = @bitCast(res);
+                    uc.uc_mcontext.gregs[REG_EFL] &= ~@as(@TypeOf(uc.uc_mcontext.gregs[REG_EFL]), 1); // Clear CF
+                }
                 if (trace.active_tracer) |t| {
                     t.recordExternalCall("syscall:darwin_bsd_write(0x2000004)");
                 }

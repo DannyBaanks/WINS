@@ -338,3 +338,255 @@ test "dispatch: queues, apply_f, semaphore and group" {
 
     dispatch.shim_dispatch_release(q);
 }
+
+fn dummyBlockInvoke(_: *anyopaque) callconv(.c) void {}
+
+var block_dispose_hits: usize = 0;
+fn dummyBlockDispose(_: *anyopaque) callconv(.c) void {
+    block_dispose_hits += 1;
+}
+
+test "abi: sprintf_chk, open flags, setlocale, getpwuid, system dylibs, unicode stubs" {
+    const shims = wins_macho.shims;
+
+    // 1. ___sprintf_chk & ___snprintf_chk must NOT treat flag/dstlen as format string
+    var buf: [64]u8 = .{0} ** 64;
+    const n1 = shims.shim_sprintf_chk(&buf, 0, buf.len, "tree v%d.%d-%s", @as(c_int, 2), @as(c_int, 3), @as([*:0]const u8, "ok"));
+    try std.testing.expect(n1 > 0);
+    try std.testing.expectEqualStrings("tree v2.3-ok", buf[0..@intCast(n1)]);
+
+    const n2 = shims.shim_snprintf_chk(&buf, 8, 0, buf.len, "abcdef12345");
+    try std.testing.expect(n2 >= 11);
+    try std.testing.expectEqualStrings("abcdef1", buf[0..7]);
+
+    // 2. Darwin O_* -> Linux O_* flag translation
+    // Darwin O_WRONLY(1) | O_CREAT(0x200) | O_TRUNC(0x400) | O_CLOEXEC(0x1000000)
+    const lx_open = shims.translateDarwinOpenFlags(0x0001 | 0x0200 | 0x0400 | 0x1000000);
+    try std.testing.expectEqual(@as(c_int, 0x0001 | 0x0040 | 0x0200 | 0x80000), lx_open);
+
+    // 3. Darwin LC_* -> Linux LC_* category translation
+    try std.testing.expectEqual(@as(c_int, 6), shims.translateDarwinLocaleCategory(0)); // LC_ALL
+    try std.testing.expectEqual(@as(c_int, 3), shims.translateDarwinLocaleCategory(1)); // LC_COLLATE
+    try std.testing.expectEqual(@as(c_int, 0), shims.translateDarwinLocaleCategory(2)); // LC_CTYPE
+
+    // 4. getpwuid returns DarwinPasswd (72 bytes) with real root entry
+    const pw = shims.shim_getpwuid(0);
+    try std.testing.expect(pw != null);
+    try std.testing.expectEqual(@as(u32, 0), pw.?.pw_uid);
+    try std.testing.expect(pw.?.pw_name != null);
+    try std.testing.expectEqualStrings("root", std.mem.span(pw.?.pw_name.?));
+
+    // 5. isDarwinSystemDylib recognizes libobjc & libswift
+    try std.testing.expect(shims.isDarwinSystemDylib("/usr/lib/libobjc.A.dylib"));
+    try std.testing.expect(shims.isDarwinSystemDylib("/usr/lib/swift/libswiftCore.dylib"));
+
+    // 6. Swift Unicode stubs must be honestly classified as STUB_FOR_PROBE_ONLY
+    const u_entry = shims.lookup("__swift_stdlib_getNormData") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(shims.ShimStatus.STUB_FOR_PROBE_ONLY, u_entry.status);
+}
+
+test "abi: objc_msgSend preserves xmm floating-point & variadic rax args" {
+    const shims = wins_macho.shims;
+    const objc = wins_macho.objc;
+    const foundation = wins_macho.foundation;
+    _ = shims.lookup("_NSLog"); // ensure Foundation initialized
+
+    const pool = objc.shim_objc_autoreleasePoolPush();
+    defer objc.shim_objc_autoreleasePoolPop(pool);
+
+    const fmt = foundation.makeNSStringFromSlice("pi=%f n=%d", true);
+    const MsgSendFmt = *const fn (?*anyopaque, [*:0]const u8, ?*anyopaque, ...) callconv(.c) ?*anyopaque;
+    const send_fmt: MsgSendFmt = @ptrCast(&objc.shim_objc_msgSend);
+    const res = send_fmt(&foundation.OBJC_CLASS_NSString, "stringWithFormat:", fmt, @as(f64, 3.141592), @as(c_int, 7));
+    try std.testing.expect(res != null);
+    try std.testing.expectEqualStrings("pi=3.141592 n=7", foundation.nsStringSlice(res));
+}
+
+test "abi: Block_copy/release refcounting prevents UAF/double-free" {
+    const dispatch = wins_macho.dispatch;
+    block_dispose_hits = 0;
+
+    const desc = dispatch.BlockDescriptor{
+        .reserved = 0,
+        .size = @sizeOf(dispatch.BlockLiteral),
+        .copy_helper = null,
+        .dispose_helper = &dummyBlockDispose,
+    };
+    var stack_blk = dispatch.BlockLiteral{
+        .isa = @intFromPtr(&dispatch.NSConcreteStackBlock),
+        .flags = 1 << 25, // BLOCK_HAS_COPY_DISPOSE
+        .reserved = 0,
+        .invoke = &dummyBlockInvoke,
+        .descriptor = &desc,
+    };
+
+    const heap1 = dispatch.shim_Block_copy(@ptrCast(&stack_blk));
+    try std.testing.expect(heap1 != null);
+    const heap2 = dispatch.shim_Block_copy(heap1);
+    try std.testing.expectEqual(heap1, heap2);
+
+    // First release must NOT free or run dispose_helper
+    dispatch.shim_Block_release(heap1);
+    try std.testing.expectEqual(@as(usize, 0), block_dispose_hits);
+
+    // Second release drops refcount to 0 and runs dispose_helper once
+    dispatch.shim_Block_release(heap2);
+    try std.testing.expectEqual(@as(usize, 1), block_dispose_hits);
+}
+
+fn darwinQsortRCmp(thunk: ?*anyopaque, a: *const anyopaque, b: *const anyopaque) callconv(.c) c_int {
+    const dir: *const c_int = @ptrCast(@alignCast(thunk.?));
+    const va = @as(*const i32, @ptrCast(@alignCast(a))).*;
+    const vb = @as(*const i32, @ptrCast(@alignCast(b))).*;
+    return (va - vb) * dir.*;
+}
+
+test "abi: darwin setjmp/longjmp, qsort_r (bsd arg order), xsi strerror_r, sigset32" {
+    const shims = wins_macho.shims;
+
+    // 1. Darwin setjmp/longjmp inside 148-byte buffer
+    var jbuf: [37]i32 align(8) = .{0} ** 37;
+    const SetJmpFn = *const fn (*anyopaque) callconv(.c) c_int;
+    const LongJmpFn = *const fn (*anyopaque, c_int) callconv(.c) noreturn;
+    const sj: SetJmpFn = @ptrCast(&shims.shim_setjmp);
+    const lj: LongJmpFn = @ptrCast(&shims.shim_longjmp);
+    var jumped = false;
+    const rc = sj(@ptrCast(&jbuf));
+    if (rc == 0) {
+        jumped = true;
+        lj(@ptrCast(&jbuf), 42);
+    }
+    try std.testing.expect(jumped);
+    try std.testing.expectEqual(@as(c_int, 42), rc);
+
+    // 2. BSD qsort_r (descending via thunk = -1)
+    var arr = [_]i32{ 3, 1, 4, 1, 5, 9, 2 };
+    var desc: c_int = -1;
+    shims.shim_qsort_r(@ptrCast(&arr), arr.len, @sizeOf(i32), @ptrCast(&desc), &darwinQsortRCmp);
+    try std.testing.expectEqualSlices(i32, &.{ 9, 5, 4, 3, 2, 1, 1 }, &arr);
+
+    // 3. XSI strerror_r returns 0 and writes message into caller buffer
+    var errbuf: [128]u8 = .{0} ** 128;
+    try std.testing.expectEqual(@as(c_int, 0), shims.shim_strerror_r(2, &errbuf, errbuf.len));
+    try std.testing.expect(std.mem.span(@as([*:0]const u8, @ptrCast(&errbuf))).len > 0);
+
+    // 4. Darwin 32-bit sigset_t helpers
+    var mask: u32 = 0xDEADBEEF;
+    try std.testing.expectEqual(@as(c_int, 0), shims.shim_sigemptyset(&mask));
+    try std.testing.expectEqual(@as(u32, 0), mask);
+    try std.testing.expectEqual(@as(c_int, 0), shims.shim_sigaddset(&mask, 15));
+    try std.testing.expectEqual(@as(c_int, 1), shims.shim_sigismember(&mask, 15));
+    try std.testing.expectEqual(@as(c_int, 0), shims.shim_sigismember(&mask, 2));
+}
+
+var test_shared_weak_freed: usize = 0;
+fn testSharedOnZeroWeak(self: *wins_macho.libcxx.SharedWeakCount) callconv(.c) void {
+    _ = self;
+    test_shared_weak_freed += 1;
+}
+
+test "libcxx: Darwin ABI v1 std::string SSO/long, shared_weak_count, mutex+cv, system_clock" {
+    const libcxx = wins_macho.libcxx;
+
+    // 1. Short SSO string (<= 22 bytes)
+    var s: libcxx.LibcxxString = .{ .raw = .{0} ** 24 };
+    _ = libcxx.shim_string_assign_cstr(&s, "wins-macho");
+    try std.testing.expect(!s.isLong());
+    try std.testing.expectEqualStrings("wins-macho", s.slice());
+
+    // 2. Long heap string (> 22 bytes) + substring ctor
+    _ = libcxx.shim_string_assign_cstr(&s, "0123456789abcdefghijklmnopqrstuvwxyz");
+    try std.testing.expect(s.isLong());
+    try std.testing.expectEqualStrings("0123456789abcdefghijklmnopqrstuvwxyz", s.slice());
+
+    var sub: libcxx.LibcxxString = .{ .raw = .{0} ** 24 };
+    libcxx.shim_string_ctor_substr(&sub, &s, 10, 6, null);
+    try std.testing.expect(!sub.isLong());
+    try std.testing.expectEqualStrings("abcdef", sub.slice());
+    libcxx.shim_string_dtor(&sub);
+    libcxx.shim_string_dtor(&s);
+
+    // 3. __shared_weak_count atomic weak release calls vtable[4]
+    test_shared_weak_freed = 0;
+    const vt = [5]usize{ 0, 0, 0, 0, @intFromPtr(&testSharedOnZeroWeak) };
+    var swc = libcxx.SharedWeakCount{
+        .vtable = &vt,
+        .shared_owners = -1,
+        .shared_weak_owners = 1,
+    };
+    libcxx.shim_shared_weak_count_release_weak(&swc);
+    try std.testing.expectEqual(@as(usize, 0), test_shared_weak_freed);
+    libcxx.shim_shared_weak_count_release_weak(&swc);
+    try std.testing.expectEqual(@as(usize, 1), test_shared_weak_freed);
+
+    // 4. system_clock::now() returns positive epoch microseconds
+    try std.testing.expect(libcxx.shim_system_clock_now() > 1_700_000_000_000_000);
+}
+
+test "libcxx + unwind: RTTI inheritance matching, CxaException ABI, and compact unwind RBP/frameless step" {
+    const libcxx = wins_macho.libcxx;
+    const unwind = wins_macho.unwind;
+    const shims = wins_macho.shims;
+
+    libcxx.ensureInitialized();
+
+    // 1. All exception/unwind symbols are REIMPLEMENTED (zero probe-only stubs)
+    const eh_syms = [_][]const u8{
+        "___cxa_allocate_exception",
+        "___cxa_free_exception",
+        "___cxa_throw",
+        "___cxa_rethrow",
+        "___cxa_begin_catch",
+        "___cxa_end_catch",
+        "___gxx_personality_v0",
+        "__Unwind_RaiseException",
+        "__Unwind_Resume",
+        "__Unwind_GetIP",
+        "__Unwind_SetIP",
+        "__Unwind_SetGR",
+        "__Unwind_GetLanguageSpecificData",
+        "__Unwind_GetRegionStart",
+    };
+    for (eh_syms) |sym| {
+        const entry = shims.lookup(sym) orelse return error.MissingSymbol;
+        try std.testing.expectEqual(shims.ShimStatus.REIMPLEMENTED, entry.status);
+    }
+
+    // 2. Itanium RTTI inheritance matching: std::out_of_range -> std::logic_error -> std::exception
+    var dummy_obj: u64 = 0x1234;
+    var adj: ?*anyopaque = @ptrCast(&dummy_obj);
+    try std.testing.expect(libcxx.typeInfoCanCatch(
+        @ptrCast(&libcxx.ti_exception),
+        @ptrCast(&libcxx.ti_out_of_range),
+        &adj,
+    ));
+    try std.testing.expect(libcxx.typeInfoCanCatch(
+        @ptrCast(&libcxx.ti_logic_error),
+        @ptrCast(&libcxx.ti_out_of_range),
+        &adj,
+    ));
+    try std.testing.expect(!libcxx.typeInfoCanCatch(
+        @ptrCast(&libcxx.ti_runtime_error),
+        @ptrCast(&libcxx.ti_out_of_range),
+        &adj,
+    ));
+
+    // 3. Synthetic x86_64 RBP-frame compact unwind step restores RBX, R12, old RBP, RIP, RSP
+    var fake_stack = [_]u64{
+        0x1111_2222_3333_4444, // [0] rbp - 16 (saved RBX)
+        0x5555_6666_7777_8888, // [1] rbp - 8  (saved R12)
+        0xAAAA_BBBB_CCCC_DDDD, // [2] rbp      (saved old RBP)
+        0x0000_0001_0000_9999, // [3] rbp + 8  (saved return RIP)
+    };
+    var regs = unwind.UnwindRegs{};
+    regs.r[unwind.UnwindRegs.RBP] = @intFromPtr(&fake_stack[2]);
+    regs.r[unwind.UnwindRegs.RSP] = @intFromPtr(&fake_stack[0]);
+    // MODE_RBP_FRAME (0x01000000), offset=2 (0x00020000), slot0=RBX(1), slot1=R12(2 << 3 = 16 = 0x10)
+    const enc: u32 = 0x0102_0011;
+    try std.testing.expect(unwind.stepCompactX86_64(enc, 0, &regs));
+    try std.testing.expectEqual(@as(u64, 0x1111_2222_3333_4444), regs.r[unwind.UnwindRegs.RBX]);
+    try std.testing.expectEqual(@as(u64, 0x5555_6666_7777_8888), regs.r[unwind.UnwindRegs.R12]);
+    try std.testing.expectEqual(@as(u64, 0xAAAA_BBBB_CCCC_DDDD), regs.r[unwind.UnwindRegs.RBP]);
+    try std.testing.expectEqual(@as(u64, 0x0000_0001_0000_9999), regs.r[unwind.UnwindRegs.RIP]);
+    try std.testing.expectEqual(@as(u64, @intFromPtr(&fake_stack[2]) + 16), regs.r[unwind.UnwindRegs.RSP]);
+}
