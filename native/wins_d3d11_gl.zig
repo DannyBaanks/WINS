@@ -111,6 +111,8 @@ const Gl = struct {
     glDepthRange: *const fn (f64, f64) callconv(.c) void,
     glEnable: *const fn (GLenum) callconv(.c) void,
     glDisable: *const fn (GLenum) callconv(.c) void,
+    glEnablei: *const fn (GLenum, GLuint) callconv(.c) void,
+    glDisablei: *const fn (GLenum, GLuint) callconv(.c) void,
     glClearColor: *const fn (f32, f32, f32, f32) callconv(.c) void,
     glClearDepth: *const fn (f64) callconv(.c) void,
     glClearStencil: *const fn (GLint) callconv(.c) void,
@@ -341,11 +343,14 @@ pub const InputElem = struct {
     offset: u32 = 0,
     step_rate: u32 = 0,
     is_instance: bool = false,
+    sem_name: [32]u8 = .{0} ** 32,
+    sem_len: u8 = 0,
+    sem_index: u32 = 0,
 };
 
 pub const InputLayout = struct {
     count: usize = 0,
-    elems: [16]InputElem = [_]InputElem{.{}} ** 16,
+    elems: [32]InputElem = [_]InputElem{.{}} ** 32,
 };
 
 pub const MAX_SRV = shader.MAX_TEX;
@@ -2442,17 +2447,17 @@ fn drawJob(raw: ?*anyopaque) void {
     if (s.blend) |bl| {
         gl.glBlendColor(s.blend_factor[0], s.blend_factor[1], s.blend_factor[2], s.blend_factor[3]);
         const nrt = @max(@as(u32, 1), @min(8, s.num_rtvs));
-        var any_blend = false;
         for (0..nrt) |i| {
             const rt = bl.rt[if (bl.independent) i else 0];
             gl.glColorMaski(@intCast(i), if ((rt.write_mask & 1) != 0) 1 else 0, if ((rt.write_mask & 2) != 0) 1 else 0, if ((rt.write_mask & 4) != 0) 1 else 0, if ((rt.write_mask & 8) != 0) 1 else 0);
             if (rt.enable) {
-                any_blend = true;
+                gl.glEnablei(0x0BE2, @intCast(i));
                 gl.glBlendFuncSeparatei(@intCast(i), rt.src_rgb, rt.dst_rgb, rt.src_a, rt.dst_a);
                 gl.glBlendEquationSeparatei(@intCast(i), rt.op_rgb, rt.op_a);
+            } else {
+                gl.glDisablei(0x0BE2, @intCast(i));
             }
         }
-        setCap(0x0BE2, any_blend);
     } else {
         gl.glDisable(0x0BE2);
         for (0..@max(@as(u32, 1), @min(8, s.num_rtvs))) |i| gl.glColorMaski(@intCast(i), 1, 1, 1, 1);
@@ -2493,18 +2498,34 @@ fn drawJob(raw: ?*anyopaque) void {
         for (il.elems[0..il.count]) |el| {
             if (el.slot >= 16) continue;
             const vb = s.vb[el.slot] orelse continue;
-            if (el.location >= 32) continue;
-            new_mask |= @as(u32, 1) << @intCast(el.location);
-            gl.glBindBuffer(0x8892, vb.gl_id);
-            gl.glEnableVertexAttribArray(el.location);
-            const ptr_off: usize = @as(usize, s.vb_offset[el.slot]) + @as(usize, el.offset);
-            const stride: GLsizei = @intCast(s.vb_stride[el.slot]);
-            if (el.is_int) {
-                gl.glVertexAttribIPointer(el.location, el.components, el.gl_type, stride, @ptrFromInt(ptr_off));
-            } else {
-                gl.glVertexAttribPointer(el.location, el.components, el.gl_type, if (el.normalized) 1 else 0, stride, @ptrFromInt(ptr_off));
+            var loc: u32 = el.location;
+            var is_int: bool = el.is_int;
+            if (vs.inputs.len > 0 and el.sem_len > 0) {
+                const sem = el.sem_name[0..el.sem_len];
+                var found = false;
+                for (vs.inputs) |se| {
+                    if (se.index == el.sem_index and std.ascii.eqlIgnoreCase(se.name, sem)) {
+                        loc = se.reg;
+                        is_int = (se.comp_type == 1 or se.comp_type == 2) and el.is_int;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) continue;
             }
-            gl.glVertexAttribDivisor(el.location, if (el.is_instance) @max(1, el.step_rate) else 0);
+            if (loc >= 32) continue;
+            new_mask |= @as(u32, 1) << @intCast(loc);
+            gl.glBindBuffer(0x8892, vb.gl_id);
+            gl.glEnableVertexAttribArray(loc);
+            const inst_off: usize = if (el.is_instance) @as(usize, j.start_instance) * @as(usize, s.vb_stride[el.slot]) else 0;
+            const ptr_off: usize = @as(usize, s.vb_offset[el.slot]) + @as(usize, el.offset) + inst_off;
+            const stride: GLsizei = @intCast(s.vb_stride[el.slot]);
+            if (is_int) {
+                gl.glVertexAttribIPointer(loc, el.components, el.gl_type, stride, @ptrFromInt(ptr_off));
+            } else {
+                gl.glVertexAttribPointer(loc, el.components, el.gl_type, if (el.normalized) 1 else 0, stride, @ptrFromInt(ptr_off));
+            }
+            gl.glVertexAttribDivisor(loc, if (el.is_instance) @max(1, el.step_rate) else 0);
         }
     }
     var cleared = g_active_attribs & ~new_mask;

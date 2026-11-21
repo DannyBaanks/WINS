@@ -491,6 +491,7 @@ fn comRelease(raw: ?*anyopaque) callconv(W) u32 {
             .deferred_ctx => if (o.payload != 0) {
                 const r: *Recorder = @ptrFromInt(o.payload);
                 r.reset();
+                if (r.map_scratch.len > 0) alloc.free(r.map_scratch);
                 r.arena.deinit();
                 alloc.destroy(r);
             },
@@ -1190,7 +1191,7 @@ fn devCreateInputLayout(_: ?*anyopaque, elems: [*]const D3D11_INPUT_ELEMENT_DESC
     const il = alloc.create(glb.InputLayout) catch return E_FAIL;
     il.* = .{};
     var auto_off = [_]u32{0} ** 16;
-    const n = @min(16, count);
+    const n = @min(32, count);
     for (0..n) |i| {
         const e = elems[i];
         const info = glb.inputFormatToGl(e.Format);
@@ -1199,18 +1200,20 @@ fn devCreateInputLayout(_: ?*anyopaque, elems: [*]const D3D11_INPUT_ELEMENT_DESC
         auto_off[slot] = off + info.byte_size;
 
         var loc: u32 = @intCast(i);
-        var matched = (sig.len == 0);
+        var sem_name: [32]u8 = .{0} ** 32;
+        var sem_len: u8 = 0;
         if (e.SemanticName) |sname| {
             const sem = std.mem.sliceTo(sname, 0);
+            const clen = @min(sem_name.len, sem.len);
+            @memcpy(sem_name[0..clen], sem[0..clen]);
+            sem_len = @intCast(clen);
             for (sig) |se| {
                 if (se.index == e.SemanticIndex and std.ascii.eqlIgnoreCase(se.name, sem)) {
                     loc = se.reg;
-                    matched = true;
                     break;
                 }
             }
         }
-        if (!matched) continue;
         il.elems[il.count] = .{
             .location = loc,
             .components = info.components,
@@ -1221,6 +1224,9 @@ fn devCreateInputLayout(_: ?*anyopaque, elems: [*]const D3D11_INPUT_ELEMENT_DESC
             .offset = off,
             .step_rate = e.InstanceDataStepRate,
             .is_instance = (e.InputSlotClass == 1),
+            .sem_name = sem_name,
+            .sem_len = sem_len,
+            .sem_index = e.SemanticIndex,
         };
         il.count += 1;
     }
@@ -1933,15 +1939,26 @@ fn ctxGenerateMips(_: ?*anyopaque, srv: ?*anyopaque) callconv(W) void {
 }
 
 fn ctxGetData(_: ?*anyopaque, q: ?*anyopaque, data: ?*anyopaque, sz: u32, _: u32) callconv(W) i32 {
-    if (data != null and sz > 0) {
+    if (data) |ptr| if (sz > 0) {
+        const bytes: [*]u8 = @ptrCast(ptr);
+        @memset(bytes[0..sz], 0);
         const qt = if (q) |r| @as(*ComObj, @ptrCast(@alignCast(r))).payload else 0;
-        if (qt == 2 and sz >= 8) { // D3D11_QUERY_TIMESTAMP
-            const ts: *u64 = @ptrCast(@alignCast(data.?));
-            ts.* = 1000;
-        } else if (sz >= 4) {
-            @as(*u32, @ptrCast(@alignCast(data.?))).* = 1;
+        switch (qt) {
+            1 => if (sz >= 8) { // D3D11_QUERY_OCCLUSION: UINT64 sample count
+                std.mem.writeInt(u64, bytes[0..8], 1_000_000, .little);
+            },
+            2 => if (sz >= 8) { // D3D11_QUERY_TIMESTAMP: UINT64 ticks
+                std.mem.writeInt(u64, bytes[0..8], 1000, .little);
+            },
+            3 => if (sz >= 12) { // D3D11_QUERY_TIMESTAMP_DISJOINT: { UINT64 Frequency; BOOL Disjoint; }
+                std.mem.writeInt(u64, bytes[0..8], 1_000_000_000, .little);
+                std.mem.writeInt(u32, bytes[8..12], 0, .little);
+            },
+            else => if (sz >= 4) { // EVENT (0), OCCLUSION_PREDICATE (7), etc.
+                std.mem.writeInt(u32, bytes[0..4], 1, .little);
+            },
         }
-    }
+    };
     return S_OK;
 }
 
@@ -2262,9 +2279,16 @@ const Cmd = struct {
     args: *const anyopaque,
 };
 
-/// A deferred Map in flight. `base` (NO_OVERWRITE only) is the content the
-/// mapping started from, so Unmap can upload just the bytes the app changed.
-const MapRec = struct { res: usize, sub: u32, mem: []u8, base: ?[]const u8 = null };
+/// A deferred Map in flight. Buffer mappings use a canary-filled scratch buffer
+/// so Unmap can detect and upload only the byte spans the app actually wrote,
+/// without racing against `b.shadow` during multithreaded command list recording.
+const MapRec = struct {
+    res: usize,
+    sub: u32,
+    mem: []u8,
+    is_buffer: bool = false,
+    uses_scratch: bool = false,
+};
 
 const Recorder = struct {
     arena: std.heap.ArenaAllocator,
@@ -2272,6 +2296,8 @@ const Recorder = struct {
     refs: std.ArrayList(*anyopaque) = .empty,
     maps: std.ArrayList(MapRec) = .empty,
     shadow: Shadow = .{},
+    map_scratch: []align(16) u8 = &.{},
+    scratch_in_use: bool = false,
 
     fn a(r: *Recorder) std.mem.Allocator {
         return r.arena.allocator();
@@ -2301,6 +2327,10 @@ const Recorder = struct {
     fn reset(r: *Recorder) void {
         for (r.refs.items) |o| _ = comRelease(o);
         _ = r.arena.reset(.free_all);
+        if (r.scratch_in_use and r.map_scratch.len > 0) {
+            fillCanary(r.map_scratch, 0, r.map_scratch.len);
+        }
+        r.scratch_in_use = false;
         r.cmds = .empty;
         r.refs = .empty;
         r.maps = .empty;
@@ -2543,29 +2573,54 @@ fn replayUpload(ctx: ?*anyopaque, res: ?*anyopaque, sub: u32, mem: [*]const u8, 
     ctxUnmap(ctx, res, sub);
 }
 
-/// Replay of a deferred NO_OVERWRITE Map of a buffer: only [off, off+len) was
-/// written by the app, so only that range reaches the shadow and GL. Writing
-/// the whole recorded copy back would clobber what other command lists put in
-/// the same ring buffer meanwhile (Scaleform vertices in DS3).
-fn replayUploadRange(_: ?*anyopaque, res: ?*anyopaque, mem: [*]const u8, off: usize, len: usize) callconv(W) void {
+/// Replay of a deferred buffer Map/Unmap dirty span: `data` holds the exact
+/// `len` bytes to upload at `off`, so only what the app wrote reaches `b.shadow`
+/// and OpenGL without clobbering other regions of the ring buffer.
+fn replayUploadSpan(_: ?*anyopaque, res: ?*anyopaque, data: [*]const u8, off: usize, len: usize) callconv(W) void {
     const o: *ComObj = @ptrCast(@alignCast(res orelse return));
     if (o.kind != .buffer or len == 0) return;
     const b: *glb.Buffer = @ptrFromInt(o.payload);
     if (off >= b.size) return;
-    glb.uploadBuffer(b, @intCast(off), mem + off, @intCast(@min(len, b.size - off)));
+    glb.uploadBuffer(b, @intCast(off), data, @intCast(@min(len, b.size - off)));
 }
 
-/// First and one-past-last differing byte of two equal-length slices.
-fn diffRange(a: []const u8, b: []const u8) ?struct { lo: usize, hi: usize } {
-    const n = @min(a.len, b.len);
-    var lo: usize = 0;
-    while (lo + 8 <= n and std.mem.readInt(u64, a[lo..][0..8], .little) == std.mem.readInt(u64, b[lo..][0..8], .little)) lo += 8;
-    while (lo < n and a[lo] == b[lo]) lo += 1;
-    if (lo == n) return null;
-    var hi: usize = n;
-    while (hi >= lo + 8 and std.mem.readInt(u64, a[hi - 8 ..][0..8], .little) == std.mem.readInt(u64, b[hi - 8 ..][0..8], .little)) hi -= 8;
-    while (hi > lo and a[hi - 1] == b[hi - 1]) hi -= 1;
-    return .{ .lo = lo, .hi = hi };
+/// Deterministic 32-bit canary for 4-byte word index `idx4`. Both 16-bit halves
+/// lie in [0x4001, 0x7FFF] with bit 0 set, avoiding 0, -1, 1.0f, -1.0f, NaN, and
+/// small integers while varying per offset.
+inline fn canaryWord(idx4: usize) u32 {
+    const x = (@as(u64, idx4) +% 1) *% 0x9E3779B97F4A7C15;
+    return @as(u32, @truncate((x >> 32) & 0x3FFE3FFE)) | 0x40014001;
+}
+
+fn fillCanary(buf: []u8, lo: usize, hi: usize) void {
+    if (lo >= hi or lo >= buf.len) return;
+    const end = @min(hi, buf.len);
+    const w_lo = lo / 4;
+    const w_hi = (end + 3) / 4;
+    var w = w_lo;
+    while (w < w_hi) : (w += 1) {
+        const cw = canaryWord(w);
+        const off = w * 4;
+        if (off + 4 <= buf.len) {
+            std.mem.writeInt(u32, buf[off..][0..4], cw, .little);
+        } else {
+            const cb = std.mem.asBytes(&cw);
+            for (off..buf.len) |b_idx| buf[b_idx] = cb[b_idx - off];
+        }
+    }
+}
+
+fn isWordDirty(buf: []const u8, w: usize) bool {
+    const cw = canaryWord(w);
+    const off = w * 4;
+    if (off + 4 <= buf.len) {
+        return std.mem.readInt(u32, buf[off..][0..4], .little) != cw;
+    }
+    const cb = std.mem.asBytes(&cw);
+    for (off..buf.len) |b_idx| {
+        if (buf[b_idx] != cb[b_idx - off]) return true;
+    }
+    return false;
 }
 
 fn mapSize(o: *ComObj) ?struct { len: usize, row: u32 } {
@@ -2582,40 +2637,61 @@ fn mapSize(o: *ComObj) ?struct { len: usize, row: u32 } {
 }
 
 /// Deferred contexts may only Map with WRITE_DISCARD (4) or WRITE_NO_OVERWRITE
-/// (5). The app writes into recorder memory; Unmap records the upload. For
-/// NO_OVERWRITE the buffer starts from the latest bytes this list wrote (or
-/// the resource's current shadow) so untouched ranges survive the upload.
+/// (5). Buffer mappings use a canary-filled scratch buffer so Unmap can upload
+/// only the dirty byte spans without reading `b.shadow` on worker threads.
 fn dMap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32, map_type: u32, _: u32, mapped: *D3D11_MAPPED_SUBRESOURCE) callconv(W) i32 {
     const r = recOf(raw);
     const o: *ComObj = @ptrCast(@alignCast(res orelse return E_INVALIDARG));
     if (map_type != 4 and map_type != 5) return E_INVALIDARG;
     const sz = mapSize(o) orelse return E_INVALIDARG;
-    // 16-aligned like a real driver: the game stores into mapped memory with movaps.
-    const mem = r.a().alignedAlloc(u8, .@"16", @max(1, sz.len)) catch return E_FAIL;
-    var base: ?[]const u8 = null;
-    if (map_type == 5) {
-        var prev: ?[]const u8 = null;
-        var i = r.maps.items.len;
-        while (i > 0) : (i -= 1) {
-            const mr = r.maps.items[i - 1];
-            if (mr.res == @intFromPtr(res) and mr.sub == sub) {
-                prev = mr.mem;
-                break;
+    const alloc_len = @max(1, sz.len);
+
+    if (o.kind == .buffer) {
+        var mem: []u8 = undefined;
+        var uses_scratch = false;
+        if (!r.scratch_in_use) {
+            if (r.map_scratch.len < alloc_len) {
+                const new_cap = @max(alloc_len, 65536);
+                const new_sc = alloc.alignedAlloc(u8, .@"16", new_cap) catch return E_FAIL;
+                fillCanary(new_sc, 0, new_sc.len);
+                if (r.map_scratch.len > 0) alloc.free(r.map_scratch);
+                r.map_scratch = new_sc;
             }
+            r.scratch_in_use = true;
+            mem = r.map_scratch[0..alloc_len];
+            uses_scratch = true;
+        } else {
+            mem = r.a().alignedAlloc(u8, .@"16", alloc_len) catch return E_FAIL;
+            fillCanary(mem, 0, mem.len);
         }
-        if (prev == null) {
-            if (o.kind == .buffer) {
-                const b: *glb.Buffer = @ptrFromInt(o.payload);
-                if (b.shadow) |sh| prev = sh;
-            } else {
-                const t: *glb.Texture = @ptrFromInt(o.payload);
-                prev = t.shadow;
-            }
-        }
-        if (prev) |p| @memcpy(mem[0..@min(mem.len, p.len)], p[0..@min(mem.len, p.len)]);
-        if (o.kind == .buffer) base = r.a().dupe(u8, mem) catch null;
+        r.maps.append(r.a(), .{
+            .res = @intFromPtr(res),
+            .sub = sub,
+            .mem = mem,
+            .is_buffer = true,
+            .uses_scratch = uses_scratch,
+        }) catch {
+            if (uses_scratch) r.scratch_in_use = false;
+            return E_FAIL;
+        };
+        mapped.pData = mem.ptr;
+        mapped.RowPitch = sz.row;
+        mapped.DepthPitch = @intCast(sz.len);
+        return S_OK;
     }
-    r.maps.append(r.a(), .{ .res = @intFromPtr(res), .sub = sub, .mem = mem, .base = base }) catch return E_FAIL;
+
+    const mem = r.a().alignedAlloc(u8, .@"16", alloc_len) catch return E_FAIL;
+    if (map_type == 5) {
+        const t: *glb.Texture = @ptrFromInt(o.payload);
+        if (t.shadow) |p| {
+            @memcpy(mem[0..@min(mem.len, p.len)], p[0..@min(mem.len, p.len)]);
+        } else {
+            @memset(mem, 0);
+        }
+    } else {
+        @memset(mem, 0);
+    }
+    r.maps.append(r.a(), .{ .res = @intFromPtr(res), .sub = sub, .mem = mem }) catch return E_FAIL;
     mapped.pData = mem.ptr;
     mapped.RowPitch = sz.row;
     mapped.DepthPitch = @intCast(sz.len);
@@ -2626,15 +2702,51 @@ fn dUnmap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32) callconv(W) void {
     const r = recOf(raw);
     var i = r.maps.items.len;
     while (i > 0) : (i -= 1) {
-        const mr = r.maps.items[i - 1];
-        if (mr.res == @intFromPtr(res) and mr.sub == sub) {
-            if (mr.base) |base| {
-                // NO_OVERWRITE on a buffer: upload only what the app changed.
-                const d = diffRange(base, mr.mem) orelse return;
-                push(r, replayUploadRange, .{ raw, r.ref(res), mr.mem.ptr, d.lo, d.hi - d.lo });
+        if (r.maps.items[i - 1].res == @intFromPtr(res) and r.maps.items[i - 1].sub == sub) {
+            const mr = r.maps.orderedRemove(i - 1);
+            defer if (mr.uses_scratch) {
+                r.scratch_in_use = false;
+            };
+            if (!mr.is_buffer) {
+                push(r, replayUpload, .{ raw, r.ref(res), sub, mr.mem.ptr, mr.mem.len });
                 return;
             }
-            push(r, replayUpload, .{ raw, r.ref(res), sub, mr.mem.ptr, mr.mem.len });
+            const n = mr.mem.len;
+            const total_words = (n + 3) / 4;
+            const max_gap_words: usize = 16; // merge untouched struct padding gaps <= 64 bytes
+            var w: usize = 0;
+            while (w < total_words) {
+                if (!isWordDirty(mr.mem, w)) {
+                    w += 1;
+                    continue;
+                }
+                const span_lo = w * 4;
+                var last_dirty_w = w;
+                w += 1;
+                while (w < total_words) {
+                    if (isWordDirty(mr.mem, w)) {
+                        if (w > last_dirty_w + 1) {
+                            const gap_lo = (last_dirty_w + 1) * 4;
+                            const gap_hi = @min(n, w * 4);
+                            @memset(mr.mem[gap_lo..gap_hi], 0);
+                        }
+                        last_dirty_w = w;
+                        w += 1;
+                    } else if (w - last_dirty_w <= max_gap_words) {
+                        w += 1;
+                    } else {
+                        break;
+                    }
+                }
+                const span_hi = @min(n, (last_dirty_w + 1) * 4);
+                const span_len = span_hi - span_lo;
+                if (r.dup(u8, mr.mem[span_lo..span_hi].ptr, span_len)) |copy_ptr| {
+                    push(r, replayUploadSpan, .{ raw, r.ref(res), copy_ptr, span_lo, span_len });
+                }
+                if (mr.uses_scratch) {
+                    fillCanary(mr.mem, span_lo, span_hi);
+                }
+            }
             return;
         }
     }
@@ -2662,6 +2774,10 @@ fn dFinishCommandList(raw: ?*anyopaque, restore: i32, pp: ?*?*anyopaque) callcon
     const cl = alloc.create(CmdList) catch return E_FAIL;
     // Hand the arena (and everything recorded into it) to the command list.
     cl.* = .{ .arena = r.arena, .cmds = r.cmds.items, .refs = r.refs.items };
+    if (r.scratch_in_use and r.map_scratch.len > 0) {
+        fillCanary(r.map_scratch, 0, r.map_scratch.len);
+    }
+    r.scratch_in_use = false;
     r.arena = std.heap.ArenaAllocator.init(alloc);
     r.cmds = .empty;
     r.refs = .empty;
