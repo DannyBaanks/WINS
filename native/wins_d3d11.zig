@@ -30,7 +30,10 @@ fn trace(comptime fmt: []const u8, args: anytype) void {
 /// WINS_D3D11_TRACE_FMT=<dxgi format>: log every create/update/map/copy that
 /// touches a texture of that format (diagnostic; off by default).
 fn traceFmtOn(fmt_id: u32) bool {
-    const C = struct { var init = false; var want: ?u32 = null; };
+    const C = struct {
+        var init = false;
+        var want: ?u32 = null;
+    };
     if (!C.init) {
         C.init = true;
         if (comptime @import("builtin").link_libc) {
@@ -357,7 +360,6 @@ fn comAddRef(raw: ?*anyopaque) callconv(W) u32 {
     return @atomicRmw(u32, &o.ref_count, .Add, 1, .acq_rel) + 1;
 }
 
-
 // ---- Private data (Get/SetPrivateData[Interface]) ---------------------------
 // Real storage keyed by (object, GUID). Engines hang their own handles off D3D
 // objects and read them back; a stub that returns S_OK without writing hands
@@ -572,7 +574,9 @@ fn comQiDefault(raw: ?*anyopaque, riid: *const GUID, ppv: *?*anyopaque) callconv
         return S_OK;
     }
     ppv.* = null;
-    const QiLog = struct { var n = std.atomic.Value(u32).init(0); };
+    const QiLog = struct {
+        var n = std.atomic.Value(u32).init(0);
+    };
     if (QiLog.n.fetchAdd(1, .monotonic) < 24) {
         std.debug.print("[WINS:D3D11] QueryInterface({s}) -> E_NOINTERFACE iid={x:0>8}-{x:0>4}-{x:0>4}-{x}\n", .{
             @tagName(o.kind), riid.data1, riid.data2, riid.data3, riid.data4,
@@ -581,7 +585,9 @@ fn comQiDefault(raw: ?*anyopaque, riid: *const GUID, ppv: *?*anyopaque) callconv
     return E_NOINTERFACE;
 }
 
-fn stubRetOk() callconv(W) i32 { return S_OK; }
+fn stubRetOk() callconv(W) i32 {
+    return S_OK;
+}
 
 /// Device creation methods WINS does not implement: fail with E_NOTIMPL and a
 /// NULL object (reported once per method) instead of S_OK with no object.
@@ -597,7 +603,9 @@ fn notImplCreate(comptime name: []const u8, comptime out_index: usize) *const an
     }.f);
 }
 fn stubVoid() callconv(W) void {}
-fn stubRetZero() callconv(W) u32 { return 0; }
+fn stubRetZero() callconv(W) u32 {
+    return 0;
+}
 fn dxgiGetParent(raw: ?*anyopaque, riid: *const GUID, pp: *?*anyopaque) callconv(W) i32 {
     const o: *ComObj = @ptrCast(@alignCast(raw orelse return E_INVALIDARG));
     if (o.parent) |p| return comQiDefault(p, riid, pp);
@@ -667,8 +675,16 @@ fn facCreateSwapChain(_: ?*anyopaque, pDev: ?*anyopaque, pDesc: *const DXGI_SWAP
 
     const bb_obj = newCom(&tex2d_vtbl, .texture2d, @intFromPtr(bb_tex), g_device) orelse return E_FAIL;
     bb_obj.desc2d = .{
-        .Width = w, .Height = h, .MipLevels = 1, .ArraySize = 1, .Format = fmt,
-        .SampleDesc = .{ .Count = 1, .Quality = 0 }, .Usage = 0, .BindFlags = 0x28, .CPUAccessFlags = 0, .MiscFlags = 0,
+        .Width = w,
+        .Height = h,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = fmt,
+        .SampleDesc = .{ .Count = 1, .Quality = 0 },
+        .Usage = 0,
+        .BindFlags = 0x28,
+        .CPUAccessFlags = 0,
+        .MiscFlags = 0,
     };
 
     const sc = newCom(&swapchain_vtbl, .swapchain, @intFromPtr(bb_obj), g_device) orelse return E_FAIL;
@@ -680,7 +696,9 @@ fn facCreateSwapChain(_: ?*anyopaque, pDev: ?*anyopaque, pDesc: *const DXGI_SWAP
     return S_OK;
 }
 
-fn facIsCurrent(_: ?*anyopaque) callconv(W) i32 { return 1; }
+fn facIsCurrent(_: ?*anyopaque) callconv(W) i32 {
+    return 1;
+}
 
 fn adEnumOutputs(_: ?*anyopaque, idx: u32, pp: *?*anyopaque) callconv(W) i32 {
     if (idx != 0) {
@@ -935,8 +953,8 @@ fn devCreateTexture2D(_: ?*anyopaque, desc: *const D3D11_TEXTURE2D_DESC, init_da
         has_init = true;
     }
     traceFmt(desc.Format, "create {d}x{d} mips={d} arr={d} usage={d} cpu=0x{x} bind=0x{x} misc=0x{x} init={} pitch0={d} nz0={d}", .{
-        desc.Width, desc.Height, desc.MipLevels, desc.ArraySize, desc.Usage, desc.CPUAccessFlags, desc.BindFlags, desc.MiscFlags,
-        has_init, pitch_buf[0], if (has_init and traceFmtOn(desc.Format)) nonzeroBytes(ptrs_buf[0], @as(usize, pitch_buf[0]) * desc.Height) else 0,
+        desc.Width, desc.Height,  desc.MipLevels,                                                                                                     desc.ArraySize, desc.Usage, desc.CPUAccessFlags, desc.BindFlags, desc.MiscFlags,
+        has_init,   pitch_buf[0], if (has_init and traceFmtOn(desc.Format)) nonzeroBytes(ptrs_buf[0], @as(usize, pitch_buf[0]) * desc.Height) else 0,
     });
     glb.createTexture2D(t, if (has_init) &ptrs_buf else null, if (has_init) &pitch_buf else null);
     const o = newCom(&tex2d_vtbl, .texture2d, @intFromPtr(t), g_device) orelse return E_FAIL;
@@ -1030,9 +1048,25 @@ fn normalizeViewDesc(kind: ComObj.Kind, vd: *[6]u32, tex: ?*glb.Texture) void {
     // Index of the first union dword and how many the dimension uses.
     const first: usize = if (kind == .dsv) 3 else 2;
     const used: usize = switch (kind) {
-        .rtv => switch (dim) { 1 => 2, 2, 4 => 1, 3, 5, 8 => 3, 7 => 2, else => 0 },
-        .dsv => switch (dim) { 1, 3 => 1, 2, 4 => 3, 6 => 2, else => 0 },
-        .srv => switch (dim) { 1, 2, 4, 7, 8, 9 => 2, 3, 5, 10 => 4, 11 => 3, else => 0 },
+        .rtv => switch (dim) {
+            1 => 2,
+            2, 4 => 1,
+            3, 5, 8 => 3,
+            7 => 2,
+            else => 0,
+        },
+        .dsv => switch (dim) {
+            1, 3 => 1,
+            2, 4 => 3,
+            6 => 2,
+            else => 0,
+        },
+        .srv => switch (dim) {
+            1, 2, 4, 7, 8, 9 => 2,
+            3, 5, 10 => 4,
+            11 => 3,
+            else => 0,
+        },
         else => 4,
     };
     for (first + used..6) |i| vd[i] = 0;
@@ -1048,14 +1082,45 @@ fn devCreateSRV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_SHADER_RES
     if (pp == null) return S_FALSE;
     const r = extractResTexture(res);
     const v = alloc.create(glb.View) catch return E_FAIL;
-    v.* = .{ .tex = r.tex, .buf = r.buf };
+    v.* = .{
+        .tex = r.tex,
+        .buf = r.buf,
+        .num_mips = if (r.tex) |t| @max(1, t.mip_levels) else 1,
+        .num_slices = if (r.tex) |t| (if (t.target == 0x8513) 6 else @max(1, t.array_size)) else 1,
+    };
     var vd: [6]u32 = .{ if (r.tex) |t| t.dxgi_fmt else 28, 4, 0, if (r.tex) |t| t.mip_levels else 1, 0, 0 };
     if (desc) |d| {
         v.dxgi_fmt = d.Format;
+        v.view_dim = d.ViewDimension;
         vd = .{ d.Format, d.ViewDimension, d.u0, d.u1, d.u2, d.u3 };
-        if (d.ViewDimension == 4) { // TEXTURE2D
-            v.first_mip = d.u0;
-            v.num_mips = d.u1;
+        switch (d.ViewDimension) {
+            2, 4, 8, 9 => { // TEXTURE1D, TEXTURE2D, TEXTURE3D, TEXTURECUBE
+                v.first_mip = d.u0;
+                const avail_m = if (r.tex) |t| @max(1, t.mip_levels) -| v.first_mip else 1;
+                v.num_mips = if (d.u1 == 0xFFFFFFFF or d.u1 == 0) @max(1, avail_m) else @min(avail_m, d.u1);
+            },
+            3, 5 => { // TEXTURE1DARRAY, TEXTURE2DARRAY
+                v.first_mip = d.u0;
+                const avail_m = if (r.tex) |t| @max(1, t.mip_levels) -| v.first_mip else 1;
+                v.num_mips = if (d.u1 == 0xFFFFFFFF or d.u1 == 0) @max(1, avail_m) else @min(avail_m, d.u1);
+                v.first_slice = d.u2;
+                const avail_s = if (r.tex) |t| @max(1, t.array_size) -| v.first_slice else 1;
+                v.num_slices = if (d.u3 == 0xFFFFFFFF or d.u3 == 0) @max(1, avail_s) else @min(avail_s, d.u3);
+            },
+            10 => { // TEXTURECUBEARRAY
+                v.first_mip = d.u0;
+                const avail_m = if (r.tex) |t| @max(1, t.mip_levels) -| v.first_mip else 1;
+                v.num_mips = if (d.u1 == 0xFFFFFFFF or d.u1 == 0) @max(1, avail_m) else @min(avail_m, d.u1);
+                v.first_slice = d.u2;
+                const avail_s = if (r.tex) |t| @max(1, t.array_size) -| v.first_slice else 1;
+                v.num_slices = if (d.u3 == 0xFFFFFFFF or d.u3 == 0) @max(1, avail_s) else @min(avail_s, d.u3 *% 6);
+            },
+            7 => { // TEXTURE2DMSARRAY
+                v.first_slice = d.u0;
+                const avail_s = if (r.tex) |t| @max(1, t.array_size) -| v.first_slice else 1;
+                v.num_slices = if (d.u1 == 0xFFFFFFFF or d.u1 == 0) @max(1, avail_s) else @min(avail_s, d.u1);
+            },
+            else => {},
         }
         // BUFFER (1) / BUFFEREX (11): FirstElement, NumElements (+ Flags, 1 = RAW).
         if (r.buf) |b| if (d.ViewDimension == 1 or d.ViewDimension == 11) {
@@ -1133,7 +1198,11 @@ fn devCreateRTV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_RENDER_TAR
     if (pp == null) return S_FALSE;
     const r = extractResTexture(res);
     const v = alloc.create(glb.View) catch return E_FAIL;
-    v.* = .{ .tex = r.tex, .buf = r.buf };
+    v.* = .{
+        .tex = r.tex,
+        .buf = r.buf,
+        .num_slices = if (r.tex) |t| (if (t.target == 0x806F) @max(1, t.depth) else @max(1, t.array_size)) else 1,
+    };
     var vd: [6]u32 = .{ if (r.tex) |t| t.dxgi_fmt else 28, 4, 0, 0, 0, 0 };
     if (desc) |d| {
         v.dxgi_fmt = d.Format;
@@ -1142,7 +1211,11 @@ fn devCreateRTV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_RENDER_TAR
             // TEXTURE1D, TEXTURE1DARRAY, TEXTURE2D, TEXTURE2DARRAY, TEXTURE3D (u1 = FirstWSlice)
             2, 3, 4, 5, 8 => {
                 v.first_mip = d.u0;
-                if (d.ViewDimension == 3 or d.ViewDimension == 5 or d.ViewDimension == 8) v.first_slice = d.u1;
+                if (d.ViewDimension == 3 or d.ViewDimension == 5 or d.ViewDimension == 8) {
+                    v.first_slice = d.u1;
+                    const avail = if (r.tex) |t| (if (d.ViewDimension == 8) t.depth else t.array_size) -| v.first_slice else 1;
+                    v.num_slices = if (d.u2 == 0xFFFFFFFF or d.u2 == 0) @max(1, avail) else @min(avail, d.u2);
+                }
             },
             else => {},
         }
@@ -1162,14 +1235,26 @@ fn devCreateDSV(_: ?*anyopaque, res: ?*anyopaque, desc: ?*const D3D11_DEPTH_STEN
     if (pp == null) return S_FALSE;
     const r = extractResTexture(res);
     const v = alloc.create(glb.View) catch return E_FAIL;
-    v.* = .{ .tex = r.tex, .buf = r.buf };
+    v.* = .{
+        .tex = r.tex,
+        .buf = r.buf,
+        .num_slices = if (r.tex) |t| @max(1, t.array_size) else 1,
+    };
     var vd: [6]u32 = .{ if (r.tex) |t| t.dxgi_fmt else 45, 3, 0, 0, 0, 0 };
     if (desc) |d| {
         v.dxgi_fmt = d.Format;
         vd = .{ d.Format, d.ViewDimension, d.Flags, d.u0, d.u1, d.u2 };
         if (d.ViewDimension == 3 or d.ViewDimension == 4) { // TEXTURE2D / TEXTURE2DARRAY
             v.first_mip = d.u0;
-            if (d.ViewDimension == 4) v.first_slice = d.u1;
+            if (d.ViewDimension == 4) {
+                v.first_slice = d.u1;
+                const avail = if (r.tex) |t| t.array_size -| v.first_slice else 1;
+                v.num_slices = if (d.u2 == 0xFFFFFFFF or d.u2 == 0) @max(1, avail) else @min(avail, d.u2);
+            }
+        } else if (d.ViewDimension == 6) { // TEXTURE2DMSARRAY
+            v.first_slice = d.u0;
+            const avail = if (r.tex) |t| t.array_size -| v.first_slice else 1;
+            v.num_slices = if (d.u1 == 0xFFFFFFFF or d.u1 == 0) @max(1, avail) else @min(avail, d.u1);
         }
     }
     const o = newCom(&view_vtbl, .dsv, @intFromPtr(v), g_device) orelse return E_FAIL;
@@ -1252,6 +1337,50 @@ fn devCreatePixelShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*any
     return S_OK;
 }
 
+fn devCreateGeometryShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
+    if (pp == null) return S_FALSE;
+    const sh = alloc.create(glb.Shader) catch return E_FAIL;
+    sh.* = .{};
+    _ = glb.createShader(sh, bc[0..bc_len], false);
+    pp.?.* = newCom(&child_vtbl, .vs, @intFromPtr(sh), g_device);
+    return S_OK;
+}
+
+fn devCreateGeometryShaderWithSO(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*const anyopaque, _: u32, _: ?*const u32, _: u32, _: u32, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
+    if (pp == null) return S_FALSE;
+    const sh = alloc.create(glb.Shader) catch return E_FAIL;
+    sh.* = .{};
+    _ = glb.createShader(sh, bc[0..bc_len], false);
+    pp.?.* = newCom(&child_vtbl, .vs, @intFromPtr(sh), g_device);
+    return S_OK;
+}
+
+fn devCreateHullShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
+    if (pp == null) return S_FALSE;
+    const sh = alloc.create(glb.Shader) catch return E_FAIL;
+    sh.* = .{};
+    _ = glb.createShader(sh, bc[0..bc_len], false);
+    if (std.c.getenv("WINS_D3D11_DUMP_DIR")) |dz| {
+        const n = dummy_shader_n.fetchAdd(1, .monotonic);
+        glb.dumpFile(std.mem.span(dz), 900000 + n, "hs.dxbc", bc[0..bc_len]);
+    }
+    pp.?.* = newCom(&child_vtbl, .vs, @intFromPtr(sh), g_device);
+    return S_OK;
+}
+
+fn devCreateDomainShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
+    if (pp == null) return S_FALSE;
+    const sh = alloc.create(glb.Shader) catch return E_FAIL;
+    sh.* = .{};
+    _ = glb.createShader(sh, bc[0..bc_len], false);
+    if (std.c.getenv("WINS_D3D11_DUMP_DIR")) |dz| {
+        const n = dummy_shader_n.fetchAdd(1, .monotonic);
+        glb.dumpFile(std.mem.span(dz), 900000 + n, "ds.dxbc", bc[0..bc_len]);
+    }
+    pp.?.* = newCom(&child_vtbl, .vs, @intFromPtr(sh), g_device);
+    return S_OK;
+}
+
 fn devCreateComputeShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
     const sh = alloc.create(glb.Shader) catch return E_FAIL;
@@ -1267,8 +1396,7 @@ fn devCreateComputeShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*a
 
 var dummy_shader_n: std.atomic.Value(u32) = .init(0);
 
-/// GS/HS/DS/CS are not translated yet. With WINS_D3D11_DUMP_DIR their DXBC is
-/// written as p<900000+n>_xs.dxbc so the missing stages can be studied offline.
+/// Unsupported shader objects retained for diagnostics and later stages.
 fn devCreateDummyShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*anyopaque, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
     if (std.c.getenv("WINS_D3D11_DUMP_DIR")) |dz| {
@@ -1485,7 +1613,9 @@ fn devCheckFeatureSupport(_: ?*anyopaque, feature: u32, data: ?*anyopaque, size:
     return S_OK;
 }
 
-fn devGetFeatureLevel(_: ?*anyopaque) callconv(W) u32 { return D3D_FEATURE_LEVEL_11_0; }
+fn devGetFeatureLevel(_: ?*anyopaque) callconv(W) u32 {
+    return D3D_FEATURE_LEVEL_11_0;
+}
 fn devGetImmediateContext(_: ?*anyopaque, pp: *?*anyopaque) callconv(W) void {
     const c = g_context.?;
     _ = comAddRef(c);
@@ -1704,7 +1834,9 @@ fn curShadow(this: ?*anyopaque) Shadow {
 }
 
 fn getTrace(comptime name: []const u8, this: ?*anyopaque, ra: usize) void {
-    const S = struct { var n = std.atomic.Value(u32).init(0); };
+    const S = struct {
+        var n = std.atomic.Value(u32).init(0);
+    };
     if (S.n.fetchAdd(1, .monotonic) < 24 and std.c.getenv("WINS_D3D11_TRACE_GET") != null)
         std.debug.print("[WINS:D3D11] {s} deferred={} ret=0x{x}\n", .{ name, shadowOf(this) != null, ra });
 }
@@ -1795,8 +1927,12 @@ fn ctxRSSetViewports(_: ?*anyopaque, num: u32, vps: ?[*]const D3D11_VIEWPORT) ca
     if (vps) |arr| {
         for (0..n) |i| {
             g_draw_state.viewports[i] = .{
-                .x = arr[i].TopLeftX, .y = arr[i].TopLeftY, .w = arr[i].Width, .h = arr[i].Height,
-                .min_depth = arr[i].MinDepth, .max_depth = arr[i].MaxDepth,
+                .x = arr[i].TopLeftX,
+                .y = arr[i].TopLeftY,
+                .w = arr[i].Width,
+                .h = arr[i].Height,
+                .min_depth = arr[i].MinDepth,
+                .max_depth = arr[i].MaxDepth,
             };
         }
     }
@@ -1808,7 +1944,10 @@ fn ctxRSSetScissors(_: ?*anyopaque, num: u32, rects: ?[*]const RECT) callconv(W)
     if (rects) |arr| {
         for (0..n) |i| {
             g_draw_state.scissors[i] = .{
-                .left = arr[i].left, .top = arr[i].top, .right = arr[i].right, .bottom = arr[i].bottom,
+                .left = arr[i].left,
+                .top = arr[i].top,
+                .right = arr[i].right,
+                .bottom = arr[i].bottom,
             };
         }
     }
@@ -1888,7 +2027,7 @@ fn ctxUpdateSubresource(_: ?*anyopaque, res: ?*anyopaque, sub: u32, box: ?*const
         const t: *glb.Texture = @ptrFromInt(o.payload);
         const bx = if (box) |b| [6]u32{ b.left, b.top, b.front, b.right, b.bottom, b.back } else [_]u32{0} ** 6;
         traceFmt(t.dxgi_fmt, "update gl={d} sub={d} box={} [{d},{d})x[{d},{d}) pitch={d} nz={d}", .{
-            t.gl_id, sub, box != null, bx[0], bx[3], bx[1], bx[4], row_pitch,
+            t.gl_id,                                                                                                                        sub, box != null, bx[0], bx[3], bx[1], bx[4], row_pitch,
             if (traceFmtOn(t.dxgi_fmt)) nonzeroBytes(dptr, @as(usize, row_pitch) * (if (box != null) bx[4] -| bx[1] else t.height)) else 0,
         });
         if (t.dxgi_fmt == 41 and traceFmtOn(41) and row_pitch >= 4100) {
@@ -1957,7 +2096,7 @@ fn ctxGetData(_: ?*anyopaque, q: ?*anyopaque, data: ?*anyopaque, sz: u32, _: u32
         const qt = if (q) |r| @as(*ComObj, @ptrCast(@alignCast(r))).payload else 0;
         switch (qt) {
             1 => if (sz >= 8) { // D3D11_QUERY_OCCLUSION: UINT64 sample count
-                std.mem.writeInt(u64, bytes[0..8], 1, .little);
+                std.mem.writeInt(u64, bytes[0..8], 1_000_000, .little);
             },
             2 => if (sz >= 8) { // D3D11_QUERY_TIMESTAMP: UINT64 ticks
                 std.mem.writeInt(u64, bytes[0..8], 1000, .little);
@@ -2024,7 +2163,93 @@ fn ctxCSSetCB(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) c
 }
 
 fn ctxGSSetShader(_: ?*anyopaque, sh: ?*anyopaque, _: ?*const anyopaque, _: u32) callconv(W) void {
-    g_draw_state.gs_active = sh != null;
+    g_draw_state.gs = payloadOf(glb.Shader, sh);
+}
+
+fn ctxGSSetCB(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= 16) break;
+        g_draw_state.gs_cb[s] = payloadOf(glb.Buffer, if (pp) |arr| arr[i] else null);
+        g_draw_state.gs_cb_off[s] = 0;
+        g_draw_state.gs_cb_sz[s] = 0;
+    }
+}
+
+fn ctxGSSetSRV(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= glb.MAX_SRV) break;
+        g_draw_state.gs_srv[s] = payloadOf(glb.View, if (pp) |arr| arr[i] else null);
+    }
+}
+
+fn ctxGSSetSamplers(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= 16) break;
+        g_draw_state.gs_samp[s] = payloadOf(glb.Sampler, if (pp) |arr| arr[i] else null);
+    }
+}
+
+fn ctxHSSetShader(_: ?*anyopaque, sh: ?*anyopaque, _: ?*const anyopaque, _: u32) callconv(W) void {
+    g_draw_state.hs = payloadOf(glb.Shader, sh);
+}
+
+fn ctxHSSetCB(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= 16) break;
+        g_draw_state.hs_cb[s] = payloadOf(glb.Buffer, if (pp) |arr| arr[i] else null);
+        g_draw_state.hs_cb_off[s] = 0;
+        g_draw_state.hs_cb_sz[s] = 0;
+    }
+}
+
+fn ctxHSSetSRV(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= glb.MAX_SRV) break;
+        g_draw_state.hs_srv[s] = payloadOf(glb.View, if (pp) |arr| arr[i] else null);
+    }
+}
+
+fn ctxHSSetSamplers(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= 16) break;
+        g_draw_state.hs_samp[s] = payloadOf(glb.Sampler, if (pp) |arr| arr[i] else null);
+    }
+}
+
+fn ctxDSSetShader(_: ?*anyopaque, sh: ?*anyopaque, _: ?*const anyopaque, _: u32) callconv(W) void {
+    g_draw_state.ds = payloadOf(glb.Shader, sh);
+}
+
+fn ctxDSSetCB(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= 16) break;
+        g_draw_state.ds_cb[s] = payloadOf(glb.Buffer, if (pp) |arr| arr[i] else null);
+        g_draw_state.ds_cb_off[s] = 0;
+        g_draw_state.ds_cb_sz[s] = 0;
+    }
+}
+
+fn ctxDSSetSRV(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= glb.MAX_SRV) break;
+        g_draw_state.ds_srv[s] = payloadOf(glb.View, if (pp) |arr| arr[i] else null);
+    }
+}
+
+fn ctxDSSetSamplers(_: ?*anyopaque, start: u32, num: u32, pp: ?[*]const ?*anyopaque) callconv(W) void {
+    for (0..num) |i| {
+        const s = start + i;
+        if (s >= 16) break;
+        g_draw_state.ds_samp[s] = payloadOf(glb.Sampler, if (pp) |arr| arr[i] else null);
+    }
 }
 
 fn ctxDispatch(_: ?*anyopaque, x: u32, y: u32, z: u32) callconv(W) void {
@@ -2051,98 +2276,106 @@ fn ctxClearState(_: ?*anyopaque) callconv(W) void {
     g_bound = .{};
 }
 
-fn ctxGetType(_: ?*anyopaque) callconv(W) u32 { return 0; } // IMMEDIATE
+fn ctxGetType(_: ?*anyopaque) callconv(W) u32 {
+    return 0;
+} // IMMEDIATE
 
 // ---- Static COM Vtables -----------------------------------------------------
 
 const dxgi_factory_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData), @ptrCast(&dxgiGetParent),
-    @ptrCast(&facEnumAdapters), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&facCreateSwapChain), @ptrCast(&stubRetOk),
-    @ptrCast(&facEnumAdapters), @ptrCast(&facIsCurrent),
+    @ptrCast(&comQiDefault),      @ptrCast(&comAddRef),                  @ptrCast(&comRelease),
+    @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData),
+    @ptrCast(&dxgiGetParent),     @ptrCast(&facEnumAdapters),            @ptrCast(&stubRetOk),
+    @ptrCast(&stubRetOk),         @ptrCast(&facCreateSwapChain),         @ptrCast(&stubRetOk),
+    @ptrCast(&facEnumAdapters),   @ptrCast(&facIsCurrent),
 };
 
 const dxgi_adapter_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData), @ptrCast(&dxgiGetParent),
-    @ptrCast(&adEnumOutputs), @ptrCast(&adGetDesc), @ptrCast(&adCheckInterface), @ptrCast(&adGetDesc1),
+    @ptrCast(&comQiDefault),      @ptrCast(&comAddRef),                  @ptrCast(&comRelease),
+    @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData),
+    @ptrCast(&dxgiGetParent),     @ptrCast(&adEnumOutputs),              @ptrCast(&adGetDesc),
+    @ptrCast(&adCheckInterface),  @ptrCast(&adGetDesc1),
 };
 
 const dxgi_output_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData), @ptrCast(&dxgiGetParent),
-    @ptrCast(&outGetDesc), @ptrCast(&outGetDisplayModeList), @ptrCast(&outFindClosestMode), @ptrCast(&stubRetOk),
-    @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
-    @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&comQiDefault),       @ptrCast(&comAddRef),                  @ptrCast(&comRelease),
+    @ptrCast(&d3dSetPrivateData),  @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData),
+    @ptrCast(&dxgiGetParent),      @ptrCast(&outGetDesc),                 @ptrCast(&outGetDisplayModeList),
+    @ptrCast(&outFindClosestMode), @ptrCast(&stubRetOk),                  @ptrCast(&stubRetOk),
+    @ptrCast(&stubRetOk),          @ptrCast(&stubRetOk),                  @ptrCast(&stubRetOk),
+    @ptrCast(&stubRetOk),          @ptrCast(&stubRetOk),                  @ptrCast(&stubRetOk),
+    @ptrCast(&stubRetOk),
 };
 
 const dxgi_device_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData), @ptrCast(&dxgiGetParent),
-    @ptrCast(&dxgidevGetAdapter), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
-    @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&comQiDefault),      @ptrCast(&comAddRef),                  @ptrCast(&comRelease),
+    @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData),
+    @ptrCast(&dxgiGetParent),     @ptrCast(&dxgidevGetAdapter),          @ptrCast(&stubRetOk),
+    @ptrCast(&stubRetOk),         @ptrCast(&stubRetOk),                  @ptrCast(&stubRetOk),
+    @ptrCast(&stubRetOk),         @ptrCast(&stubRetOk),
 };
 
 const swapchain_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData), @ptrCast(&dxgiGetParent),
-    @ptrCast(&scGetDevice), @ptrCast(&scPresent), @ptrCast(&scGetBuffer),
-    @ptrCast(&scSetFullscreenState), @ptrCast(&scGetFullscreenState), @ptrCast(&scGetDesc),
-    @ptrCast(&scResizeBuffers), @ptrCast(&scResizeTarget), @ptrCast(&scGetContainingOutput),
-    @ptrCast(&stubRetOk), @ptrCast(&stubRetOk),
+    @ptrCast(&comQiDefault),          @ptrCast(&comAddRef),                  @ptrCast(&comRelease),
+    @ptrCast(&d3dSetPrivateData),     @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&d3dGetPrivateData),
+    @ptrCast(&dxgiGetParent),         @ptrCast(&scGetDevice),                @ptrCast(&scPresent),
+    @ptrCast(&scGetBuffer),           @ptrCast(&scSetFullscreenState),       @ptrCast(&scGetFullscreenState),
+    @ptrCast(&scGetDesc),             @ptrCast(&scResizeBuffers),            @ptrCast(&scResizeTarget),
+    @ptrCast(&scGetContainingOutput), @ptrCast(&stubRetOk),                  @ptrCast(&stubRetOk),
 };
 
 const child_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),         @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface),
 };
 
 /// ID3D11{Blend,DepthStencil,Rasterizer,Sampler}State: DeviceChild + GetDesc (7).
 const state_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
-    @ptrCast(&stateGetDesc),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),         @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&stateGetDesc),
 };
 
 /// ID3D11Query/Predicate: DeviceChild + GetDataSize (7) + GetDesc (8).
 const query_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
-    @ptrCast(&queryGetDataSize), @ptrCast(&stateGetDesc),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),         @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&queryGetDataSize),  @ptrCast(&stateGetDesc),
 };
 
 const buf_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
-    @ptrCast(&resGetType), @ptrCast(&stubVoid), @ptrCast(&stubRetZero),
-    @ptrCast(&bufGetDesc),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),         @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&resGetType),        @ptrCast(&stubVoid),
+    @ptrCast(&stubRetZero),                @ptrCast(&bufGetDesc),
 };
 
 const tex2d_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
-    @ptrCast(&resGetType), @ptrCast(&stubVoid), @ptrCast(&stubRetZero),
-    @ptrCast(&tex2dGetDesc),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),         @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&resGetType),        @ptrCast(&stubVoid),
+    @ptrCast(&stubRetZero),                @ptrCast(&tex2dGetDesc),
 };
 
 const tex1d_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
-    @ptrCast(&resGetType), @ptrCast(&stubVoid), @ptrCast(&stubRetZero),
-    @ptrCast(&tex1dGetDesc),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),         @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&resGetType),        @ptrCast(&stubVoid),
+    @ptrCast(&stubRetZero),                @ptrCast(&tex1dGetDesc),
 };
 
 const tex3d_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
-    @ptrCast(&resGetType), @ptrCast(&stubVoid), @ptrCast(&stubRetZero),
-    @ptrCast(&tex3dGetDesc),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),         @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&resGetType),        @ptrCast(&stubVoid),
+    @ptrCast(&stubRetZero),                @ptrCast(&tex3dGetDesc),
 };
 
 const view_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
-    @ptrCast(&viewGetResource), @ptrCast(&viewGetDesc),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),         @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&viewGetResource),   @ptrCast(&viewGetDesc),
 };
 
 const device_vtbl = [_]?*const anyopaque{
@@ -2157,11 +2390,11 @@ const device_vtbl = [_]?*const anyopaque{
     @ptrCast(&devCreateDSV), // 10
     @ptrCast(&devCreateInputLayout), // 11
     @ptrCast(&devCreateVertexShader), // 12
-    @ptrCast(&devCreateDummyShader), // 13 GS
-    @ptrCast(&devCreateDummyShader), // 14 GS+SO
+    @ptrCast(&devCreateGeometryShader), // 13 GS
+    @ptrCast(&devCreateGeometryShaderWithSO), // 14 GS+SO
     @ptrCast(&devCreatePixelShader), // 15
-    @ptrCast(&devCreateDummyShader), // 16 HS
-    @ptrCast(&devCreateDummyShader), // 17 DS
+    @ptrCast(&devCreateHullShader), // 16 HS
+    @ptrCast(&devCreateDomainShader), // 17 DS
     @ptrCast(&devCreateComputeShader), // 18 CS
     notImplCreate("CreateClassLinkage", 1), // 19
     @ptrCast(&devCreateBlendState), // 20
@@ -2219,7 +2452,7 @@ const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&ctxIASetIndexBuffer), // 19
     @ptrCast(&ctxDrawIndexedInstanced), // 20
     @ptrCast(&ctxDrawInstanced), // 21
-    iStub(22), // 22 GSSetConstantBuffers
+    @ptrCast(&ctxGSSetCB), // 22 GSSetConstantBuffers
     @ptrCast(&ctxGSSetShader), // 23
     @ptrCast(&ctxIASetTopology), // 24
     @ptrCast(&ctxVSSetSRV), // 25
@@ -2228,8 +2461,8 @@ const context_vtbl = [_]?*const anyopaque{
     iStub(28), // 28 End
     @ptrCast(&ctxGetData), // 29
     iStub(30), // 30 SetPredication
-    iStub(31), // 31 GSSetShaderResources
-    iStub(32), // 32 GSSetSamplers
+    @ptrCast(&ctxGSSetSRV), // 31 GSSetShaderResources
+    @ptrCast(&ctxGSSetSamplers), // 32 GSSetSamplers
     @ptrCast(&ctxOMSetRenderTargets), // 33
     iStub(34), // 34 OMSetRenderTargetsAndUAVs
     @ptrCast(&ctxOMSetBlendState), // 35
@@ -2256,8 +2489,8 @@ const context_vtbl = [_]?*const anyopaque{
     @ptrCast(&stubRetZero), // 56 GetResourceMinLOD
     @ptrCast(&ctxResolveSubresource), // 57
     @ptrCast(&ctxExecuteCommandList), // 58
-    iStub(59), iStub(60), iStub(61), iStub(62), // 59..62 HS
-    iStub(63), iStub(64), iStub(65), iStub(66), // 63..66 DS
+    @ptrCast(&ctxHSSetSRV), @ptrCast(&ctxHSSetShader), @ptrCast(&ctxHSSetSamplers), @ptrCast(&ctxHSSetCB), // 59..62 HS
+    @ptrCast(&ctxDSSetSRV), @ptrCast(&ctxDSSetShader), @ptrCast(&ctxDSSetSamplers), @ptrCast(&ctxDSSetCB), // 63..66 DS
     @ptrCast(&ctxCSSetSRV), // 67
     @ptrCast(&ctxCSSetUAV), // 68
     @ptrCast(&ctxCSSetShader), // 69
@@ -2526,14 +2759,18 @@ fn dRSSetState(raw: ?*anyopaque, rs: ?*anyopaque) callconv(W) void {
 fn dRSSetViewports(raw: ?*anyopaque, num: u32, vps: ?[*]const D3D11_VIEWPORT) callconv(W) void {
     const r = recOf(raw);
     r.shadow.nvp = @min(8, num);
-    if (vps) |arr| for (0..r.shadow.nvp) |i| { r.shadow.vps[i] = arr[i]; };
+    if (vps) |arr| for (0..r.shadow.nvp) |i| {
+        r.shadow.vps[i] = arr[i];
+    };
     push(r, ctxRSSetViewports, .{ raw, num, r.dup(D3D11_VIEWPORT, vps, num) });
 }
 
 fn dRSSetScissors(raw: ?*anyopaque, num: u32, rects: ?[*]const RECT) callconv(W) void {
     const r = recOf(raw);
     r.shadow.nsc = @min(8, num);
-    if (rects) |arr| for (0..r.shadow.nsc) |i| { r.shadow.sc[i] = arr[i]; };
+    if (rects) |arr| for (0..r.shadow.nsc) |i| {
+        r.shadow.sc[i] = arr[i];
+    };
     push(r, ctxRSSetScissors, .{ raw, num, r.dup(RECT, rects, num) });
 }
 
@@ -2615,19 +2852,19 @@ fn replayUpload(ctx: ?*anyopaque, res: ?*anyopaque, sub: u32, mem: [*]const u8, 
 /// Replay of a deferred buffer Map/Unmap dirty span: `data` holds the exact
 /// `len` bytes to upload at `off`, so only what the app wrote reaches `b.shadow`
 /// and OpenGL without clobbering other regions of the ring buffer.
-fn replayUploadSpan(_: ?*anyopaque, res: ?*anyopaque, data: [*]const u8, off: usize, len: usize) callconv(W) void {
+fn replayUploadSpans(_: ?*anyopaque, res: ?*anyopaque, spans_ptr: [*]const glb.BufSpan, count: usize) callconv(W) void {
     const o: *ComObj = @ptrCast(@alignCast(res orelse return));
-    if (o.kind != .buffer or len == 0) return;
+    if (o.kind != .buffer or count == 0) return;
     const b: *glb.Buffer = @ptrFromInt(o.payload);
-    if (off >= b.size) return;
-    glb.uploadBuffer(b, @intCast(off), data, @intCast(@min(len, b.size - off)));
+    glb.uploadBufferSpans(b, spans_ptr[0..count]);
 }
 
 /// Deterministic 16-bit canary for 2-byte half-word index `idx2`. Lies in
-/// [0x4001, 0x7BFD] with bit 0 set (never 0, 0xFFFF, 1.0f/f16, or f16 Inf/NaN).
+/// [0x7FC1, 0x7FFF] with bit 0 set: quiet NaN in f16 and in the upper 16 bits
+/// of f32, and outside small i16/u16 integers, so valid writes never collide.
 inline fn canaryHalf(idx2: usize) u16 {
     const x = (@as(u64, idx2) +% 1) *% 0x9E3779B97F4A7C15;
-    return @as(u16, @truncate((x >> 48) & 0x3BFE)) | 0x4001;
+    return 0x7FC1 | ((@as(u16, @truncate(x >> 58)) & 0x1F) << 1);
 }
 
 fn fillCanary(buf: []u8, lo: usize, hi: usize) void {
@@ -2747,7 +2984,7 @@ fn dUnmap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32) callconv(W) void {
             }
             const n = mr.mem.len;
             const total_halves = (n + 1) / 2;
-            const max_gap_halves: usize = 32; // merge untouched struct padding gaps <= 64 bytes
+            var spans: std.ArrayListUnmanaged(glb.BufSpan) = .empty;
             var h: usize = 0;
             while (h < total_halves) {
                 if (!isHalfDirty(mr.mem, h)) {
@@ -2757,29 +2994,21 @@ fn dUnmap(raw: ?*anyopaque, res: ?*anyopaque, sub: u32) callconv(W) void {
                 const span_lo = h * 2;
                 var last_dirty_h = h;
                 h += 1;
-                while (h < total_halves) {
-                    if (isHalfDirty(mr.mem, h)) {
-                        if (h > last_dirty_h + 1) {
-                            const gap_lo = (last_dirty_h + 1) * 2;
-                            const gap_hi = @min(n, h * 2);
-                            @memset(mr.mem[gap_lo..gap_hi], 0);
-                        }
-                        last_dirty_h = h;
-                        h += 1;
-                    } else if (h - last_dirty_h <= max_gap_halves) {
-                        h += 1;
-                    } else {
-                        break;
-                    }
+                while (h < total_halves and isHalfDirty(mr.mem, h)) {
+                    last_dirty_h = h;
+                    h += 1;
                 }
                 const span_hi = @min(n, (last_dirty_h + 1) * 2);
                 const span_len = span_hi - span_lo;
                 if (r.dup(u8, mr.mem[span_lo..span_hi].ptr, span_len)) |copy_ptr| {
-                    push(r, replayUploadSpan, .{ raw, r.ref(res), copy_ptr, span_lo, span_len });
+                    spans.append(r.a(), .{ .off = @intCast(span_lo), .data = copy_ptr, .len = @intCast(span_len) }) catch {};
                 }
                 if (mr.uses_scratch) {
                     fillCanary(mr.mem, span_lo, span_hi);
                 }
+            }
+            if (spans.items.len > 0) {
+                push(r, replayUploadSpans, .{ raw, r.ref(res), spans.items.ptr, spans.items.len });
             }
             return;
         }
@@ -2875,9 +3104,9 @@ fn devCreateDeferredContext(_: ?*anyopaque, _: u32, pp: ?*?*anyopaque) callconv(
 }
 
 const cmdlist_vtbl = [_]?*const anyopaque{
-    @ptrCast(&comQiDefault), @ptrCast(&comAddRef), @ptrCast(&comRelease),
-    @ptrCast(&childGetDevice), @ptrCast(&d3dGetPrivateData), @ptrCast(&d3dSetPrivateData), @ptrCast(&d3dSetPrivateDataInterface),
-    @ptrCast(&cmdlistGetContextFlags),
+    @ptrCast(&comQiDefault),               @ptrCast(&comAddRef),              @ptrCast(&comRelease),
+    @ptrCast(&childGetDevice),             @ptrCast(&d3dGetPrivateData),      @ptrCast(&d3dSetPrivateData),
+    @ptrCast(&d3dSetPrivateDataInterface), @ptrCast(&cmdlistGetContextFlags),
 };
 
 /// Unrecorded deferred-context slot: it still runs the immediate method right
@@ -2936,7 +3165,18 @@ const deferred_vtbl = blk: {
     v[54] = dObj1(ctxGenerateMips);
     v[57] = @ptrCast(&dResolveSubresource);
     v[58] = @ptrCast(&dExecuteCommandList);
+    v[22] = dSetArr(ctxGSSetCB);
     v[23] = dSetShader(ctxGSSetShader);
+    v[31] = dSetArr(ctxGSSetSRV);
+    v[32] = dSetArr(ctxGSSetSamplers);
+    v[59] = dSetArr(ctxHSSetSRV);
+    v[60] = dSetShader(ctxHSSetShader);
+    v[61] = dSetArr(ctxHSSetSamplers);
+    v[62] = dSetArr(ctxHSSetCB);
+    v[63] = dSetArr(ctxDSSetSRV);
+    v[64] = dSetShader(ctxDSSetShader);
+    v[65] = dSetArr(ctxDSSetSamplers);
+    v[66] = dSetArr(ctxDSSetCB);
     v[39] = dObj1(ctxDrawIndexedInstancedIndirect);
     v[40] = dObj1(ctxDrawInstancedIndirect);
     v[41] = dVal(ctxDispatch);
@@ -2951,7 +3191,6 @@ const deferred_vtbl = blk: {
     v[114] = @ptrCast(&dFinishCommandList);
     break :blk v;
 };
-
 
 // ---- DLL Export Entry Points ------------------------------------------------
 

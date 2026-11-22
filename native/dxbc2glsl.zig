@@ -28,7 +28,14 @@ pub fn main(init: std.process.Init) !void {
         if (shader.translate(gpa, bytes)) |tr_const| {
             var tr = tr_const;
             defer tr.deinit(gpa);
-            const name = try std.fmt.bufPrint(&name_buf, "{s}.{s}", .{ base, switch (tr.stage) { .compute => "comp", .pixel => "frag", else => "vert" } });
+            const name = try std.fmt.bufPrint(&name_buf, "{s}.{s}", .{ base, switch (tr.stage) {
+                .compute => "comp",
+                .pixel => "frag",
+                .geometry => "geom",
+                .hull => "tesc",
+                .domain => "tese",
+                else => "vert",
+            } });
             try out_dir.writeFile(io, .{ .sub_path = name, .data = tr.glsl });
             ok += 1;
         } else |e| {

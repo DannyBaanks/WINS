@@ -12,11 +12,64 @@ const std = @import("std");
 
 pub const Error = error{ Malformed, Unsupported, OutOfMemory };
 
-pub const Stage = enum { vertex, pixel, compute, other };
+pub const Stage = enum {
+    vertex,
+    hull,
+    hull_control_point,
+    hull_fork,
+    hull_join,
+    domain,
+    domain_tri,
+    domain_quad,
+    domain_isoline,
+    geometry,
+    pixel,
+    compute,
+    other,
+};
 
-/// GLSL name prefix of a stage's resources (p = pixel, v = vertex, c = compute).
+pub const TessDomain = enum(u8) { none = 0, isoline = 1, tri = 2, quad = 3 };
+pub const TessPartitioning = enum(u8) { none = 0, integer = 1, pow2 = 2, fractional_odd = 3, fractional_even = 4 };
+pub const TessOutputPrimitive = enum(u8) { none = 0, point = 1, line = 2, triangle_cw = 3, triangle_ccw = 4 };
+
+pub const TessInfo = struct {
+    output_control_points: u32 = 1,
+    domain: TessDomain = .none,
+    partitioning: TessPartitioning = .none,
+    output_primitive: TessOutputPrimitive = .none,
+    max_tess_factor: f32 = 64.0,
+};
+
+/// GLSL resource prefixes stay unique across every linked stage.
 pub fn stagePrefix(stage: Stage) []const u8 {
-    return switch (stage) { .pixel => "p", .compute => "c", else => "v" };
+    return switch (stage) {
+        .pixel => "p",
+        .geometry => "g",
+        .compute => "c",
+        .hull, .hull_control_point, .hull_fork, .hull_join => "h",
+        .domain, .domain_tri, .domain_quad, .domain_isoline => "d",
+        else => "v",
+    };
+}
+
+fn isDomainStage(stage: Stage) bool {
+    return stage == .domain or stage == .domain_tri or stage == .domain_quad or stage == .domain_isoline;
+}
+
+fn isHullStage(stage: Stage) bool {
+    return stage == .hull or stage == .hull_control_point or stage == .hull_fork or stage == .hull_join;
+}
+
+const TessFactor = struct { inner: bool, index: u32 };
+
+fn tessFactor(sysval: u32, semantic_index: u32) ?TessFactor {
+    return switch (sysval) {
+        11, 13 => .{ .inner = false, .index = semantic_index },
+        12, 14 => .{ .inner = true, .index = semantic_index },
+        15 => .{ .inner = false, .index = 0 },
+        16 => .{ .inner = false, .index = 1 },
+        else => null,
+    };
 }
 
 /// D3D11 SRV slots per stage (t0..t127). DS3 samples t31+ in some shaders.
@@ -85,6 +138,9 @@ pub const Translated = struct {
     stage: Stage,
     inputs: []SigElem,
     outputs: []SigElem,
+    patch_inputs: []SigElem = &.{},
+    patch_outputs: []SigElem = &.{},
+    tess: TessInfo = .{},
     cb_mask: u16,
     tex_bindings: []TexBinding,
     buf_bindings: []BufBinding = &.{},
@@ -94,6 +150,8 @@ pub const Translated = struct {
         a.free(self.glsl);
         a.free(self.inputs);
         a.free(self.outputs);
+        a.free(self.patch_inputs);
+        a.free(self.patch_outputs);
         a.free(self.tex_bindings);
         a.free(self.buf_bindings);
         a.free(self.img_bindings);
@@ -204,9 +262,27 @@ fn imgCoord(a: std.mem.Allocator, src: *const Operand, dim: TexDim, stage: Stage
 
 fn imgType(d: MemDecl) []const u8 {
     return switch (d.ty) {
-        .u => switch (d.dim) { .buf => "uimageBuffer", .tex1d, .tex1d_array => "uimage1DArray", .tex2d_array => "uimage2DArray", .tex3d => "uimage3D", else => "uimage2D" },
-        .i => switch (d.dim) { .buf => "iimageBuffer", .tex1d, .tex1d_array => "iimage1DArray", .tex2d_array => "iimage2DArray", .tex3d => "iimage3D", else => "iimage2D" },
-        .f => switch (d.dim) { .buf => "imageBuffer", .tex1d, .tex1d_array => "image1DArray", .tex2d_array => "image2DArray", .tex3d => "image3D", else => "image2D" },
+        .u => switch (d.dim) {
+            .buf => "uimageBuffer",
+            .tex1d, .tex1d_array => "uimage1DArray",
+            .tex2d_array => "uimage2DArray",
+            .tex3d => "uimage3D",
+            else => "uimage2D",
+        },
+        .i => switch (d.dim) {
+            .buf => "iimageBuffer",
+            .tex1d, .tex1d_array => "iimage1DArray",
+            .tex2d_array => "iimage2DArray",
+            .tex3d => "iimage3D",
+            else => "iimage2D",
+        },
+        .f => switch (d.dim) {
+            .buf => "imageBuffer",
+            .tex1d, .tex1d_array => "image1DArray",
+            .tex2d_array => "image2DArray",
+            .tex3d => "image3D",
+            else => "image2D",
+        },
     };
 }
 
@@ -288,6 +364,16 @@ fn samplerType(dim: TexDim) []const u8 {
     };
 }
 
+fn samplerTypeShadow(dim: TexDim) []const u8 {
+    return switch (dim) {
+        .cube => "samplerCubeShadow",
+        .cube_array => "samplerCubeArrayShadow",
+        .tex1d, .tex1d_array => "sampler1DArrayShadow",
+        .tex2d_array => "sampler2DArrayShadow",
+        else => "sampler2DShadow",
+    };
+}
+
 fn setErr(msg: []const u8) Error {
     last_error = msg;
     return error.Unsupported;
@@ -298,15 +384,21 @@ fn readU32(b: []const u8, off: usize) !u32 {
     return std.mem.readInt(u32, b[off..][0..4], .little);
 }
 
-fn parseSigChunk(a: std.mem.Allocator, chunk: []const u8, is_osg5: bool) ![]SigElem {
+const SigKind = enum { v0, v5, v1 }; // ISGN/OSGN = 24B, OSG5 = 28B, ISG1/OSG1 = 32B
+
+fn parseSigChunk(a: std.mem.Allocator, chunk: []const u8, kind: SigKind) ![]SigElem {
     if (chunk.len < 8) return error.Malformed;
     const count = try readU32(chunk, 0);
-    const elem_sz: usize = if (is_osg5) 32 else 24;
+    const elem_sz: usize = switch (kind) {
+        .v0 => 24,
+        .v5 => 28,
+        .v1 => 32,
+    };
     if (8 + @as(usize, count) * elem_sz > chunk.len) return error.Malformed;
     var list = try a.alloc(SigElem, count);
     for (0..count) |i| {
         const base = 8 + i * elem_sz;
-        const off_adj: usize = if (is_osg5) 4 else 0;
+        const off_adj: usize = if (kind == .v0) 0 else 4;
         const name_off = try readU32(chunk, base + off_adj);
         const sem_idx = try readU32(chunk, base + off_adj + 4);
         const sysval = try readU32(chunk, base + off_adj + 8);
@@ -506,8 +598,18 @@ fn formatIndex(a: std.mem.Allocator, iv: IndexVal) ![]const u8 {
 fn formatBaseVar(a: std.mem.Allocator, op: *const Operand, stage: Stage) ![]const u8 {
     return switch (op.op_type) {
         0 => std.fmt.allocPrint(a, "r[{s}]", .{try formatIndex(a, op.indices[0])}),
-        1 => std.fmt.allocPrint(a, "vi{s}", .{try formatIndex(a, op.indices[0])}),
-        2 => std.fmt.allocPrint(a, "vo{s}", .{try formatIndex(a, op.indices[0])}),
+        1 => if (stage == .geometry or stage == .hull_control_point or stage == .hull_fork or stage == .hull_join or isDomainStage(stage))
+            (if (op.index_dim >= 2)
+                std.fmt.allocPrint(a, "vi{s}[{s}]", .{ try formatIndex(a, op.indices[1]), try formatIndex(a, op.indices[0]) })
+            else
+                std.fmt.allocPrint(a, "vi{s}[0]", .{try formatIndex(a, op.indices[0])}))
+        else
+            std.fmt.allocPrint(a, "vi{s}", .{try formatIndex(a, op.indices[0])}),
+        2 => switch (stage) {
+            .hull_control_point => std.fmt.allocPrint(a, "vo{s}[gl_InvocationID]", .{try formatIndex(a, op.indices[0])}),
+            .hull_fork, .hull_join => std.fmt.allocPrint(a, "pc[{s}]", .{try formatIndex(a, op.indices[0])}),
+            else => std.fmt.allocPrint(a, "vo{s}", .{try formatIndex(a, op.indices[0])}),
+        },
         3 => std.fmt.allocPrint(a, "x{d}[{s}]", .{ op.indices[0].imm, try formatIndex(a, op.indices[1]) }),
         8 => blk: {
             const prefix = stagePrefix(stage);
@@ -517,10 +619,22 @@ fn formatBaseVar(a: std.mem.Allocator, op: *const Operand, stage: Stage) ![]cons
             const prefix = stagePrefix(stage);
             break :blk std.fmt.allocPrint(a, "{s}icb[{s}]", .{ prefix, try formatIndex(a, op.indices[0]) });
         },
-        11 => try a.dupe(u8, "vec4(uintBitsToFloat(uint(gl_PrimitiveID)), 0.0, 0.0, 0.0)"),
+        11 => try a.dupe(u8, if (stage == .geometry) "vec4(uintBitsToFloat(uint(gl_PrimitiveIDIn)), 0.0, 0.0, 0.0)" else "vec4(uintBitsToFloat(uint(gl_PrimitiveID)), 0.0, 0.0, 0.0)"),
         12 => try a.dupe(u8, "oDepth"),
         13 => try a.dupe(u8, "dummyNull"),
+        22 => try a.dupe(u8, "vec4(uintBitsToFloat(uint(gl_InvocationID)), 0.0, 0.0, 0.0)"),
+        23 => try a.dupe(u8, "vec4(uintBitsToFloat(hsForkID), 0.0, 0.0, 0.0)"),
+        24 => try a.dupe(u8, "vec4(uintBitsToFloat(hsJoinID), 0.0, 0.0, 0.0)"),
+        25 => std.fmt.allocPrint(a, "vi{s}[{s}]", .{ try formatIndex(a, op.indices[1]), try formatIndex(a, op.indices[0]) }),
+        26 => std.fmt.allocPrint(a, "vo{s}[{s}]", .{ try formatIndex(a, op.indices[1]), try formatIndex(a, op.indices[0]) }),
+        27 => std.fmt.allocPrint(a, "pc[{s}]", .{try formatIndex(a, op.indices[0])}),
+        28 => switch (stage) {
+            .domain_tri => try a.dupe(u8, "vec4(gl_TessCoord, 0.0)"),
+            .domain_isoline => try a.dupe(u8, "vec4(gl_TessCoord.y, gl_TessCoord.x, 0.0, 0.0)"),
+            else => try a.dupe(u8, "vec4(gl_TessCoord.xy, 0.0, 0.0)"),
+        },
         35 => try a.dupe(u8, "vec4(uintBitsToFloat(uint(gl_SampleMaskIn[0])), 0.0, 0.0, 0.0)"),
+        37 => try a.dupe(u8, "vec4(uintBitsToFloat(uint(gl_InvocationID)), 0.0, 0.0, 0.0)"),
         // Compute system values (vThreadID, vThreadGroupID, vThreadIDInGroup,
         // vThreadIDInGroupFlattened) hold integer bits like every register.
         32 => try a.dupe(u8, "uintBitsToFloat(uvec4(gl_GlobalInvocationID, 0u))"),
@@ -574,9 +688,21 @@ fn formatSrc(a: std.mem.Allocator, op: *const Operand, mask: u8, ty: NumType, st
         } else {
             var parts: std.ArrayList(u8) = .empty;
             const ctor = switch (ty) {
-                .f => switch (cnt) { 2 => "vec2(", 3 => "vec3(", else => "vec4(" },
-                .i => switch (cnt) { 2 => "ivec2(", 3 => "ivec3(", else => "ivec4(" },
-                .u => switch (cnt) { 2 => "uvec2(", 3 => "uvec3(", else => "uvec4(" },
+                .f => switch (cnt) {
+                    2 => "vec2(",
+                    3 => "vec3(",
+                    else => "vec4(",
+                },
+                .i => switch (cnt) {
+                    2 => "ivec2(",
+                    3 => "ivec3(",
+                    else => "ivec4(",
+                },
+                .u => switch (cnt) {
+                    2 => "uvec2(",
+                    3 => "uvec3(",
+                    else => "uvec4(",
+                },
             };
             try parts.appendSlice(a, ctor);
             var first = true;
@@ -635,9 +761,24 @@ fn assignDst(a: std.mem.Allocator, out: *std.ArrayList(u8), dst: *const Operand,
 
 fn typePrefix(cnt: usize, ty: NumType) []const u8 {
     return switch (ty) {
-        .f => switch (cnt) { 1 => "float", 2 => "vec2", 3 => "vec3", else => "vec4" },
-        .i => switch (cnt) { 1 => "int", 2 => "ivec2", 3 => "ivec3", else => "ivec4" },
-        .u => switch (cnt) { 1 => "uint", 2 => "uvec2", 3 => "uvec3", else => "uvec4" },
+        .f => switch (cnt) {
+            1 => "float",
+            2 => "vec2",
+            3 => "vec3",
+            else => "vec4",
+        },
+        .i => switch (cnt) {
+            1 => "int",
+            2 => "ivec2",
+            3 => "ivec3",
+            else => "ivec4",
+        },
+        .u => switch (cnt) {
+            1 => "uint",
+            2 => "uvec2",
+            3 => "uvec3",
+            else => "uvec4",
+        },
     };
 }
 
@@ -754,6 +895,13 @@ const SbOp = enum(u16) {
     gather4 = 109,
     sample_pos = 110,
     sample_info = 111,
+    hs_decls = 113,
+    hs_control_point_phase = 114,
+    hs_fork_phase = 115,
+    hs_join_phase = 116,
+    emit_stream = 117,
+    cut_stream = 118,
+    emitthencut_stream = 119,
     bufinfo = 121,
     deriv_rtx_coarse = 122,
     deriv_rtx_fine = 123,
@@ -773,6 +921,15 @@ const SbOp = enum(u16) {
     bfi = 140,
     bfrev = 141,
     swapc = 142,
+    dcl_stream = 143,
+    dcl_input_control_point_count = 147,
+    dcl_output_control_point_count = 148,
+    dcl_tess_domain = 149,
+    dcl_tess_partitioning = 150,
+    dcl_tess_output_primitive = 151,
+    dcl_hs_max_tessfactor = 152,
+    dcl_hs_fork_phase_instance_count = 153,
+    dcl_hs_join_phase_instance_count = 154,
     dcl_thread_group = 155,
     dcl_uav_typed = 156,
     dcl_uav_raw = 157,
@@ -809,8 +966,31 @@ const SbOp = enum(u16) {
     imm_atomic_umax = 188,
     imm_atomic_umin = 189,
     sync = 190,
+    dcl_gs_instance_count = 206,
     _,
 };
+
+const HullPhaseKind = enum { decls, control_point, fork, join };
+const HullPhaseBody = struct {
+    kind: HullPhaseKind,
+    index: u32,
+    instance_count: u32,
+    body: std.ArrayList(u8),
+};
+
+fn flushHullPhase(
+    a: std.mem.Allocator,
+    phases: *std.ArrayList(HullPhaseBody),
+    body: *std.ArrayList(u8),
+    kind: HullPhaseKind,
+    index: u32,
+    instance_count: u32,
+) !void {
+    if (kind != .decls or body.items.len != 0) {
+        try phases.append(a, .{ .kind = kind, .index = index, .instance_count = instance_count, .body = body.* });
+    }
+    body.* = .empty;
+}
 
 pub fn parseInputSignature(gpa: std.mem.Allocator, dxbc: []const u8) ![]SigElem {
     if (dxbc.len < 32 or !std.mem.eql(u8, dxbc[0..4], "DXBC")) return error.Malformed;
@@ -822,26 +1002,52 @@ pub fn parseInputSignature(gpa: std.mem.Allocator, dxbc: []const u8) ![]SigElem 
         const tag = dxbc[off..][0..4];
         const csz = try readU32(dxbc, off + 4);
         if (off + 8 + csz > dxbc.len) return error.Malformed;
-        if (std.mem.eql(u8, tag, "ISGN") or std.mem.eql(u8, tag, "ISG1")) {
-            return parseSigChunk(gpa, dxbc[off + 8 ..][0..csz], false);
+        if (std.mem.eql(u8, tag, "ISGN")) {
+            return parseSigChunk(gpa, dxbc[off + 8 ..][0..csz], .v0);
+        }
+        if (std.mem.eql(u8, tag, "ISG1")) {
+            return parseSigChunk(gpa, dxbc[off + 8 ..][0..csz], .v1);
         }
     }
     return gpa.alloc(SigElem, 0);
 }
 
 pub fn translate(gpa: std.mem.Allocator, dxbc: []const u8) !Translated {
-    return translateWithVaryings(gpa, dxbc, null);
+    return translateInternal(gpa, dxbc, null, &.{}, .{});
 }
 
 pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_outputs: ?[]const SigElem) !Translated {
+    return translateInternal(gpa, dxbc, vs_outputs, &.{}, .{});
+}
+
+pub fn translateTessellation(
+    gpa: std.mem.Allocator,
+    dxbc: []const u8,
+    hs_outputs: ?[]const SigElem,
+    hs_patch_outputs: []const SigElem,
+    hs_tess: TessInfo,
+) !Translated {
+    return translateInternal(gpa, dxbc, hs_outputs, hs_patch_outputs, hs_tess);
+}
+
+fn translateInternal(
+    gpa: std.mem.Allocator,
+    dxbc: []const u8,
+    vs_outputs: ?[]const SigElem,
+    hs_patch_outputs: []const SigElem,
+    hs_tess: TessInfo,
+) !Translated {
     last_error = "";
+    _ = hs_patch_outputs;
     if (dxbc.len < 32 or !std.mem.eql(u8, dxbc[0..4], "DXBC")) return error.Malformed;
     const nchunks = try readU32(dxbc, 28);
     if (nchunks == 0 or nchunks > 32 or 32 + @as(usize, nchunks) * 4 > dxbc.len) return error.Malformed;
 
     var isgn_chunk: ?[]const u8 = null;
+    var isgn_kind: SigKind = .v0;
     var osgn_chunk: ?[]const u8 = null;
-    var osg5 = false;
+    var osgn_kind: SigKind = .v0;
+    var pcsg_chunk: ?[]const u8 = null;
     var shdr_chunk: ?[]const u8 = null;
 
     for (0..nchunks) |i| {
@@ -851,9 +1057,27 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
         const csz = try readU32(dxbc, off + 4);
         if (off + 8 + csz > dxbc.len) return error.Malformed;
         const payload = dxbc[off + 8 ..][0..csz];
-        if (std.mem.eql(u8, tag, "ISGN") or std.mem.eql(u8, tag, "ISG1")) isgn_chunk = payload;
-        if (std.mem.eql(u8, tag, "OSGN") or std.mem.eql(u8, tag, "OSG1")) { osgn_chunk = payload; osg5 = false; }
-        if (std.mem.eql(u8, tag, "OSG5")) { osgn_chunk = payload; osg5 = true; }
+        if (std.mem.eql(u8, tag, "ISGN")) {
+            isgn_chunk = payload;
+            isgn_kind = .v0;
+        }
+        if (std.mem.eql(u8, tag, "ISG1")) {
+            isgn_chunk = payload;
+            isgn_kind = .v1;
+        }
+        if (std.mem.eql(u8, tag, "OSGN")) {
+            osgn_chunk = payload;
+            osgn_kind = .v0;
+        }
+        if (std.mem.eql(u8, tag, "OSG5")) {
+            osgn_chunk = payload;
+            osgn_kind = .v5;
+        }
+        if (std.mem.eql(u8, tag, "OSG1")) {
+            osgn_chunk = payload;
+            osgn_kind = .v1;
+        }
+        if (std.mem.eql(u8, tag, "PCSG")) pcsg_chunk = payload;
         if (std.mem.eql(u8, tag, "SHDR") or std.mem.eql(u8, tag, "SHEX")) shdr_chunk = payload;
     }
 
@@ -870,34 +1094,72 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     for (0..n_toks) |i| toks[i] = std.mem.readInt(u32, sc[i * 4 ..][0..4], .little);
 
     const ptype_raw = (toks[0] >> 16) & 0xFFFF;
-    const stage: Stage = switch (ptype_raw) {
+    const program_stage: Stage = switch (ptype_raw) {
         0 => .pixel,
         1 => .vertex,
+        2 => .geometry,
+        3 => .hull,
+        4 => .domain,
         5 => .compute,
         else => .other,
     };
-    if (stage == .other) return setErr("unsupported shader stage");
+    if (program_stage == .other) return setErr("unsupported shader stage");
+    var stage = program_stage;
 
-    const inputs = if (isgn_chunk) |c| try parseSigChunk(gpa, c, false) else try gpa.alloc(SigElem, 0);
+    const inputs = if (isgn_chunk) |c| try parseSigChunk(gpa, c, isgn_kind) else try gpa.alloc(SigElem, 0);
     errdefer gpa.free(inputs);
-    const outputs = if (osgn_chunk) |c| try parseSigChunk(gpa, c, osg5) else try gpa.alloc(SigElem, 0);
+    const outputs = if (osgn_chunk) |c| try parseSigChunk(gpa, c, osgn_kind) else try gpa.alloc(SigElem, 0);
     errdefer gpa.free(outputs);
+    const patch_signatures = if (pcsg_chunk) |c| try parseSigChunk(gpa, c, .v0) else try gpa.alloc(SigElem, 0);
+    errdefer if (program_stage != .domain and program_stage != .hull) gpa.free(patch_signatures);
+    const patch_inputs = if (program_stage == .domain) patch_signatures else try gpa.alloc(SigElem, 0);
+    errdefer if (program_stage == .domain) gpa.free(patch_inputs);
+    const patch_outputs = if (program_stage == .hull) patch_signatures else try gpa.alloc(SigElem, 0);
+    errdefer if (program_stage == .hull) gpa.free(patch_outputs);
 
     var n_temps: u32 = 0;
     var cb_sizes = [_]u32{0} ** 16;
     var cb_mask: u16 = 0;
     var tex_dims = [_]TexDim{.none} ** MAX_TEX;
     var tex_samp = [_]u8{0xFF} ** MAX_TEX;
+    var tex_regular = [_]bool{false} ** MAX_TEX;
+    var tex_shadow = [_]bool{false} ** MAX_TEX;
+    var tex_shadow_samp = [_]u8{0xFF} ** MAX_TEX;
     var idx_temp_sizes = [_]u32{0} ** 8;
     var icb_vals: ?[]const u32 = null;
     var sv_pos_out_reg: ?u32 = null;
     var sv_pos_in_reg: ?u32 = null;
+    var sv_layer_out_reg: ?u32 = null;
+    var sv_layer_out_comp: u8 = 0;
+    var sv_vp_out_reg: ?u32 = null;
+    var sv_vp_out_comp: u8 = 0;
+    var gs_in_prim: u32 = 1; // POINT
+    var gs_out_prim: u32 = 5; // TRIANGLESTRIP
+    var gs_max_vtx: u32 = 4;
+    var gs_invocations: u32 = 1;
     var mem: Mem = .{};
     var local_size = [3]u32{ 1, 1, 1 };
+    var tess: TessInfo = if (program_stage == .domain) hs_tess else .{};
+    var hull_phases: std.ArrayList(HullPhaseBody) = .empty;
+    var hull_phase_kind: HullPhaseKind = .decls;
+    var hull_fork_index: u32 = 0;
+    var hull_join_index: u32 = 0;
+    var hull_instance_count: u32 = 1;
+    var has_control_point_phase = false;
 
-    if (stage == .vertex) {
+    if (stage == .vertex or stage == .geometry or isDomainStage(stage)) {
         for (outputs) |o| {
             if (o.sysval == 1 or std.ascii.eqlIgnoreCase(o.name, "SV_Position")) sv_pos_out_reg = o.reg;
+            if (stage == .geometry) {
+                if (o.sysval == 4 or std.ascii.eqlIgnoreCase(o.name, "SV_RenderTargetArrayIndex")) {
+                    sv_layer_out_reg = o.reg;
+                    sv_layer_out_comp = if (o.mask != 0) @ctz(o.mask) else 0;
+                }
+                if (o.sysval == 5 or std.ascii.eqlIgnoreCase(o.name, "SV_ViewportArrayIndex")) {
+                    sv_vp_out_reg = o.reg;
+                    sv_vp_out_comp = if (o.mask != 0) @ctz(o.mask) else 0;
+                }
+            }
         }
     } else {
         for (inputs) |in_e| {
@@ -939,9 +1201,103 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
         }
 
         switch (op) {
-            .dcl_global_flags, .dcl_sampler, .dcl_index_range, .dcl_gs_out_prim, .dcl_gs_in_prim, .dcl_max_out_vtx,
-            .dcl_input, .dcl_input_sgv, .dcl_input_siv, .dcl_input_ps, .dcl_input_ps_sgv, .dcl_input_ps_siv,
-            .dcl_output, .dcl_output_sgv, .dcl_output_siv => continue,
+            .hs_decls => {
+                try flushHullPhase(a, &hull_phases, &body, hull_phase_kind, 0, hull_instance_count);
+                hull_phase_kind = .decls;
+                hull_instance_count = 1;
+                stage = .hull;
+                continue;
+            },
+            .hs_control_point_phase => {
+                try flushHullPhase(a, &hull_phases, &body, hull_phase_kind, 0, hull_instance_count);
+                hull_phase_kind = .control_point;
+                hull_instance_count = 1;
+                has_control_point_phase = true;
+                stage = .hull_control_point;
+                continue;
+            },
+            .hs_fork_phase => {
+                const previous_index = if (hull_phase_kind == .fork) hull_fork_index -| 1 else 0;
+                try flushHullPhase(a, &hull_phases, &body, hull_phase_kind, previous_index, hull_instance_count);
+                hull_phase_kind = .fork;
+                hull_fork_index += 1;
+                hull_instance_count = 1;
+                stage = .hull_fork;
+                continue;
+            },
+            .hs_join_phase => {
+                const previous_index = if (hull_phase_kind == .join) hull_join_index -| 1 else 0;
+                try flushHullPhase(a, &hull_phases, &body, hull_phase_kind, previous_index, hull_instance_count);
+                hull_phase_kind = .join;
+                hull_join_index += 1;
+                hull_instance_count = 1;
+                stage = .hull_join;
+                continue;
+            },
+            .dcl_input_control_point_count => {
+                continue;
+            },
+            .dcl_output_control_point_count => {
+                tess.output_control_points = (itok & 0x0001F800) >> 11;
+                continue;
+            },
+            .dcl_tess_domain => {
+                tess.domain = @enumFromInt((itok & 0x00001800) >> 11);
+                if (program_stage == .domain) {
+                    stage = switch (tess.domain) {
+                        .tri => .domain_tri,
+                        .quad => .domain_quad,
+                        .isoline => .domain_isoline,
+                        else => .domain,
+                    };
+                }
+                continue;
+            },
+            .dcl_tess_partitioning => {
+                tess.partitioning = @enumFromInt((itok & 0x00003800) >> 11);
+                continue;
+            },
+            .dcl_tess_output_primitive => {
+                tess.output_primitive = @enumFromInt((itok & 0x00003800) >> 11);
+                continue;
+            },
+            .dcl_hs_max_tessfactor => {
+                if (p < next_k) tess.max_tess_factor = @bitCast(toks[p]);
+                continue;
+            },
+            .dcl_hs_fork_phase_instance_count, .dcl_hs_join_phase_instance_count => {
+                if (p < next_k) hull_instance_count = @max(1, toks[p]);
+                continue;
+            },
+            .dcl_global_flags, .dcl_sampler, .dcl_index_range, .dcl_stream, .dcl_input, .dcl_input_sgv, .dcl_input_siv, .dcl_input_ps, .dcl_input_ps_sgv, .dcl_input_ps_siv, .dcl_output, .dcl_output_sgv, .dcl_output_siv => continue,
+            .dcl_gs_in_prim => {
+                gs_in_prim = (itok >> 11) & 0x3F;
+                continue;
+            },
+            .dcl_gs_out_prim => {
+                gs_out_prim = (itok >> 11) & 0x3F;
+                continue;
+            },
+            .dcl_max_out_vtx => {
+                if (p < next_k) gs_max_vtx = toks[p];
+                continue;
+            },
+            .dcl_gs_instance_count => {
+                if (p < next_k) gs_invocations = @max(1, toks[p]);
+                continue;
+            },
+            .emit, .emit_stream, .emitthencut, .emitthencut_stream => {
+                if (op == .emit_stream or op == .emitthencut_stream) _ = try decodeOperand(a, toks, &p);
+                if (sv_pos_out_reg) |r| try appendFmt(&body, a, "    gl_Position = vo{d};\n", .{r});
+                if (sv_layer_out_reg) |r| try appendFmt(&body, a, "    gl_Layer = floatBitsToInt(vo{d}.{c});\n", .{ r, swzChar(sv_layer_out_comp) });
+                if (sv_vp_out_reg) |r| try appendFmt(&body, a, "    gl_ViewportIndex = floatBitsToInt(vo{d}.{c});\n", .{ r, swzChar(sv_vp_out_comp) });
+                try body.appendSlice(a, "    EmitVertex();\n");
+                if (op == .emitthencut or op == .emitthencut_stream) try body.appendSlice(a, "    EndPrimitive();\n");
+            },
+            .cut, .cut_stream => {
+                if (op == .cut_stream) _ = try decodeOperand(a, toks, &p);
+                try body.appendSlice(a, "    EndPrimitive();\n");
+            },
             .dcl_temps => {
                 if (p < next_k) n_temps = @max(n_temps, toks[p]);
                 continue;
@@ -972,7 +1328,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             },
             .nop => continue,
             .ret => {
-                if (stage == .vertex) {
+                if (stage == .vertex or isDomainStage(stage)) {
                     if (sv_pos_out_reg) |r| {
                         try appendFmt(&body, a, "    gl_Position = vo{d};\n", .{r});
                     }
@@ -983,27 +1339,30 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const c0 = try decodeOperand(a, toks, &p);
                 const ce = try formatSrc(a, &c0, 1, .u, stage);
                 const cmp = if (bool_nz) "!= 0u" else "== 0u";
-                if (stage == .vertex and sv_pos_out_reg != null) {
+                if ((stage == .vertex or isDomainStage(stage)) and sv_pos_out_reg != null) {
                     try appendFmt(&body, a, "    if ({s} {s}) {{ gl_Position = vo{d}; return; }}\n", .{ ce, cmp, sv_pos_out_reg.? });
                 } else {
                     try appendFmt(&body, a, "    if ({s} {s}) return;\n", .{ ce, cmp });
                 }
             },
             .mov => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const s0 = try decodeOperand(a, toks, &p);
                 const rhs = try formatSrc(a, &s0, dst.mask, .f, stage);
                 try assignDst(a, &body, &dst, rhs, .f, stage);
             },
             .movc => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const c0 = try decodeOperand(a, toks, &p);
                 const s1 = try decodeOperand(a, toks, &p);
                 const s2 = try decodeOperand(a, toks, &p);
                 inline for (0..4) |c| {
                     const bit: u8 = @as(u8, 1) << @intCast(c);
                     if ((dst.mask & bit) != 0) {
-                        var sub_dst = dst; sub_dst.mask = bit;
+                        var sub_dst = dst;
+                        sub_dst.mask = bit;
                         const ce = try formatSrc(a, &c0, bit, .u, stage);
                         const e1 = try formatSrc(a, &s1, bit, .f, stage);
                         const e2 = try formatSrc(a, &s2, bit, .f, stage);
@@ -1013,7 +1372,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 }
             },
             .add, .mul, .div, .min, .max, .rsq, .rcp => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const s0 = try decodeOperand(a, toks, &p);
                 const a0 = try formatSrc(a, &s0, dst.mask, .f, stage);
                 if (op == .rsq) {
@@ -1035,7 +1395,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 }
             },
             .mad => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const s0 = try decodeOperand(a, toks, &p);
                 const s1 = try decodeOperand(a, toks, &p);
                 const s2 = try decodeOperand(a, toks, &p);
@@ -1045,7 +1406,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "({s} * {s} + {s})", .{ a0, a1, a2 }), .f, stage);
             },
             .dp2, .dp3, .dp4 => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const s0 = try decodeOperand(a, toks, &p);
                 const s1 = try decodeOperand(a, toks, &p);
                 const dmask: u8 = if (op == .dp2) 0x3 else if (op == .dp3) 0x7 else 0xF;
@@ -1056,10 +1418,9 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const rhs = if (cnt == 1) dot_e else try std.fmt.allocPrint(a, "{s}({s})", .{ typePrefix(cnt, .f), dot_e });
                 try assignDst(a, &body, &dst, rhs, .f, stage);
             },
-            .exp, .frc, .log, .round_ni, .round_pi, .round_ne, .round_z, .sqrt,
-            .deriv_rtx, .deriv_rtx_coarse, .deriv_rtx_fine,
-            .deriv_rty, .deriv_rty_coarse, .deriv_rty_fine => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+            .exp, .frc, .log, .round_ni, .round_pi, .round_ne, .round_z, .sqrt, .deriv_rtx, .deriv_rtx_coarse, .deriv_rtx_fine, .deriv_rty, .deriv_rty_coarse, .deriv_rty_fine => {
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const s0 = try decodeOperand(a, toks, &p);
                 const a0 = try formatSrc(a, &s0, dst.mask, .f, stage);
                 const fn_name = switch (op) {
@@ -1078,8 +1439,10 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}({s})", .{ fn_name, a0 }), .f, stage);
             },
             .sincos => {
-                var dsin = try decodeOperand(a, toks, &p); dsin.sat = sat;
-                var dcos = try decodeOperand(a, toks, &p); dcos.sat = sat;
+                var dsin = try decodeOperand(a, toks, &p);
+                dsin.sat = sat;
+                var dcos = try decodeOperand(a, toks, &p);
+                dcos.sat = sat;
                 const s0 = try decodeOperand(a, toks, &p);
                 const m = if (dsin.op_type != 13) dsin.mask else dcos.mask;
                 const a0 = try formatSrc(a, &s0, m, .f, stage);
@@ -1090,11 +1453,17 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const dst = try decodeOperand(a, toks, &p);
                 const s0 = try decodeOperand(a, toks, &p);
                 const s1 = try decodeOperand(a, toks, &p);
-                const cmp_op = switch (op) { .eq => "==", .ge => ">=", .lt => "<", else => "!=" };
+                const cmp_op = switch (op) {
+                    .eq => "==",
+                    .ge => ">=",
+                    .lt => "<",
+                    else => "!=",
+                };
                 inline for (0..4) |c| {
                     const bit: u8 = @as(u8, 1) << @intCast(c);
                     if ((dst.mask & bit) != 0) {
-                        var sd = dst; sd.mask = bit;
+                        var sd = dst;
+                        sd.mask = bit;
                         const e0 = try formatSrc(a, &s0, bit, .f, stage);
                         const e1 = try formatSrc(a, &s1, bit, .f, stage);
                         try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "(({s} {s} {s}) ? 0xFFFFFFFFu : 0u)", .{ e0, cmp_op, e1 }), .u, stage);
@@ -1106,11 +1475,17 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const s0 = try decodeOperand(a, toks, &p);
                 const s1 = try decodeOperand(a, toks, &p);
                 const ty: NumType = if (op == .ult or op == .uge) .u else .i;
-                const cmp_op = switch (op) { .ieq => "==", .ige, .uge => ">=", .ilt, .ult => "<", else => "!=" };
+                const cmp_op = switch (op) {
+                    .ieq => "==",
+                    .ige, .uge => ">=",
+                    .ilt, .ult => "<",
+                    else => "!=",
+                };
                 inline for (0..4) |c| {
                     const bit: u8 = @as(u8, 1) << @intCast(c);
                     if ((dst.mask & bit) != 0) {
-                        var sd = dst; sd.mask = bit;
+                        var sd = dst;
+                        sd.mask = bit;
                         const e0 = try formatSrc(a, &s0, bit, ty, stage);
                         const e1 = try formatSrc(a, &s1, bit, ty, stage);
                         try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "(({s} {s} {s}) ? 0xFFFFFFFFu : 0u)", .{ e0, cmp_op, e1 }), .u, stage);
@@ -1200,26 +1575,35 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 }.f, .{ "", "" });
             },
             .sample, .sample_c, .sample_c_lz, .sample_l, .sample_d, .sample_b, .ld, .ld_ms => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const coord = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
                 const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
                 const tdim = tex_dims[reg];
                 const cmask = sampleCoordMask(tdim);
+                const is_cmp = (op == .sample_c or op == .sample_c_lz);
                 // ld_ms carries a sample index; WINS backs MS resources with
                 // single-sample GL textures, so it reads sample 0 (lod 0).
                 if (op == .ld_ms) {
                     _ = try decodeOperand(a, toks, &p);
                 } else if (op != .ld) {
                     const smp = try decodeOperand(a, toks, &p);
-                    if (tex_samp[reg] == 0xFF) tex_samp[reg] = @intCast(@min(15, smp.indices[0].imm));
+                    const sidx: u8 = @intCast(@min(15, smp.indices[0].imm));
+                    if (is_cmp) {
+                        if (tex_shadow_samp[reg] == 0xFF) tex_shadow_samp[reg] = sidx;
+                    } else {
+                        if (tex_samp[reg] == 0xFF) tex_samp[reg] = sidx;
+                    }
                 }
                 var extra_e: []const u8 = "";
                 if (op == .sample_l) {
                     const lod = try decodeOperand(a, toks, &p);
                     extra_e = try formatSrc(a, &lod, 1, .f, stage);
-                } else if (op == .sample_c or op == .sample_c_lz) {
-                    _ = try decodeOperand(a, toks, &p);
+                } else if (is_cmp) {
+                    const ref_op = try decodeOperand(a, toks, &p);
+                    extra_e = try formatSrc(a, &ref_op, 1, .f, stage);
+                    tex_shadow[reg] = true;
                 } else if (op == .sample_d) {
                     _ = try decodeOperand(a, toks, &p);
                     _ = try decodeOperand(a, toks, &p);
@@ -1227,12 +1611,20 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                     const bias = try decodeOperand(a, toks, &p);
                     extra_e = try formatSrc(a, &bias, 1, .f, stage);
                 }
+                if (!is_cmp) tex_regular[reg] = true;
                 const cname = try std.fmt.allocPrint(a, "{s}tex", .{stagePrefix(stage)});
                 const call_expr = if (op == .ld or op == .ld_ms) blk: {
                     const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, fetchCoordMask(tdim), .i, stage), .i);
                     if (tdim == .buf) break :blk try std.fmt.allocPrint(a, "texelFetch({s}{d}, {s})", .{ cname, reg, cexpr });
                     const lod_e = if (op == .ld_ms) "0" else try formatSrc(a, &coord, 8, .i, stage);
                     break :blk try std.fmt.allocPrint(a, "texelFetch({s}{d}, {s}, {s})", .{ cname, reg, cexpr, lod_e });
+                } else if (is_cmp) blk: {
+                    const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
+                    if (tdim == .cube_array) {
+                        break :blk try std.fmt.allocPrint(a, "vec4(texture({s}{d}_sh, {s}, {s}))", .{ cname, reg, cexpr, extra_e });
+                    }
+                    const vec_ty = if (tdim == .cube or tdim == .tex2d_array) "vec4" else "vec3";
+                    break :blk try std.fmt.allocPrint(a, "vec4(texture({s}{d}_sh, {s}({s}, {s})))", .{ cname, reg, vec_ty, cexpr, extra_e });
                 } else if (op == .sample_l) blk: {
                     const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
                     break :blk try std.fmt.allocPrint(a, "textureLod({s}{d}, {s}, {s})", .{ cname, reg, cexpr, extra_e });
@@ -1248,12 +1640,14 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}.{s}", .{ call_expr, sw }), .f, stage);
             },
             .bfrev, .countbits, .firstbit_hi, .firstbit_lo, .firstbit_shi, .f32tof16, .f16tof32 => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const s0 = try decodeOperand(a, toks, &p);
                 inline for (0..4) |c| {
                     const bit: u8 = @as(u8, 1) << @intCast(c);
                     if ((dst.mask & bit) != 0) {
-                        var sd = dst; sd.mask = bit;
+                        var sd = dst;
+                        sd.mask = bit;
                         const u = try formatSrc(a, &s0, bit, .u, stage);
                         switch (op) {
                             .bfrev => try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "bitfieldReverse({s})", .{u}), .u, stage),
@@ -1283,7 +1677,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 inline for (0..4) |c| {
                     const bit: u8 = @as(u8, 1) << @intCast(c);
                     if ((dst.mask & bit) != 0) {
-                        var sd = dst; sd.mask = bit;
+                        var sd = dst;
+                        sd.mask = bit;
                         const w = try std.fmt.allocPrint(a, "({s} & 31u)", .{try formatSrc(a, &sw, bit, .u, stage)});
                         const o = try std.fmt.allocPrint(a, "({s} & 31u)", .{try formatSrc(a, &so, bit, .u, stage)});
                         if (op == .ubfe) {
@@ -1305,7 +1700,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 inline for (0..4) |c| {
                     const bit: u8 = @as(u8, 1) << @intCast(c);
                     if ((dst.mask & bit) != 0) {
-                        var sd = dst; sd.mask = bit;
+                        var sd = dst;
+                        sd.mask = bit;
                         const w = try std.fmt.allocPrint(a, "({s} & 31u)", .{try formatSrc(a, &sw, bit, .u, stage)});
                         const o = try std.fmt.allocPrint(a, "({s} & 31u)", .{try formatSrc(a, &so, bit, .u, stage)});
                         const ins = try formatSrc(a, &si, bit, .u, stage);
@@ -1340,7 +1736,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                     inline for (0..4) |c| {
                         const bit: u8 = @as(u8, 1) << @intCast(c);
                         if ((d1.mask & bit) != 0) {
-                            var sd = d1; sd.mask = bit;
+                            var sd = d1;
+                            sd.mask = bit;
                             const ch = swzChar(c);
                             const rhs = if (op == .uaddc)
                                 try std.fmt.allocPrint(a, "(({s}a.{c} + {s}b.{c} < {s}a.{c}) ? 1u : 0u)", .{ tmp, ch, tmp, ch, tmp, ch })
@@ -1373,10 +1770,12 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 if (d1.op_type != 13) try assignDst(a, &body, &d1, try std.fmt.allocPrint(a, "{s}b.{s}", .{ tmp, maskStr(d1.mask, &mb) }), .f, stage);
             },
             .resinfo => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const mip = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
                 const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
+                tex_regular[reg] = true;
                 const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ stagePrefix(stage), reg });
                 const l = try formatSrc(a, &mip, 1, .i, stage);
                 const iv = switch (tex_dims[reg]) {
@@ -1397,11 +1796,13 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "{s}.{s}", .{ full, swz }), if (rt == 2) .u else .f, stage);
             },
             .gather4, .lod => {
-                var dst = try decodeOperand(a, toks, &p); dst.sat = sat;
+                var dst = try decodeOperand(a, toks, &p);
+                dst.sat = sat;
                 const coord = try decodeOperand(a, toks, &p);
                 const res = try decodeOperand(a, toks, &p);
                 const smp = try decodeOperand(a, toks, &p);
                 const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
+                tex_regular[reg] = true;
                 if (tex_samp[reg] == 0xFF) tex_samp[reg] = @intCast(@min(15, smp.indices[0].imm));
                 const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ stagePrefix(stage), reg });
                 const cexpr = try tex1dCoord(a, tex_dims[reg], try formatSrc(a, &coord, sampleCoordMask(tex_dims[reg]), .f, stage), .f);
@@ -1465,7 +1866,8 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 inline for (0..4) |c| {
                     const bit: u8 = @as(u8, 1) << @intCast(c);
                     if ((dst.mask & bit) != 0) {
-                        var sd = dst; sd.mask = bit;
+                        var sd = dst;
+                        sd.mask = bit;
                         try assignDst(a, &body, &sd, try std.fmt.allocPrint(a, "{s}[{s} + {d}u]", .{ arr, tmp, res.swz[c] }), .u, stage);
                     }
                 }
@@ -1504,9 +1906,7 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                 const d = memDecl(&mem, &dst) orelse return setErr("store_uav_typed on an unknown UAV");
                 try appendFmt(&body, a, "    imageStore({s}img{d}, {s}, {s});\n", .{ stagePrefix(stage), dst.indices[0].imm, try imgCoord(a, &coord, d.dim, stage), try formatSrc(a, &val, 0xF, d.ty, stage) });
             },
-            .atomic_and, .atomic_or, .atomic_xor, .atomic_cmp_store, .atomic_iadd, .atomic_imax, .atomic_imin, .atomic_umax, .atomic_umin,
-            .imm_atomic_iadd, .imm_atomic_and, .imm_atomic_or, .imm_atomic_xor, .imm_atomic_exch, .imm_atomic_cmp_exch,
-            .imm_atomic_imax, .imm_atomic_imin, .imm_atomic_umax, .imm_atomic_umin => {
+            .atomic_and, .atomic_or, .atomic_xor, .atomic_cmp_store, .atomic_iadd, .atomic_imax, .atomic_imin, .atomic_umax, .atomic_umin, .imm_atomic_iadd, .imm_atomic_and, .imm_atomic_or, .imm_atomic_xor, .imm_atomic_exch, .imm_atomic_cmp_exch, .imm_atomic_imax, .imm_atomic_imin, .imm_atomic_umax, .imm_atomic_umin => {
                 const is_imm = @intFromEnum(op) >= @intFromEnum(SbOp.imm_atomic_iadd);
                 var out: ?Operand = null;
                 if (is_imm) {
@@ -1548,8 +1948,10 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
                     const arr = try memArray(a, &res, stage);
                     const tmp = try std.fmt.allocPrint(a, "wt{d}", .{k});
                     if (d.kind == .structured) {
-                        var ai = addr; ai.swz = .{ addr.swz[0], addr.swz[0], addr.swz[0], addr.swz[0] };
-                        var ao = addr; ao.swz = .{ addr.swz[1], addr.swz[1], addr.swz[1], addr.swz[1] };
+                        var ai = addr;
+                        ai.swz = .{ addr.swz[0], addr.swz[0], addr.swz[0], addr.swz[0] };
+                        var ao = addr;
+                        ao.swz = .{ addr.swz[1], addr.swz[1], addr.swz[1], addr.swz[1] };
                         try emitMemAddr(a, &body, tmp, ai, &ao, d.stride, stage);
                     } else {
                         try emitMemAddr(a, &body, tmp, null, &addr, d.stride, stage);
@@ -1650,6 +2052,20 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             else => reportUnhandled(@intFromEnum(op), stage, "dropped"),
         }
     }
+    if (program_stage == .hull) {
+        const phase_index = switch (hull_phase_kind) {
+            .fork => hull_fork_index -| 1,
+            .join => hull_join_index -| 1,
+            else => 0,
+        };
+        try flushHullPhase(a, &hull_phases, &body, hull_phase_kind, phase_index, hull_instance_count);
+    }
+    // The first tessellation target is DS3's quad-based fog/sky/postprocess
+    // family. Other domains require their clip-distance coverage to be proven
+    // before drawing them instead of silently producing corrupt geometry.
+    if ((program_stage == .hull or program_stage == .domain) and tess.domain != .quad) {
+        return setErr("only quad tessellation is implemented");
+    }
     var hdr: std.ArrayList(u8) = .empty;
     // Compute and SM5 memory (SSBOs, images) need GLSL 4.30; formatted image
     // loads (typed UAV reads without a format qualifier) are an NVIDIA/Mesa EXT.
@@ -1662,7 +2078,13 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
         try hdr.appendSlice(a, "#version 420 core\n#extension GL_ARB_texture_query_levels : enable\n");
     }
     const prefix = stagePrefix(stage);
-    const cb_base: u32 = if (stage == .pixel) 16 else 0;
+    const cb_base: u32 = switch (stage) {
+        .pixel => 16,
+        .geometry => 32,
+        .hull, .hull_control_point, .hull_fork, .hull_join => 48,
+        .domain, .domain_tri, .domain_quad, .domain_isoline => 64,
+        else => 0,
+    };
     for (0..16) |i| {
         if ((cb_mask & (@as(u16, 1) << @intCast(i))) != 0) {
             const sz = @max(@as(u32, 1), @min(@as(u32, 4096), cb_sizes[i]));
@@ -1690,20 +2112,37 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     }
 
     var tlist: std.ArrayList(TexBinding) = .empty;
-    const tex_base: u32 = if (stage == .vertex) GL_UNITS else 0;
+    const tex_base: u32 = switch (stage) {
+        .vertex => GL_UNITS,
+        .geometry => GL_UNITS * 2,
+        .hull, .hull_control_point, .hull_fork, .hull_join => GL_UNITS * 3,
+        .domain, .domain_tri, .domain_quad, .domain_isoline => GL_UNITS * 4,
+        else => 0,
+    };
     var n_units: u32 = 0;
     for (0..MAX_TEX) |i| {
         if (tex_dims[i] != .none) {
-            if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
-            const unit = tex_base + n_units;
-            n_units += 1;
-            const stype = samplerType(tex_dims[i]);
-            try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d};\n", .{
-                unit, stype, prefix, i,
-            });
-            // Fetch-only textures keep their own index (no sampler needed; s# < 16).
-            const samp: u8 = if (tex_samp[i] == 0xFF) @intCast(@min(15, i)) else tex_samp[i];
-            try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
+            if (tex_regular[i] or !tex_shadow[i]) {
+                if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
+                const unit = tex_base + n_units;
+                n_units += 1;
+                try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d};\n", .{
+                    unit, samplerType(tex_dims[i]), prefix, i,
+                });
+                // Fetch-only textures keep their own index (no sampler needed; s# < 16).
+                const samp: u8 = if (tex_samp[i] == 0xFF) @intCast(@min(15, i)) else tex_samp[i];
+                try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
+            }
+            if (tex_shadow[i]) {
+                if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
+                const unit = tex_base + n_units;
+                n_units += 1;
+                try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d}_sh;\n", .{
+                    unit, samplerTypeShadow(tex_dims[i]), prefix, i,
+                });
+                const samp: u8 = if (tex_shadow_samp[i] == 0xFF) @intCast(@min(15, i)) else tex_shadow_samp[i];
+                try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
+            }
         }
     }
 
@@ -1712,7 +2151,13 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     // consume counters a one-word block, typed UAVs images, tgsm shared arrays.
     var blist: std.ArrayList(BufBinding) = .empty;
     var ilist: std.ArrayList(ImgBinding) = .empty;
-    const ssbo_base: u32 = if (stage == .pixel) 16 else 0;
+    const ssbo_base: u32 = switch (stage) {
+        .pixel => 16,
+        .geometry => 32,
+        .hull, .hull_control_point, .hull_fork, .hull_join => 48,
+        .domain, .domain_tri, .domain_quad, .domain_isoline => 64,
+        else => 0,
+    };
     var n_ssbo: u32 = 0;
     for (mem.srv, 0..) |d, i| {
         if (d.kind != .raw and d.kind != .structured) continue;
@@ -1750,6 +2195,45 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
     }
     if (stage == .compute) {
         try appendFmt(&hdr, a, "layout(local_size_x = {d}, local_size_y = {d}, local_size_z = {d}) in;\n", .{ local_size[0], local_size[1], local_size[2] });
+    } else if (stage == .geometry) {
+        const in_p: []const u8 = switch (gs_in_prim) {
+            1 => "points",
+            2 => "lines",
+            3 => "triangles",
+            6 => "lines_adjacency",
+            7 => "triangles_adjacency",
+            else => "points",
+        };
+        const out_p: []const u8 = switch (gs_out_prim) {
+            1 => "points",
+            3 => "line_strip",
+            5 => "triangle_strip",
+            else => "triangle_strip",
+        };
+        if (gs_invocations > 1) {
+            try appendFmt(&hdr, a, "layout({s}, invocations = {d}) in;\n", .{ in_p, gs_invocations });
+        } else {
+            try appendFmt(&hdr, a, "layout({s}) in;\n", .{in_p});
+        }
+        try appendFmt(&hdr, a, "layout({s}, max_vertices = {d}) out;\n", .{ out_p, @max(1, gs_max_vtx) });
+    } else if (program_stage == .hull) {
+        if (tess.output_control_points == 0 or tess.output_control_points > 32) {
+            return setErr("invalid hull output control point count");
+        }
+        try appendFmt(&hdr, a, "layout(vertices = {d}) out;\n", .{tess.output_control_points});
+    } else if (program_stage == .domain) {
+        const spacing: []const u8 = switch (tess.partitioning) {
+            .none, .integer => "equal_spacing",
+            .fractional_odd => "fractional_odd_spacing",
+            .fractional_even => "fractional_even_spacing",
+            .pow2 => return setErr("pow2 tessellation partitioning has no GL equivalent"),
+        };
+        const winding: []const u8 = switch (tess.output_primitive) {
+            .triangle_cw => "cw",
+            else => "ccw",
+        };
+        const point_mode: []const u8 = if (tess.output_primitive == .point) ", point_mode" else "";
+        try appendFmt(&hdr, a, "layout(quads, {s}, {s}{s}) in;\n", .{ spacing, winding, point_mode });
     }
 
     // A DXBC signature may pack several elements into one register (TEXCOORD0.xy +
@@ -1785,6 +2269,92 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
             if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
             try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
         }
+    } else if (stage == .geometry) {
+        for (inputs) |in_e| {
+            if (in_e.reg >= 64) continue;
+            if (!firstUseOfReg(&in_seen, in_e.reg)) continue;
+            var loc: u32 = in_e.reg;
+            if (vs_outputs) |vouts| {
+                for (vouts) |vo| {
+                    if (vo.index == in_e.index and std.ascii.eqlIgnoreCase(vo.name, in_e.name)) {
+                        loc = vo.reg;
+                        break;
+                    }
+                }
+            }
+            try appendFmt(&hdr, a, "layout(location = {d}) in vec4 vi{d}[];\n", .{ loc, in_e.reg });
+        }
+        for (outputs) |out_e| {
+            if (out_e.reg >= 64) continue;
+            if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
+            try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
+        }
+    } else if (program_stage == .hull) {
+        for (inputs) |in_e| {
+            if (in_e.reg >= 64) continue;
+            if (!firstUseOfReg(&in_seen, in_e.reg)) continue;
+            var loc: u32 = in_e.reg;
+            if (vs_outputs) |vouts| {
+                for (vouts) |vo| {
+                    if (vo.index == in_e.index and std.ascii.eqlIgnoreCase(vo.name, in_e.name)) {
+                        loc = vo.reg;
+                        break;
+                    }
+                }
+            }
+            try appendFmt(&hdr, a, "layout(location = {d}) in vec4 vi{d}[];\n", .{ loc, in_e.reg });
+        }
+        for (outputs) |out_e| {
+            if (out_e.reg >= 64) continue;
+            if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
+            try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d}[{d}];\n", .{ out_e.reg, out_e.reg, tess.output_control_points });
+        }
+        var patch_count: u32 = 0;
+        for (patch_outputs) |out_e| {
+            if (out_e.reg >= 64) continue;
+            if (tessFactor(out_e.sysval, out_e.index) == null) {
+                return setErr("user patch constants are not implemented for quads");
+            }
+            patch_count = @max(patch_count, out_e.reg + 1);
+        }
+        if (patch_count > 0) try appendFmt(&hdr, a, "vec4 pc[{d}];\n", .{patch_count});
+    } else if (program_stage == .domain) {
+        for (inputs) |in_e| {
+            if (in_e.reg >= 64) continue;
+            if (!firstUseOfReg(&in_seen, in_e.reg)) continue;
+            var loc: u32 = in_e.reg;
+            if (vs_outputs) |vouts| {
+                for (vouts) |vo| {
+                    if (vo.index == in_e.index and std.ascii.eqlIgnoreCase(vo.name, in_e.name)) {
+                        loc = vo.reg;
+                        break;
+                    }
+                }
+            }
+            try appendFmt(&hdr, a, "layout(location = {d}) in vec4 vi{d}[];\n", .{ loc, in_e.reg });
+        }
+        for (outputs) |out_e| {
+            if (out_e.reg >= 64) continue;
+            if (out_e.sysval == 1 or std.ascii.eqlIgnoreCase(out_e.name, "SV_Position")) {
+                // Clip-space position is copied to gl_Position on return; it is
+                // not an ordinary varying but its DXBC output register exists.
+                try appendFmt(&hdr, a, "vec4 vo{d};\n", .{out_e.reg});
+                continue;
+            }
+            if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
+            try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
+        }
+        var patch_count: u32 = 0;
+        for (patch_inputs) |in_e| {
+            if (in_e.reg >= 64) continue;
+            const factor = tessFactor(in_e.sysval, in_e.index) orelse {
+                return setErr("user patch constants are not implemented for quads");
+            };
+            const array_name: []const u8 = if (factor.inner) "gl_TessLevelInner" else "gl_TessLevelOuter";
+            patch_count = @max(patch_count, in_e.reg + 1);
+            try appendFmt(&sv_init, a, "    pc[{d}] = vec4({s}[{d}], 0.0, 0.0, 0.0);\n", .{ in_e.reg, array_name, factor.index });
+        }
+        if (patch_count > 0) try appendFmt(&hdr, a, "vec4 pc[{d}];\n", .{patch_count});
     } else {
         for (inputs) |in_e| {
             if (!firstUseOfReg(&in_seen, in_e.reg)) continue;
@@ -1814,32 +2384,110 @@ pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_output
         }
     }
 
-    try hdr.appendSlice(a, "void main() {\n");
-    if (n_temps > 0) {
-        try appendFmt(&hdr, a, "    vec4 r[{d}];\n", .{n_temps});
-    }
-    for (0..8) |i| {
-        if (idx_temp_sizes[i] > 0) {
-            try appendFmt(&hdr, a, "    vec4 x{d}[{d}];\n", .{ i, idx_temp_sizes[i] });
+    if (program_stage == .hull) {
+        for (hull_phases.items) |phase| {
+            if (phase.kind == .decls) continue;
+            switch (phase.kind) {
+                .control_point => try hdr.appendSlice(a, "void hs_cp() {\n"),
+                .fork => try appendFmt(&hdr, a, "void hs_fork_{d}(uint hsForkID) {{\n", .{phase.index}),
+                .join => try appendFmt(&hdr, a, "void hs_join_{d}(uint hsJoinID) {{\n", .{phase.index}),
+                .decls => unreachable,
+            }
+            if (n_temps > 0) try appendFmt(&hdr, a, "    vec4 r[{d}];\n", .{n_temps});
+            for (0..8) |i| {
+                if (idx_temp_sizes[i] > 0) {
+                    try appendFmt(&hdr, a, "    vec4 x{d}[{d}];\n", .{ i, idx_temp_sizes[i] });
+                }
+            }
+            try hdr.appendSlice(a, "    vec4 dummyNull;\n    float oDepth;\n");
+            var phase_epilogue: std.ArrayList(u8) = .empty;
+            if (phase.kind == .fork or phase.kind == .join) {
+                for (patch_outputs) |out_e| {
+                    if (tessFactor(out_e.sysval, out_e.index)) |factor| {
+                        if (hull_phases.items.len > 1) {
+                            if (phase.index == 0 and factor.inner) continue;
+                            if (phase.index > 0 and !factor.inner) continue;
+                        }
+                        const array_name: []const u8 = if (factor.inner) "gl_TessLevelInner" else "gl_TessLevelOuter";
+                        try appendFmt(&phase_epilogue, a, "    {s}[{d}] = pc[{d}].x;\n", .{ array_name, factor.index, out_e.reg });
+                    }
+                }
+            }
+            if (phase_epilogue.items.len != 0) {
+                const replacement = try std.fmt.allocPrint(a, "{s}    return;\n", .{phase_epilogue.items});
+                const phase_source = try std.mem.replaceOwned(u8, a, phase.body.items, "    return;\n", replacement);
+                try hdr.appendSlice(a, phase_source);
+                if (std.mem.indexOf(u8, phase.body.items, "    return;\n") == null) {
+                    try hdr.appendSlice(a, phase_epilogue.items);
+                }
+            } else {
+                try hdr.appendSlice(a, phase.body.items);
+            }
+            try hdr.appendSlice(a, "}\n");
         }
-    }
-    if (stage == .pixel) {
-        if (sv_pos_in_reg) |r| {
-            try appendFmt(&hdr, a, "    vi{d} = gl_FragCoord;\n", .{r});
+
+        try hdr.appendSlice(a, "void main() {\n");
+        try hdr.appendSlice(a, sv_init.items);
+        if (!has_control_point_phase) {
+            // Some HS blobs only calculate patch constants. D3D still requires
+            // the ordinary control points to reach the domain shader.
+            for (outputs) |out_e| {
+                for (inputs) |in_e| {
+                    if (out_e.index == in_e.index and std.ascii.eqlIgnoreCase(out_e.name, in_e.name)) {
+                        try appendFmt(&hdr, a, "    vo{d}[gl_InvocationID] = vi{d}[gl_InvocationID];\n", .{ out_e.reg, in_e.reg });
+                        break;
+                    }
+                }
+            }
         }
+        try hdr.appendSlice(a, "    barrier();\n");
+        for (hull_phases.items) |phase| {
+            switch (phase.kind) {
+                .control_point => try hdr.appendSlice(a, "    hs_cp();\n    barrier();\n"),
+                .fork => try appendFmt(&hdr, a, "    if (gl_InvocationID == 0) {{\n        for (uint hsForkID = 0u; hsForkID < {d}u; ++hsForkID) hs_fork_{d}(hsForkID);\n    }}\n    barrier();\n", .{ phase.instance_count, phase.index }),
+                .join => try appendFmt(&hdr, a, "    if (gl_InvocationID == 0) {{\n        for (uint hsJoinID = 0u; hsJoinID < {d}u; ++hsJoinID) hs_join_{d}(hsJoinID);\n    }}\n    barrier();\n", .{ phase.instance_count, phase.index }),
+                .decls => {},
+            }
+        }
+        const max_tess = try formatFloatBits(a, @bitCast(tess.max_tess_factor), .f);
+        for (0..4) |i| {
+            try appendFmt(&hdr, a, "    gl_TessLevelOuter[{d}] = min(gl_TessLevelOuter[{d}], {s});\n", .{ i, i, max_tess });
+        }
+        for (0..2) |i| {
+            try appendFmt(&hdr, a, "    gl_TessLevelInner[{d}] = min(gl_TessLevelInner[{d}], {s});\n", .{ i, i, max_tess });
+        }
+        try hdr.appendSlice(a, "}\n");
+    } else {
+        try hdr.appendSlice(a, "void main() {\n");
+        if (n_temps > 0) {
+            try appendFmt(&hdr, a, "    vec4 r[{d}];\n", .{n_temps});
+        }
+        for (0..8) |i| {
+            if (idx_temp_sizes[i] > 0) {
+                try appendFmt(&hdr, a, "    vec4 x{d}[{d}];\n", .{ i, idx_temp_sizes[i] });
+            }
+        }
+        if (stage == .pixel) {
+            if (sv_pos_in_reg) |r| {
+                try appendFmt(&hdr, a, "    vi{d} = gl_FragCoord;\n", .{r});
+            }
+        }
+        try hdr.appendSlice(a, sv_init.items);
+        try hdr.appendSlice(a, "    vec4 dummyNull;\n    float oDepth;\n");
+        try hdr.appendSlice(a, body.items);
+        try hdr.appendSlice(a, "}\n");
     }
-    try hdr.appendSlice(a, sv_init.items);
-    try hdr.appendSlice(a, "    vec4 dummyNull;\n    float oDepth;\n");
-    try hdr.appendSlice(a, body.items);
-    try hdr.appendSlice(a, "}\n");
 
     const glsl_z = try gpa.allocSentinel(u8, hdr.items.len, 0);
     @memcpy(glsl_z, hdr.items);
     return .{
         .glsl = glsl_z,
-        .stage = stage,
+        .stage = program_stage,
         .inputs = inputs,
         .outputs = outputs,
+        .patch_inputs = patch_inputs,
+        .patch_outputs = patch_outputs,
+        .tess = tess,
         .cb_mask = cb_mask,
         .tex_bindings = try tlist.toOwnedSlice(gpa),
         .buf_bindings = try blist.toOwnedSlice(gpa),
@@ -1940,4 +2588,81 @@ test "packed signature registers get one declaration" {
     try std.testing.expect(firstUseOfReg(&seen, @as(u32, 3)));
     try std.testing.expect(!firstUseOfReg(&seen, @as(u32, 3)));
     try std.testing.expect(firstUseOfReg(&seen, @as(u32, 4)));
+}
+
+fn tessDxbc(buf: []u8, program_type: u32, tokens: []const u32) []const u8 {
+    @memset(buf, 0);
+    @memcpy(buf[0..4], "DXBC");
+    std.mem.writeInt(u32, buf[20..24], 1, .little);
+    std.mem.writeInt(u32, buf[28..32], 1, .little);
+    std.mem.writeInt(u32, buf[32..36], 36, .little);
+    @memcpy(buf[36..40], "SHDR");
+    std.mem.writeInt(u32, buf[40..44], @intCast(tokens.len * 4), .little);
+    for (tokens, 0..) |token, i| {
+        std.mem.writeInt(u32, buf[44 + i * 4 ..][0..4], token, .little);
+    }
+    _ = program_type;
+    return buf[0 .. 44 + tokens.len * 4];
+}
+
+test "quad domain emits tess coordinates and rejects other domains explicitly" {
+    const version_ds: u32 = (4 << 16) | 0x50;
+    const tokens = [_]u32{
+        version_ds,
+        13,
+        (1 << 24) | 149 | (3 << 11),
+        (2 << 24) | 104,
+        1,
+        (3 << 24) | 101,
+        2 | (0xF << 4) | (2 << 12) | (1 << 20),
+        0,
+        (4 << 24) | 54,
+        2 | (0xF << 4) | (2 << 12) | (1 << 20),
+        0,
+        2 | (1 << 2) | (0xE4 << 4) | (28 << 12),
+        (1 << 24) | 62,
+    };
+    var buf: [256]u8 = undefined;
+    var tr = try translate(std.testing.allocator, tessDxbc(&buf, 4, &tokens));
+    defer tr.deinit(std.testing.allocator);
+    try std.testing.expect(tr.stage == .domain);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "layout(quads, equal_spacing, ccw) in;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "vec4(gl_TessCoord.xy, 0.0, 0.0)") != null);
+
+    var tri_tokens = tokens;
+    tri_tokens[2] = (1 << 24) | 149 | (2 << 11);
+    try std.testing.expectError(error.Unsupported, translate(std.testing.allocator, tessDxbc(&buf, 4, &tri_tokens)));
+}
+
+test "hull phases keep independent names counts and uniform barriers" {
+    const tokens = [_]u32{
+        (3 << 16) | 0x50,
+        17,
+        (1 << 24) | 147 | (1 << 11),
+        (1 << 24) | 148 | (2 << 11),
+        (1 << 24) | 149 | (3 << 11),
+        (1 << 24) | 150 | (1 << 11),
+        (1 << 24) | 151 | (4 << 11),
+        (2 << 24) | 152,
+        @bitCast(@as(f32, 3.0)),
+        (1 << 24) | 115,
+        (2 << 24) | 153,
+        2,
+        (1 << 24) | 62,
+        (1 << 24) | 115,
+        (2 << 24) | 153,
+        4,
+        (1 << 24) | 62,
+    };
+    var buf: [256]u8 = undefined;
+    var tr = try translate(std.testing.allocator, tessDxbc(&buf, 3, &tokens));
+    defer tr.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "layout(vertices = 2) out;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "void hs_fork_0(uint hsForkID)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "void hs_fork_1(uint hsForkID)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "hsForkID < 2u") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "hsForkID < 4u") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "if (gl_InvocationID == 0) {\n        for") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "    }\n    barrier();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "min(gl_TessLevelOuter[0], 3.00000000)") != null);
 }

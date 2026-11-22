@@ -190,6 +190,7 @@ const Gl = struct {
     glGetProgramInfoLog: *const fn (GLuint, GLsizei, ?*GLsizei, [*]u8) callconv(.c) void,
     glDeleteProgram: *const fn (GLuint) callconv(.c) void,
     glUseProgram: *const fn (GLuint) callconv(.c) void,
+    glPatchParameteri: *const fn (GLenum, GLint) callconv(.c) void,
 
     glDrawArrays: *const fn (GLenum, GLint, GLsizei) callconv(.c) void,
     glDrawElements: *const fn (GLenum, GLsizei, GLenum, ?*const anyopaque) callconv(.c) void,
@@ -221,6 +222,9 @@ const FnClipControl = *const fn (GLenum, GLenum) callconv(.c) void;
 const FnCopyImageSubData = *const fn (GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei) callconv(.c) void;
 const FnSwapIntervalEXT = *const fn (?*anyopaque, c_ulong, c_int) callconv(.c) void;
 const FnClearTexImage = *const fn (GLuint, GLint, GLenum, GLenum, ?*const anyopaque) callconv(.c) void;
+const FnTexStorage2D = *const fn (GLenum, GLsizei, GLenum, GLsizei, GLsizei) callconv(.c) void;
+const FnTexStorage3D = *const fn (GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei) callconv(.c) void;
+const FnTextureView = *const fn (GLuint, GLenum, GLuint, GLenum, GLuint, GLuint, GLuint, GLuint) callconv(.c) void;
 
 var gl: Gl = undefined;
 var xlib: Xlib = undefined;
@@ -229,6 +233,9 @@ var p_clip_control: ?FnClipControl = null;
 var p_copy_image: ?FnCopyImageSubData = null;
 var p_swap_interval: ?FnSwapIntervalEXT = null;
 var p_clear_tex_image: ?FnClearTexImage = null;
+var p_tex_storage_2d: ?FnTexStorage2D = null;
+var p_tex_storage_3d: ?FnTexStorage3D = null;
+var p_texture_view: ?FnTextureView = null;
 var g_gl_display: ?*anyopaque = null;
 var g_gl_ctx: ?*anyopaque = null;
 var g_gl_dummy_win: c_ulong = 0;
@@ -267,6 +274,7 @@ pub const Texture = struct {
     is_depth: bool = false,
     is_compressed: bool = false,
     is_swapchain: bool = false,
+    immutable: bool = false,
     shadow: ?[]u8 = null,
     row_pitch: u32 = 0,
 };
@@ -287,6 +295,11 @@ pub const View = struct {
     uav_flags: u32 = 0,
     /// Typed buffer view as a GL buffer texture (created on first bind).
     gl_tbo: GLuint = 0,
+    /// SRV ViewDimension (0 = default/unspecified).
+    view_dim: u32 = 0,
+    /// Texture view for sRGB/linear, mip/slice subrange, or stencil mode on immutable textures.
+    gl_view: GLuint = 0,
+    gl_view_target: GLenum = 0,
     /// Append/consume counter (one uint GL buffer) and a pending initial count.
     counter: GLuint = 0,
     counter_set: ?u32 = null,
@@ -425,8 +438,26 @@ pub const DrawState = struct {
     vs_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
     ps_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
 
-    /// A geometry shader is bound (GS is not translated: such draws are skipped).
-    gs_active: bool = false,
+    gs: ?*Shader = null,
+    gs_cb: [16]?*Buffer = [_]?*Buffer{null} ** 16,
+    gs_cb_off: [16]u32 = [_]u32{0} ** 16,
+    gs_cb_sz: [16]u32 = [_]u32{0} ** 16,
+    gs_srv: [MAX_SRV]?*View = [_]?*View{null} ** MAX_SRV,
+    gs_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
+
+    hs: ?*Shader = null,
+    hs_cb: [16]?*Buffer = [_]?*Buffer{null} ** 16,
+    hs_cb_off: [16]u32 = [_]u32{0} ** 16,
+    hs_cb_sz: [16]u32 = [_]u32{0} ** 16,
+    hs_srv: [MAX_SRV]?*View = [_]?*View{null} ** MAX_SRV,
+    hs_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
+
+    ds: ?*Shader = null,
+    ds_cb: [16]?*Buffer = [_]?*Buffer{null} ** 16,
+    ds_cb_off: [16]u32 = [_]u32{0} ** 16,
+    ds_cb_sz: [16]u32 = [_]u32{0} ** 16,
+    ds_srv: [MAX_SRV]?*View = [_]?*View{null} ** MAX_SRV,
+    ds_samp: [16]?*Sampler = [_]?*Sampler{null} ** 16,
 
     cs: ?*Shader = null,
     cs_cb: [16]?*Buffer = [_]?*Buffer{null} ** 16,
@@ -466,6 +497,13 @@ pub const GlTexFmt = struct {
     is_stencil: bool,
     is_a8: bool,
 };
+
+fn isSrgbDxgi(fmt: u32) bool {
+    return switch (fmt) {
+        29, 72, 75, 78, 91, 93, 99 => true,
+        else => false,
+    };
+}
 
 pub fn dxgiToGlFormat(fmt: u32) GlTexFmt {
     return switch (fmt) {
@@ -560,7 +598,9 @@ pub fn inputFormatToGl(fmt: u32) InputFmtInfo {
         64 => .{ .components = 1, .gl_type = 0x1400, .normalized = false, .is_int = true, .byte_size = 1 }, // R8_SINT
         87, 88 => .{ .components = 0x80E1, .gl_type = 0x1401, .normalized = true, .is_int = false, .byte_size = 4 }, // GL_BGRA (B8G8R8A8/X8)
         else => blk: {
-            const S = struct { var seen: [128]bool = @splat(false); };
+            const S = struct {
+                var seen: [128]bool = @splat(false);
+            };
             if (fmt < 128 and !S.seen[fmt]) {
                 S.seen[fmt] = true;
                 std.debug.print("[WINS:D3D11] input layout: DXGI format {d} not mapped (treated as RGBA32F)\n", .{fmt});
@@ -641,6 +681,9 @@ fn loadGl() bool {
     if (glx.glXGetProcAddressARB("glCopyImageSubData")) |s| p_copy_image = @ptrCast(@alignCast(s));
     if (glx.glXGetProcAddressARB("glXSwapIntervalEXT")) |s| p_swap_interval = @ptrCast(@alignCast(s));
     if (glx.glXGetProcAddressARB("glClearTexImage")) |s| p_clear_tex_image = @ptrCast(@alignCast(s));
+    if (glx.glXGetProcAddressARB("glTexStorage2D")) |s| p_tex_storage_2d = @ptrCast(@alignCast(s));
+    if (glx.glXGetProcAddressARB("glTexStorage3D")) |s| p_tex_storage_3d = @ptrCast(@alignCast(s));
+    if (glx.glXGetProcAddressARB("glTextureView")) |s| p_texture_view = @ptrCast(@alignCast(s));
     return true;
 }
 
@@ -714,6 +757,7 @@ fn initContextState() void {
     gl.glGenFramebuffers(1, &g_copy_fbo_draw);
     gl.glPixelStorei(0x0CF5, 1);
     gl.glPixelStorei(0x0D05, 1);
+    gl.glEnable(0x884F); // GL_TEXTURE_CUBE_MAP_SEAMLESS (always on in D3D11)
 }
 
 fn openGlxInitial() bool {
@@ -829,8 +873,11 @@ pub fn init(hwnd: usize, w: u32, h: u32) bool {
 
 // ---- GL Caches (Program Pair & FBO) -----------------------------------------
 
-const ProgKey = packed struct(u128) {
+const ProgKey = struct {
     vs: u64,
+    hs: u64,
+    ds: u64,
+    gs: u64,
     ps: u64,
 };
 
@@ -838,8 +885,14 @@ const LinkedProg = struct {
     prog: GLuint = 0,
     ps_tex_bindings: []const shader.TexBinding = &.{},
     vs_tex_bindings: []const shader.TexBinding = &.{},
+    hs_tex_bindings: []const shader.TexBinding = &.{},
+    ds_tex_bindings: []const shader.TexBinding = &.{},
+    gs_tex_bindings: []const shader.TexBinding = &.{},
     ps_buf_bindings: []const shader.BufBinding = &.{},
     vs_buf_bindings: []const shader.BufBinding = &.{},
+    hs_buf_bindings: []const shader.BufBinding = &.{},
+    ds_buf_bindings: []const shader.BufBinding = &.{},
+    gs_buf_bindings: []const shader.BufBinding = &.{},
 };
 
 var g_progs: std.AutoHashMapUnmanaged(ProgKey, LinkedProg) = .{};
@@ -878,11 +931,14 @@ fn compileGlShader(kind: GLenum, src: [:0]const u8, label: []const u8) GLuint {
 
 /// A failed translate/compile/link is cached too (prog = 0): retrying it on every
 /// draw recompiled the same broken GLSL ~80k times and wrote a 600 MB log.
-fn getOrLinkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
+fn getOrLinkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shader) LinkedProg {
+    const hs_uid: u64 = if (hs) |h| h.uid else 0;
+    const ds_uid: u64 = if (ds) |d| d.uid else 0;
+    const gs_uid: u64 = if (gs) |g| g.uid else 0;
     const ps_uid: u64 = if (ps) |p| p.uid else 0;
-    const key: ProgKey = .{ .vs = vs.uid, .ps = ps_uid };
+    const key: ProgKey = .{ .vs = vs.uid, .hs = hs_uid, .ds = ds_uid, .gs = gs_uid, .ps = ps_uid };
     if (g_progs.get(key)) |hit| return hit;
-    const res = linkProgram(vs, ps);
+    const res = linkProgram(vs, hs, ds, gs, ps);
     if (res.prog == 0) {
         g_progs.put(alloc, key, res) catch {};
         dumpFailedBytecode(vs, ps);
@@ -894,7 +950,9 @@ fn getOrLinkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
 /// (fail<N>_vs.dxbc / fail<N>_ps.dxbc) so the translator can be fixed offline.
 fn dumpFailedBytecode(vs: *Shader, ps: ?*Shader) void {
     const dir = getenv("WINS_D3D11_CAPTURE") orelse return;
-    const S = struct { var n: u32 = 0; };
+    const S = struct {
+        var n: u32 = 0;
+    };
     S.n += 1;
     if (S.n > 64) return;
     var buf: [1024]u8 = undefined;
@@ -904,9 +962,12 @@ fn dumpFailedBytecode(vs: *Shader, ps: ?*Shader) void {
     }
 }
 
-fn linkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
+fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shader) LinkedProg {
+    const hs_uid: u64 = if (hs) |h| h.uid else 0;
+    const ds_uid: u64 = if (ds) |d| d.uid else 0;
+    const gs_uid: u64 = if (gs) |g| g.uid else 0;
     const ps_uid: u64 = if (ps) |p| p.uid else 0;
-    const key: ProgKey = .{ .vs = vs.uid, .ps = ps_uid };
+    const key: ProgKey = .{ .vs = vs.uid, .hs = hs_uid, .ds = ds_uid, .gs = gs_uid, .ps = ps_uid };
 
     var tv = shader.translateWithVaryings(alloc, vs.bytecode, null) catch |e| {
         std.debug.print("[WINS:D3D11:GL] VS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
@@ -917,24 +978,90 @@ fn linkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
     if (gl_vs == 0) return .{};
     defer gl.glDeleteShader(gl_vs);
 
+    var gl_hs: GLuint = 0;
+    var gl_ds: GLuint = 0;
+    var hs_tex: []const shader.TexBinding = &.{};
+    var ds_tex: []const shader.TexBinding = &.{};
+    var hs_buf: []const shader.BufBinding = &.{};
+    var ds_buf: []const shader.BufBinding = &.{};
+    var th_opt: ?shader.Translated = null;
+    var td_opt: ?shader.Translated = null;
+    defer if (th_opt) |*th| th.deinit(alloc);
+    defer if (td_opt) |*td| td.deinit(alloc);
+    var prev_outputs: []const shader.SigElem = tv.outputs;
+    if (hs) |h| {
+        const th = shader.translateWithVaryings(alloc, h.bytecode, tv.outputs) catch |e| {
+            std.debug.print("[WINS:D3D11:GL] HS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
+            return .{};
+        };
+        gl_hs = compileGlShader(0x8E88, th.glsl, "HS"); // GL_TESS_CONTROL_SHADER
+        hs_tex = alloc.dupe(shader.TexBinding, th.tex_bindings) catch &.{};
+        hs_buf = alloc.dupe(shader.BufBinding, th.buf_bindings) catch &.{};
+        prev_outputs = th.outputs;
+        th_opt = th;
+        if (gl_hs == 0) return .{};
+        const d = ds orelse {
+            std.debug.print("[WINS:D3D11:GL] patch program has HS but no DS\n", .{});
+            return .{};
+        };
+        const td = shader.translateTessellation(alloc, d.bytecode, th.outputs, th.patch_outputs, th.tess) catch |e| {
+            std.debug.print("[WINS:D3D11:GL] DS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
+            return .{};
+        };
+        gl_ds = compileGlShader(0x8E87, td.glsl, "DS"); // GL_TESS_EVALUATION_SHADER
+        ds_tex = alloc.dupe(shader.TexBinding, td.tex_bindings) catch &.{};
+        ds_buf = alloc.dupe(shader.BufBinding, td.buf_bindings) catch &.{};
+        prev_outputs = td.outputs;
+        td_opt = td;
+        if (gl_ds == 0) return .{};
+    } else if (ds != null) {
+        std.debug.print("[WINS:D3D11:GL] patch program has DS but no HS\n", .{});
+        return .{};
+    }
+    defer if (gl_hs != 0) gl.glDeleteShader(gl_hs);
+    defer if (gl_ds != 0) gl.glDeleteShader(gl_ds);
+
+    var gl_gs: GLuint = 0;
+    var gs_tex: []const shader.TexBinding = &.{};
+    var gs_buf: []const shader.BufBinding = &.{};
+    var tg_opt: ?shader.Translated = null;
+    defer if (tg_opt) |*tg| tg.deinit(alloc);
+    if (gs) |g| {
+        const tg = shader.translateWithVaryings(alloc, g.bytecode, prev_outputs) catch |e| {
+            std.debug.print("[WINS:D3D11:GL] GS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
+            return .{};
+        };
+        gl_gs = compileGlShader(0x8DD9, tg.glsl, "GS"); // GL_GEOMETRY_SHADER
+        gs_tex = alloc.dupe(shader.TexBinding, tg.tex_bindings) catch &.{};
+        gs_buf = alloc.dupe(shader.BufBinding, tg.buf_bindings) catch &.{};
+        prev_outputs = tg.outputs;
+        tg_opt = tg;
+        if (gl_gs == 0) return .{};
+    }
+    defer if (gl_gs != 0) gl.glDeleteShader(gl_gs);
+
     var gl_ps: GLuint = 0;
     var ps_tex: []const shader.TexBinding = &.{};
     var ps_buf: []const shader.BufBinding = &.{};
     const trace_glsl = (getenv("WINS_D3D11_TRACE_DRAWS") != null);
     if (trace_glsl) {
-        const S = struct { var n: u32 = 0; };
+        const S = struct {
+            var n: u32 = 0;
+        };
         S.n += 1;
         if (S.n == 1 or (S.n >= 18 and S.n <= 21)) {
             std.debug.print("=== TRACE_GLSL VS#{d} ===\n{s}\n", .{ S.n, tv.glsl });
         }
     }
     if (ps) |p| {
-        var tp = shader.translateWithVaryings(alloc, p.bytecode, tv.outputs) catch |e| {
+        var tp = shader.translateWithVaryings(alloc, p.bytecode, prev_outputs) catch |e| {
             std.debug.print("[WINS:D3D11:GL] PS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
             return .{};
         };
         if (trace_glsl) {
-            const S = struct { var n: u32 = 0; };
+            const S = struct {
+                var n: u32 = 0;
+            };
             S.n += 1;
             if (S.n == 1 or (S.n >= 18 and S.n <= 21)) {
                 std.debug.print("=== TRACE_GLSL PS#{d} (tex={d}) ===\n{s}\n", .{ S.n, tp.tex_bindings.len, tp.glsl });
@@ -954,6 +1081,9 @@ fn linkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
 
     const prog = gl.glCreateProgram();
     gl.glAttachShader(prog, gl_vs);
+    if (gl_hs != 0) gl.glAttachShader(prog, gl_hs);
+    if (gl_ds != 0) gl.glAttachShader(prog, gl_ds);
+    if (gl_gs != 0) gl.glAttachShader(prog, gl_gs);
     gl.glAttachShader(prog, gl_ps);
     gl.glLinkProgram(prog);
     var ok: GLint = 0;
@@ -969,7 +1099,19 @@ fn linkProgram(vs: *Shader, ps: ?*Shader) LinkedProg {
 
     const vs_tex = alloc.dupe(shader.TexBinding, tv.tex_bindings) catch &.{};
     const vs_buf = alloc.dupe(shader.BufBinding, tv.buf_bindings) catch &.{};
-    const res: LinkedProg = .{ .prog = prog, .ps_tex_bindings = ps_tex, .vs_tex_bindings = vs_tex, .ps_buf_bindings = ps_buf, .vs_buf_bindings = vs_buf };
+    const res: LinkedProg = .{
+        .prog = prog,
+        .ps_tex_bindings = ps_tex,
+        .vs_tex_bindings = vs_tex,
+        .hs_tex_bindings = hs_tex,
+        .ds_tex_bindings = ds_tex,
+        .gs_tex_bindings = gs_tex,
+        .ps_buf_bindings = ps_buf,
+        .vs_buf_bindings = vs_buf,
+        .hs_buf_bindings = hs_buf,
+        .ds_buf_bindings = ds_buf,
+        .gs_buf_bindings = gs_buf,
+    };
     dumpProgram(prog, vs, ps, tv.glsl);
     g_progs.put(alloc, key, res) catch {};
     return res;
@@ -1025,7 +1167,10 @@ fn cbVec(cb: ?*Buffer, off_regs: u32, reg: u32) [4]f32 {
 /// WINS_D3D11_TRACE_REGS="v0:22,v1:6,p0:26" (stage, slot, register). With
 /// WINS_D3D11_DUMP_DIR set, A8 atlases are also read back as PGM. Off by default.
 fn traceProgConstants(s: *const DrawState, prog: GLuint, fw: u32, fh: u32) void {
-    const C = struct { var init = false; var env: ?[*:0]const u8 = null; };
+    const C = struct {
+        var init = false;
+        var env: ?[*:0]const u8 = null;
+    };
     if (!C.init) {
         C.init = true;
         C.env = getenv("WINS_D3D11_TRACE_PROG");
@@ -1040,7 +1185,9 @@ fn traceProgConstants(s: *const DrawState, prog: GLuint, fw: u32, fh: u32) void 
         }
         return;
     };
-    const S = struct { var n: [8]u32 = .{0} ** 8; };
+    const S = struct {
+        var n: [8]u32 = .{0} ** 8;
+    };
     S.n[slot_idx] += 1;
     const n = S.n[slot_idx];
     if (n > 4 and n % 500 != 0) return;
@@ -1111,7 +1258,7 @@ fn traceProgConstants(s: *const DrawState, prog: GLuint, fw: u32, fh: u32) void 
     } else std.debug.print("[WINS:TRACEPROG]   vb0 has no CPU shadow\n", .{});
     const vp = if (s.num_viewports > 0) s.viewports[0] else std.mem.zeroes(@TypeOf(s.viewports[0]));
     std.debug.print("[WINS:TRACEPROG] prog={d} n={d} f={d} fb={d}x{d} vp=({d:.1},{d:.1},{d:.1},{d:.1}) stencil={} ref={d}\n", .{
-        prog, n, g_present_count, fw, fh, vp.x, vp.y, vp.w, vp.h,
+        prog,                                                 n,             g_present_count, fw, fh, vp.x, vp.y, vp.w, vp.h,
         if (s.depth_stencil) |d| d.stencil_enable else false, s.stencil_ref,
     });
     const regs_z = getenv("WINS_D3D11_TRACE_REGS") orelse return;
@@ -1128,15 +1275,86 @@ fn traceProgConstants(s: *const DrawState, prog: GLuint, fw: u32, fh: u32) void 
     }
 }
 
+/// Format-only texture view for FBO attachments (RTV/DSV): preserves the full
+/// mip and layer range so glFramebufferTexture2D/Layer(first_mip, first_slice)
+/// addresses the right subresource without double-offsetting.
+fn getAttachTexId(v: *View) GLuint {
+    const t = v.tex orelse return 0;
+    if (v.dxgi_fmt == 0 or isSrgbDxgi(v.dxgi_fmt) == isSrgbDxgi(t.dxgi_fmt) or
+        t.is_swapchain or !t.immutable or p_texture_view == null or
+        (t.target != 0x0DE1 and t.target != 0x8513 and t.target != 0x8C1A))
+    {
+        return t.gl_id;
+    }
+    if (v.gl_view == 0) {
+        const tv = p_texture_view.?;
+        const vgf = dxgiToGlFormat(v.dxgi_fmt);
+        const layers: GLuint = if (t.target == 0x8513) 6 else @max(1, t.array_size);
+        gl.glGenTextures(1, &v.gl_view);
+        tv(v.gl_view, t.target, t.gl_id, @intCast(vgf.internal), 0, t.mip_levels, 0, layers);
+        v.gl_view_target = t.target;
+    }
+    return v.gl_view;
+}
+
+/// Texture view for SRV sampling: honors sRGB/linear reinterpretation, mip
+/// subranges (MostDetailedMip/MipLevels for bloom/Hi-Z/exposure pyramids),
+/// array slice subranges (and 2D views of a single 2D-array slice), and
+/// stencil-index sampling on depth-stencil formats (X24_TYPELESS_G8_UINT).
+fn getSrvTex(v: *View) struct { target: GLenum, id: GLuint } {
+    const t = v.tex orelse return .{ .target = 0x0DE1, .id = 0 };
+    if (t.is_swapchain or !t.immutable or p_texture_view == null or
+        (t.target != 0x0DE1 and t.target != 0x8513 and t.target != 0x8C1A))
+    {
+        return .{ .target = t.target, .id = t.gl_id };
+    }
+    const total_mips: u32 = @max(1, t.mip_levels);
+    const total_layers: u32 = if (t.target == 0x8513) 6 else @max(1, t.array_size);
+    const min_mip: u32 = @min(v.first_mip, total_mips - 1);
+    const max_mips: u32 = total_mips - min_mip;
+    const num_mips: u32 = if (v.num_mips == 0 or v.num_mips == 0xFFFFFFFF) max_mips else @max(1, @min(max_mips, v.num_mips));
+    const min_layer: u32 = @min(v.first_slice, total_layers - 1);
+    const max_layers: u32 = total_layers - min_layer;
+    var want_target: GLenum = t.target;
+    var num_layers: u32 = if (v.num_slices == 0 or v.num_slices == 0xFFFFFFFF) max_layers else @max(1, @min(max_layers, v.num_slices));
+    if (t.target == 0x8C1A and v.view_dim == 4) { // TEXTURE2D view of one slice of a TEXTURE_2D_ARRAY
+        want_target = 0x0DE1;
+        num_layers = 1;
+    }
+    const need_srgb = (v.dxgi_fmt != 0 and isSrgbDxgi(v.dxgi_fmt) != isSrgbDxgi(t.dxgi_fmt));
+    const want_stencil = (v.dxgi_fmt == 47 or v.dxgi_fmt == 22); // X24_TYPELESS_G8_UINT / X32_TYPELESS_G8X24_UINT
+    const need_mip = (min_mip != 0 or num_mips != total_mips);
+    const need_layer = (min_layer != 0 or num_layers != total_layers or want_target != t.target);
+    if (!need_srgb and !need_mip and !need_layer and !want_stencil) {
+        return .{ .target = t.target, .id = t.gl_id };
+    }
+    if (v.gl_view == 0) {
+        const tv = p_texture_view.?;
+        // Only change the GL internal format for sRGB<->linear reinterpretation;
+        // depth textures must keep their depth internal format for glTextureView.
+        const gf = dxgiToGlFormat(if (need_srgb) v.dxgi_fmt else t.dxgi_fmt);
+        gl.glGenTextures(1, &v.gl_view);
+        tv(v.gl_view, want_target, t.gl_id, @intCast(gf.internal), min_mip, num_mips, min_layer, num_layers);
+        v.gl_view_target = want_target;
+        if (want_stencil) {
+            gl.glBindTexture(want_target, v.gl_view);
+            gl.glTexParameteri(want_target, 0x90EA, 0x1901); // GL_DEPTH_STENCIL_TEXTURE_MODE = GL_STENCIL_INDEX
+            gl.glBindTexture(want_target, 0);
+        }
+    }
+    return .{ .target = if (v.gl_view_target != 0) v.gl_view_target else t.target, .id = v.gl_view };
+}
+
 fn attachTextureView(att: GLenum, v: *View) void {
     const tex = v.tex orelse return;
+    const id = getAttachTexId(v);
     if (tex.target == 0x8C1A or tex.target == 0x806F or tex.target == 0x8C18) { // 2D_ARRAY / 3D / 1D_ARRAY
-        gl.glFramebufferTextureLayer(0x8D40, att, tex.gl_id, @intCast(v.first_mip), @intCast(v.first_slice));
+        gl.glFramebufferTextureLayer(0x8D40, att, id, @intCast(v.first_mip), @intCast(v.first_slice));
     } else if (tex.target == 0x8513) { // CUBE_MAP
         const face: GLenum = 0x8515 + @as(GLenum, @intCast(v.first_slice % 6));
-        gl.glFramebufferTexture2D(0x8D40, att, face, tex.gl_id, @intCast(v.first_mip));
+        gl.glFramebufferTexture2D(0x8D40, att, face, id, @intCast(v.first_mip));
     } else {
-        gl.glFramebufferTexture2D(0x8D40, att, 0x0DE1, tex.gl_id, @intCast(v.first_mip));
+        gl.glFramebufferTexture2D(0x8D40, att, 0x0DE1, id, @intCast(v.first_mip));
     }
 }
 
@@ -1162,7 +1380,7 @@ fn bindFramebufferForState(s: *const DrawState) struct { w: u32, h: u32 } {
     for (0..key.num_rtvs) |i| {
         if (s.rtv[i]) |rv| {
             if (rv.tex) |t| {
-                key.rtvs[i] = t.gl_id;
+                key.rtvs[i] = getAttachTexId(rv);
                 key.rtv_mips[i] = rv.first_mip;
                 key.rtv_slices[i] = rv.first_slice;
                 any = true;
@@ -1327,6 +1545,35 @@ fn uploadBufferJob(raw: ?*anyopaque) void {
     gl.glBindBuffer(target, 0);
 }
 
+pub const BufSpan = struct { off: u32, data: [*]const u8, len: u32 };
+const BufUploadSpansJob = struct { b: *Buffer, spans: []const BufSpan };
+
+fn uploadBufferSpansJob(raw: ?*anyopaque) void {
+    const j: *BufUploadSpansJob = @ptrCast(@alignCast(raw.?));
+    const b = j.b;
+    if (b.gl_id == 0) return;
+    const target = glTargetForBuffer(b.bind_flags);
+    gl.glBindBuffer(target, b.gl_id);
+    for (j.spans) |sp| {
+        if (sp.len > 0) gl.glBufferSubData(target, @intCast(sp.off), @intCast(sp.len), @ptrCast(sp.data));
+    }
+    gl.glBindBuffer(target, 0);
+}
+
+pub fn uploadBufferSpans(b: *Buffer, spans: []const BufSpan) void {
+    if (spans.len == 0) return;
+    if (b.shadow) |sh| {
+        for (spans) |sp| {
+            const end = @min(sh.len, @as(usize, sp.off) + sp.len);
+            if (sp.off < end and @intFromPtr(sp.data) != @intFromPtr(sh.ptr + sp.off)) {
+                @memcpy(sh[sp.off..end], sp.data[0 .. end - sp.off]);
+            }
+        }
+    }
+    var j: BufUploadSpansJob = .{ .b = b, .spans = spans };
+    run(&uploadBufferSpansJob, &j);
+}
+
 pub fn uploadBuffer(b: *Buffer, offset: u32, data: [*]const u8, len: u32) void {
     if (b.shadow) |sh| {
         const end = @min(sh.len, @as(usize, offset) + len);
@@ -1396,7 +1643,8 @@ fn upload3DLevel(level: u32, w: u32, h: u32, d: u32, gf: GlTexFmt, ptr: ?*const 
     }
 }
 
-fn uploadMipSlice2D(target: GLenum, level: u32, w: u32, h: u32, gf: GlTexFmt, ptr: ?*const anyopaque, pitch: u32) void {
+fn uploadMipSlice2D(target: GLenum, level: u32, w: u32, h: u32, gf: GlTexFmt, ptr: ?*const anyopaque, pitch: u32, sub: bool) void {
+    if (sub and ptr == null) return;
     if (gf.compressed) {
         const bw = @max(1, (w + 3) / 4);
         const bh = @max(1, (h + 3) / 4);
@@ -1404,16 +1652,19 @@ fn uploadMipSlice2D(target: GLenum, level: u32, w: u32, h: u32, gf: GlTexFmt, pt
         if (ptr) |p| {
             // Check if row stride matches tight packing
             const row_bytes = bw * gf.block_bytes;
-            if (pitch == 0 or pitch == row_bytes or bh == 1) {
-                gl.glCompressedTexImage2D(target, @intCast(level), @intCast(gf.internal), @intCast(w), @intCast(h), 0, @intCast(sz), p);
-            } else {
+            const upload_ptr: *const anyopaque = if (pitch == 0 or pitch == row_bytes or bh == 1) p else blk: {
                 const tmp = alloc.alloc(u8, sz) catch return;
-                defer alloc.free(tmp);
                 const src: [*]const u8 = @ptrCast(p);
                 for (0..bh) |ry| {
                     @memcpy(tmp[ry * row_bytes ..][0..row_bytes], src[ry * pitch ..][0..row_bytes]);
                 }
-                gl.glCompressedTexImage2D(target, @intCast(level), @intCast(gf.internal), @intCast(w), @intCast(h), 0, @intCast(sz), tmp.ptr);
+                break :blk tmp.ptr;
+            };
+            defer if (@intFromPtr(upload_ptr) != @intFromPtr(p)) alloc.free(@as([*]u8, @ptrCast(@constCast(upload_ptr)))[0..sz]);
+            if (sub) {
+                gl.glCompressedTexSubImage2D(target, @intCast(level), 0, 0, @intCast(w), @intCast(h), @intCast(gf.internal), @intCast(sz), upload_ptr);
+            } else {
+                gl.glCompressedTexImage2D(target, @intCast(level), @intCast(gf.internal), @intCast(w), @intCast(h), 0, @intCast(sz), upload_ptr);
             }
         } else {
             gl.glCompressedTexImage2D(target, @intCast(level), @intCast(gf.internal), @intCast(w), @intCast(h), 0, @intCast(sz), null);
@@ -1422,7 +1673,11 @@ fn uploadMipSlice2D(target: GLenum, level: u32, w: u32, h: u32, gf: GlTexFmt, pt
         if (ptr != null and pitch > w * gf.bpp and gf.bpp > 0) {
             gl.glPixelStorei(0x0CF2, @intCast(pitch / gf.bpp)); // GL_UNPACK_ROW_LENGTH
         }
-        gl.glTexImage2D(target, @intCast(level), gf.internal, @intCast(w), @intCast(h), 0, gf.format, gf.ty, ptr);
+        if (sub) {
+            gl.glTexSubImage2D(target, @intCast(level), 0, 0, @intCast(w), @intCast(h), gf.format, gf.ty, ptr);
+        } else {
+            gl.glTexImage2D(target, @intCast(level), gf.internal, @intCast(w), @intCast(h), 0, gf.format, gf.ty, ptr);
+        }
         if (ptr != null and pitch > w * gf.bpp and gf.bpp > 0) {
             gl.glPixelStorei(0x0CF2, 0);
         }
@@ -1433,7 +1688,13 @@ fn uploadMipSlice2D(target: GLenum, level: u32, w: u32, h: u32, gf: GlTexFmt, pt
 /// initialised 2D textures of that size (or min<N>: either side >= N; cap 160), mip 0 read back as RGBA8 (GL
 /// decompresses BC*), to tex<gl>_<fmt>.ppm with alpha as tex<gl>_a.pgm.
 fn dumpTex2D(t: *const Texture) void {
-    const C = struct { var init = false; var w: u32 = 0; var h: u32 = 0; var n: u32 = 0; var min: u32 = 0; };
+    const C = struct {
+        var init = false;
+        var w: u32 = 0;
+        var h: u32 = 0;
+        var n: u32 = 0;
+        var min: u32 = 0;
+    };
     if (!C.init) {
         C.init = true;
         if (getenv("WINS_D3D11_DUMP_TEX")) |z| {
@@ -1537,17 +1798,25 @@ fn createTexture2DJob(raw: ?*anyopaque) void {
             md = @max(1, md >> 1);
         }
     } else if (t.target == 0x0DE1) {
+        if (p_tex_storage_2d) |ts2d| {
+            ts2d(0x0DE1, @intCast(t.mip_levels), @intCast(gf.internal), @intCast(t.width), @intCast(t.height));
+            t.immutable = true;
+        }
         var mw = t.width;
         var mh = t.height;
         for (0..t.mip_levels) |m| {
             const p = if (j.init_ptrs) |ps| ps[m] else null;
             const pitch = if (j.init_pitches) |pits| pits[m] else 0;
-            uploadMipSlice2D(0x0DE1, @intCast(m), mw, mh, gf, p, pitch);
+            uploadMipSlice2D(0x0DE1, @intCast(m), mw, mh, gf, p, pitch, t.immutable);
             mw = @max(1, mw >> 1);
             mh = @max(1, mh >> 1);
         }
         if (j.init_ptrs != null) dumpTex2D(t);
     } else if (t.target == 0x8513) { // Cubemap
+        if (p_tex_storage_2d) |ts2d| {
+            ts2d(0x8513, @intCast(t.mip_levels), @intCast(gf.internal), @intCast(t.width), @intCast(t.height));
+            t.immutable = true;
+        }
         for (0..6) |face| {
             var mw = t.width;
             var mh = t.height;
@@ -1555,24 +1824,37 @@ fn createTexture2DJob(raw: ?*anyopaque) void {
                 const idx = face * t.mip_levels + m;
                 const p = if (j.init_ptrs) |ps| ps[idx] else null;
                 const pitch = if (j.init_pitches) |pits| pits[idx] else 0;
-                uploadMipSlice2D(0x8515 + @as(GLenum, @intCast(face)), @intCast(m), mw, mh, gf, p, pitch);
+                uploadMipSlice2D(0x8515 + @as(GLenum, @intCast(face)), @intCast(m), mw, mh, gf, p, pitch, t.immutable);
                 mw = @max(1, mw >> 1);
                 mh = @max(1, mh >> 1);
             }
         }
     } else { // TEXTURE_2D_ARRAY
+        if (p_tex_storage_3d) |ts3d| {
+            ts3d(0x8C1A, @intCast(t.mip_levels), @intCast(gf.internal), @intCast(t.width), @intCast(t.height), @intCast(t.array_size));
+            t.immutable = true;
+        }
         var mw = t.width;
         var mh = t.height;
         for (0..t.mip_levels) |m| {
-            gl.glTexImage3D(0x8C1A, @intCast(m), gf.internal, @intCast(mw), @intCast(mh), @intCast(t.array_size), 0, gf.format, gf.ty, null);
+            if (!t.immutable) {
+                gl.glTexImage3D(0x8C1A, @intCast(m), gf.internal, @intCast(mw), @intCast(mh), @intCast(t.array_size), 0, gf.format, gf.ty, null);
+            }
             if (j.init_ptrs) |ps| {
                 for (0..t.array_size) |sl| {
                     const idx = sl * t.mip_levels + m;
                     if (ps[idx]) |p| {
                         const pitch = if (j.init_pitches) |pits| pits[idx] else 0;
-                        if (pitch > mw * gf.bpp and gf.bpp > 0) gl.glPixelStorei(0x0CF2, @intCast(pitch / gf.bpp));
-                        gl.glTexSubImage3D(0x8C1A, @intCast(m), 0, 0, @intCast(sl), @intCast(mw), @intCast(mh), 1, gf.format, gf.ty, p);
-                        gl.glPixelStorei(0x0CF2, 0);
+                        if (gf.compressed) {
+                            const bw = @max(1, (mw + 3) / 4);
+                            const bh = @max(1, (mh + 3) / 4);
+                            const sz = bw * bh * gf.block_bytes;
+                            gl.glCompressedTexSubImage3D(0x8C1A, @intCast(m), 0, 0, @intCast(sl), @intCast(mw), @intCast(mh), 1, @intCast(gf.internal), @intCast(sz), p);
+                        } else {
+                            if (pitch > mw * gf.bpp and gf.bpp > 0) gl.glPixelStorei(0x0CF2, @intCast(pitch / gf.bpp));
+                            gl.glTexSubImage3D(0x8C1A, @intCast(m), 0, 0, @intCast(sl), @intCast(mw), @intCast(mh), 1, gf.format, gf.ty, p);
+                            gl.glPixelStorei(0x0CF2, 0);
+                        }
                     }
                 }
             }
@@ -1779,9 +2061,17 @@ fn createSamplerJob(raw: ?*anyopaque) void {
 
 pub fn createSampler(s: *Sampler, filter: u32, addr_u: u32, addr_v: u32, addr_w: u32, mip_bias: f32, max_aniso: u32, cmp_func: u32, border: [4]f32, min_lod: f32, max_lod: f32) void {
     var j: SampJob = .{
-        .s = s, .filter = filter, .addr_u = addr_u, .addr_v = addr_v, .addr_w = addr_w,
-        .mip_bias = mip_bias, .max_aniso = max_aniso, .cmp_func = cmp_func,
-        .border = border, .min_lod = min_lod, .max_lod = max_lod,
+        .s = s,
+        .filter = filter,
+        .addr_u = addr_u,
+        .addr_v = addr_v,
+        .addr_w = addr_w,
+        .mip_bias = mip_bias,
+        .max_aniso = max_aniso,
+        .cmp_func = cmp_func,
+        .border = border,
+        .min_lod = min_lod,
+        .max_lod = max_lod,
     };
     run(&createSamplerJob, &j);
 }
@@ -1804,7 +2094,9 @@ pub fn createShader(sh: *Shader, bytes: []const u8, is_pixel: bool) bool {
     sh.bytecode = alloc.dupe(u8, bytes) catch return false;
     {
         // Rare progress line: titles that stream thousands of shaders at boot.
-        const S = struct { var n = std.atomic.Value(u32).init(0); };
+        const S = struct {
+            var n = std.atomic.Value(u32).init(0);
+        };
         const n = S.n.fetchAdd(1, .monotonic) + 1;
         if (n % 1000 == 0) std.debug.print("[WINS:D3D11:GL] {d} shaders created (present #{d})\n", .{ n, g_present_count });
     }
@@ -1843,18 +2135,27 @@ const ClearRtvJob = struct { rtv: *View, rgba: [4]f32 };
 
 fn clearRtvJob(raw: ?*anyopaque) void {
     const j: *ClearRtvJob = @ptrCast(@alignCast(raw.?));
+    const n_slices = @max(@as(u32, 1), j.rtv.num_slices);
+    var slice_view = j.rtv.*;
+    slice_view.num_slices = 1;
     var tmp: DrawState = .{};
-    tmp.rtv[0] = j.rtv;
+    tmp.rtv[0] = &slice_view;
     tmp.num_rtvs = 1;
-    _ = bindFramebufferForState(&tmp);
+    const rtv_fmt = if (j.rtv.dxgi_fmt != 0) j.rtv.dxgi_fmt else (if (j.rtv.tex) |t| t.dxgi_fmt else 0);
+    setCap(0x8DB9, isSrgbDxgi(rtv_fmt)); // GL_FRAMEBUFFER_SRGB
     gl.glColorMaski(0, 1, 1, 1, 1);
     gl.glDisable(0x0C11); // SCISSOR_TEST
-    gl.glClearBufferfv(0x1800, 0, &j.rgba); // GL_COLOR
+    for (0..n_slices) |si| {
+        slice_view.first_slice = j.rtv.first_slice + @as(u32, @intCast(si));
+        _ = bindFramebufferForState(&tmp);
+        gl.glClearBufferfv(0x1800, 0, &j.rgba); // GL_COLOR
+    }
     if (getenv("WINS_D3D11_TRACE_DRAWS") != null and g_present_count < 6) {
         const t = j.rtv.tex;
         std.debug.print("[WINS:D3D11:GL] clearRtv frame={d} rtv_gl={d} sw={} {d}x{d} rgba=({d:.3},{d:.3},{d:.3},{d:.3})\n", .{
-            g_present_count, if (t) |x| x.gl_id else 0, if (t) |x| x.is_swapchain else false,
-            if (t) |x| x.width else 0, if (t) |x| x.height else 0, j.rgba[0], j.rgba[1], j.rgba[2], j.rgba[3],
+            g_present_count,           if (t) |x| x.gl_id else 0,  if (t) |x| x.is_swapchain else false,
+            if (t) |x| x.width else 0, if (t) |x| x.height else 0, j.rgba[0],
+            j.rgba[1],                 j.rgba[2],                  j.rgba[3],
         });
     }
 }
@@ -1868,21 +2169,27 @@ const ClearDsvJob = struct { dsv: *View, flags: u32, depth: f32, stencil: u8 };
 
 fn clearDsvJob(raw: ?*anyopaque) void {
     const j: *ClearDsvJob = @ptrCast(@alignCast(raw.?));
+    const n_slices = @max(@as(u32, 1), j.dsv.num_slices);
+    var slice_view = j.dsv.*;
+    slice_view.num_slices = 1;
     var tmp: DrawState = .{};
-    tmp.dsv = j.dsv;
-    _ = bindFramebufferForState(&tmp);
+    tmp.dsv = &slice_view;
     gl.glDisable(0x0C11);
     const has_d = (j.flags & 1) != 0;
     const has_s = (j.flags & 2) != 0;
     if (has_d) gl.glDepthMask(1);
     if (has_s) gl.glStencilMask(0xFF);
-    if (has_d and has_s) {
-        gl.glClearBufferfi(0x84F9, 0, j.depth, @intCast(j.stencil));
-    } else if (has_d) {
-        gl.glClearBufferfv(0x1801, 0, (&j.depth)[0..1].ptr);
-    } else if (has_s) {
-        gl.glClearStencil(@intCast(j.stencil));
-        gl.glClear(0x0400);
+    for (0..n_slices) |si| {
+        slice_view.first_slice = j.dsv.first_slice + @as(u32, @intCast(si));
+        _ = bindFramebufferForState(&tmp);
+        if (has_d and has_s) {
+            gl.glClearBufferfi(0x84F9, 0, j.depth, @intCast(j.stencil));
+        } else if (has_d) {
+            gl.glClearBufferfv(0x1801, 0, (&j.depth)[0..1].ptr);
+        } else if (has_s) {
+            gl.glClearStencil(@intCast(j.stencil));
+            gl.glClear(0x0400);
+        }
     }
 }
 
@@ -2075,18 +2382,38 @@ fn copyTexJob(raw: ?*anyopaque) void {
     const ch: u32 = if (j.has_box) @max(1, j.bx[4] -| j.bx[1]) else sh;
 
     if (p_copy_image) |ci| {
-        ci(j.src.gl_id, j.src.target, @intCast(smip), @intCast(sx), @intCast(sy), @intCast(sslice + sz),
-            j.dst.gl_id, j.dst.target, @intCast(dmip), @intCast(j.dx), @intCast(j.dy), @intCast(dslice + j.dz),
-            @intCast(cw), @intCast(ch), 1);
+        ci(j.src.gl_id, j.src.target, @intCast(smip), @intCast(sx), @intCast(sy), @intCast(sslice + sz), j.dst.gl_id, j.dst.target, @intCast(dmip), @intCast(j.dx), @intCast(j.dy), @intCast(dslice + j.dz), @intCast(cw), @intCast(ch), 1);
     } else if (!j.src.is_depth and !j.dst.is_depth) {
         gl.glBindFramebuffer(0x8CA8, g_copy_fbo_read);
         gl.glFramebufferTexture2D(0x8CA8, 0x8CE0, 0x0DE1, j.src.gl_id, @intCast(smip));
         gl.glBindFramebuffer(0x8CA9, g_copy_fbo_draw);
         gl.glFramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, j.dst.gl_id, @intCast(dmip));
-        gl.glBlitFramebuffer(@intCast(sx), @intCast(sy), @intCast(sx + cw), @intCast(sy + ch),
-            @intCast(j.dx), @intCast(j.dy), @intCast(j.dx + cw), @intCast(j.dy + ch), 0x4000, 0x2600);
+        gl.glBlitFramebuffer(@intCast(sx), @intCast(sy), @intCast(sx + cw), @intCast(sy + ch), @intCast(j.dx), @intCast(j.dy), @intCast(j.dx + cw), @intCast(j.dy + ch), 0x4000, 0x2600);
         gl.glBindFramebuffer(0x8CA8, 0);
+        gl.glDisable(0x8DB9); // GL_FRAMEBUFFER_SRGB
         gl.glBindFramebuffer(0x8CA9, 0);
+    }
+}
+
+fn copyAllTexJob(raw: ?*anyopaque) void {
+    const j: *CopyJob = @ptrCast(@alignCast(raw.?));
+    const nmips = @min(@max(1, j.src.mip_levels), @max(1, j.dst.mip_levels));
+    const s_layers: u32 = if (j.src.target == 0x8513) 6 else @max(1, j.src.array_size);
+    const d_layers: u32 = if (j.dst.target == 0x8513) 6 else @max(1, j.dst.array_size);
+    const nlayers = @min(s_layers, d_layers);
+    if (nmips == 1 and nlayers == 1) {
+        copyTexJob(raw);
+        return;
+    }
+    const smips = @max(1, j.src.mip_levels);
+    const dmips = @max(1, j.dst.mip_levels);
+    for (0..nlayers) |sl| {
+        for (0..nmips) |m| {
+            var sub_job = j.*;
+            sub_job.src_sub = @intCast(sl * smips + m);
+            sub_job.dst_sub = @intCast(sl * dmips + m);
+            copyTexJob(&sub_job);
+        }
     }
 }
 
@@ -2103,18 +2430,32 @@ pub fn copyResource(dst_tex: ?*Texture, dst_buf: ?*Buffer, src_tex: ?*Texture, s
     }
     if (dst_tex != null and src_tex != null) {
         var j: CopyJob = .{
-            .dst = dst_tex.?, .dst_sub = 0, .dx = 0, .dy = 0, .dz = 0,
-            .src = src_tex.?, .src_sub = 0, .has_box = false, .bx = .{0} ** 6,
+            .dst = dst_tex.?,
+            .dst_sub = 0,
+            .dx = 0,
+            .dy = 0,
+            .dz = 0,
+            .src = src_tex.?,
+            .src_sub = 0,
+            .has_box = false,
+            .bx = .{0} ** 6,
         };
-        run(&copyTexJob, &j);
+        run(&copyAllTexJob, &j);
     }
 }
 
 pub fn copySubresourceRegion(dst_tex: ?*Texture, dst_sub: u32, dx: u32, dy: u32, dz: u32, src_tex: ?*Texture, src_sub: u32, has_box: bool, bx: [6]u32) void {
     if (dst_tex == null or src_tex == null) return;
     var j: CopyJob = .{
-        .dst = dst_tex.?, .dst_sub = dst_sub, .dx = dx, .dy = dy, .dz = dz,
-        .src = src_tex.?, .src_sub = src_sub, .has_box = has_box, .bx = bx,
+        .dst = dst_tex.?,
+        .dst_sub = dst_sub,
+        .dx = dx,
+        .dy = dy,
+        .dz = dz,
+        .src = src_tex.?,
+        .src_sub = src_sub,
+        .has_box = has_box,
+        .bx = bx,
     };
     run(&copyTexJob, &j);
 }
@@ -2166,6 +2507,11 @@ fn glPrimTopology(t: u32) GLenum {
         3 => 0x0003, // LINE_STRIP
         4 => 0x0004, // TRIANGLES
         5 => 0x0005, // TRIANGLE_STRIP
+        10 => 0x000A, // LINES_ADJACENCY
+        11 => 0x000B, // LINE_STRIP_ADJACENCY
+        12 => 0x000C, // TRIANGLES_ADJACENCY
+        13 => 0x000D, // TRIANGLE_STRIP_ADJACENCY
+        33...64 => 0x000E, // PATCHES; vertices = topology - 32
         else => 0x0004,
     };
 }
@@ -2173,7 +2519,10 @@ fn glPrimTopology(t: u32) GLenum {
 /// WINS_D3D11_TRACE_FRAME=N: also trace every draw of present #N (with
 /// WINS_D3D11_TRACE_DRAWS).
 fn traceFrame() bool {
-    const C = struct { var init = false; var n: ?u32 = null; };
+    const C = struct {
+        var init = false;
+        var n: ?u32 = null;
+    };
     if (!C.init) {
         C.init = true;
         if (getenv("WINS_D3D11_TRACE_FRAME")) |z| C.n = std.fmt.parseInt(u32, std.mem.span(z), 10) catch null;
@@ -2186,8 +2535,9 @@ fn bindTextureSlots(bindings: []const shader.TexBinding, srvs: *const [MAX_SRV]?
         const unit: GLuint = b.unit;
         gl.glActiveTexture(0x84C0 + unit);
         if (srvs[b.reg]) |rv| {
-            if (rv.tex) |t| {
-                gl.glBindTexture(t.target, t.gl_id);
+            if (rv.tex != null) {
+                const sv = getSrvTex(rv);
+                gl.glBindTexture(sv.target, sv.id);
             } else if (rv.buf != null and b.dim == .buf) {
                 gl.glBindTexture(0x8C2A, bufferTexture(rv)); // GL_TEXTURE_BUFFER
             } else {
@@ -2301,7 +2651,9 @@ fn bindSsbo(binding: GLuint, v: ?*View) void {
         gl.glBindBufferRange(GL_SSBO, binding, b.gl_id, @intCast(view.buf_off), @intCast(size));
     } else {
         // Unaligned first element: the shader would index from the buffer start.
-        const S = struct { var told = false; };
+        const S = struct {
+            var told = false;
+        };
         if (!S.told) {
             S.told = true;
             std.debug.print("[WINS:D3D11:GL] buffer view offset {d} not {d}-aligned: bound from 0\n", .{ view.buf_off, g_ssbo_align });
@@ -2343,7 +2695,10 @@ fn bindImageSlots(bindings: []const shader.ImgBinding, uavs: *const [shader.MAX_
         if (v.tex) |t| {
             const fmt: GLenum = if (ib.atomic) 0x8236 else imageFormat(dxgiToGlFormat(t.dxgi_fmt).internal);
             // 2D array, 3D, 1D array, cube, cube array bind every layer.
-            const layered: u8 = switch (t.target) { 0x8C1A, 0x806F, 0x8C18, 0x9009, 0x8513 => 1, else => 0 };
+            const layered: u8 = switch (t.target) {
+                0x8C1A, 0x806F, 0x8C18, 0x9009, 0x8513 => 1,
+                else => 0,
+            };
             gl.glBindImageTexture(ib.unit, t.gl_id, @intCast(v.first_mip), layered, 0, GL_READ_WRITE, fmt);
         } else if (v.buf != null) {
             const fmt: GLenum = if (ib.atomic) 0x8236 else bufferViewFormat(v.dxgi_fmt);
@@ -2456,10 +2811,22 @@ fn drawJob(raw: ?*anyopaque) void {
     const j: *DrawJob = @ptrCast(@alignCast(raw.?));
     const s = j.s;
     const vs = s.vs orelse return;
-    const lp = getOrLinkProgram(vs, s.ps);
+    const is_patch = s.topology >= 33 and s.topology <= 64;
+    const lp = getOrLinkProgram(vs, if (is_patch) s.hs else null, if (is_patch) s.ds else null, s.gs, s.ps);
     if (lp.prog == 0) return;
 
     const fb_dim = bindFramebufferForState(s);
+    var need_srgb = false;
+    for (0..@min(8, s.num_rtvs)) |i| {
+        if (s.rtv[i]) |rv| {
+            const fmt = if (rv.dxgi_fmt != 0) rv.dxgi_fmt else (if (rv.tex) |t| t.dxgi_fmt else 0);
+            if (isSrgbDxgi(fmt)) {
+                need_srgb = true;
+                break;
+            }
+        }
+    }
+    setCap(0x8DB9, need_srgb); // GL_FRAMEBUFFER_SRGB
     gl.glUseProgram(lp.prog);
 
     // Viewport (default to RT size if SetViewports wasn't called yet)
@@ -2491,12 +2858,14 @@ fn drawJob(raw: ?*anyopaque) void {
         } else {
             gl.glDisable(0x0C11);
         }
+        setCap(0x864F, !rs.depth_clip); // GL_DEPTH_CLAMP (DepthClipEnable == FALSE)
     } else {
         gl.glPolygonMode(0x0408, 0x1B02);
         gl.glEnable(0x0B44);
         gl.glCullFace(0x0405);
         gl.glFrontFace(0x0900);
         gl.glDisable(0x0C11);
+        gl.glDisable(0x864F); // GL_DEPTH_CLAMP
     }
 
     // Depth-Stencil
@@ -2559,14 +2928,47 @@ fn drawJob(raw: ?*anyopaque) void {
                 gl.glBindBufferBase(0x8A11, @intCast(16 + i), cb.gl_id);
             }
         }
+        if (s.gs != null) if (s.gs_cb[i]) |cb| {
+            const off = s.gs_cb_off[i] * 16;
+            const sz = if (s.gs_cb_sz[i] > 0) @min(cb.size -| off, s.gs_cb_sz[i] * 16) else (cb.size -| off);
+            if (off > 0 and sz > 0) {
+                gl.glBindBufferRange(0x8A11, @intCast(32 + i), cb.gl_id, @intCast(off), @intCast(sz));
+            } else {
+                gl.glBindBufferBase(0x8A11, @intCast(32 + i), cb.gl_id);
+            }
+        };
+        if (s.hs != null) if (s.hs_cb[i]) |cb| {
+            const off = s.hs_cb_off[i] * 16;
+            const sz = if (s.hs_cb_sz[i] > 0) @min(cb.size -| off, s.hs_cb_sz[i] * 16) else (cb.size -| off);
+            if (off > 0 and sz > 0) {
+                gl.glBindBufferRange(0x8A11, @intCast(48 + i), cb.gl_id, @intCast(off), @intCast(sz));
+            } else {
+                gl.glBindBufferBase(0x8A11, @intCast(48 + i), cb.gl_id);
+            }
+        };
+        if (s.ds != null) if (s.ds_cb[i]) |cb| {
+            const off = s.ds_cb_off[i] * 16;
+            const sz = if (s.ds_cb_sz[i] > 0) @min(cb.size -| off, s.ds_cb_sz[i] * 16) else (cb.size -| off);
+            if (off > 0 and sz > 0) {
+                gl.glBindBufferRange(0x8A11, @intCast(64 + i), cb.gl_id, @intCast(off), @intCast(sz));
+            } else {
+                gl.glBindBufferBase(0x8A11, @intCast(64 + i), cb.gl_id);
+            }
+        };
     }
 
     // Textures & Samplers
     bindTextureSlots(lp.ps_tex_bindings, &s.ps_srv, &s.ps_samp);
     bindTextureSlots(lp.vs_tex_bindings, &s.vs_srv, &s.vs_samp);
+    if (s.gs != null) bindTextureSlots(lp.gs_tex_bindings, &s.gs_srv, &s.gs_samp);
+    if (s.hs != null) bindTextureSlots(lp.hs_tex_bindings, &s.hs_srv, &s.hs_samp);
+    if (s.ds != null) bindTextureSlots(lp.ds_tex_bindings, &s.ds_srv, &s.ds_samp);
     // Raw/structured SRVs (UAVs in VS/PS are not bound yet: OMSetRenderTargetsAndUAVs)
     bindBufSlots(lp.ps_buf_bindings, &s.ps_srv, null);
     bindBufSlots(lp.vs_buf_bindings, &s.vs_srv, null);
+    if (s.gs != null) bindBufSlots(lp.gs_buf_bindings, &s.gs_srv, null);
+    if (s.hs != null) bindBufSlots(lp.hs_buf_bindings, &s.hs_srv, null);
+    if (s.ds != null) bindBufSlots(lp.ds_buf_bindings, &s.ds_srv, null);
 
     // Input Layout + Vertex Buffers on Default VAO
     var new_mask: u32 = 0;
@@ -2613,6 +3015,9 @@ fn drawJob(raw: ?*anyopaque) void {
     g_active_attribs = new_mask;
 
     // Index Buffer & Draw
+    if (s.topology >= 33 and s.topology <= 64) {
+        gl.glPatchParameteri(0x8E72, @intCast(s.topology - 32)); // GL_PATCH_VERTICES
+    }
     const mode = glPrimTopology(s.topology);
     if (j.kind == .arrays) {
         gl.glDrawArrays(mode, @intCast(j.start_vertex), @intCast(j.count));
@@ -2676,20 +3081,17 @@ fn drawJob(raw: ?*anyopaque) void {
         const ds_en: bool = if (s.depth_stencil) |d| d.depth_enable else true;
         const ds_fn: u32 = if (s.depth_stencil) |d| d.depth_func else 0x0201;
         std.debug.print("[WINS:D3D11:GL] draw#{d} f={d} k={} cnt={d} si={d} bv={d} sv={d} rt0={d}(sw={}) dsv={} vp={d}x{d}(nvp={d}) il={} vb0={d}(st={d},off={d}) ib={} cb=({d},{d}) srv0={d} prog={d} bl=({}/0x{x}) ds=({}/0x{x}) rs=(cull={},sc={}) ctrPx=({d},{d},{d},{d})\n", .{
-            g_draw_count, g_present_count, j.kind, j.count, j.start_index, j.base_vertex, j.start_vertex,
-            if (rt0) |r| r.gl_id else 0, if (rt0) |r| r.is_swapchain else false, s.dsv != null,
-            fb_dim.w, fb_dim.h, s.num_viewports, if (s.input_layout) |il| il.count else 0,
-            if (vb0) |v| v.gl_id else 0, s.vb_stride[0], s.vb_offset[0], s.ib != null,
-            if (cb_vs0) |c| c.size else 0, if (cb_ps0) |c| c.size else 0,
-            if (ps0) |p| p.gl_id else 0, lp.prog,
-            bl_en, bl_mask, ds_en, ds_fn, rs_cull, rs_sc, px[0], px[1], px[2], px[3],
+            g_draw_count,                g_present_count,                        j.kind,         j.count,      j.start_index,                 j.base_vertex,                 j.start_vertex,
+            if (rt0) |r| r.gl_id else 0, if (rt0) |r| r.is_swapchain else false, s.dsv != null,  fb_dim.w,     fb_dim.h,                      s.num_viewports,               if (s.input_layout) |il| il.count else 0,
+            if (vb0) |v| v.gl_id else 0, s.vb_stride[0],                         s.vb_offset[0], s.ib != null, if (cb_vs0) |c| c.size else 0, if (cb_ps0) |c| c.size else 0, if (ps0) |p| p.gl_id else 0,
+            lp.prog,                     bl_en,                                  bl_mask,        ds_en,        ds_fn,                         rs_cull,                       rs_sc,
+            px[0],                       px[1],                                  px[2],          px[3],
         });
         if (traceFrame()) if (s.blend) |bl| {
             const r0 = bl.rt[0];
             std.debug.print("    blend rt0 en={} src=0x{x}/0x{x} dst=0x{x}/0x{x} op=0x{x}/0x{x} mask=0x{x} factor=({d:.2},{d:.2},{d:.2},{d:.2}) indep={} rtfmt={d}\n", .{
-                r0.enable, r0.src_rgb, r0.src_a, r0.dst_rgb, r0.dst_a, r0.op_rgb, r0.op_a, r0.write_mask,
-                s.blend_factor[0], s.blend_factor[1], s.blend_factor[2], s.blend_factor[3], bl.independent,
-                if (rt0) |r| r.dxgi_fmt else 0,
+                r0.enable,         r0.src_rgb,        r0.src_a,          r0.dst_rgb,        r0.dst_a,       r0.op_rgb,                      r0.op_a, r0.write_mask,
+                s.blend_factor[0], s.blend_factor[1], s.blend_factor[2], s.blend_factor[3], bl.independent, if (rt0) |r| r.dxgi_fmt else 0,
             });
         };
         if (traceFrame() and s.dsv != null) {
@@ -2808,26 +3210,30 @@ fn drawJob(raw: ?*anyopaque) void {
 pub var g_skipped_stage_draws: u32 = 0;
 
 pub fn draw(s: *const DrawState, kind: DrawKind, count: u32, inst_count: u32, start_vertex: u32, start_index: u32, base_vertex: i32, start_instance: u32) void {
-    // Tessellation (patch-list topologies 33..64) and geometry shaders are not
-    // translated: the VS output is not clip-space geometry then, so drawing it
-    // as triangles only scribbles over the targets. Skip those draws.
-    if (s.topology >= 33 or s.gs_active) {
+    if (s.topology >= 33 and (s.topology > 64 or s.hs == null or s.ds == null)) {
         g_skipped_stage_draws += 1;
-        if (g_skipped_stage_draws == 1 or g_skipped_stage_draws % 10000 == 0)
-            std.debug.print("[WINS:D3D11:GL] {d} draws skipped (tessellation/GS not translated)\n", .{g_skipped_stage_draws});
+        if (g_skipped_stage_draws <= 5 or g_skipped_stage_draws % 10000 == 0)
+            std.debug.print("[WINS:D3D11:GL] {d} draws skipped (incomplete tessellation topo={d} count={d} inst={d} hs={} ds={})\n", .{
+                g_skipped_stage_draws, s.topology, count, inst_count, s.hs != null, s.ds != null,
+            });
         return;
     }
     g_draw_count += 1;
     var j: DrawJob = .{
-        .s = s, .kind = kind, .count = count, .inst_count = inst_count,
-        .start_vertex = start_vertex, .start_index = start_index,
-        .base_vertex = base_vertex, .start_instance = start_instance,
+        .s = s,
+        .kind = kind,
+        .count = count,
+        .inst_count = inst_count,
+        .start_vertex = start_vertex,
+        .start_index = start_index,
+        .base_vertex = base_vertex,
+        .start_instance = start_instance,
     };
     run(&drawJob, &j);
 }
 
 pub fn drawIndirect(s: *const DrawState, indexed: bool, buf: *Buffer, off: u32) void {
-    if (s.topology >= 33 or s.gs_active) {
+    if (s.topology >= 33 and (s.topology > 64 or s.hs == null or s.ds == null)) {
         g_skipped_stage_draws += 1;
         return;
     }
@@ -2925,6 +3331,7 @@ fn presentJob(raw: ?*anyopaque) void {
     const dst_w = @max(1, sz.w);
     const dst_h = @max(1, sz.h);
 
+    gl.glDisable(0x8DB9); // GL_FRAMEBUFFER_SRGB
     gl.glBindFramebuffer(0x8CA9, 0);
     // Flip Y cleanly because row 0 of D3D11 FBO texture is TOP whereas X11 default GL backbuffer row 0 is BOTTOM!
     gl.glBlitFramebuffer(0, 0, @intCast(t.width), @intCast(t.height), 0, @intCast(dst_h), @intCast(dst_w), 0, 0x4000, 0x2601);
