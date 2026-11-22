@@ -75,9 +75,10 @@ fn tessFactor(sysval: u32, semantic_index: u32) ?TessFactor {
 
 /// D3D11 SRV slots per stage (t0..t127). DS3 samples t31+ in some shaders.
 pub const MAX_TEX = 128;
-/// GL texture units are compacted per stage: PS 0-15, VS 16-31, GS 32-47,
-/// HS 48-63 and DS 64-79, so the whole program fits the portable 80-unit floor.
-pub const GL_UNITS = 16;
+/// GL texture units are compacted per stage: PS 0-31, VS 32-63, GS 64-95,
+/// HS 96-127 and DS 128-159. The target NVIDIA exposes 192 combined units and
+/// 32 per stage; all five stages fit without dropping DS3's texture-heavy PS.
+pub const GL_UNITS = 32;
 
 pub const TexDim = enum(u8) {
     none = 0,
@@ -2160,7 +2161,7 @@ fn translateInternal(
     for (0..MAX_TEX) |i| {
         if (tex_dims[i] != .none) {
             if (tex_regular[i] or !tex_shadow[i]) {
-                if (n_units >= GL_UNITS) return setErr("more than 16 textures in one stage");
+                if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
                 const unit = tex_base + n_units;
                 n_units += 1;
                 try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d};\n", .{
@@ -2171,7 +2172,7 @@ fn translateInternal(
                 try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
             }
             if (tex_shadow[i]) {
-                if (n_units >= GL_UNITS) return setErr("more than 16 textures in one stage");
+                if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
                 const unit = tex_base + n_units;
                 n_units += 1;
                 try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d}_sh;\n", .{
