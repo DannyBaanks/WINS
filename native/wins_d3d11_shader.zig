@@ -38,6 +38,7 @@ pub const TessInfo = struct {
     partitioning: TessPartitioning = .none,
     output_primitive: TessOutputPrimitive = .none,
     max_tess_factor: f32 = 64.0,
+    patch_location_base: u32 = 0,
 };
 
 /// GLSL resource prefixes stay unique across every linked stage.
@@ -74,9 +75,9 @@ fn tessFactor(sysval: u32, semantic_index: u32) ?TessFactor {
 
 /// D3D11 SRV slots per stage (t0..t127). DS3 samples t31+ in some shaders.
 pub const MAX_TEX = 128;
-/// GL texture units per stage: each declared t# gets the next unit (NVIDIA
-/// allows 32 samplers per stage), PS from 0, VS from GL_UNITS.
-pub const GL_UNITS = 32;
+/// GL texture units are compacted per stage: PS 0-15, VS 16-31, GS 32-47,
+/// HS 48-63 and DS 64-79, so the whole program fits the portable 80-unit floor.
+pub const GL_UNITS = 16;
 
 pub const TexDim = enum(u8) {
     none = 0,
@@ -133,6 +134,8 @@ pub const ImgBinding = struct {
     atomic: bool,
 };
 
+const ClipOutput = struct { reg: u32 = 0, comp: u8 = 0, index: u32 = 0 };
+
 pub const Translated = struct {
     glsl: [:0]u8,
     stage: Stage,
@@ -141,6 +144,7 @@ pub const Translated = struct {
     patch_inputs: []SigElem = &.{},
     patch_outputs: []SigElem = &.{},
     tess: TessInfo = .{},
+    clip_distance_count: u32 = 0,
     cb_mask: u16,
     tex_bindings: []TexBinding,
     buf_bindings: []BufBinding = &.{},
@@ -595,14 +599,19 @@ fn formatIndex(a: std.mem.Allocator, iv: IndexVal) ![]const u8 {
     return iv.expr;
 }
 
+fn formatInputArray(a: std.mem.Allocator, op: *const Operand) ![]const u8 {
+    if (op.index_dim < 2) return std.fmt.allocPrint(a, "vi{s}[0]", .{try formatIndex(a, op.indices[0])});
+    if (op.indices[1].kind == .expr) {
+        return std.fmt.allocPrint(a, "vi{s}[{s}]", .{ try formatIndex(a, op.indices[0]), try formatIndex(a, op.indices[1]) });
+    }
+    return std.fmt.allocPrint(a, "vi{s}[{s}]", .{ try formatIndex(a, op.indices[1]), try formatIndex(a, op.indices[0]) });
+}
+
 fn formatBaseVar(a: std.mem.Allocator, op: *const Operand, stage: Stage) ![]const u8 {
     return switch (op.op_type) {
         0 => std.fmt.allocPrint(a, "r[{s}]", .{try formatIndex(a, op.indices[0])}),
         1 => if (stage == .geometry or stage == .hull_control_point or stage == .hull_fork or stage == .hull_join or isDomainStage(stage))
-            (if (op.index_dim >= 2)
-                std.fmt.allocPrint(a, "vi{s}[{s}]", .{ try formatIndex(a, op.indices[1]), try formatIndex(a, op.indices[0]) })
-            else
-                std.fmt.allocPrint(a, "vi{s}[0]", .{try formatIndex(a, op.indices[0])}))
+            try formatInputArray(a, op)
         else
             std.fmt.allocPrint(a, "vi{s}", .{try formatIndex(a, op.indices[0])}),
         2 => switch (stage) {
@@ -625,7 +634,7 @@ fn formatBaseVar(a: std.mem.Allocator, op: *const Operand, stage: Stage) ![]cons
         22 => try a.dupe(u8, "vec4(uintBitsToFloat(uint(gl_InvocationID)), 0.0, 0.0, 0.0)"),
         23 => try a.dupe(u8, "vec4(uintBitsToFloat(hsForkID), 0.0, 0.0, 0.0)"),
         24 => try a.dupe(u8, "vec4(uintBitsToFloat(hsJoinID), 0.0, 0.0, 0.0)"),
-        25 => std.fmt.allocPrint(a, "vi{s}[{s}]", .{ try formatIndex(a, op.indices[1]), try formatIndex(a, op.indices[0]) }),
+        25 => try formatInputArray(a, op),
         26 => std.fmt.allocPrint(a, "vo{s}[{s}]", .{ try formatIndex(a, op.indices[1]), try formatIndex(a, op.indices[0]) }),
         27 => std.fmt.allocPrint(a, "pc[{s}]", .{try formatIndex(a, op.indices[0])}),
         28 => switch (stage) {
@@ -992,6 +1001,26 @@ fn flushHullPhase(
     body.* = .empty;
 }
 
+fn emitReturnOutputs(
+    a: std.mem.Allocator,
+    body: *std.ArrayList(u8),
+    stage: Stage,
+    sv_pos_out_reg: ?u32,
+    clip_outputs: [8]ClipOutput,
+    clip_distance_count: u32,
+) !void {
+    if (stage == .vertex or isDomainStage(stage)) {
+        if (sv_pos_out_reg) |reg| {
+            try appendFmt(body, a, "    gl_Position = vo{d};\n", .{reg});
+        }
+    }
+    if (isDomainStage(stage)) {
+        for (clip_outputs[0..clip_distance_count]) |clip| {
+            try appendFmt(body, a, "    gl_ClipDistance[{d}] = vo{d}.{c};\n", .{ clip.index, clip.reg, swzChar(clip.comp) });
+        }
+    }
+}
+
 pub fn parseInputSignature(gpa: std.mem.Allocator, dxbc: []const u8) ![]SigElem {
     if (dxbc.len < 32 or !std.mem.eql(u8, dxbc[0..4], "DXBC")) return error.Malformed;
     const nchunks = try readU32(dxbc, 28);
@@ -1139,13 +1168,15 @@ fn translateInternal(
     var gs_invocations: u32 = 1;
     var mem: Mem = .{};
     var local_size = [3]u32{ 1, 1, 1 };
-    var tess: TessInfo = if (program_stage == .domain) hs_tess else .{};
+    var tess = hs_tess;
     var hull_phases: std.ArrayList(HullPhaseBody) = .empty;
     var hull_phase_kind: HullPhaseKind = .decls;
     var hull_fork_index: u32 = 0;
     var hull_join_index: u32 = 0;
     var hull_instance_count: u32 = 1;
     var has_control_point_phase = false;
+    var clip_outputs = [_]ClipOutput{.{}} ** 8;
+    var clip_distance_count: u32 = 0;
 
     if (stage == .vertex or stage == .geometry or isDomainStage(stage)) {
         for (outputs) |o| {
@@ -1164,6 +1195,17 @@ fn translateInternal(
     } else {
         for (inputs) |in_e| {
             if (in_e.sysval == 1 or std.ascii.eqlIgnoreCase(in_e.name, "SV_Position")) sv_pos_in_reg = in_e.reg;
+        }
+    }
+    if (program_stage == .domain) {
+        for (outputs) |out_e| {
+            if (out_e.sysval != 6 and !std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) continue;
+            for (0..4) |component| {
+                if ((out_e.mask & (@as(u8, 1) << @intCast(component))) == 0) continue;
+                if (clip_distance_count >= clip_outputs.len) return setErr("more than 8 clip distances");
+                clip_outputs[clip_distance_count] = .{ .reg = out_e.reg, .comp = @intCast(component), .index = clip_distance_count };
+                clip_distance_count += 1;
+            }
         }
     }
 
@@ -1328,19 +1370,17 @@ fn translateInternal(
             },
             .nop => continue,
             .ret => {
-                if (stage == .vertex or isDomainStage(stage)) {
-                    if (sv_pos_out_reg) |r| {
-                        try appendFmt(&body, a, "    gl_Position = vo{d};\n", .{r});
-                    }
-                }
+                try emitReturnOutputs(a, &body, stage, sv_pos_out_reg, clip_outputs, clip_distance_count);
                 try body.appendSlice(a, "    return;\n");
             },
             .retc => {
                 const c0 = try decodeOperand(a, toks, &p);
                 const ce = try formatSrc(a, &c0, 1, .u, stage);
                 const cmp = if (bool_nz) "!= 0u" else "== 0u";
-                if ((stage == .vertex or isDomainStage(stage)) and sv_pos_out_reg != null) {
-                    try appendFmt(&body, a, "    if ({s} {s}) {{ gl_Position = vo{d}; return; }}\n", .{ ce, cmp, sv_pos_out_reg.? });
+                if ((stage == .vertex or isDomainStage(stage)) and (sv_pos_out_reg != null or clip_distance_count > 0)) {
+                    try appendFmt(&body, a, "    if ({s} {s}) {{\n", .{ ce, cmp });
+                    try emitReturnOutputs(a, &body, stage, sv_pos_out_reg, clip_outputs, clip_distance_count);
+                    try body.appendSlice(a, "        return;\n    }\n");
                 } else {
                     try appendFmt(&body, a, "    if ({s} {s}) return;\n", .{ ce, cmp });
                 }
@@ -2060,11 +2100,8 @@ fn translateInternal(
         };
         try flushHullPhase(a, &hull_phases, &body, hull_phase_kind, phase_index, hull_instance_count);
     }
-    // The first tessellation target is DS3's quad-based fog/sky/postprocess
-    // family. Other domains require their clip-distance coverage to be proven
-    // before drawing them instead of silently producing corrupt geometry.
-    if ((program_stage == .hull or program_stage == .domain) and tess.domain != .quad) {
-        return setErr("only quad tessellation is implemented");
+    if ((program_stage == .hull or program_stage == .domain) and tess.domain == .none) {
+        return setErr("missing tessellation domain");
     }
     var hdr: std.ArrayList(u8) = .empty;
     // Compute and SM5 memory (SSBOs, images) need GLSL 4.30; formatted image
@@ -2123,7 +2160,7 @@ fn translateInternal(
     for (0..MAX_TEX) |i| {
         if (tex_dims[i] != .none) {
             if (tex_regular[i] or !tex_shadow[i]) {
-                if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
+                if (n_units >= GL_UNITS) return setErr("more than 16 textures in one stage");
                 const unit = tex_base + n_units;
                 n_units += 1;
                 try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d};\n", .{
@@ -2134,7 +2171,7 @@ fn translateInternal(
                 try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
             }
             if (tex_shadow[i]) {
-                if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
+                if (n_units >= GL_UNITS) return setErr("more than 16 textures in one stage");
                 const unit = tex_base + n_units;
                 n_units += 1;
                 try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d}_sh;\n", .{
@@ -2233,7 +2270,13 @@ fn translateInternal(
             else => "ccw",
         };
         const point_mode: []const u8 = if (tess.output_primitive == .point) ", point_mode" else "";
-        try appendFmt(&hdr, a, "layout(quads, {s}, {s}{s}) in;\n", .{ spacing, winding, point_mode });
+        const domain_name: []const u8 = switch (tess.domain) {
+            .tri => "triangles",
+            .quad => "quads",
+            .isoline => "isolines",
+            else => return setErr("invalid tessellation domain"),
+        };
+        try appendFmt(&hdr, a, "layout({s}, {s}, {s}{s}) in;\n", .{ domain_name, spacing, winding, point_mode });
     }
 
     // A DXBC signature may pack several elements into one register (TEXCOORD0.xy +
@@ -2273,6 +2316,14 @@ fn translateInternal(
         for (inputs) |in_e| {
             if (in_e.reg >= 64) continue;
             if (!firstUseOfReg(&in_seen, in_e.reg)) continue;
+            if (in_e.sysval == 1 or std.ascii.eqlIgnoreCase(in_e.name, "SV_Position")) {
+                // Position is a built-in per-vertex interface in GLSL, not a
+                // user varying. DS writes it to gl_Position, so GS must read
+                // gl_in[].gl_Position rather than a nonexistent location.
+                try appendFmt(&hdr, a, "vec4 vi{d}[32];\n", .{in_e.reg});
+                try appendFmt(&sv_init, a, "    for (int gs_cp = 0; gs_cp < gl_in.length(); ++gs_cp) vi{d}[gs_cp] = gl_in[gs_cp].gl_Position;\n", .{in_e.reg});
+                continue;
+            }
             var loc: u32 = in_e.reg;
             if (vs_outputs) |vouts| {
                 for (vouts) |vo| {
@@ -2309,15 +2360,17 @@ fn translateInternal(
             if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
             try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d}[{d}];\n", .{ out_e.reg, out_e.reg, tess.output_control_points });
         }
+        var patch_location_base: u32 = 0;
+        for (outputs) |out_e| {
+            if (out_e.reg < 64) patch_location_base = @max(patch_location_base, out_e.reg + 2);
+        }
+        tess.patch_location_base = @max(tess.patch_location_base, patch_location_base);
         var patch_count: u32 = 0;
         for (patch_outputs) |out_e| {
             if (out_e.reg >= 64) continue;
-            if (tessFactor(out_e.sysval, out_e.index) == null) {
-                return setErr("user patch constants are not implemented for quads");
-            }
             patch_count = @max(patch_count, out_e.reg + 1);
         }
-        if (patch_count > 0) try appendFmt(&hdr, a, "vec4 pc[{d}];\n", .{patch_count});
+        if (patch_count > 0) try appendFmt(&hdr, a, "layout(location = {d}) patch out vec4 pc[{d}];\n", .{ patch_location_base, patch_count });
     } else if (program_stage == .domain) {
         for (inputs) |in_e| {
             if (in_e.reg >= 64) continue;
@@ -2335,26 +2388,33 @@ fn translateInternal(
         }
         for (outputs) |out_e| {
             if (out_e.reg >= 64) continue;
+            if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
             if (out_e.sysval == 1 or std.ascii.eqlIgnoreCase(out_e.name, "SV_Position")) {
                 // Clip-space position is copied to gl_Position on return; it is
                 // not an ordinary varying but its DXBC output register exists.
                 try appendFmt(&hdr, a, "vec4 vo{d};\n", .{out_e.reg});
                 continue;
             }
-            if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
+            if (out_e.sysval == 6 or std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) {
+                try appendFmt(&hdr, a, "vec4 vo{d};\n", .{out_e.reg});
+                continue;
+            }
             try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
+        }
+        if (clip_distance_count > 0) {
+            try appendFmt(&hdr, a, "out float gl_ClipDistance[{d}];\n", .{clip_distance_count});
+        }
+        for (inputs) |in_e| {
+            if (in_e.reg < 64) tess.patch_location_base = @max(tess.patch_location_base, in_e.reg + 2);
         }
         var patch_count: u32 = 0;
         for (patch_inputs) |in_e| {
             if (in_e.reg >= 64) continue;
-            const factor = tessFactor(in_e.sysval, in_e.index) orelse {
-                return setErr("user patch constants are not implemented for quads");
-            };
-            const array_name: []const u8 = if (factor.inner) "gl_TessLevelInner" else "gl_TessLevelOuter";
             patch_count = @max(patch_count, in_e.reg + 1);
-            try appendFmt(&sv_init, a, "    pc[{d}] = vec4({s}[{d}], 0.0, 0.0, 0.0);\n", .{ in_e.reg, array_name, factor.index });
+            // The HS writes tess factors into pc[] as patch outputs. Do not
+            // initialize them here: patch inputs are read-only in GLSL.
         }
-        if (patch_count > 0) try appendFmt(&hdr, a, "vec4 pc[{d}];\n", .{patch_count});
+        if (patch_count > 0) try appendFmt(&hdr, a, "layout(location = {d}) patch in vec4 pc[{d}];\n", .{ tess.patch_location_base, patch_count });
     } else {
         for (inputs) |in_e| {
             if (!firstUseOfReg(&in_seen, in_e.reg)) continue;
@@ -2402,9 +2462,13 @@ fn translateInternal(
             try hdr.appendSlice(a, "    vec4 dummyNull;\n    float oDepth;\n");
             var phase_epilogue: std.ArrayList(u8) = .empty;
             if (phase.kind == .fork or phase.kind == .join) {
+                var fork_phase_total: u32 = 0;
+                for (hull_phases.items) |other| {
+                    if (other.kind == .fork or other.kind == .join) fork_phase_total += 1;
+                }
                 for (patch_outputs) |out_e| {
                     if (tessFactor(out_e.sysval, out_e.index)) |factor| {
-                        if (hull_phases.items.len > 1) {
+                        if (fork_phase_total > 1) {
                             if (phase.index == 0 and factor.inner) continue;
                             if (phase.index > 0 and !factor.inner) continue;
                         }
@@ -2414,10 +2478,10 @@ fn translateInternal(
                 }
             }
             if (phase_epilogue.items.len != 0) {
-                const replacement = try std.fmt.allocPrint(a, "{s}    return;\n", .{phase_epilogue.items});
-                const phase_source = try std.mem.replaceOwned(u8, a, phase.body.items, "    return;\n", replacement);
+                const replacement = try std.fmt.allocPrint(a, "{s}return;", .{phase_epilogue.items});
+                const phase_source = try std.mem.replaceOwned(u8, a, phase.body.items, "return;", replacement);
                 try hdr.appendSlice(a, phase_source);
-                if (std.mem.indexOf(u8, phase.body.items, "    return;\n") == null) {
+                if (std.mem.indexOf(u8, phase.body.items, "return;") == null) {
                     try hdr.appendSlice(a, phase_epilogue.items);
                 }
             } else {
@@ -2488,6 +2552,7 @@ fn translateInternal(
         .patch_inputs = patch_inputs,
         .patch_outputs = patch_outputs,
         .tess = tess,
+        .clip_distance_count = clip_distance_count,
         .cb_mask = cb_mask,
         .tex_bindings = try tlist.toOwnedSlice(gpa),
         .buf_bindings = try blist.toOwnedSlice(gpa),
@@ -2605,7 +2670,7 @@ fn tessDxbc(buf: []u8, program_type: u32, tokens: []const u32) []const u8 {
     return buf[0 .. 44 + tokens.len * 4];
 }
 
-test "quad domain emits tess coordinates and rejects other domains explicitly" {
+test "quad and triangle domains emit their tess coordinates" {
     const version_ds: u32 = (4 << 16) | 0x50;
     const tokens = [_]u32{
         version_ds,
@@ -2631,7 +2696,10 @@ test "quad domain emits tess coordinates and rejects other domains explicitly" {
 
     var tri_tokens = tokens;
     tri_tokens[2] = (1 << 24) | 149 | (2 << 11);
-    try std.testing.expectError(error.Unsupported, translate(std.testing.allocator, tessDxbc(&buf, 4, &tri_tokens)));
+    var tri = try translate(std.testing.allocator, tessDxbc(&buf, 4, &tri_tokens));
+    defer tri.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, tri.glsl, "layout(triangles, equal_spacing, ccw) in;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tri.glsl, "vec4(gl_TessCoord, 0.0)") != null);
 }
 
 test "hull phases keep independent names counts and uniform barriers" {
@@ -2665,4 +2733,19 @@ test "hull phases keep independent names counts and uniform barriers" {
     try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "if (gl_InvocationID == 0) {\n        for") != null);
     try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "    }\n    barrier();") != null);
     try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "min(gl_TessLevelOuter[0], 3.00000000)") != null);
+}
+
+test "tess factors keep domain-specific outer and inner slots" {
+    const quad_outer = tessFactor(11, 2).?;
+    try std.testing.expect(!quad_outer.inner and quad_outer.index == 2);
+    const quad_inner = tessFactor(12, 1).?;
+    try std.testing.expect(quad_inner.inner and quad_inner.index == 1);
+    const tri_outer = tessFactor(13, 3).?;
+    try std.testing.expect(!tri_outer.inner and tri_outer.index == 3);
+    const tri_inner = tessFactor(14, 0).?;
+    try std.testing.expect(tri_inner.inner and tri_inner.index == 0);
+    const line_detail = tessFactor(15, 0).?;
+    const line_density = tessFactor(16, 0).?;
+    try std.testing.expect(!line_detail.inner and line_detail.index == 0);
+    try std.testing.expect(!line_density.inner and line_density.index == 1);
 }

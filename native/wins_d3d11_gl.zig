@@ -883,6 +883,7 @@ const ProgKey = struct {
 
 const LinkedProg = struct {
     prog: GLuint = 0,
+    clip_distance_count: u32 = 0,
     ps_tex_bindings: []const shader.TexBinding = &.{},
     vs_tex_bindings: []const shader.TexBinding = &.{},
     hs_tex_bindings: []const shader.TexBinding = &.{},
@@ -990,7 +991,20 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
     defer if (td_opt) |*td| td.deinit(alloc);
     var prev_outputs: []const shader.SigElem = tv.outputs;
     if (hs) |h| {
-        const th = shader.translateWithVaryings(alloc, h.bytecode, tv.outputs) catch |e| {
+        const d = ds orelse {
+            std.debug.print("[WINS:D3D11:GL] patch program has HS but no DS\n", .{});
+            return .{};
+        };
+        var hs_link_tess: shader.TessInfo = .{};
+        const ds_inputs = shader.parseInputSignature(alloc, d.bytecode) catch |e| {
+            std.debug.print("[WINS:D3D11:GL] DS input signature err={s}\n", .{@errorName(e)});
+            return .{};
+        };
+        defer if (ds_inputs.len > 0) alloc.free(ds_inputs);
+        for (ds_inputs) |in_e| {
+            if (in_e.reg < 64) hs_link_tess.patch_location_base = @max(hs_link_tess.patch_location_base, in_e.reg + 2);
+        }
+        const th = shader.translateTessellation(alloc, h.bytecode, tv.outputs, &.{}, hs_link_tess) catch |e| {
             std.debug.print("[WINS:D3D11:GL] HS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
             return .{};
         };
@@ -1000,10 +1014,6 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
         prev_outputs = th.outputs;
         th_opt = th;
         if (gl_hs == 0) return .{};
-        const d = ds orelse {
-            std.debug.print("[WINS:D3D11:GL] patch program has HS but no DS\n", .{});
-            return .{};
-        };
         const td = shader.translateTessellation(alloc, d.bytecode, th.outputs, th.patch_outputs, th.tess) catch |e| {
             std.debug.print("[WINS:D3D11:GL] DS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
             return .{};
@@ -1101,6 +1111,7 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
     const vs_buf = alloc.dupe(shader.BufBinding, tv.buf_bindings) catch &.{};
     const res: LinkedProg = .{
         .prog = prog,
+        .clip_distance_count = if (td_opt) |td| td.clip_distance_count else 0,
         .ps_tex_bindings = ps_tex,
         .vs_tex_bindings = vs_tex,
         .hs_tex_bindings = hs_tex,
@@ -2828,6 +2839,9 @@ fn drawJob(raw: ?*anyopaque) void {
     }
     setCap(0x8DB9, need_srgb); // GL_FRAMEBUFFER_SRGB
     gl.glUseProgram(lp.prog);
+    for (0..8) |clip_index| {
+        setCap(@intCast(0x3000 + clip_index), clip_index < lp.clip_distance_count); // GL_CLIP_DISTANCE0..7
+    }
 
     // Viewport (default to RT size if SetViewports wasn't called yet)
     if (s.num_viewports > 0) {
