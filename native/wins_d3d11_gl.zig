@@ -1111,7 +1111,7 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
     const vs_buf = alloc.dupe(shader.BufBinding, tv.buf_bindings) catch &.{};
     const res: LinkedProg = .{
         .prog = prog,
-        .clip_distance_count = if (td_opt) |td| td.clip_distance_count else 0,
+        .clip_distance_count = if (td_opt) |td| td.clip_distance_count else tv.clip_distance_count,
         .ps_tex_bindings = ps_tex,
         .vs_tex_bindings = vs_tex,
         .hs_tex_bindings = hs_tex,
@@ -2532,13 +2532,27 @@ fn glPrimTopology(t: u32) GLenum {
 fn traceFrame() bool {
     const C = struct {
         var init = false;
-        var n: ?u32 = null;
+        var enabled = false;
     };
     if (!C.init) {
         C.init = true;
-        if (getenv("WINS_D3D11_TRACE_FRAME")) |z| C.n = std.fmt.parseInt(u32, std.mem.span(z), 10) catch null;
+        C.enabled = getenv("WINS_D3D11_TRACE_FRAME") != null;
     }
-    return if (C.n) |n| g_present_count == n else false;
+    if (!C.enabled) return false;
+    const z = getenv("WINS_D3D11_TRACE_FRAME") orelse return false;
+    var frames = std.mem.tokenizeScalar(u8, std.mem.span(z), ',');
+    while (frames.next()) |frame| {
+        const n = std.fmt.parseInt(u32, frame, 10) catch continue;
+        if (n == g_present_count) return true;
+    }
+    return false;
+}
+
+fn unbindTextureTargets() void {
+    // Clear every target D3D can bind. Clearing only GL_TEXTURE_2D leaves a
+    // previous cube/array/3D/buffer texture visible to the next program.
+    const targets = [_]GLenum{ 0x0DE1, 0x806F, 0x8513, 0x8C1A, 0x8C18, 0x9009, 0x8C2A, 0x9100 };
+    for (targets) |target| gl.glBindTexture(target, 0);
 }
 
 fn bindTextureSlots(bindings: []const shader.TexBinding, srvs: *const [MAX_SRV]?*View, samps: *const [16]?*Sampler) void {
@@ -2552,10 +2566,10 @@ fn bindTextureSlots(bindings: []const shader.TexBinding, srvs: *const [MAX_SRV]?
             } else if (rv.buf != null and b.dim == .buf) {
                 gl.glBindTexture(0x8C2A, bufferTexture(rv)); // GL_TEXTURE_BUFFER
             } else {
-                gl.glBindTexture(0x0DE1, 0);
+                unbindTextureTargets();
             }
         } else {
-            gl.glBindTexture(0x0DE1, 0);
+            unbindTextureTargets();
         }
         const sid: GLuint = if (samps[b.samp]) |smp| smp.gl_id else 0;
         gl.glBindSampler(unit, sid);
@@ -2932,6 +2946,8 @@ fn drawJob(raw: ?*anyopaque) void {
             } else {
                 gl.glBindBufferBase(0x8A11, @intCast(i), cb.gl_id);
             }
+        } else {
+            gl.glBindBufferBase(0x8A11, @intCast(i), zeroBuffer());
         }
         if (s.ps_cb[i]) |cb| {
             const off = s.ps_cb_off[i] * 16;
@@ -2941,34 +2957,48 @@ fn drawJob(raw: ?*anyopaque) void {
             } else {
                 gl.glBindBufferBase(0x8A11, @intCast(16 + i), cb.gl_id);
             }
+        } else {
+            gl.glBindBufferBase(0x8A11, @intCast(16 + i), zeroBuffer());
         }
-        if (s.gs != null) if (s.gs_cb[i]) |cb| {
-            const off = s.gs_cb_off[i] * 16;
-            const sz = if (s.gs_cb_sz[i] > 0) @min(cb.size -| off, s.gs_cb_sz[i] * 16) else (cb.size -| off);
-            if (off > 0 and sz > 0) {
-                gl.glBindBufferRange(0x8A11, @intCast(32 + i), cb.gl_id, @intCast(off), @intCast(sz));
+        if (s.gs != null) {
+            if (s.gs_cb[i]) |cb| {
+                const off = s.gs_cb_off[i] * 16;
+                const sz = if (s.gs_cb_sz[i] > 0) @min(cb.size -| off, s.gs_cb_sz[i] * 16) else (cb.size -| off);
+                if (off > 0 and sz > 0) {
+                    gl.glBindBufferRange(0x8A11, @intCast(32 + i), cb.gl_id, @intCast(off), @intCast(sz));
+                } else {
+                    gl.glBindBufferBase(0x8A11, @intCast(32 + i), cb.gl_id);
+                }
             } else {
-                gl.glBindBufferBase(0x8A11, @intCast(32 + i), cb.gl_id);
+                gl.glBindBufferBase(0x8A11, @intCast(32 + i), zeroBuffer());
             }
-        };
-        if (s.hs != null) if (s.hs_cb[i]) |cb| {
-            const off = s.hs_cb_off[i] * 16;
-            const sz = if (s.hs_cb_sz[i] > 0) @min(cb.size -| off, s.hs_cb_sz[i] * 16) else (cb.size -| off);
-            if (off > 0 and sz > 0) {
-                gl.glBindBufferRange(0x8A11, @intCast(48 + i), cb.gl_id, @intCast(off), @intCast(sz));
+        }
+        if (s.hs != null) {
+            if (s.hs_cb[i]) |cb| {
+                const off = s.hs_cb_off[i] * 16;
+                const sz = if (s.hs_cb_sz[i] > 0) @min(cb.size -| off, s.hs_cb_sz[i] * 16) else (cb.size -| off);
+                if (off > 0 and sz > 0) {
+                    gl.glBindBufferRange(0x8A11, @intCast(48 + i), cb.gl_id, @intCast(off), @intCast(sz));
+                } else {
+                    gl.glBindBufferBase(0x8A11, @intCast(48 + i), cb.gl_id);
+                }
             } else {
-                gl.glBindBufferBase(0x8A11, @intCast(48 + i), cb.gl_id);
+                gl.glBindBufferBase(0x8A11, @intCast(48 + i), zeroBuffer());
             }
-        };
-        if (s.ds != null) if (s.ds_cb[i]) |cb| {
-            const off = s.ds_cb_off[i] * 16;
-            const sz = if (s.ds_cb_sz[i] > 0) @min(cb.size -| off, s.ds_cb_sz[i] * 16) else (cb.size -| off);
-            if (off > 0 and sz > 0) {
-                gl.glBindBufferRange(0x8A11, @intCast(64 + i), cb.gl_id, @intCast(off), @intCast(sz));
+        }
+        if (s.ds != null) {
+            if (s.ds_cb[i]) |cb| {
+                const off = s.ds_cb_off[i] * 16;
+                const sz = if (s.ds_cb_sz[i] > 0) @min(cb.size -| off, s.ds_cb_sz[i] * 16) else (cb.size -| off);
+                if (off > 0 and sz > 0) {
+                    gl.glBindBufferRange(0x8A11, @intCast(64 + i), cb.gl_id, @intCast(off), @intCast(sz));
+                } else {
+                    gl.glBindBufferBase(0x8A11, @intCast(64 + i), cb.gl_id);
+                }
             } else {
-                gl.glBindBufferBase(0x8A11, @intCast(64 + i), cb.gl_id);
+                gl.glBindBufferBase(0x8A11, @intCast(64 + i), zeroBuffer());
             }
-        };
+        }
     }
 
     // Textures & Samplers

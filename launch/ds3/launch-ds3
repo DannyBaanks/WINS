@@ -280,6 +280,13 @@ if [[ -n "$CAPTURE_DIR" ]]; then
 else
     BWRAP_ARGS+=(--unsetenv WINS_D3D11_CAPTURE)
 fi
+# Optional draw diagnostics, disabled unless explicitly requested by the user.
+if [[ -n "${WINS_D3D11_TRACE_DRAWS:-}" ]]; then
+    BWRAP_ARGS+=(--setenv WINS_D3D11_TRACE_DRAWS "$WINS_D3D11_TRACE_DRAWS")
+fi
+if [[ -n "${WINS_D3D11_TRACE_FRAME:-}" ]]; then
+    BWRAP_ARGS+=(--setenv WINS_D3D11_TRACE_FRAME "$WINS_D3D11_TRACE_FRAME")
+fi
 if [[ -d /dev/dri ]]; then
     BWRAP_ARGS+=(--dev-bind-try /dev/dri /dev/dri)
 fi

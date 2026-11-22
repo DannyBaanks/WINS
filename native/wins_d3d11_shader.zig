@@ -639,7 +639,7 @@ fn formatBaseVar(a: std.mem.Allocator, op: *const Operand, stage: Stage) ![]cons
         27 => std.fmt.allocPrint(a, "pc[{s}]", .{try formatIndex(a, op.indices[0])}),
         28 => switch (stage) {
             .domain_tri => try a.dupe(u8, "vec4(gl_TessCoord, 0.0)"),
-            .domain_isoline => try a.dupe(u8, "vec4(gl_TessCoord.y, gl_TessCoord.x, 0.0, 0.0)"),
+            .domain_isoline => try a.dupe(u8, "vec4(gl_TessCoord.x, 0.0, 0.0, 0.0)"),
             else => try a.dupe(u8, "vec4(gl_TessCoord.xy, 0.0, 0.0)"),
         },
         35 => try a.dupe(u8, "vec4(uintBitsToFloat(uint(gl_SampleMaskIn[0])), 0.0, 0.0, 0.0)"),
@@ -1014,7 +1014,7 @@ fn emitReturnOutputs(
             try appendFmt(body, a, "    gl_Position = vo{d};\n", .{reg});
         }
     }
-    if (isDomainStage(stage)) {
+    if (stage == .vertex or isDomainStage(stage)) {
         for (clip_outputs[0..clip_distance_count]) |clip| {
             try appendFmt(body, a, "    gl_ClipDistance[{d}] = vo{d}.{c};\n", .{ clip.index, clip.reg, swzChar(clip.comp) });
         }
@@ -1197,7 +1197,7 @@ fn translateInternal(
             if (in_e.sysval == 1 or std.ascii.eqlIgnoreCase(in_e.name, "SV_Position")) sv_pos_in_reg = in_e.reg;
         }
     }
-    if (program_stage == .domain) {
+    if (program_stage == .domain or program_stage == .vertex) {
         for (outputs) |out_e| {
             if (out_e.sysval != 6 and !std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) continue;
             for (0..4) |component| {
@@ -2310,7 +2310,14 @@ fn translateInternal(
             // SV_Depth / SV_Coverage have no register (0xFFFFFFFF): oDepth -> gl_FragDepth.
             if (out_e.reg >= 64) continue;
             if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
+            if (out_e.sysval == 6 or std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) {
+                try appendFmt(&hdr, a, "vec4 vo{d};\n", .{out_e.reg});
+                continue;
+            }
             try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
+        }
+        if (clip_distance_count > 0) {
+            try appendFmt(&hdr, a, "out float gl_ClipDistance[{d}];\n", .{clip_distance_count});
         }
     } else if (stage == .geometry) {
         for (inputs) |in_e| {
