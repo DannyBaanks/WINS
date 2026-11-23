@@ -21,6 +21,7 @@ WORK="$(mktemp -d /tmp/wins-gate.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
 fail=0
+unproven=0
 note() { printf '  %s\n' "$1"; }
 
 echo "== G1: no public source references the probe directory"
@@ -90,34 +91,55 @@ else
 fi
 
 echo "== G4: a clean build resolves what it implements, and claims nothing more"
-out="$(cd "$WORK" && "$WORK/winrun32" --check \
-        "$HOME/.local/share/Steam/steamapps/common/Fallout New Vegas/FalloutNV.exe" 2>&1)"
-if printf '%s' "$out" | grep -q 'Check PASSED'; then
-    note "ok: every import of the Steam exe resolves, DSOUND ordinal 11 included"
-else
-    note "FAIL: the clean build leaves imports unresolved"
-    printf '%s\n' "$out" | grep 'UNRESOLVED' | head -5
-    fail=1
+# The canary is a maximal, real import surface (dsound imports by ordinal,
+# the actual i386 vorbis bridge, xinput, ...): it must be a real, unmodified
+# image. The installed game is gone (uninstalled to free disk). Resolve the
+# canary from an override, the install, or the 4GB patcher's pre-patch
+# original kept beside it -- the pristine image the patcher left behind is
+# the same import surface. No canary means the gate cannot adjudicate: say
+# UNPROVEN, do not pretend the checks ran, and do not dress env rot up as a
+# product failure.
+canary="${WINS_GATE_EXE:-}"
+if [ -z "$canary" ]; then
+    canary="$HOME/.local/share/Steam/steamapps/common/Fallout New Vegas/FalloutNV.exe"
+    if [ ! -f "$canary" ]; then
+        canary="$(ls -t "$HOME/.local/share/Steam/steamapps/common/Fallout New Vegas/"FalloutNV.exe.pre-4gb-* 2>/dev/null | head -n1)"
+    fi
 fi
-# What is implemented, and what the artifact is not allowed to claim.
-#
-# libvorbisfile is bridged to the REAL i386 library, so it is resolved.
-# DirectSound is implemented (COM objects over memory-backed buffers) and so it
-# resolves too -- but the claim must be backed by code inside the shipped
-# binary, and the limitation that remains (no PCM reaches a device) must stay
-# written down. A mute device presented as a working one is the same failure
-# mode as the dummy Steam vtables the DRM rejected.
-if printf '%s' "$out" | grep -qi 'UNRESOLVED libvorbisfile'; then
-    note "FAIL: the vorbis bridge regressed; libvorbisfile is unresolved again"
-    fail=1
+out=""
+if [ -n "$canary" ] && [ -f "$canary" ]; then
+    note "canary image: $canary"
+    out="$(cd "$WORK" && "$WORK/winrun32" --check "$canary" 2>&1)"
+    if printf '%s' "$out" | grep -q 'Check PASSED'; then
+        note "ok: every import of the canary exe resolves, DSOUND ordinal 11 included"
+    else
+        note "FAIL: the clean build leaves imports unresolved"
+        printf '%s\n' "$out" | grep 'UNRESOLVED' | head -5
+        fail=1
+    fi
+    # What is implemented, and what the artifact is not allowed to claim.
+    #
+    # libvorbisfile is bridged to the REAL i386 library, so it is resolved.
+    # DirectSound is implemented (COM objects over memory-backed buffers) and so it
+    # resolves too -- but the claim must be backed by code inside the shipped
+    # binary, and the limitation that remains (no PCM reaches a device) must stay
+    # written down. A mute device presented as a working one is the same failure
+    # mode as the dummy Steam vtables the DRM rejected.
+    if printf '%s' "$out" | grep -qi 'UNRESOLVED libvorbisfile'; then
+        note "FAIL: the vorbis bridge regressed; libvorbisfile is unresolved again"
+        fail=1
+    else
+        note "ok: libvorbisfile resolves to the real i386 library"
+    fi
+    if printf '%s' "$out" | grep -qi 'UNRESOLVED DSOUND\|UNRESOLVED dsound'; then
+        note "FAIL: DirectSound regressed to unresolved"
+        fail=1
+    else
+        note "ok: DirectSound resolves"
+    fi
 else
-    note "ok: libvorbisfile resolves to the real i386 library"
-fi
-if printf '%s' "$out" | grep -qi 'UNRESOLVED DSOUND\|UNRESOLVED dsound'; then
-    note "FAIL: DirectSound regressed to unresolved"
-    fail=1
-else
-    note "ok: DirectSound resolves"
+    note "UNPROVEN: no canary image (set WINS_GATE_EXE, install the game, or keep a pre-4gb backup)"
+    unproven=1
 fi
 if grep -q 'wins_dsound\.DirectSoundCreate' "$WORK/nm.txt"; then
     note "ok: the wins_dsound implementation is linked (Create8 folds into Create; the ordinal proof is the PASS above)"
@@ -138,9 +160,13 @@ else
 fi
 
 echo
-if [[ $fail -eq 0 ]]; then
+if [[ $fail -eq 0 && $unproven -eq 0 ]]; then
     echo "SEPARATION GATE: PASSED - the published artifact does not depend on native/probe/"
     exit 0
+fi
+if [[ $fail -eq 0 && $unproven -eq 1 ]]; then
+    echo "SEPARATION GATE: UNPROVEN - no canary image; publication is not adjudicated (set WINS_GATE_EXE)"
+    exit 1
 fi
 echo "SEPARATION GATE: FAILED - the lab is still load-bearing; do not publish"
 exit 1
