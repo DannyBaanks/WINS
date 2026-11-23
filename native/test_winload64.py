@@ -54,7 +54,7 @@ class WinLoad64Tests(unittest.TestCase):
         zig('build-exe', '-target', 'x86_64-windows-gnu', '-O', 'ReleaseSmall', str(FIX / 'fixture_host.zig'),
             f'-femit-bin={cls.dlls / "fixture_host.exe"}', cwd=cls.work)
         for loader in ('winload64', 'winload64_bad_tls_index'):
-            zig('build-exe', str(ROOT / 'native' / f'{loader}.zig'), '-O', 'ReleaseSafe',
+            zig('build-exe', str(ROOT / 'native' / f'{loader}.zig'), '-O', 'ReleaseSafe', '-lc',
                 f'-femit-bin={cls.work / loader}', cwd=cls.work)
 
     @classmethod
