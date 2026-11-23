@@ -54,7 +54,7 @@ const X64 = [_][]const u8{"winrun"};
 pub const libraries = [_]Library{
     .{
         .name = "wins-kernel32",
-        .version = "0.1.3",
+        .version = "0.1.4",
         .dlls = &.{"kernel32.dll"},
         .loaders = &BOTH,
         .sources = &.{ "native/winrun32.zig", "native/winrun_kernel32.zig", "native/winrun_seh64.zig", "native/winrun_threads.zig" },
@@ -104,7 +104,7 @@ pub const libraries = [_]Library{
     },
     .{
         .name = "wins-msvcrt",
-        .version = "0.2.1",
+        .version = "0.3.0",
         .dlls = &.{ "msvcrt.dll", "ucrtbase.dll" },
         .loaders = &BOTH,
         .sources = &.{ "native/winrun_msvcrt.zig", "native/winrun32.zig" },
@@ -114,7 +114,7 @@ pub const libraries = [_]Library{
     },
     .{
         .name = "wins-user32",
-        .version = "0.2.0",
+        .version = "0.2.1",
         .dlls = &.{"user32.dll"},
         .loaders = &BOTH,
         .sources = &.{ "native/wins_user32.zig", "native/winrun_gui_support.zig", "native/winrun_extra_dlls.zig" },
@@ -124,7 +124,7 @@ pub const libraries = [_]Library{
     },
     .{
         .name = "wins-gdi32",
-        .version = "0.2.0",
+        .version = "0.2.1",
         .dlls = &.{"gdi32.dll"},
         .loaders = &BOTH,
         .sources = &.{ "native/winrun32.zig", "native/winrun_gui_support.zig", "native/winrun_gdi_fb.zig" },
@@ -294,7 +294,7 @@ pub const libraries = [_]Library{
     },
     .{
         .name = "wins-ws2-32",
-        .version = "0.1.0",
+        .version = "0.1.1",
         .dlls = &.{ "ws2_32.dll", "wsock32.dll" },
         .loaders = &BOTH,
         .sources = &.{"native/winrun_extra_dlls.zig"},
