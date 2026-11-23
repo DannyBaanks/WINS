@@ -1,0 +1,9 @@
+{"ts_ns": 64695841410442, "rel_us": 2668, "event": "START", "detail": "target=./fixtures/target_e_darwin_apis run_id=run_target_e"}
+{"ts_ns": 64695841705747, "rel_us": 2964, "event": "IMAGE_MAPPED", "detail": "base=0x737cd2b36000 slide=126975653142528 segs=5"}
+{"ts_ns": 64695841731315, "rel_us": 2989, "event": "ENTRYPOINT_RESOLVED", "detail": "entryoff=0x5d0 entry_address=0x737cd2b365d0"}
+{"ts_ns": 64695841812348, "rel_us": 3070, "event": "DYLIB_GRAPH_READY", "detail": "images=1 deps=1"}
+{"ts_ns": 64695842024006, "rel_us": 3282, "event": "FIXUPS_APPLIED", "detail": "images=1"}
+{"ts_ns": 64695842054413, "rel_us": 3312, "event": "IMPORTS_RESOLVED", "detail": "symbols=15"}
+{"ts_ns": 64695842115398, "rel_us": 3373, "event": "TRANSFER_CONTROL", "detail": "rip=0x737cd2b365d0 seccomp_trap=true"}
+{"ts_ns": 64695842139423, "rel_us": 3397, "event": "FIRST_EXTERNAL_CALL", "detail": "symbol=_mach_timebase_info"}
+{"ts_ns": 64695842209325, "rel_us": 3467, "event": "EXIT", "detail": "return_code=0"}

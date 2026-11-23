@@ -1,0 +1,9 @@
+{"ts_ns": 64687628938685, "rel_us": 2646, "event": "START", "detail": "target=./fixtures/target_d_boundary run_id=run_target_d_resolved"}
+{"ts_ns": 64687630076195, "rel_us": 3784, "event": "IMAGE_MAPPED", "detail": "base=0x7da08a58d000 slide=138124174348288 segs=5"}
+{"ts_ns": 64687630101913, "rel_us": 3810, "event": "ENTRYPOINT_RESOLVED", "detail": "entryoff=0x5d0 entry_address=0x7da08a58d5d0"}
+{"ts_ns": 64687630182084, "rel_us": 3890, "event": "DYLIB_GRAPH_READY", "detail": "images=1 deps=1"}
+{"ts_ns": 64687630348898, "rel_us": 4057, "event": "FIXUPS_APPLIED", "detail": "images=1"}
+{"ts_ns": 64687630378634, "rel_us": 4086, "event": "IMPORTS_RESOLVED", "detail": "symbols=3"}
+{"ts_ns": 64687630480706, "rel_us": 4188, "event": "TRANSFER_CONTROL", "detail": "rip=0x7da08a58d5d0 seccomp_trap=true"}
+{"ts_ns": 64687630505793, "rel_us": 4213, "event": "FIRST_EXTERNAL_CALL", "detail": "symbol=_mach_absolute_time"}
+{"ts_ns": 64687630550998, "rel_us": 4259, "event": "EXIT", "detail": "return_code=0"}

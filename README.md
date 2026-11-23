@@ -1,7 +1,11 @@
 # WINS — WINS Is Not a Sandbox
 
-> **Port Windows desktop apps to native Linux — no Wine, no VM, no emulated Windows.**
-> Look inside the installer, find out what the app really is, and re-host it as a normal Linux program.
+> **Port Windows (PE) and macOS (Mach-O) programs to native Linux — no Wine, no Darling, no VM.**
+> Look inside the binary, find out what it really needs, and re-host it as a normal Linux program.
+
+WINS now explores two native compatibility frontiers:
+1. **WINS-Windows (PE)** — unpacks Windows installers, re-hosts Electron/NW.js/.NET apps natively, and runs native Win32/Win64 PE binaries under its own Zig PE loaders (`winrun32` / `winrun_gui`).
+2. **WINS-MachO (Darwin / macOS)** — loads `x86_64` Mach-O executables and `.dylib`s directly on Linux in Zig ([`wins-macho/`](./wins-macho/)), translating Darwin ABI, `dyld` fixups, Objective-C runtime (`_objc_msgSend`), and BSD syscalls without a macOS VM or Darling.
 
 WINS takes a Windows installer or executable, works out what it is *made of*, and rebuilds it as something that
 runs on Linux by itself. In this project, **a "port" means exactly that: a program made for Windows that now runs on
@@ -305,6 +309,42 @@ re-applied at any time and is covered by the test suite.
 ```bash
 wins heal-bin <app-dir> --dry-run --json   # report only, machine readable
 ```
+
+---
+
+## WINS-MachO — macOS Mach-O Frontier (`wins-macho/`)
+
+An experimental, evidence-driven Mach-O 64-bit (`x86_64`) loader and Darwin ABI runtime written in **Zig 0.16.0** — no macOS VM, no Darling, no Apple SDKs or proprietary binaries in the repository.
+
+### Build & test
+
+```bash
+cd wins-macho
+zig build && zig build test
+./zig-out/bin/wins_macho [--inspect-only] [--run-id <id>] <macho_path> [args...]
+```
+
+### Architecture
+
+- **Mach-O Parser & Universal Slice Extractor** (`src/macho/`): fail-closed 64-bit Mach-O parser + `FAT_MAGIC` Universal Binary `x86_64` slice extraction, `LC_DYLD_INFO_ONLY` rebase/bind/lazy_bind opcodes, `LC_DYLD_EXPORTS_TRIE`, and `LC_DYLD_CHAINED_FIXUPS` (`DYLD_CHAINED_PTR_64` / `DYLD_CHAINED_PTR_64_OFFSET`).
+- **Memory Mapper & Entrypoint** (`src/loader/`): skips `__PAGEZERO`, reserves `PROT_NONE`, copies segments + zero-fill, restores strict `initprot` (`r-x` / `rw-` / `r--`, no global RWX), and transfers control to `LC_MAIN` using System V AMD64 ABI.
+- **Minimal `dyld`** (`src/dyld/`): dependency graph, `@executable_path` / `@loader_path` / `@rpath` expansion, flat/weak namespace lookup, and explicit `UNRESOLVED_SYMBOL` reporting.
+- **Darwin ABI & Kernel Trap Boundary** (`src/darwin/`, `src/runtime/`):
+  - `DarwinStat64` (144-byte `stat`/`lstat`/`fstat`) & `DarwinDirent64` (`opendir$INODE64`/`readdir$INODE64`) layout translation.
+  - `DarwinRuneLocale` (`__DefaultRuneLocale`, `___maskrune`, `___tolower`), `mach_absolute_time`, `mach_timebase_info`, `sysctlbyname`, `pthread_mutex_*`, `arc4random*`, `_NSGetExecutablePath`, `dlopen`/`dlsym`.
+  - Minimal Objective-C 2.0 runtime (`objc.zig`): parses `ObjcClass`/`ClassRoT`/`MethodListT` and dispatches `_objc_msgSend` via a naked `x86_64` tail-call dispatcher.
+  - `seccomp-bpf` (`SECCOMP_RET_TRAP` for `rax >= 0x1000000`) + `SIGSYS` handler translating Darwin BSD `SYS_write` (`0x2000004`) and logging `FIRST_UNSUPPORTED_KERNEL_BOUNDARY` on Mach traps (e.g. `0x100001a` `mach_reply_port`) into `evidence/<run-id>/crash.json`.
+
+### What is demonstrated vs not demonstrated
+
+| Target / Capability | Status | Observed Result |
+|---|---|---|
+| Adversarial parser & Universal `FAT_MAGIC` / Chained Fixups tests | **DEMONSTRATED** | `zig build test` passes (exit 0) |
+| Custom `x86_64` Mach-O (`target_a_nostdlib`, `target_b_main` + `@rpath/libhelper.dylib`, `target_c_cli`, `target_e_darwin_apis`) | **DEMONSTRATED** | Executes natively on Linux; `pthread_create`, `stat`, `sysctlbyname`, `mach_absolute_time`, `dlopen`/`dlsym` verified |
+| Objective-C 2.0 ARC Mach-O (`target_f_objc.m`) | **DEMONSTRATED** | `[Greeter add:10 to:5]`, `[Greeter alloc]`, `initWithFactor:3`, `[g scale:15]` -> `objc class=15 instance_scaled=45` (exit 45) |
+| Darwin BSD syscall vs Mach trap boundary (`target_c_syscall_probe`) | **DEMONSTRATED / BLOCKED** | `0x2000004` (`SYS_write`) executes; `0x100001a` (`mach_reply_port`) traps cleanly as `SIGSYS` (`crash.json`) |
+| Third-party macOS Sonoma CLI (`tree 2.3.2` from Homebrew, `LC_DYLD_CHAINED_FIXUPS`) | **PARTIAL (DEMONSTRATED / BLOCKED)** | `tree -L 2 /tmp/brew-probe` lists real Linux directories and exits `0`; `tree --version` hits `SIGSEGV` (`rdi=0x0` after `_strlen`) |
+| `Foundation` / `AppKit` / `libswiftCore` / `arm64` execution | **NOT_DEMONSTRATED** | `arm64` binaries are inspectable via `--inspect-only` and rejected for execution (`IncompatibleArchitecture`) |
 
 ---
 

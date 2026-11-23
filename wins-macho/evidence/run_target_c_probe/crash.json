@@ -1,0 +1,12 @@
+{
+  "signal": 31,
+  "si_addr": "0x76ce9ee52682",
+  "rip": "0x76ce9ee52682",
+  "rsp": "0x7ffffcb44460",
+  "rax": "0x100001a",
+  "rdi": "0x0",
+  "rsi": "0x0",
+  "rdx": "0x0",
+  "last_event": "SIGNAL",
+  "last_shim": "syscall:darwin_bsd_write(0x2000004)"
+}

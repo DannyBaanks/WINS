@@ -1,0 +1,9 @@
+{"ts_ns": 70393467009499, "rel_us": 2859, "event": "START", "detail": "target=/tmp/brew-probe/tree/2.3.2/bin/tree run_id=run_brew_tree_dir"}
+{"ts_ns": 70393467431334, "rel_us": 3281, "event": "IMAGE_MAPPED", "detail": "base=0x7fd301e14000 slide=140539951398912 segs=5"}
+{"ts_ns": 70393467457894, "rel_us": 3307, "event": "ENTRYPOINT_RESOLVED", "detail": "entryoff=0x5b64 entry_address=0x7fd301e19b64"}
+{"ts_ns": 70393467542734, "rel_us": 3392, "event": "DYLIB_GRAPH_READY", "detail": "images=1 deps=1"}
+{"ts_ns": 70393467838832, "rel_us": 3688, "event": "FIXUPS_APPLIED", "detail": "images=1"}
+{"ts_ns": 70393467870151, "rel_us": 3720, "event": "IMPORTS_RESOLVED", "detail": "symbols=63"}
+{"ts_ns": 70393468008442, "rel_us": 3858, "event": "TRANSFER_CONTROL", "detail": "rip=0x7fd301e19b64 seccomp_trap=true"}
+{"ts_ns": 70393468038919, "rel_us": 3888, "event": "FIRST_EXTERNAL_CALL", "detail": "symbol=_malloc"}
+{"ts_ns": 70393468234277, "rel_us": 4084, "event": "EXIT", "detail": "return_code=0"}

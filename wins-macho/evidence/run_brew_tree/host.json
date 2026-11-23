@@ -1,0 +1,6 @@
+{
+  "sysname": "Linux",
+  "machine": "x86_64",
+  "release": "7.0.0-43-generic",
+  "seccomp_darwin_trap_active": false
+}

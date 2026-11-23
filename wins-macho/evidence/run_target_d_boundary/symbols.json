@@ -1,0 +1,4 @@
+[
+  {"symbol": "dyld_stub_binder", "requested_by": "./fixtures/target_d_boundary", "provider": "/usr/lib/libSystem.B.dylib", "status": "STUB_FOR_PROBE_ONLY", "linux_equiv": "runtime:trap", "address": "0x1219b50"},
+  {"symbol": "_printf", "requested_by": "./fixtures/target_d_boundary", "provider": "/usr/lib/libSystem.B.dylib", "status": "NATIVE_MAPPING", "linux_equiv": "libc:printf", "address": "0x7873fa260100"}
+]

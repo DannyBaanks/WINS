@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+fixtures/*
+!fixtures/*.c
+!fixtures/*.m
+!fixtures/*.swift

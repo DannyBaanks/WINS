@@ -1,0 +1,5 @@
+[
+  {"requested": "@rpath/libhelper.dylib", "resolved": "./fixtures/libhelper.dylib", "kind": "LOCAL_MACHO"},
+  {"requested": "/usr/lib/libSystem.B.dylib", "resolved": "darwin-shim://libSystem.B.dylib", "kind": "DARWIN_SHIM"},
+  {"requested": "/usr/lib/libSystem.B.dylib", "resolved": "darwin-shim://libSystem.B.dylib", "kind": "DARWIN_SHIM"}
+]
