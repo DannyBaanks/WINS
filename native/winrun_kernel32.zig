@@ -2843,7 +2843,7 @@ fn GetModuleFileNameA(mod: usize, buf: ?[*]u8, sz: u32) callconv(W) u32 {
 
 fn GetProcessAffinityMask(proc: usize, proc_mask: ?*usize, sys_mask: ?*usize) callconv(W) u32 {
     _ = proc;
-    const m: usize = cpuMask(cpuCount());
+    const m: usize = @truncate(cpuMask(cpuCount()));
     if (proc_mask) |p| p.* = m;
     if (sys_mask) |s| s.* = m;
     return 1;

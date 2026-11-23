@@ -4,7 +4,7 @@
 > Look inside the binary, find out what it really needs, and re-host it as a normal Linux program.
 
 WINS now explores two native compatibility frontiers:
-1. **WINS-Windows (PE)** — unpacks Windows installers, re-hosts Electron/NW.js/.NET apps natively, and runs native Win32/Win64 PE binaries under its own Zig PE loaders (`winrun32` / `winrun_gui`).
+1. **WINS-Windows (PE)** — unpacks Windows installers, re-hosts Electron/NW.js/.NET apps natively, and runs native Win32/Win64 PE binaries under its own Zig PE loaders (`winrun32` for i386, `winrun64` for x86-64).
 2. **WINS-MachO (Darwin / macOS)** — loads `x86_64` Mach-O executables and `.dylib`s directly on Linux in Zig ([`wins-macho/`](./wins-macho/)), translating Darwin ABI, `dyld` fixups, Objective-C runtime (`_objc_msgSend`), and BSD syscalls without a macOS VM or Darling.
 
 WINS takes a Windows installer or executable, works out what it is *made of*, and rebuilds it as something that
@@ -13,11 +13,12 @@ Linux** (as a launcher + app folder, or as a single AppImage).
 
 Most "Windows-only" desktop software is not really Windows code. It is a web app in Electron, an NW.js game, a
 managed .NET program, or a Python bundle, wrapped in a Windows installer. For those, WINS peels the wrapper off and
-runs the real program on its native Linux runtime. For genuinely native Win32 code (C++ against `kernel32`, `user32`,
-Direct3D...) WINS does not pretend: it measures how far away a Linux version is, and either builds fuzz-verified Linux
-replacements for the Windows APIs the program calls, one function at a time, or, for 32-bit programs, runs the program
-itself under its own PE loaders (32-bit and 64-bit) that answer those APIs natively. Fallout: New Vegas (i386) and
-Cuphead (x86-64, Unity) are the worked examples of the second route.
+runs the real program on its native Linux runtime. For genuinely native Win32/Win64 code (C++ against `kernel32`,
+`user32`, Direct3D...) WINS does not pretend: it measures how far away a Linux version is, and either builds
+fuzz-verified Linux replacements for the Windows APIs the program calls, one function at a time, or runs the program
+itself under its own PE loaders (32-bit `winrun32` and 64-bit `winrun64`) that answer those APIs natively.
+**Fallout: New Vegas** (i386, Direct3D 9), **Cuphead** (x86-64, Unity / Direct3D 11), and **Dark Souls III**
+(x86-64, FromSoftware engine / Direct3D 11 SM5 + tessellation + compute) are the worked examples of the second route.
 
 ---
 
@@ -35,13 +36,33 @@ demonstrated and what has **not** — a launcher existing is not the same as the
 | **Notepad++ 8.9.9** | Native Win32 (C++, Scintilla) | Installed via the transpiler path (28 MB); POSIX shims for part of its API surface | Classified, API surface harvested | **The desktop entry is broken** (it points at a deleted temp directory) and a working run is not demonstrated |
 | **Fallout: New Vegas** (Steam build) | Native Win32 (i386 C++; Direct3D 9, DirectSound, DirectInput, DirectShow, Bink) | Runs under the WINS i386 PE loader through a Steam compatibility tool (`launch/falloutnv/`): no Proton, no Wine. The installed game is read-only to it; WINS keeps its own profile and saves | Menu, New Game, character creation, Continue from a save, the Mojave exterior, Pip-Boy UI/controls, console teleporting, underwater/water rendering (`SetClipPlane` implemented), effects, Pip-Boy sounds, voices, music and the intro video, rendered on the host GPU (the NVIDIA one on a hybrid laptop). Observed in hand play-throughs on one machine (`2026-11-15`) | Long sessions, most quests, combat-heavy scenes, surface reflection checks across all water cells, controllers (`wins-xinput` unexercised live), live Bink audio run, mods and script extenders. One machine only: Ubuntu 24.04, hybrid AMD/NVIDIA laptop |
 | **Cuphead** (Steam build) | Native Win64 Unity 2017.4 game (Mono scripting; Direct3D 11, DirectSound via FMOD, XInput via Rewired, Steamworks.NET) | Runs under the WINS x86-64 PE loader (`winrun64`) through a Steam compatibility tool (`launch/cuphead/`): no Proton, no Wine. Direct3D 11 is translated to OpenGL; the game files are mounted read-only and pinned by SHA-256; WINS keeps its own profile and saves | Title screen, main menu, slot select, saves written, the intro cutscene and storybook, Elder Kettle's tutorial dialogue with its text, a level played to the death card, game audio through PipeWire, keyboard input, and `SteamAPI_Init` against the live Steam client (`[WINS:SteamBridge64] connected to the real host SteamClient017`). Observed in a hand play-through on one machine (`2026-11-18`): cutscenes without stutter, dialogue text visible | Achievement/stat round trips, Steam Cloud, the Steam overlay, controllers live, long sessions, most bosses, the DLC. One machine only: Ubuntu 24.04, NVIDIA, GNOME on X11 |
+| **Dark Souls III** (Steam build) | Native Win64 C++ (FromSoftware engine; Direct3D 11 SM5 with VS/HS/DS/GS/PS/CS, deferred contexts, FMOD Ex, DirectInput8/XInput, SteamStub + Arxan) | Runs under `winrun64` through a Steam compatibility tool (`launch/ds3/`): no Proton, no Wine. Full DXBC SM5→GLSL 4.20 translator (tessellation + compute + multi-RT masking), game files mounted read-only and pinned by SHA-256, isolated profile and saves | Steam Play button launch with live `SteamClient017` IPC, SteamStub unpack, title screen, menus, character creation (3D knight), loading screens, and 1920×1080 fullscreen gameplay in Cemetery of Ash with volumetric sky/clouds, god rays, PBR lighting, bloom, water reflections and dynamic ripples, FMOD Ex audio via PipeWire, keyboard/mouse/gamepad input, and zero `glError`/shader failures in the live log (`2026-11-23`) | Full playthrough, bosses, late-game zones, DLCs, Steam Cloud/overlay/achievements, online multiplayer (offline mode only), non-NVIDIA GPUs, stream-output GS, long-session GL view cleanup. One machine only: Ubuntu 24.04, RTX 4050, X11 |
 | WinMerge, Greenshot | Native Win32 / legacy .NET Framework + WinForms | Classified only | Correct triage | Nothing runs: they are routed to the transpiler recipe, which only analyses and harvests (the port is **NOT_DEMONSTRATED**) |
 
 **Honest scope:** WINS reliably ports *runtime-wrapped* software (Electron, NW.js, modern .NET). It does **not** yet
-run arbitrary native Win32 applications: its own loaders run one large native 32-bit game and one native 64-bit Unity
-game, after the Windows APIs each game needs were implemented one by one, and every other native program is a project
-of its own. `libs/GAPS.md`
+run arbitrary native Win32/Win64 applications: its own loaders run one large native 32-bit game (Fallout: New Vegas)
+and two native 64-bit games (Cuphead and Dark Souls III), after the Windows APIs and D3D11/DXBC features each game
+needs were implemented one by one, and every other native program is a project of its own. `libs/GAPS.md`
 measures how far each one is. See *How far can it go?* below for a worked example with a real, huge one.
+
+---
+
+## Dark Souls III running natively on Linux (`winrun64`)
+
+Captured directly from the native X11 window (`1920×1080`, Ubuntu 24.04, NVIDIA RTX 4050) running `DarkSoulsIII.exe`
+through `launch/ds3/` under WINS's own Zig x86-64 PE loader (`winrun64`) and DXBC SM5 → OpenGL 4.5 translator — **no
+Wine, no Proton, no DXVK**.
+
+| Cemetery of Ash — Volumetric Sky & Horizon | Cemetery of Ash — God Rays & Ruins Lighting |
+| :---: | :---: |
+| ![Dark Souls III Cemetery of Ash sky and clouds running on Linux via WINS](./docs/screenshots/ds3/cemetery-sky.jpg) | ![Dark Souls III Cemetery of Ash ruins and volumetric light beams running on Linux via WINS](./docs/screenshots/ds3/cemetery-ruins.jpg) |
+| **Water Reflections & Dynamic Expansion Ripples** | **Title Screen (`SteamClient017` IPC + Scaleform UI)** |
+| ![Dark Souls III water puddle reflections and ripples running on Linux via WINS](./docs/screenshots/ds3/water-ripples.jpg) | ![Dark Souls III title screen running on Linux via WINS](./docs/screenshots/ds3/title.jpg) |
+
+Key subsystems built in Zig inside `winrun64` to reach in-game rendering:
+- **Win64 PE32+ loader & runtime**: `KUSER_SHARED_DATA`, real `PEB`/`Ldr`/`ProcessHeap`, x64 SEH/`.pdata` unwinding, `int 0x2d`/`int3` exception dispatch (compatible with SteamStub and Arxan runtime checks), and `SteamBridge64` speaking directly to the host's `steamclient.so` (`SteamClient017`).
+- **Direct3D 11 + DXBC SM5 → GLSL 4.20 Core translator** (`native/wins_d3d11*.zig`): Vertex, Hull, Domain (quad/triangle/isoline tessellation), Geometry, Pixel, and Compute shaders, deferred contexts & command lists, structured/raw SRV/UAV SSBOs, typed UAV images & atomics, `DrawIndirect`/`DispatchIndirect`, dual-source blending, and exact D3D11 per-RT `OSGN` output masking (`ps_out_mask`) so unwritten render targets (such as DS3's bloom buffer during sky/cloud passes) stay untouched.
+- **Audio & input**: FMOD Ex over DirectSound → PipeWire/PulseAudio, DirectInput8 + Win32 mouse/keyboard, and XInput/SDL2 gamepad support.
 
 ---
 
@@ -56,10 +77,13 @@ measures how far each one is. See *How far can it go?* below for a worked exampl
 4. **Rebuild Windows APIs for Linux, proven by fuzzing** (`winlux*`) — each replacement is differential- or
    metamorphic-fuzzed in a `bubblewrap` sandbox against an independent oracle, and ships with deliberately broken
    variants that the fuzzer **must** catch.
-5. **Run native 32-bit Windows programs on its own loader** (`winrun32`) — a PE loader plus the Windows APIs it
-   answers, in Zig, split into versioned libraries (`wins-d3d9`, `wins-dsound`, ...). `winrun32 --imports prog.exe`
-   says which imports resolve and which Windows DLLs have no library yet. See [`libs/README.md`](./libs/README.md).
-6. **Tell you when it will not work** — with numbers (see 3ds Max below).
+5. **Run native 32-bit and 64-bit Windows programs on its own loaders** (`winrun32`, `winrun64`) — Zig PE loaders plus
+   the Windows APIs they answer (`wins-d3d9`, `wins-d3d11`, `wins-dsound`, `wins-dinput`, `wins-xinput`, Steam IPC
+   bridge). `winrun32 --imports prog.exe` says which imports resolve and which Windows DLLs have no library yet. See
+   [`libs/README.md`](./libs/README.md).
+6. **Run `x86_64` macOS Mach-O binaries directly on Linux** (`wins-macho`) — Zig Mach-O loader, minimal `dyld`,
+   Objective-C 2.0 runtime, and Darwin ABI / `seccomp-bpf` syscall translation. See [`wins-macho/`](./wins-macho/).
+7. **Tell you when it will not work** — with numbers (see 3ds Max below).
 
 ---
 
@@ -112,7 +136,7 @@ What each one does **not** do is part of its contract:
 | Loader | Runs | State |
 |---|---|---|
 | `winrun32` | 32-bit (i386) PE32 | Runs Fallout: New Vegas (see the table above). `--check` and `--imports` resolve a program's imports without running it; `--libs` prints the library registry |
-| `winrun64` | x86-64 PE32+ with a window, Direct3D 11 (on OpenGL), DirectSound, XInput, Steam | Runs Cuphead (see the table above). Threads, Win32 sync objects (events, semaphores, waitable timers, IOCP, APCs) and a Win64↔Linux Steamworks bridge (MSVC x64 ↔ SysV ABI: hidden result pointers, XMM float arguments, callback struct packing) to the host's `steamclient.so` |
+| `winrun64` | x86-64 PE32+ with a window, Direct3D 11 SM5 (on OpenGL 4.5), DirectSound, DirectInput8, XInput, Steam | Runs **Cuphead** and **Dark Souls III** (see the table and screenshots above). Full SM5 shader translation (VS/HS/DS/GS/PS/CS + tessellation + compute + deferred contexts), Win32 sync objects (events, semaphores, waitable timers, IOCP, APCs), x64 SEH unwinding, and a Win64↔Linux Steamworks bridge (`SteamClient017`) to the host's `steamclient.so` |
 | `winrun` | x86-64 console PE32+ | Maps the image, resolves imports and **refuses to run if any is missing**; execution requires the boxed launcher. No program is claimed to run on it here |
 | `winrun_gui` | x86-64 with a window | Same, with the window support. `--check` measures; no program is claimed to run on it here |
 
@@ -122,29 +146,52 @@ Each Windows DLL a loader answers for is a **library** with a version (`wins-d3d
 programs ask for. A resolved import is not a working API: the registry's `status` and `evidence` say what was actually
 run.
 
-Fallout: New Vegas (Steam build) as a Steam compatibility tool; the requirements (32-bit libraries, `bubblewrap`) are
-in [`launch/falloutnv/README.txt`](./launch/falloutnv/README.txt):
+### How to use each native Steam launcher
+
+#### 1. Fallout: New Vegas (`winrun32`, i386 / Direct3D 9)
+Requirements (32-bit libraries, `bubblewrap`) are in [`launch/falloutnv/README.txt`](./launch/falloutnv/README.txt):
 
 ```bash
-tools/build_all.sh /tmp/wins-build              # a new, empty directory
-launch/falloutnv/install.sh /tmp/wins-build     # then restart Steam and force the "WINS (Fallout: New Vegas)" tool
+tools/build_all.sh /tmp/wins-build                  # a new, empty directory
+launch/falloutnv/install.sh /tmp/wins-build         # restart Steam -> Properties > Compatibility > "WINS (Fallout: New Vegas)"
 ```
 
-Your Steam saves are not mounted or touched; WINS keeps its own profile in `~/.local/share/wins/falloutnv/profile`.
+Your Steam saves are untouched; WINS keeps its own profile in `~/.local/share/wins/falloutnv/profile` and logs in
+`~/.local/state/wins/falloutnv/logs/`.
 
-Cuphead (Steam build) the same way; `tools/build_all.sh` does not build `winrun64` yet, so it is built explicitly. The
-details (pinned game hashes, what the sandbox exposes) are in [`launch/cuphead/README.txt`](./launch/cuphead/README.txt):
+#### 2. Cuphead (`winrun64`, x86-64 / Unity / Direct3D 11)
+`tools/build_all.sh` does not build `winrun64` yet, so build `winrun64` once and install the compatibility tool.
+Details (pinned game hashes, sandbox policy) are in [`launch/cuphead/README.txt`](./launch/cuphead/README.txt):
 
 ```bash
-mkdir -p /tmp/wins-cuphead-build                # a new, empty directory
-(cd native && zig build-exe winrun64.zig -O ReleaseSafe -lc -lX11 -femit-bin=/tmp/wins-cuphead-build/winrun64)
-launch/cuphead/install.sh /tmp/wins-cuphead-build   # then restart Steam and force the "WINS (Cuphead)" tool
+mkdir -p /tmp/wins-win64-build
+(cd native && zig build-exe winrun64.zig -O ReleaseSafe -lc -lX11 -femit-bin=/tmp/wins-win64-build/winrun64)
+launch/cuphead/install.sh /tmp/wins-win64-build     # restart Steam -> Properties > Compatibility > "WINS (Cuphead)"
 ```
 
-The installed game is mounted read-only and its binaries are checked against pinned SHA-256s (a Steam update that
-changes them is refused). Saves live in `~/.local/share/wins/cuphead/profile`; each run's log, including Unity's own
-`unity.log`, goes to `~/.local/state/wins/cuphead/logs/`. Diagnostics, all off by default: `WINS_D3D11_CAPTURE=<dir>`
-(frame dumps), `WINS_D3D11_DUMP_DIR=<dir>` (translated shaders), `WINS_D3D11_TRACE_PROG=<n>`, `WINS_TRACE=1`.
+The installed game is mounted read-only and verified against pinned SHA-256s. Saves live in
+`~/.local/share/wins/cuphead/profile`; logs (including `unity.log`) go to `~/.local/state/wins/cuphead/logs/`.
+
+#### 3. Dark Souls III (`winrun64`, x86-64 / Direct3D 11 SM5)
+Uses the same `winrun64` binary built above. Full details, pinned hashes, and offline guidance are in
+[`launch/ds3/README.txt`](./launch/ds3/README.txt):
+
+```bash
+mkdir -p /tmp/wins-win64-build
+(cd native && zig build-exe winrun64.zig -O ReleaseSafe -lc -lX11 -femit-bin=/tmp/wins-win64-build/winrun64)
+launch/ds3/install.sh /tmp/wins-win64-build         # restart Steam -> Properties > Compatibility > "WINS (Dark Souls III)"
+```
+
+Restart Steam once, open **DARK SOULS III → Properties → Compatibility**, select **`WINS (Dark Souls III)`**, and
+click **Play** (recommended: **Offline mode**). The game folder is mounted read-only; saves and `GraphicsConfig.xml`
+live in `~/.local/share/wins/ds3/profile`, and logs go to `~/.local/state/wins/ds3/logs/`.
+
+**`winrun64` diagnostics (all off by default, pass via Steam Launch Options):**
+- `WINS_D3D11_DUMP_DIR=<dir>` — dump translated GLSL & DXBC shaders
+- `WINS_D3D11_CAPTURE=<dir>` — capture failed shader DXBCs for offline debugging
+- `WINS_D3D11_TRACE_DRAWS=1` — log per-frame draw calls (`WINS_D3D11_TRACE_PROG=<n>` to filter one program)
+- `WINS_D3D11_SNAP_TRIG=1` — enable on-demand 1-frame RenderDoc-style capture (`touch <profile>/snap_req` → `snap_out/{draws.log,final.ppm,p*_*.{glsl,dxbc}}`)
+- `WINS_GPU=integrated` — keep integrated GLX GPU instead of NVIDIA PRIME; `WINS_TRACE=1` — verbose loader trace
 
 ---
 
@@ -174,6 +221,8 @@ WINS was pointed at the full installer (5.76 GB). It deposits every file without
 - **libs**: [./libs/README.md](./libs/README.md) - The Windows DLLs WINS stands in for, as versioned libraries (`wins-d3d9`, `wins-dsound`, ...), what has been run through each, and the generated gap report of the DLLs and imports WINS still lacks compared with Windows.
 - **launch**: [./launch/falloutnv/README.txt](./launch/falloutnv/README.txt) - The Steam compatibility tool for Fallout: New Vegas (launcher, installer): the Play button runs the game under the WINS i386 loader.
   - [./launch/cuphead/README.txt](./launch/cuphead/README.txt) - The Steam compatibility tool for Cuphead: the Play button runs the Win64 game under `winrun64`.
+  - [./launch/ds3/README.txt](./launch/ds3/README.txt) - The Steam compatibility tool for Dark Souls III: the Play button runs `DarkSoulsIII.exe` under `winrun64`.
+- **wins-macho**: [./wins-macho/](./wins-macho/) - Experimental Zig `x86_64` Mach-O loader, minimal `dyld`, Objective-C 2.0 runtime, and Darwin ABI / `seccomp-bpf` translation layer.
 
 ---
 
@@ -222,6 +271,10 @@ tools/check_libs.sh /tmp/wins-build             # is libs/registry.json current?
 tools/separation_gate.sh                        # the shipped loader does not depend on native/probe
 zig test native/wins_libs.zig
 python3 -m pytest tests/test_winrun32.py
+# Win64 D3D11 & DXBC shader translator unit tests (zig 0.16, libX11)
+zig test native/wins_d3d11_shader.zig -lc
+zig test native/wins_d3d11_gl.zig -lc
+zig test native/wins_d3d11.zig -lc -lX11
 ```
 
 `native.test_winluxtrust` also needs `osslsigncode` (set `WINS_OSSLSIGNCODE` if it is not on `PATH`) and skips itself
@@ -229,29 +282,55 @@ when it is missing.
 
 ---
 
-## Quickstart
+## Quickstart — Usage by Component
 
 ### Prerequisites
 * Linux x86_64 (tested on Ubuntu 24.04 LTS), `python3`, `7zz` (or `7z`), `unzip`, `curl`.
-* Electron apps: `bunx` or `npx` (ASAR unpacking). Native tools: Zig 0.16 and `bubblewrap`.
-* Native 32-bit programs (Fallout: New Vegas): the i386 libraries named in `launch/falloutnv/README.txt`.
-* Native 64-bit programs (Cuphead): `libX11`, OpenGL (GLX) and PulseAudio/PipeWire; see `launch/cuphead/README.txt`.
+* Electron apps: `bunx` or `npx` (ASAR unpacking). Native tools & Mach-O loader: Zig 0.16 and `bubblewrap`.
+* Native 32-bit games (Fallout: New Vegas): the i386 libraries named in `launch/falloutnv/README.txt`.
+* Native 64-bit games (Cuphead, Dark Souls III): `libX11`, OpenGL 4.5 (GLX), PulseAudio/PipeWire, and SDL2; see `launch/cuphead/README.txt` and `launch/ds3/README.txt`.
 
-### Install
+### Install CLI
 ```bash
 git clone https://github.com/DannyBaanks/WINS.git
 cd WINS
 export PATH="$PWD/bin:$PATH"
 ```
 
-### Use
+### Usage examples for each subsystem
+
 ```bash
-wins probe  Qwen-1.0.3.44-release-win-x64.exe          # what is it really? (add --json for agents)
-wins transmute Qwen-1.0.3.44-release-win-x64.exe        # port it to a native Linux app
-wins harvest npp.8.9.9.Installer.x64.exe                # inspect a native PE: APIs, embedded engines
-wins fuzz --iterations 100000                           # differential fuzzer (Zig)
-wins test notion --timeout 5.0                         # cleanroom run + structured diagnostics
-wins list                                               # available recipes
+# 1. Runtime-wrapped desktop apps (Electron / .NET / NW.js)
+wins probe     Qwen-1.0.3.44-release-win-x64.exe        # inspect runtime & feasibility (--json for agents)
+wins transmute Qwen-1.0.3.44-release-win-x64.exe        # re-host natively on Linux + launcher/.desktop
+wins heal-bin  ~/.local/share/manus-desktop --app-id manus   # heal Windows companion .exe helpers
+wins test      notion --timeout 5.0                     # cleanroom run + structured diagnostics
+wins list                                               # list available recipes
+
+# 2. Static PE inspection & native Zig toolbox (wins-native)
+mkdir -p build && zig build-exe native/main.zig -O ReleaseSafe -femit-bin=build/wins-native
+build/wins-native inspect   SomeApp.exe                 # SHA-256, PE format, sections
+build/wins-native imports   SomeApp.exe --json          # IAT + delay-load imports + CLR flag
+wins harvest   npp.8.9.9.Installer.x64.exe              # harvest APIs & embedded engines
+
+# 3. Differential API fuzzing (winlux*)
+wins fuzz --iterations 100000                           # fuzz Win32 shims against independent oracles
+
+# 4. Native 32-bit Windows games (winrun32 — Fallout: New Vegas)
+tools/build_all.sh /tmp/wins-build
+/tmp/wins-build/winrun32 --imports FalloutNV.exe        # check import resolution without executing
+launch/falloutnv/install.sh /tmp/wins-build             # install Steam compatibility tool
+
+# 5. Native 64-bit Windows games (winrun64 — Cuphead & Dark Souls III)
+mkdir -p /tmp/wins-win64-build
+(cd native && zig build-exe winrun64.zig -O ReleaseSafe -lc -lX11 -femit-bin=/tmp/wins-win64-build/winrun64)
+launch/cuphead/install.sh /tmp/wins-win64-build         # install "WINS (Cuphead)" in Steam
+launch/ds3/install.sh     /tmp/wins-win64-build         # install "WINS (Dark Souls III)" in Steam
+
+# 6. macOS Mach-O x86_64 binaries on Linux (wins-macho)
+(cd wins-macho && zig build && zig build test)
+wins-macho/zig-out/bin/wins_macho --inspect-only /path/to/macos_bin
+wins-macho/zig-out/bin/wins_macho /path/to/macos_bin [args...]
 ```
 
 Example `probe` output:
@@ -280,7 +359,7 @@ Example `probe` output:
 | **Electron** | Working: ASAR de-layering, platform-check patching, `.node` healing with Linux prebuilds, runtime re-binding. Demonstrated on Notion |
 | **NW.js (RPG Maker MZ games)** | No `wins` recipe yet: Look Outside was packaged as an AppImage separately (its own `GUIA.md` lives next to the AppImage in `~/Documentos/Look Outside Linux/` on the author's machine). Turning that into a recipe is the obvious next step |
 | **.NET (modern) / Avalonia** | Extraction and `runtimeconfig.json` adaptation implemented; a successful launch of ShareX is not demonstrated |
-| **Native Win32 PE** | i386: the WINS PE loader (`winrun32`) runs Fallout: New Vegas. x86-64: `winrun64` runs Cuphead; `winrun` / `winrun_gui` resolve imports and refuse anything incomplete, with no program claimed to run on them. Everything else: triage and API harvest (`recipe_transpiler`, analysis only; the port is NOT_DEMONSTRATED) |
+| **Native Win32 / Win64 PE** | i386: the WINS PE loader (`winrun32`) runs Fallout: New Vegas. x86-64: `winrun64` runs Cuphead and Dark Souls III (with SM5 DXBC→GLSL tessellation + compute); `winrun` / `winrun_gui` resolve imports and refuse anything incomplete, with no program claimed to run on them. Everything else: triage and API harvest (`recipe_transpiler`, analysis only; the port is NOT_DEMONSTRATED) |
 | **PyInstaller** | Recipe is a stub (`transmute` returns failure) |
 | **JVM / Launch4j** | Planned |
 
@@ -360,9 +439,10 @@ fighting a Wine prefix, an agent can decide, port, or report why not — with ev
 
 A PE import inventory, a compiled shim, or a finite fuzz run is not proof that a Windows program was ported or behaves
 equivalently. No `winlux*` replacement has been compared with a real Windows kernel. Games and apps are verified only
-as far as the table above says. Fallout: New Vegas and Cuphead were checked by hand on one machine, not by an automated
-end-to-end test (the loaders' unit and regression tests cover pieces such as staging texture uploads and sync objects);
-the gap report measures import resolution, not behaviour.
+as far as the table above says. Fallout: New Vegas, Cuphead, and Dark Souls III were checked by hand on one machine,
+not by an automated end-to-end test (the loaders' unit and regression tests cover pieces such as DXBC shader
+translation, D3D11 state/blend/RT semantics, staging texture uploads, and sync objects); the gap report measures
+import resolution, not behaviour.
 
 ---
 
