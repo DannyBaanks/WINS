@@ -94,7 +94,7 @@ After adding the entry to `servers.json`, reload **only the main hub process** w
 ```bash
 systemctl --user reload isymcp-hub
 ```
-*(Live daemon registration in the shared host hub is left for explicit operator approval to avoid cutting active TUI sessions.)*
+Verified live on the host `isymcp-hub`: `hub_discover(server="wins-mcp")` reports all 8 tools (`isolation: "shared"`), and `hub_execute` runs `wins.capture_frame`, `wins.audit_frame`, and `wins.blame_pixel` end-to-end without restarting unrelated hub backends.
 
 ---
 
@@ -131,5 +131,5 @@ All core debugging steps require **zero vision**:
 1. **Multi-RT texture IDs (`rt1..rt7`):** `native/wins_d3d11_gl.zig` currently logs `nrt` and `rt0` in `draws.log`, not `rt1..rt7`. Therefore `D3D11_CLEARED_UNWRITTEN_RT_SAMPLED` honestly reports `certainty: "INFERRED_CANDIDATE"` when linking a zero-cleared texture sampled later (such as DS3's `tex=1279`) to preceding undeclared-`SV_Target` MRT draws. Logging `rt1..rt7` in `wins_d3d11_gl.zig` would promote that link to `OBSERVED_WRITE`.
 2. **Fixed probe coordinates:** `wins_d3d11_gl.zig` currently probes 6 fixed coordinates (`p0..p5`). Calling `wins.blame_pixel` on unprobed coordinates honestly returns `INSUFFICIENT_EVIDENCE` (never fabricates `before/after`). Adding `WINS_D3D11_SNAP_PROBES=x1,y1;x2,y2` in L0 is the clean next step.
 3. **Water splash rectangular defect:** No separate pre-fix `snap_out/` capture of the Cemetery of Ash water puddle exists on disk (the `ps_out_mask` fix resolved both the sky and the water ripples simultaneously). Therefore the water-puddle case is `NOT_DEMONSTRATED` against a real puddle snapshot, though the same `D3D11_MRT_UNDECLARED_SV_TARGET` auditor covers multi-RT decal/particle shaders.
-4. **Live `isymcp-hub` reload:** The `servers.json` schema was verified against `chatgpt-http-mcp/hub/src/config.zig` and stdio MCP E2E was tested via `WinsMcpClient`; live registration into the host's running `isymcp-hub` daemon is pending user reload authorization (`NOT_DEMONSTRATED` on the shared daemon).
-5. **Local small-model benchmark (§11):** Optional evaluation can be run once a local Ollama model is pulled/running.
+4. **Live `isymcp-hub` integration:** Verified live via `systemctl --user reload isymcp-hub` + `hub_discover` / `hub_execute` (8 tools served in `shared` isolation without disturbing other hub backends).
+5. **Local small-model benchmark (§11):** Optional evaluation (`NOT_DEMONSTRATED` until a local Ollama server/model is running).
