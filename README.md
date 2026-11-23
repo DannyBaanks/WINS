@@ -223,6 +223,7 @@ WINS was pointed at the full installer (5.76 GB). It deposits every file without
   - [./launch/cuphead/README.txt](./launch/cuphead/README.txt) - The Steam compatibility tool for Cuphead: the Play button runs the Win64 game under `winrun64`.
   - [./launch/ds3/README.txt](./launch/ds3/README.txt) - The Steam compatibility tool for Dark Souls III: the Play button runs `DarkSoulsIII.exe` under `winrun64`.
 - **wins-macho**: [./wins-macho/](./wins-macho/) - Experimental Zig `x86_64` Mach-O loader, minimal `dyld`, Objective-C 2.0 runtime, and Darwin ABI / `seccomp-bpf` translation layer.
+- **wins_mcp**: [./wins_mcp/README.md](./wins_mcp/README.md) - Evidence-driven MCP debugging server (`bin/wins-mcp`), deterministic D3D11/OpenGL & Steam auditors, causal pixel blame, resumable 6-phase workflow (`wins-debug-workflow`), and SHA-256 receipts.
 
 ---
 

@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""WINS-MCP v0.1 stdio server entrypoint.
+
+Usage:
+  bin/wins-mcp                  # run JSON-RPC 2.0 MCP server on stdin/stdout
+  bin/wins-mcp --list-tools     # print registered tool names and schemas as JSON
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from wins_mcp.server import TOOL_DEFINITIONS, run_stdio_server
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="WINS-MCP v0.1 evidence-driven debugging MCP server.")
+    parser.add_argument("--list-tools", action="store_true", help="Print MCP tool definitions as JSON and exit.")
+    args = parser.parse_args()
+    if args.list_tools:
+        print(json.dumps({"tools": TOOL_DEFINITIONS}, indent=2))
+        return 0
+    return run_stdio_server()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

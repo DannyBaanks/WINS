@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "wins-mcp": {
+      "command": "python3",
+      "args": [
+        "<WINS_REPO_PATH>/bin/wins-mcp"
+      ],
+      "env": {
+        "WINS_MCP_HOME": "<USER_HOME>",
+        "PATH": "/usr/local/bin:/usr/bin:/bin"
+      },
+      "isolation": "shared",
+      "description": "WINS evidence-driven D3D11/OpenGL & Steam debugging MCP server (read-only by default)"
+    }
+  }
+}
