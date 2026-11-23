@@ -111,7 +111,7 @@ class WinLoad64Tests(unittest.TestCase):
     def test_unimplemented_import_executes_nothing(self):
         r = self.box('fixture_c.dll', *self.pin('fixture_c.dll'), '--call', 'fixc_probe')
         self.assertEqual(r.returncode, 4, r.stderr)
-        self.assertIn('GetLogicalProcessorInformation', r.stderr)
+        self.assertIn('GetProcessorSystemCycleTime', r.stderr)
         self.assertNotIn('READY', r.stderr)
 
     def test_dllmain_false(self):
