@@ -268,26 +268,151 @@ const FONT8X8: [95][8]u8 = .{
     .{ 0x76, 0xDC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, // '~'
 };
 
+fn asciiGlyph(ch: u8) [8]u8 {
+    return FONT8X8[(if (ch >= 0x20 and ch <= 0x7e) ch else '?') - 0x20];
+}
+
+/// 8x16 cell: the 8x8 ASCII glyph with every row doubled.
+fn doubled(g: [8]u8) [16]u8 {
+    var out: [16]u8 = undefined;
+    for (g, 0..) |r, i| {
+        out[2 * i] = r;
+        out[2 * i + 1] = r;
+    }
+    return out;
+}
+
+const Mark = enum { none, grave, acute, circ, tilde, diaer, ring, cedilla };
+
+/// Two 1-px rows drawn above the letter.
+fn markRows(m: Mark) [2]u8 {
+    return switch (m) {
+        .grave => .{ 0x30, 0x18 },
+        .acute => .{ 0x0C, 0x18 },
+        .circ => .{ 0x38, 0x6C },
+        .tilde => .{ 0x76, 0xDC },
+        .diaer => .{ 0x6C, 0x6C },
+        .ring => .{ 0x38, 0x28 },
+        .none, .cedilla => .{ 0, 0 },
+    };
+}
+
+/// Latin-1 letter -> ASCII base + diacritic.
+fn decompose(c: u16) ?struct { base: u8, mark: Mark } {
+    const M = Mark;
+    const a6 = [_]M{ .grave, .acute, .circ, .tilde, .diaer, .ring };
+    const e4 = [_]M{ .grave, .acute, .circ, .diaer };
+    const o5 = [_]M{ .grave, .acute, .circ, .tilde, .diaer };
+    const lower: u8 = if (c >= 0xE0) 0x20 else 0;
+    const u = if (c >= 0xE0) c - 0x20 else c;
+    return switch (u) {
+        0xC0...0xC5 => .{ .base = 'A' + lower, .mark = a6[u - 0xC0] },
+        0xC6 => .{ .base = 'A' + lower, .mark = .none }, // Æ
+        0xC7 => .{ .base = 'C' + lower, .mark = .cedilla },
+        0xC8...0xCB => .{ .base = 'E' + lower, .mark = e4[u - 0xC8] },
+        0xCC...0xCF => .{ .base = 'I' + lower, .mark = e4[u - 0xCC] },
+        0xD0 => .{ .base = 'D' + lower, .mark = .none },
+        0xD1 => .{ .base = 'N' + lower, .mark = .tilde },
+        0xD2...0xD6 => .{ .base = 'O' + lower, .mark = o5[u - 0xD2] },
+        0xD8 => .{ .base = 'O' + lower, .mark = .none },
+        0xD9...0xDC => .{ .base = 'U' + lower, .mark = e4[u - 0xD9] },
+        0xDD => .{ .base = 'Y' + lower, .mark = .acute },
+        0xDE => .{ .base = 'P' + lower, .mark = .none },
+        0xDF => if (lower != 0) .{ .base = 'y', .mark = .diaer } else .{ .base = 'B', .mark = .none }, // ÿ / ß
+        else => null,
+    };
+}
+
+fn rotated180(g: [8]u8) [8]u8 {
+    var out: [8]u8 = undefined;
+    for (g, 0..) |r, i| out[7 - i] = @bitReverse(r);
+    return out;
+}
+
+/// 8x16 glyph for a UTF-16 unit: ASCII, Latin-1 letters composed from base +
+/// diacritic (Spanish/Portuguese/French), ¿ ¡ ° €, typographic punctuation
+/// folded to ASCII; anything else is '?'.
+pub fn glyph16(c: u16) [16]u8 {
+    if (c >= 0x20 and c <= 0x7e) return doubled(asciiGlyph(@intCast(c)));
+    switch (c) {
+        0xA0 => return doubled(asciiGlyph(' ')),
+        0xA1 => return doubled(rotated180(asciiGlyph('!'))),
+        0xBF => return doubled(rotated180(asciiGlyph('?'))),
+        0xB0 => return doubled(.{ 0x38, 0x6C, 0x38, 0, 0, 0, 0, 0 }),
+        0xB4 => return doubled(.{ 0x0C, 0x18, 0, 0, 0, 0, 0, 0 }),
+        0xA8 => return doubled(.{ 0x6C, 0, 0, 0, 0, 0, 0, 0 }),
+        0xAB => return doubled(.{ 0, 0x36, 0x6C, 0xD8, 0x6C, 0x36, 0, 0 }),
+        0xBB => return doubled(.{ 0, 0xD8, 0x6C, 0x36, 0x6C, 0xD8, 0, 0 }),
+        0xB7 => return doubled(.{ 0, 0, 0, 0x18, 0, 0, 0, 0 }),
+        0xD7 => return doubled(asciiGlyph('x')),
+        0xF7 => return doubled(.{ 0, 0x18, 0, 0x7E, 0, 0x18, 0, 0 }),
+        0x20AC => return doubled(.{ 0x3C, 0x66, 0xF8, 0x60, 0xF8, 0x66, 0x3C, 0 }),
+        0x2018, 0x2019, 0x201A => return doubled(asciiGlyph('\'')),
+        0x201C, 0x201D, 0x201E => return doubled(asciiGlyph('"')),
+        0x2010...0x2015, 0x2212 => return doubled(asciiGlyph('-')),
+        0x2026 => return doubled(.{ 0, 0, 0, 0, 0, 0, 0x92, 0 }),
+        0x2022 => return doubled(.{ 0, 0, 0x38, 0x7C, 0x38, 0, 0, 0 }),
+        else => {},
+    }
+    const d = decompose(c) orelse return doubled(asciiGlyph('?'));
+    var g = asciiGlyph(d.base);
+    if ((d.base | 0x20) == 'i' and d.mark != .none and d.base >= 'a') g[0] = 0; // dotless i under the accent
+    if (d.mark == .cedilla) {
+        var out = doubled(g);
+        out[14] = 0x18;
+        out[15] = 0x30;
+        return out;
+    }
+    const mr = markRows(d.mark);
+    if (g[0] == 0 and g[1] == 0) { // lowercase: two blank rows (4 px) above the x-height
+        var out = doubled(g);
+        out[1] = mr[0];
+        out[2] = mr[1];
+        return out;
+    }
+    if (d.mark == .none) return doubled(g);
+    // capital: accent in px 0-1, gap, then rows 0..6 in 13 px (row 3 single height)
+    var out: [16]u8 = @splat(0);
+    out[0] = mr[0];
+    out[1] = mr[1];
+    var py: usize = 3;
+    for (g[0..7], 0..) |r, i| {
+        out[py] = r;
+        py += 1;
+        if (i != 3) {
+            out[py] = r;
+            py += 1;
+        }
+    }
+    return out;
+}
+
 pub fn drawChar(s: *Surface, clip: Clip, x: i32, y: i32, ch_u16: u16, fg: u32, bg: ?u32) void {
-    const ch: u8 = if (ch_u16 >= 0x20 and ch_u16 <= 0x7e) @intCast(ch_u16) else '?';
-    const glyph = FONT8X8[ch - 0x20];
-    var row: i32 = 0;
-    while (row < 8) : (row += 1) {
-        const bits = glyph[@intCast(row)];
+    const glyph = glyph16(ch_u16);
+    for (glyph, 0..) |bits, row| {
         var col: i32 = 0;
         while (col < 8) : (col += 1) {
             const on = (bits & (@as(u8, 0x80) >> @intCast(col))) != 0;
-            const px = x + col;
-            const py0 = y + row * 2;
+            const py = y + @as(i32, @intCast(row));
             if (on) {
-                putPixelClipped(s, clip, px, py0, fg);
-                putPixelClipped(s, clip, px, py0 + 1, fg);
+                putPixelClipped(s, clip, x + col, py, fg);
             } else if (bg) |bcol| {
-                putPixelClipped(s, clip, px, py0, bcol);
-                putPixelClipped(s, clip, px, py0 + 1, bcol);
+                putPixelClipped(s, clip, x + col, py, bcol);
             }
         }
     }
+}
+
+test "glyph16: Spanish letters get their accent, unknown stays '?'" {
+    const q = glyph16('?');
+    try std.testing.expectEqualSlices(u8, &q, &glyph16(0x4E00)); // CJK -> '?'
+    const n = glyph16('n');
+    const enye = glyph16(0xF1);
+    try std.testing.expectEqualSlices(u8, n[3..], enye[3..]); // body unchanged
+    try std.testing.expect(enye[1] != 0 and n[1] == 0); // tilde on top
+    try std.testing.expect(!std.mem.eql(u8, &glyph16(0xE1), &glyph16(0xE0))); // á != à
+    try std.testing.expect(!std.mem.eql(u8, &glyph16(0xC9), &glyph16('E'))); // É has its accent
+    try std.testing.expect(!std.mem.eql(u8, &glyph16(0xBF), &q)); // ¿ is not '?'
 }
 
 pub fn drawTextU16(

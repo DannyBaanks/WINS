@@ -41,7 +41,10 @@ build() { # name source [extra zig args...]
 }
 
 # x86-64 PE loader and the PE/installer inspection tools.
-build winrun      native/winrun.zig  -O ReleaseSafe
+# -lc: the loader's extra_dlls socket stack (std.c.getenv trace/appdata reads)
+# needs libc, like every other loader recipe in this repo (winrun64 -lc -lX11,
+# winrun32 -lc -dynamic).
+build winrun      native/winrun.zig  -O ReleaseSafe -lc
 # The x86-64 loader for programs with a window; needs libX11 for the host window.
 build winrun_gui  native/winrun_gui.zig -O ReleaseSafe -lc -lX11
 build wins-native native/main.zig    -O ReleaseSafe

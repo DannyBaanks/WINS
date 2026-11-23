@@ -87,6 +87,11 @@ const builtin = @import("builtin");
 // means the System V AMD64 ABI (rdi, rsi, rdx, rcx, r8, r9) while Windows PE32+
 // CRT exports still expect the Microsoft x64 ABI (.winapi: rcx, rdx, r8, r9).
 const W: std.builtin.CallingConvention = .winapi;
+/// Windows code calls these through its IAT, so they must use the Windows ABI:
+/// on i386 that is cdecl (`.c`), on x86-64 it is the Win64 convention (the
+/// `.winapi` alias below names `.{ .x86_64_win = .{} }`). Plain `.c` on
+/// x86-64 Linux is System V (args in rdi/rsi/...), which made every msvcrt
+/// shim receive its arguments in the wrong registers under the x64 loaders.
 const C: std.builtin.CallingConvention = if (builtin.cpu.arch == .x86_64) .winapi else .c;
 
 // ---------------------------------------------------------------------------
@@ -2063,6 +2068,7 @@ fn ldexp(x: f64, exp: i32) callconv(C) f64 {
 // 10. Formatting & Scanning
 // ---------------------------------------------------------------------------
 
+/// pub: winload64's UCRT __stdio_common_* reuse this formatter.
 pub fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) i32 {
     const f = fmt orelse return -1;
     var arg_idx: usize = 0;
@@ -2142,9 +2148,38 @@ pub fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[
             }
         }
 
-        var is_long = false;
-        while (f[fi] == 'l' or f[fi] == 'z' or f[fi] == 'I' or f[fi] == 'h') : (fi += 1) {
-            if (f[fi] != 'h') is_long = true;
+        // Argument width, MSVC rules: none/l/I32 = 32 bits (Windows `long` is 32-bit),
+        // ll/I64/I/z/j/t = 64 bits, h = 16, hh = 8. A variadic int arrives in a full
+        // slot whose upper half is undefined, so narrower values must be truncated.
+        var bits: u8 = 32;
+        while (true) {
+            switch (f[fi]) {
+                'h' => {
+                    bits = if (f[fi + 1] == 'h') 8 else 16;
+                    fi += if (f[fi + 1] == 'h') 2 else 1;
+                },
+                'l' => {
+                    bits = if (f[fi + 1] == 'l') 64 else 32;
+                    fi += if (f[fi + 1] == 'l') 2 else 1;
+                },
+                'I' => {
+                    if (f[fi + 1] == '6' and f[fi + 2] == '4') {
+                        bits = 64;
+                        fi += 3;
+                    } else if (f[fi + 1] == '3' and f[fi + 2] == '2') {
+                        bits = 32;
+                        fi += 3;
+                    } else {
+                        bits = @bitSizeOf(usize);
+                        fi += 1;
+                    }
+                },
+                'z', 'j', 't' => {
+                    bits = @bitSizeOf(usize);
+                    fi += 1;
+                },
+                else => break,
+            }
         }
 
         const spec = f[fi];
@@ -2175,21 +2210,32 @@ pub fn vsnprintf_impl(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, ap_raw: ?[
                 piece = tmp[0..1];
             },
             'd', 'i' => {
-                const sval: i64 = if (is_long) @as(i64, @bitCast(@as(u64, arg_val))) else @as(i64, @as(i32, @truncate(@as(isize, @bitCast(arg_val)))));
+                const raw: u64 = arg_val;
+                const sval: i64 = switch (bits) {
+                    8 => @as(i8, @truncate(@as(i64, @bitCast(raw)))),
+                    16 => @as(i16, @truncate(@as(i64, @bitCast(raw)))),
+                    32 => @as(i32, @truncate(@as(i64, @bitCast(raw)))),
+                    else => @bitCast(raw),
+                };
                 piece = std.fmt.bufPrint(&tmp, "{d}", .{sval}) catch "";
             },
-            'u' => {
-                const uval: u64 = if (is_long) arg_val else @as(u32, @truncate(arg_val));
-                piece = std.fmt.bufPrint(&tmp, "{d}", .{uval}) catch "";
+            'u', 'x', 'X', 'o' => {
+                const raw: u64 = arg_val;
+                const uval: u64 = switch (bits) {
+                    8 => @as(u8, @truncate(raw)),
+                    16 => @as(u16, @truncate(raw)),
+                    32 => @as(u32, @truncate(raw)),
+                    else => raw,
+                };
+                piece = switch (spec) {
+                    'u' => std.fmt.bufPrint(&tmp, "{d}", .{uval}) catch "",
+                    'x' => std.fmt.bufPrint(&tmp, "{x}", .{uval}) catch "",
+                    'X' => std.fmt.bufPrint(&tmp, "{X}", .{uval}) catch "",
+                    else => std.fmt.bufPrint(&tmp, "{o}", .{uval}) catch "",
+                };
             },
-            'x', 'p' => {
-                piece = std.fmt.bufPrint(&tmp, "{x}", .{arg_val}) catch "";
-            },
-            'X' => {
-                piece = std.fmt.bufPrint(&tmp, "{X}", .{arg_val}) catch "";
-            },
-            'o' => {
-                piece = std.fmt.bufPrint(&tmp, "{o}", .{arg_val}) catch "";
+            'p' => { // MSVC: fixed-width uppercase hex (16 digits on x64, 8 on i386)
+                piece = std.fmt.bufPrint(&tmp, "{X:0>[1]}", .{ arg_val, @sizeOf(usize) * 2 }) catch "";
             },
             else => {},
         }
@@ -2247,6 +2293,12 @@ fn _vscprintf(fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(C) i32 {
 fn sprintf(buf: ?[*]u8, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) callconv(C) i32 {
     const args = [_]usize{ a1, a2, a3, a4, a5, a6, a7, a8 };
     return vsnprintf_impl(buf, 4096, fmt, &args);
+}
+
+/// _snprintf/snprintf: bounded sprintf. Up to 7 variadic slots after the format.
+fn _snprintf(buf: ?[*]u8, count: usize, fmt: ?[*:0]const u8, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize) callconv(C) i32 {
+    const args = [_]usize{ a1, a2, a3, a4, a5, a6, a7 };
+    return vsnprintf_impl(buf, count, fmt, &args);
 }
 
 fn vfprintf(stream: ?*MsvcrtFile, fmt: ?[*:0]const u8, ap_raw: ?[*]const usize) callconv(C) i32 {
@@ -3675,6 +3727,7 @@ pub fn lookup(name: []const u8) ?usize {
     if (std.mem.eql(u8, name, "vsprintf")) return @intFromPtr(&vsprintf);
     if (std.mem.eql(u8, name, "vsnprintf")) return @intFromPtr(&vsnprintf_c99);
     if (std.mem.eql(u8, name, "sprintf")) return @intFromPtr(&sprintf);
+    if (std.mem.eql(u8, name, "_snprintf") or std.mem.eql(u8, name, "snprintf")) return @intFromPtr(&_snprintf);
     if (std.mem.eql(u8, name, "sscanf")) return @intFromPtr(&sscanf);
 
     // Control flow

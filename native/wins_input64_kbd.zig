@@ -16,6 +16,7 @@ const std = @import("std");
 const x11 = @import("x11_window.zig");
 
 extern "X11" fn XKeycodeToKeysym(display: ?*anyopaque, keycode: c_uint, index: c_int) c_ulong;
+extern "X11" fn XLookupString(event: *x11.XKeyEvent, buf: [*]u8, len: c_int, keysym: ?*c_ulong, status: ?*anyopaque) c_int;
 
 const X_SHIFT_MASK: c_uint = 0x0001;
 const X_LOCK_MASK: c_uint = 0x0002;
@@ -295,4 +296,105 @@ test "charForVk honours shift and caps" {
     try std.testing.expectEqual(@as(u16, ';'), charForVk(0xBA, false, false));
     try std.testing.expectEqual(@as(u16, ':'), charForVk(0xBA, true, false));
     try std.testing.expectEqual(@as(u16, 0), charForVk(0x25, false, false)); // Left: no char
+}
+
+// ---- characters from the live X layout (latam, es, ...) ----
+
+/// Dead key waiting for the next key (0 = none), e.g. dead_acute before 'a'.
+var g_dead: c_ulong = 0;
+
+/// The character a key press produces under the live X keyboard layout, decided
+/// when the X event arrives (not when the program calls TranslateMessage, by
+/// which time later events may have released Shift). Dead keys (´ ` ¨ ~ ^)
+/// compose with the next key. 0 = no character.
+pub fn charForKeyEvent(ke: *const x11.XKeyEvent) u16 {
+    var copy = ke.*;
+    var buf: [16]u8 = undefined;
+    var ks: c_ulong = 0;
+    _ = XLookupString(&copy, &buf, buf.len, &ks, null);
+    if (ks >= 0xfe50 and ks <= 0xfe5f) { // dead_grave .. : remember, no character yet
+        g_dead = ks;
+        return 0;
+    }
+    if (isModifierKeysym(ks)) return 0;
+    var ch = charForKeysym(ks, ke.state);
+    if (g_dead != 0) {
+        const dead = g_dead;
+        g_dead = 0;
+        if (ch == ' ') return deadSpacing(dead);
+        if (compose(dead, ch)) |c| ch = c;
+    }
+    return ch;
+}
+
+fn isModifierKeysym(ks: c_ulong) bool {
+    return (ks >= 0xffe1 and ks <= 0xffee) or ks == 0xfe03 or ks == 0xff7e; // Shift..Hyper, ISO_Level3_Shift, Mode_switch
+}
+
+pub fn charForKeysym(ks: c_ulong, state: c_uint) u16 {
+    const ctrl = (state & 0x0004) != 0;
+    const ch: u32 = if ((ks >= 0x20 and ks <= 0x7e) or (ks >= 0xa0 and ks <= 0xff))
+        @intCast(ks)
+    else if ((ks & 0xff000000) == 0x01000000)
+        @intCast(ks & 0xffffff)
+    else switch (ks) {
+        0xff08 => 0x08, // BackSpace
+        0xff09, 0xfe20 => 0x09, // Tab, ISO_Left_Tab
+        0xff0d, 0xff8d => 0x0d, // Return, KP_Enter
+        0xff1b => 0x1b, // Escape
+        0xff80 => ' ', // KP_Space
+        0xffaa...0xffb9 => @intCast(ks - 0xff80), // KP_Multiply .. KP_9
+        else => 0,
+    };
+    if (ch == 0 or ch > 0xffff) return 0;
+    if (ctrl) {
+        // Ctrl+letter -> control character (Ctrl+A = 0x01), as Windows does.
+        if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) return @intCast(ch & 0x1f);
+        if (ch == 0x0d) return 0x0a;
+        if (ch == 0x08) return 0x7f;
+        if (ch < 0x20) return @intCast(ch);
+        return 0;
+    }
+    return @intCast(ch);
+}
+
+fn deadSpacing(dead: c_ulong) u16 {
+    return switch (dead) {
+        0xfe50 => '`',
+        0xfe51 => 0xb4, // ´
+        0xfe52 => '^',
+        0xfe53 => '~',
+        0xfe57 => 0xa8, // ¨
+        else => 0,
+    };
+}
+
+fn compose(dead: c_ulong, ch: u16) ?u16 {
+    const base = "aeiouAEIOUnNcCyY";
+    const idx = std.mem.indexOfScalar(u8, base, if (ch < 0x80) @intCast(ch) else return null) orelse return null;
+    const table: []const u16 = switch (dead) {
+        0xfe51 => &.{ 0xe1, 0xe9, 0xed, 0xf3, 0xfa, 0xc1, 0xc9, 0xcd, 0xd3, 0xda, 0x144, 0x143, 0x107, 0x106, 0xfd, 0xdd }, // acute
+        0xfe50 => &.{ 0xe0, 0xe8, 0xec, 0xf2, 0xf9, 0xc0, 0xc8, 0xcc, 0xd2, 0xd9, 0, 0, 0, 0, 0, 0 }, // grave
+        0xfe52 => &.{ 0xe2, 0xea, 0xee, 0xf4, 0xfb, 0xc2, 0xca, 0xce, 0xd4, 0xdb, 0, 0, 0, 0, 0, 0 }, // circumflex
+        0xfe53 => &.{ 0xe3, 0, 0, 0xf5, 0, 0xc3, 0, 0, 0xd5, 0, 0xf1, 0xd1, 0, 0, 0, 0 }, // tilde
+        0xfe57 => &.{ 0xe4, 0xeb, 0xef, 0xf6, 0xfc, 0xc4, 0xcb, 0xcf, 0xd6, 0xdc, 0, 0, 0, 0, 0xff, 0 }, // diaeresis
+        else => return null,
+    };
+    const c = table[idx];
+    return if (c == 0) null else c;
+}
+
+test "layout characters: Latin-1 keysyms, Ctrl letters, keypad, dead-key compose" {
+    try std.testing.expectEqual(@as(u16, 'A'), charForKeysym('A', 0));
+    try std.testing.expectEqual(@as(u16, 0xf1), charForKeysym(0xf1, 0)); // ñ
+    try std.testing.expectEqual(@as(u16, '@'), charForKeysym('@', 0x80)); // AltGr (Mod5) does not block
+    try std.testing.expectEqual(@as(u16, 0x13), charForKeysym('s', 0x4)); // Ctrl+S
+    try std.testing.expectEqual(@as(u16, 0), charForKeysym('1', 0x4));
+    try std.testing.expectEqual(@as(u16, '7'), charForKeysym(0xffb7, 0)); // KP_7
+    try std.testing.expectEqual(@as(u16, 0x0d), charForKeysym(0xff0d, 0));
+    try std.testing.expectEqual(@as(u16, 0x20ac), charForKeysym(0x10020ac, 0)); // € (Unicode keysym)
+    try std.testing.expectEqual(@as(?u16, 0xe1), compose(0xfe51, 'a'));
+    try std.testing.expectEqual(@as(?u16, 0xf1), compose(0xfe53, 'n'));
+    try std.testing.expectEqual(@as(?u16, 0xdc), compose(0xfe57, 'U'));
+    try std.testing.expectEqual(@as(?u16, null), compose(0xfe51, 'x'));
 }

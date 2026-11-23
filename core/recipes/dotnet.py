@@ -56,6 +56,22 @@ class DotNetRecipe(BaseRecipe):
             print(f"  Host .NET Version: {host_dotnet_ver or 'not installed'}")
             print(f"  Avalonia X11 UI Backend: {'Detected' if has_avalonia else 'Not detected'}")
 
+            # 3b. Fail closed on desktop-only frameworks.
+            # WPF/WinForms live in Microsoft.WindowsDesktop.App, which has no
+            # Linux implementation. Rewriting the runtimeconfig would only
+            # produce an app that dies on the first WPF type it touches, so
+            # the recipe says so instead of shipping a broken launcher.
+            if runtime_cfg and self._requires_windows_desktop(runtime_cfg):
+                print(
+                    "[WINS:DotNet:BLOCKED] Target needs Microsoft.WindowsDesktop.App "
+                    "(WPF/WinForms). There is no Linux implementation of that "
+                    "framework: the managed logic can be ported to a cross-platform "
+                    "UI, but the XAML surface must be rewritten. No launcher was "
+                    "generated.",
+                    file=sys.stderr,
+                )
+                return False
+
             # 4. Adapt Runtime Configuration for Linux Host
             if runtime_cfg:
                 self._adapt_runtime_config(runtime_cfg, tfm)
@@ -107,6 +123,37 @@ exec dotnet "$APP_DIR/{os.path.basename(main_dll)}" "$@"
 
     def _extract_payload(self, target_exe: str, payload_dir: str, envelope_type: str) -> bool:
         """Extracts installer using static tools first, then cleanroom sandbox."""
+        # 0. Velopack / Squirrel: the nupkg payload is a ZIP appended to the setup PE.
+        if envelope_type == "velopack":
+            try:
+                from ..velopack import find_zip_overlay, open_overlay_zip
+
+                overlay = find_zip_overlay(target_exe)
+                if not overlay:
+                    return False
+                staging = os.path.join(payload_dir, "_velopack_tmp")
+                os.makedirs(staging, exist_ok=True)
+                with open_overlay_zip(target_exe, overlay) as archive:
+                    for member in archive.namelist():
+                        # ZipFile.extract sanitizes member paths (no zip-slip).
+                        archive.extract(member, staging)
+                # Velopack lays the application out under lib/app.
+                source = staging
+                candidate = os.path.join(staging, "lib", "app")
+                if os.path.isdir(candidate):
+                    source = candidate
+                for item in os.listdir(source):
+                    s = os.path.join(source, item)
+                    d = os.path.join(payload_dir, item)
+                    if os.path.isdir(s):
+                        shutil.copytree(s, d, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(s, d)
+                shutil.rmtree(staging, ignore_errors=True)
+                return True
+            except Exception:
+                return False
+
         # 1. Innoextract for Inno Setup
         inno = shutil.which("innoextract") or os.path.expanduser("~/.local/bin/innoextract")
         if inno and os.path.isfile(inno) and os.access(inno, os.X_OK):
@@ -164,6 +211,21 @@ exec dotnet "$APP_DIR/{os.path.basename(main_dll)}" "$@"
                     break
 
         return main_dll, runtime_cfg, deps_cfg
+
+    def _requires_windows_desktop(self, runtime_cfg: str) -> bool:
+        """True when the runtime config binds Microsoft.WindowsDesktop.App."""
+        try:
+            with open(runtime_cfg, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            ro = data.get("runtimeOptions", {})
+            frameworks = ro.get("frameworks", []) or []
+            for framework in frameworks:
+                if "WindowsDesktop" in framework.get("name", ""):
+                    return True
+            included = ro.get("includedFrameworks", {}) or {}
+            return any("WindowsDesktop" in name for name in included)
+        except Exception:
+            return False
 
     def _inspect_target_framework(self, runtime_cfg: Optional[str]) -> Optional[str]:
         if not runtime_cfg or not os.path.isfile(runtime_cfg):

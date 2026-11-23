@@ -197,6 +197,68 @@ fn compare(gpa: std.mem.Allocator, io: Io, candidate_path: []const u8, oracle_pa
     try Io.File.stderr().writeStreamingAll(io, result.stderr);
     if (result.term != .exited or result.term.exited != 0) return error.FuzzFailed;
 }
+fn velopackInspect(gpa: std.mem.Allocator, io: Io, path: []const u8, json: bool) !void {
+    const bytes = try Dir.cwd().readFileAlloc(io, path, gpa, .limited(512 * 1024 * 1024));
+    defer gpa.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    var info = try @import("velopack.zig").parse(gpa, bytes);
+    defer @import("velopack.zig").deinitInfo(gpa, &info);
+    if (json) {
+        const doc = .{
+            .sha256 = &hash,
+            .size_bytes = bytes.len,
+            .archive_offset = info.archive_offset,
+            .archive_size = info.archive_size,
+            .entry_count = info.entry_count,
+            .nuspec = .{
+                .id = info.nuspec.id,
+                .version = info.nuspec.version,
+                .channel = info.nuspec.channel,
+                .rid = info.nuspec.rid,
+                .os = info.nuspec.os,
+                .main_exe = info.nuspec.main_exe,
+                .runtime_dependencies = info.nuspec.runtime_dependencies,
+            },
+            .entries = info.entries,
+        };
+        const output = try std.json.Stringify.valueAlloc(gpa, doc, .{ .whitespace = .indent_2 });
+        defer gpa.free(output);
+        try say(io, output);
+        try say(io, "\n");
+        return;
+    }
+    const header = try std.fmt.allocPrint(gpa, "SHA256: {s}\nOverlay: Velopack ZIP at offset {d} ({d} bytes), {d} entries\n", .{ &hash, info.archive_offset, info.archive_size, info.entry_count });
+    defer gpa.free(header);
+    try say(io, header);
+    if (info.nuspec.id) |id| {
+        const meta = try std.fmt.allocPrint(gpa, "nuspec: id={s} version={s} channel={s} rid={s} os={s} mainExe={s} runtimeDependencies={s}\n", .{
+            id,
+            info.nuspec.version orelse "?",
+            info.nuspec.channel orelse "?",
+            info.nuspec.rid orelse "?",
+            info.nuspec.os orelse "?",
+            info.nuspec.main_exe orelse "?",
+            info.nuspec.runtime_dependencies orelse "?",
+        });
+        defer gpa.free(meta);
+        try say(io, meta);
+    }
+    for (info.entries) |entry| {
+        const line = try std.fmt.allocPrint(gpa, "  {s} ({d} bytes, method {d})\n", .{ entry.name, entry.uncompressed_size, entry.method });
+        defer gpa.free(line);
+        try say(io, line);
+    }
+}
+fn velopackExtract(gpa: std.mem.Allocator, io: Io, path: []const u8, out_dir: []const u8) !void {
+    const bytes = try Dir.cwd().readFileAlloc(io, path, gpa, .limited(512 * 1024 * 1024));
+    defer gpa.free(bytes);
+    const summary = try @import("velopack.zig").extract(gpa, io, bytes, out_dir);
+    const line = try std.fmt.allocPrint(gpa, "Extracted {d} files ({d} bytes), skipped {d} entries into {s}\n", .{ summary.files_written, summary.bytes_written, summary.entries_skipped, out_dir });
+    defer gpa.free(line);
+    try say(io, line);
+}
 fn closureCmd(gpa: std.mem.Allocator, io: Io, cab: []const u8, tsv: []const u8, key: []const u8, extractor: []const u8, out: []const u8) !void {
     const report = try @import("closure.zig").run(gpa, io, cab, tsv, key, extractor, out);
     const output = try std.json.Stringify.valueAlloc(gpa, report, .{ .whitespace = .indent_1 });
@@ -228,6 +290,16 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("extraction: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
+    } else if ((args.len == 3 or (args.len == 4 and std.mem.eql(u8, args[3], "--json"))) and std.mem.eql(u8, args[1], "velopack-inspect")) {
+        velopackInspect(a, io, args[2], args.len == 4) catch |e| {
+            std.log.err("velopack-inspect: {s}", .{@errorName(e)});
+            std.process.exit(1);
+        };
+    } else if (args.len == 4 and std.mem.eql(u8, args[1], "velopack-extract")) {
+        velopackExtract(a, io, args[2], args[3]) catch |e| {
+            std.log.err("velopack-extract: {s}", .{@errorName(e)});
+            std.process.exit(1);
+        };
     } else if (args.len == 5 and std.mem.eql(u8, args[1], "compile-c")) {
         compileC(a, io, args[2], args[3], args[4]) catch |e| {
             std.log.err("compilation: {s}", .{@errorName(e)});
@@ -243,5 +315,5 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("comparison: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
-    } else fail(io, "Usage: wins-native inspect FILE | cab-find FILE MEMBER [--json] | imports FILE [--json] | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno|msi> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS | closure CAB FILE_TSV ROOT_KEY EXTRACTOR NEW_OUT_DIR\n");
+    } else fail(io, "Usage: wins-native inspect FILE | cab-find FILE MEMBER [--json] | imports FILE [--json] | velopack-inspect FILE [--json] | velopack-extract FILE NEW_OUTPUT_DIR | extract FILE NEW_OUTPUT_DIR EXTRACTOR_PATH <7z|inno|msi> | compile-c SOURCE NEW_OUTPUT_DIR ZIG_INSTALL_DIR | compare CANDIDATE ORACLE RUNNER ITERATIONS | closure CAB FILE_TSV ROOT_KEY EXTRACTOR NEW_OUT_DIR\n");
 }

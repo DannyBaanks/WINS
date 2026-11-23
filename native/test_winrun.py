@@ -46,7 +46,7 @@ class WinrunTests(unittest.TestCase):
         zig(str(ROOT/'native/fuzz_winrun.zig'), '-O', 'ReleaseSafe', f'-femit-bin={t/"fuzz"}')
         cls.loaders = {}
         for name in ('winrun', 'winrun_bad_norelocs', 'winrun_bad_exitcode', 'winrun_bad_writecount', 'winrun_bad_zero_read', 'winrun_bad_zero_pid'):
-            zig(str(ROOT/f'native/{name}.zig'), '-O', 'ReleaseSafe', f'-femit-bin={t/name}')
+            zig(str(ROOT/f'native/{name}.zig'), '-O', 'ReleaseSafe', '-lc', f'-femit-bin={t/name}')
             cls.loaders[name] = t/name
 
     def fuzz(self, loader, iterations):
