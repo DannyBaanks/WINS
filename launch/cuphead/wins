@@ -2,10 +2,23 @@
 set -eu
 TOOL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 verb=${1:-}
+target=${2:-}
+target_lc=$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')
 case "$verb" in
   waitforexitandrun|run)
-    printf '[WINS Steam] verb=%s SteamAppId=%s SteamGameId=%s STEAM_COMPAT_APP_ID=%s args=%s\n' \
-      "$verb" "${SteamAppId:-unset}" "${SteamGameId:-unset}" "${STEAM_COMPAT_APP_ID:-unset}" "$#" >&2
+    # Steam invokes install-script helpers (e.g. iscriptevaluator.exe) via
+    # `wins run <helper>` before launching the game with `waitforexitandrun`.
+    # Running the game on those helper calls causes Steam to launch the game a
+    # second time as soon as the user exits.
+    case "$target_lc" in
+      *iscriptevaluator.exe|*vcredist*.exe|*vc_redist*.exe|*dxsetup.exe|*dotnetfx*.exe|*ndp*.exe)
+        printf '[WINS Steam] skipping Steam setup helper (verb=%s target=%s)\n' \
+          "$verb" "$target" >&2
+        exit 0
+        ;;
+    esac
+    printf '[WINS Steam] verb=%s SteamAppId=%s SteamGameId=%s STEAM_COMPAT_APP_ID=%s args=%s target=%s\n' \
+      "$verb" "${SteamAppId:-unset}" "${SteamGameId:-unset}" "${STEAM_COMPAT_APP_ID:-unset}" "$#" "$target" >&2
     WINS_STEAM_VERB="$verb"
     export WINS_STEAM_VERB
     exec "$TOOL_DIR/launch-cuphead"
