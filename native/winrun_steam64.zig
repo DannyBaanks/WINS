@@ -8,8 +8,21 @@ const std = @import("std");
 
 const W = std.builtin.CallingConvention{ .x86_64_win = .{} };
 const C = std.builtin.CallingConvention.c;
-pub const steam_app_id: u32 = 268910;
-pub const module_handle: usize = 0x7FFD_5354_0000;
+/// The app id this run belongs to: the launcher's WINS_STEAM_APP_ID, else the
+/// STEAM_COMPAT_APP_ID Steam itself gives a compatibility tool, else Cuphead
+/// (the first game this bridge served). A different SteamAppId is a conflict.
+pub const default_steam_app_id: u32 = 268910;
+pub fn expectedAppId() u32 {
+    inline for (.{ "WINS_STEAM_APP_ID", "STEAM_COMPAT_APP_ID" }) |name| {
+        if (getenv(name)) |v| if (std.fmt.parseInt(u32, std.mem.span(v), 10)) |id| return id else |_| {};
+    }
+    return default_steam_app_id;
+}
+/// Synthetic handle used while no steamclient64.dll image is mapped. When the
+/// launcher pins the host's real (Valve-signed) steamclient64.dll, winrun64 maps
+/// it as a facade image and this becomes that image's base.
+pub const synthetic_module_handle: usize = 0x7FFD_5354_0000;
+pub var module_handle: usize = synthetic_module_handle;
 const client_dll_name = "steamclient64.dll";
 const ipc_marker = "ValveIPCSharedObj";
 const max_slots = 40;
@@ -81,6 +94,25 @@ fn callbackLayout(callback: i32) CallbackLayout {
         1307 => .remote_file_share,
         1331 => .remote_write_complete,
         1332 => .remote_read_complete,
+        // Same field shape as UserStatsReceived_t / UserStatsStored_t, so the same conversion:
+        143 => .user_stats_received, // ValidateAuthTicketResponse_t: CSteamID, EAuthSessionResponse, CSteamID
+        304 => .user_stats_stored, // PersonaStateChange_t: uint64 steamID, int flags (Linux 12, Windows 16)
+        // Only 1/4-byte fields, or 8-byte fields already 8-aligned with a size that is a
+        // multiple of 8: identical bytes under Linux pack(4) and Windows pack(8).
+        101, // SteamServersConnected_t (empty)
+        102, // SteamServerConnectFailure_t: EResult, bool
+        103, // SteamServersDisconnected_t: EResult
+        117, // IPCFailure_t: uint8
+        125, // LicensesUpdated_t (empty)
+        154, // EncryptedAppTicketResponse_t: EResult
+        163, // GetAuthSessionTicketResponse_t: HAuthTicket, EResult
+        331, // GameOverlayActivated_t: uint8, bool, AppId_t
+        701, // IPCountry_t (empty)
+        702, // LowBatteryPower_t: uint8
+        703, // SteamAPICallCompleted_t: SteamAPICall_t, int, uint32 (16 both)
+        704, // SteamShutdown_t (empty)
+        5001, // SteamParentalSettingsChanged_t (empty)
+        => .same,
         else => .unsupported,
     };
 }
@@ -239,7 +271,7 @@ pub fn querySteamPidValue(pid: u32, value_type: ?*u32, data: ?[*]u8, size: ?*u32
 
 pub fn appIdMatches(value: []const u8) bool {
     const parsed = std.fmt.parseInt(u32, value, 10) catch return false;
-    return parsed == steam_app_id;
+    return parsed == expectedAppId();
 }
 
 fn appIdEnvAllowed() bool {
@@ -287,6 +319,15 @@ fn hostSteamRoot(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.local/share/Steam", .{home}) catch null;
 }
 
+/// Host path of the Windows client DLL Steam for Linux ships (Proton copies the
+/// same file into its prefixes): <SteamRoot>/steamclient64.dll.
+pub fn hostWindowsClientPath(buf: []u8) ?[]const u8 {
+    var root_buf: [1024]u8 = undefined;
+    const root = hostSteamRoot(&root_buf) orelse return null;
+    const sep = if (std.mem.endsWith(u8, root, "/")) "" else "/";
+    return std.fmt.bufPrint(buf, "{s}{s}steamclient64.dll", .{ root, sep }) catch null;
+}
+
 pub fn nativeClientPath(buf: []u8, steam_root: []const u8) ?[:0]const u8 {
     if (steam_root.len == 0) return null;
     const sep = if (std.mem.endsWith(u8, steam_root, "/")) "" else "/";
@@ -330,19 +371,44 @@ fn traceInterface(source: []const u8, version: []const u8) void {
     if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] {s} requested {s}\n", .{ source, version });
 }
 
+var steam_trace_state: i8 = -1;
+var steam_seen: [16][max_slots]bool = @splat(@splat(false));
+/// WINS_STEAM_TRACE: one line the first time each interface method is called, so a
+/// late new call (after a menu step) stands out.
+fn steamFirstCallTrace(adapter: *const Adapter, slot: usize, a1: usize, a2: usize, a3: usize, result: usize) void {
+    if (steam_trace_state < 0) steam_trace_state = if (std.c.getenv("WINS_STEAM_TRACE") != null) 1 else 0;
+    if (steam_trace_state != 1) return;
+    const k = @intFromEnum(adapter.kind) & 15;
+    if (slot >= max_slots or steam_seen[k][slot]) return;
+    steam_seen[k][slot] = true;
+    std.debug.print("[WINS:SteamCall] {s}{d}[{d}](0x{x}, 0x{x}, 0x{x}) -> 0x{x}\n", .{ @tagName(adapter.kind), adapter.version, slot, a1, a2, a3, result });
+}
+
 fn dispatch(slot: usize, this: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize, a7: usize, a8: usize) usize {
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] enter slot {d} this=0x{x}\n", .{ slot, this });
     if (this == 0) return 0;
     const adapter: *const Adapter = @ptrFromInt(this);
     if (adapter.real == 0) return 0;
     // The working 32-bit bridge measured these client slots failing on the raw
     // vtable before a pipe exists. Never apply them to sub-interface slots.
-    if (adapter.kind == .client and slot == 0) return if (g_pipe_fn) |f| f() else 0;
-    if (adapter.kind == .client and slot == 2) return if (g_user_fn) |f| f(@truncate(a1)) else 0;
+    if (adapter.kind == .client and slot == 0) {
+        const pipe = if (g_pipe_fn) |f| f() else 0;
+        if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] client{d}[0] CreateSteamPipe -> {d}\n", .{ adapter.version, pipe });
+        return pipe;
+    }
+    if (adapter.kind == .client and slot == 2) {
+        const user = if (g_user_fn) |f| f(@truncate(a1)) else 0;
+        if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] client{d}[2] ConnectToGlobalUser({d}) -> {d}\n", .{ adapter.version, a1, user });
+        return user;
+    }
     const real_vtable: [*]const usize = @ptrFromInt((@as(*const usize, @ptrFromInt(adapter.real)).*));
     const address = real_vtable[slot];
     if (address == 0) return 0;
     const method: *const fn (usize, usize, usize, usize, usize, usize, usize, usize, usize) callconv(C) usize = @ptrFromInt(address);
     const result = method(adapter.real, a1, a2, a3, a4, a5, a6, a7, a8);
+    @import("winrun_seh64.zig").maybeArmStep(@intCast(0x10000 + slot));
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] {s}{d}[{d}](0x{x}, 0x{x}, 0x{x}) -> 0x{x}\n", .{ @tagName(adapter.kind), adapter.version, slot, a1, a2, a3, result });
+    steamFirstCallTrace(adapter, slot, a1, a2, a3, result);
     if (adapter.kind != .client) return result;
     if (!isClientGetter(slot)) return result;
     const version_ptr = if (slot == 9) a2 else a3;
@@ -476,6 +542,7 @@ fn checkCallbackSysv(callback: i32) callconv(C) u32 {
 fn clientSetPostResultThunk(comptime slot: usize) VFunc {
     return @ptrCast(&struct {
         fn call(this: usize, callback: usize) callconv(W) usize {
+            if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] callback-hook thunk this=0x{x} cb=0x{x}\n", .{ this, callback });
             if (this == 0) return 0;
             const adapter: *const Adapter = @ptrFromInt(this);
             if (adapter.kind != .client or adapter.real == 0) return 0;
@@ -491,6 +558,7 @@ fn clientSetPostResultThunk(comptime slot: usize) VFunc {
 fn clientSetWarningHookThunk() VFunc {
     return @ptrCast(&struct {
         fn call(this: usize, callback: usize) callconv(W) usize {
+            if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] callback-hook thunk this=0x{x} cb=0x{x}\n", .{ this, callback });
             if (this == 0) return 0;
             const adapter: *const Adapter = @ptrFromInt(this);
             if (adapter.kind != .client or adapter.real == 0) return 0;
@@ -506,6 +574,7 @@ fn clientSetWarningHookThunk() VFunc {
 fn clientSetCheckCallbackThunk() VFunc {
     return @ptrCast(&struct {
         fn call(this: usize, callback: usize) callconv(W) usize {
+            if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:SteamABI64] callback-hook thunk this=0x{x} cb=0x{x}\n", .{ this, callback });
             if (this == 0) return 0;
             const adapter: *const Adapter = @ptrFromInt(this);
             if (adapter.kind != .client or adapter.real == 0) return 0;
@@ -523,7 +592,7 @@ fn ensureClient() bool {
     if (g_attempted) return false;
     g_attempted = true;
     if (!appIdEnvAllowed()) {
-        std.debug.print("[WINS:SteamBridge64] SteamAppId conflicts with Cuphead ({d}); refusing Steam client access.\n", .{steam_app_id});
+        std.debug.print("[WINS:SteamBridge64] SteamAppId conflicts with this run's app id ({d}); refusing Steam client access.\n", .{expectedAppId()});
         return false;
     }
     if (!liveValveIpc()) {
@@ -581,10 +650,17 @@ pub fn loadLibrary(raw: []const u8) usize {
 
 pub fn getProcAddress(handle: usize, raw_symbol: []const u8) usize {
     if (handle != module_handle or !ensureClient()) return 0;
+    return bridgedExport(raw_symbol);
+}
+
+/// Win64 implementation of a steamclient64.dll export, or 0 when it is not bridged.
+pub fn bridgedExport(raw_symbol: []const u8) usize {
+    if (!ensureClient()) return 0;
     if (std.mem.eql(u8, raw_symbol, "CreateInterface")) return @intFromPtr(&createInterfaceWin);
     if (std.mem.eql(u8, raw_symbol, "Steam_BGetCallback") and g_bget_callback != null) return @intFromPtr(&steamBGetCallbackWin);
     if (std.mem.eql(u8, raw_symbol, "Steam_FreeLastCallback") and g_free_last_callback != null) return @intFromPtr(&steamFreeLastCallbackWin);
     if (std.mem.eql(u8, raw_symbol, "Steam_GetAPICallResult") and g_get_api_call_result != null) return @intFromPtr(&steamGetApiCallResultWin);
+    traceInterface("GetProcAddress (not bridged)", raw_symbol);
     return 0;
 }
 
@@ -595,7 +671,8 @@ fn steamBGetCallbackWin(pipe: u32, out: ?*CallbackMsg) callconv(W) bool {
     if (!got) return false;
     const msg = out.?.*;
     if (callbackLayout(msg.callback) == .unsupported) {
-        std.debug.print("[WINS:SteamABI64] dropped unsupported callback id={d}\n", .{msg.callback});
+        // Ids >= 1000000 are steamclient-internal (k_iClient*): no game registers them.
+        if (msg.callback < 1_000_000) std.debug.print("[WINS:SteamABI64] dropped unsupported callback id={d}\n", .{msg.callback});
         if (g_free_last_callback) |free| free(pipe);
         return false;
     }
@@ -639,15 +716,39 @@ fn steamGetApiCallResultWin(pipe: u32, call: u64, buffer: ?[*]u8, buffer_size: i
     return convertCallbackToWin(expected_callback, callback_data_win[0..native_size], buffer.?[0..@intCast(buffer_size)]) != null;
 }
 
+/// ISteamClient revisions whose vtable prefix matches 017 for every slot the
+/// adapter treats specially (pipe/user 0 and 2, getters, callback hooks 21/31-33).
+fn clientRevisionBridged(name: []const u8) bool {
+    const revisions = [_][]const u8{ "SteamClient012", "SteamClient013", "SteamClient014", "SteamClient015", "SteamClient016" };
+    for (revisions) |r| if (std.mem.eql(u8, name, r)) return true;
+    return false;
+}
+
 fn createInterfaceWin(name: ?[*:0]const u8, return_code: ?*i32) callconv(W) ?*anyopaque {
     if (return_code) |rc| rc.* = 1;
     if (name == null) return null;
     const requested = std.mem.span(name.?);
     traceInterface("CreateInterface", requested);
     if (!ensureClient()) return null;
-    if (!std.mem.eql(u8, requested, "SteamClient017")) return null;
+    var real = g_client_real;
+    if (!std.mem.eql(u8, requested, "SteamClient017")) {
+        if (!clientRevisionBridged(requested)) {
+            traceInterface("CreateInterface (not bridged)", requested);
+            return null;
+        }
+        // Another ISteamClient revision (SteamStub's DRM module asks for 014 after
+        // 017): the host client still serves it; only the object differs.
+        var host_rc: i32 = -1;
+        const name_z = std.heap.page_allocator.dupeZ(u8, requested) catch return null;
+        defer std.heap.page_allocator.free(name_z);
+        const obj = g_create.?(name_z.ptr, &host_rc) orelse {
+            traceInterface("CreateInterface (host refused)", requested);
+            return null;
+        };
+        real = @intFromPtr(obj);
+    }
     if (return_code) |rc| rc.* = 0;
-    const wrapped = adapterFor(g_client_real, .client, requested);
+    const wrapped = adapterFor(real, .client, requested);
     return if (wrapped == 0) null else @ptrFromInt(wrapped);
 }
 
@@ -746,10 +847,21 @@ test "host Steam root prefers Steam's exported install path over a sandboxed HOM
 }
 
 test "Steam app id parsing is exact and rejects malformed values" {
+    _ = unsetenv("WINS_STEAM_APP_ID");
+    _ = unsetenv("STEAM_COMPAT_APP_ID");
     try std.testing.expect(appIdMatches("268910"));
     try std.testing.expect(!appIdMatches("268911"));
     try std.testing.expect(!appIdMatches("268910x"));
     try std.testing.expect(!appIdMatches(""));
+    // Steam's compat-tool app id selects the game; the launcher's value wins over it.
+    _ = setenv("STEAM_COMPAT_APP_ID", "374320", 1);
+    try std.testing.expect(appIdMatches("374320"));
+    try std.testing.expect(!appIdMatches("268910"));
+    _ = setenv("WINS_STEAM_APP_ID", "268910", 1);
+    try std.testing.expect(appIdMatches("268910"));
+    try std.testing.expect(!appIdMatches("374320"));
+    _ = unsetenv("WINS_STEAM_APP_ID");
+    _ = unsetenv("STEAM_COMPAT_APP_ID");
 }
 
 test "missing host Steam process is never assigned a synthetic pid" {

@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+# WINS Steam compatibility tool launcher: DARK SOULS III (AppID 374320).
+#
+# Runs the installed 64-bit DarkSoulsIII.exe under the WINS Win64 loader inside
+# bubblewrap: no Proton and no Wine. The installed game stays read-only. WINS
+# keeps its own profile (AppData: saves, GraphicsConfig.xml) under
+# ~/.local/share/wins/ds3/profile.
+#
+# Overrides:
+#   WINS_STEAM_ROOT      Steam installation (default ~/.local/share/Steam)
+#   WINS_STEAM_PID       live Steam IPC owner (normally auto-detected)
+#   WINS_ALLOW_NO_STEAM=1 diagnostic mode: no Steam IPC/SteamAPI support
+#   WINS_WINRUN64        absolute path to an alternate winrun64 build
+#   WINS_KEEP_RUN_DIR=1  keep the temporary workspace for diagnosis
+set -euo pipefail
+umask 077
+
+APP_ID=374320
+HOST_HOME="${HOME:?HOME is not set}"
+STEAM_ROOT="${WINS_STEAM_ROOT:-$HOST_HOME/.local/share/Steam}"
+GAME_ROOT="$STEAM_ROOT/steamapps/common/DARK SOULS III/Game"
+TOOL_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+PROFILE_ROOT="$HOST_HOME/.local/share/wins/ds3/profile"
+STATE_ROOT="$HOST_HOME/.local/state/wins/ds3"
+KEEP_RUN_DIR=${WINS_KEEP_RUN_DIR:-0}
+ALLOW_NO_STEAM=${WINS_ALLOW_NO_STEAM:-0}
+USER_ID="$(id -u)"
+GROUP_ID="$(id -g)"
+
+# These are the exact Win64 images approved for this launcher. The loader
+# repeats the checks for every image it maps; doing them here also catches an
+# unused/dynamically loaded image before the cleanroom starts.
+DS3_EXE_SHA256=ef5e07c55222f14ffddecf2c724a0c2a95cef0d4da0e075b0de0bb108b69498c
+STEAM_API64_SHA256=fc20547408a7c34f0bd4946a34c21aab48a75e3b98dce9e55969f486d37b212f
+FMODEX64_SHA256=3cfda68e1488c1ba7171b218da27f2feded47b958352a9240a5ce78831794468
+FMOD_EVENT64_SHA256=27008d07df0ccfa5ad66ca6820e34fe378388515fecb0c22c48daeb26379c314
+BINKW64_SHA256=d43ab5a4cbd84b4a41a71d5e17c049ca8f14e84ddcd4e300ed4196886de20e2e
+
+fail() {
+    printf '[WINS Steam] %s\n' "$*" >&2
+    exit 1
+}
+
+verify_sha256() {
+    local path="$1" expected="$2" label="$3" actual
+    [[ -f "$path" ]] || fail "$label is missing: $path"
+    actual="$(sha256sum -- "$path" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] ||
+        fail "$label SHA-256 mismatch: expected $expected, got $actual"
+    printf '[WINS Steam] verified PIN %-23s %s\n' "$label" "$actual" >&2
+}
+
+if [[ -n "${SteamAppId:-}" && "$SteamAppId" != "$APP_ID" ]]; then
+    fail "SteamAppId mismatch: expected $APP_ID, got $SteamAppId."
+fi
+if [[ -n "${SteamGameId:-}" && "$SteamGameId" != "$APP_ID" ]]; then
+    fail "SteamGameId mismatch: expected $APP_ID, got $SteamGameId."
+fi
+[[ "${STEAM_COMPAT_APP_ID:-}" == "$APP_ID" ]] ||
+    fail "Steam did not provide STEAM_COMPAT_APP_ID=$APP_ID; launch this tool from DARK SOULS III in Steam."
+export SteamAppId="$APP_ID"
+export SteamGameId="$APP_ID"
+
+[[ -x "$STEAM_ROOT/steamrt64/steam" && -d "$STEAM_ROOT/linux64" ]] ||
+    fail "Steam client files are not at the expected installation path: $STEAM_ROOT"
+if [[ -n "${STEAM_COMPAT_CLIENT_INSTALL_PATH:-}" ]]; then
+    compat_client="$(readlink -f -- "$STEAM_COMPAT_CLIENT_INSTALL_PATH")"
+    steam_root_real="$(readlink -f -- "$STEAM_ROOT")"
+    [[ "$compat_client" == "$steam_root_real" ]] ||
+        fail "STEAM_COMPAT_CLIENT_INSTALL_PATH does not match WINS_STEAM_ROOT: $compat_client"
+fi
+[[ -f "$GAME_ROOT/DarkSoulsIII.exe" ]] ||
+    fail "DARK SOULS III is not installed at: $GAME_ROOT"
+
+WINRUN64="${WINS_WINRUN64:-$TOOL_DIR/dist/winrun64}"
+[[ "$WINRUN64" == /* ]] || fail "WINS_WINRUN64 must be an absolute path: $WINRUN64"
+[[ -f "$WINRUN64" && -x "$WINRUN64" ]] ||
+    fail "The WINS Win64 loader is missing or not executable: $WINRUN64"
+WINRUN64="$(readlink -f -- "$WINRUN64")"
+WINRUN64_SHA256="$(sha256sum -- "$WINRUN64" | awk '{print $1}')"
+
+command -v bwrap >/dev/null 2>&1 || fail "bubblewrap (bwrap) is required."
+command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required."
+command -v setsid >/dev/null 2>&1 || fail "setsid (util-linux) is required."
+[[ -n "${DISPLAY:-}" ]] || fail "DISPLAY must name an X11 display (for example, :99)."
+
+verify_sha256 "$GAME_ROOT/DarkSoulsIII.exe" "$DS3_EXE_SHA256" "DarkSoulsIII.exe"
+verify_sha256 "$GAME_ROOT/steam_api64.dll" "$STEAM_API64_SHA256" "steam_api64.dll"
+verify_sha256 "$GAME_ROOT/fmodex64.dll" "$FMODEX64_SHA256" "fmodex64.dll"
+verify_sha256 "$GAME_ROOT/fmod_event64.dll" "$FMOD_EVENT64_SHA256" "fmod_event64.dll"
+verify_sha256 "$GAME_ROOT/binkw64.dll" "$BINKW64_SHA256" "binkw64.dll"
+# steamclient64.dll belongs to the Steam client and changes with Steam updates:
+# pin whatever is installed now (the loader still verifies what it maps).
+[[ -f "$STEAM_ROOT/steamclient64.dll" ]] || fail "steamclient64.dll missing in $STEAM_ROOT"
+STEAMCLIENT64_SHA256="$(sha256sum -- "$STEAM_ROOT/steamclient64.dll" | awk '{print $1}')"
+
+# Steam has several processes named "steam". Select the one that owns the real
+# shared-memory IPC object; never synthesize a Steam ownership token. The
+# explicit no-Steam mode is diagnostic only and leaves the Steam bridge off.
+STEAM_PID=""
+STEAM_EXE=""
+STEAM_STATUS="disabled by WINS_ALLOW_NO_STEAM=1"
+if [[ "$ALLOW_NO_STEAM" != "1" ]]; then
+    STEAM_PID="${WINS_STEAM_PID:-}"
+    if [[ -z "$STEAM_PID" ]]; then
+        steam_matches=()
+        for proc in /proc/[0-9]*; do
+            [[ -r "$proc/comm" && -r "$proc/maps" ]] || continue
+            comm=""
+            IFS= read -r comm < "$proc/comm" || continue
+            [[ "$comm" == "steam" ]] || continue
+            if awk 'index($0, "ValveIPCSharedObj-Steam") { found=1 } END { exit(found ? 0 : 1) }' "$proc/maps"; then
+                steam_matches+=("${proc##*/}")
+            fi
+        done
+        if [[ "${#steam_matches[@]}" -ne 1 ]]; then
+            fail "Could not identify exactly one live Steam IPC process (matches=${#steam_matches[@]})."
+        fi
+        STEAM_PID="${steam_matches[0]}"
+    fi
+    [[ "$STEAM_PID" =~ ^[0-9]+$ ]] || fail "Invalid Steam process id."
+    [[ -r "/proc/$STEAM_PID/comm" ]] || fail "Steam process $STEAM_PID is not visible."
+    [[ "$(cat "/proc/$STEAM_PID/comm")" == "steam" ]] ||
+        fail "Process $STEAM_PID is not the Steam client."
+    awk 'index($0, "ValveIPCSharedObj-Steam") { found=1 } END { exit(found ? 0 : 1) }' \
+        "/proc/$STEAM_PID/maps" ||
+        fail "Steam process $STEAM_PID does not own ValveIPCSharedObj-Steam."
+    STEAM_EXE="$(readlink -f "/proc/$STEAM_PID/exe")" ||
+        fail "Could not resolve the Steam client executable."
+    [[ "$STEAM_EXE" == "$(readlink -f -- "$STEAM_ROOT")/steamrt64/steam" ]] ||
+        fail "Steam executable path changed: $STEAM_EXE"
+    STEAM_STATUS="live PID $STEAM_PID"
+elif [[ -n "${WINS_STEAM_PID:-}" ]]; then
+    fail "WINS_ALLOW_NO_STEAM=1 and WINS_STEAM_PID cannot be combined."
+fi
+
+mkdir -p "$PROFILE_ROOT/AppData/LocalLow" \
+         "$PROFILE_ROOT/AppData/Roaming" \
+         "$PROFILE_ROOT/AppData/Local" \
+         "$PROFILE_ROOT/.config" \
+         "$PROFILE_ROOT/.cache" \
+         "$PROFILE_ROOT/.local/share" \
+         "$PROFILE_ROOT/tmp"
+mkdir -p "$STATE_ROOT/logs"
+
+RUN_ROOT="$(mktemp -d "/tmp/wins-ds3-${USER_ID}.XXXXXXXX")" ||
+    fail "Could not create the temporary game workspace."
+chmod 700 "$RUN_ROOT"
+LOADER_PID=""
+TEE_PID=""
+
+stop_loader() {
+    [[ -n "$LOADER_PID" ]] || return 0
+    if kill -0 "$LOADER_PID" 2>/dev/null; then
+        kill -TERM -- "-$LOADER_PID" 2>/dev/null ||
+            kill -TERM "$LOADER_PID" 2>/dev/null || true
+        for _ in {1..50}; do
+            kill -0 "$LOADER_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$LOADER_PID" 2>/dev/null; then
+            kill -KILL -- "-$LOADER_PID" 2>/dev/null ||
+                kill -KILL "$LOADER_PID" 2>/dev/null || true
+        fi
+    fi
+    wait "$LOADER_PID" 2>/dev/null || true
+}
+
+stop_tee() {
+    [[ -n "$TEE_PID" ]] || return 0
+    if kill -0 "$TEE_PID" 2>/dev/null; then
+        kill -TERM "$TEE_PID" 2>/dev/null || true
+    fi
+    wait "$TEE_PID" 2>/dev/null || true
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    stop_loader
+    stop_tee
+    if [[ "$KEEP_RUN_DIR" == "1" ]]; then
+        printf '[WINS Steam] Kept temporary game workspace: %s\n' "$RUN_ROOT" >&2
+    elif [[ "$RUN_ROOT" == "/tmp/wins-ds3-${USER_ID}."* && -d "$RUN_ROOT" && ! -L "$RUN_ROOT" ]]; then
+        rm -rf --one-file-system -- "$RUN_ROOT"
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+mkdir -p "$RUN_ROOT/home" "$RUN_ROOT/tmp"
+PULSE_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$USER_ID}"
+
+CAPTURE_DIR=""
+if [[ -n "${WINS_D3D11_CAPTURE:-}" ]]; then
+    [[ "$WINS_D3D11_CAPTURE" == /* ]] ||
+        fail "WINS_D3D11_CAPTURE must be an absolute directory path."
+    mkdir -p -- "$WINS_D3D11_CAPTURE"
+    CAPTURE_DIR="$(readlink -f -- "$WINS_D3D11_CAPTURE")"
+    [[ -d "$CAPTURE_DIR" ]] || fail "WINS_D3D11_CAPTURE is not a directory: $CAPTURE_DIR"
+fi
+
+BWRAP_ARGS=(
+    --unshare-user
+    --uid "$USER_ID"
+    --gid "$GROUP_ID"
+    --ro-bind / /
+    --tmpfs /home
+    --dir "$HOST_HOME"
+    --dir "$HOST_HOME/.local"
+    --dir "$HOST_HOME/.local/share"
+    --dir "$STEAM_ROOT"
+    --dir "$STEAM_ROOT/linux64"
+    --dir "$STEAM_ROOT/steamrt64"
+    --ro-bind "$STEAM_ROOT/linux64" "$STEAM_ROOT/linux64"
+    --ro-bind "$STEAM_ROOT/steamrt64" "$STEAM_ROOT/steamrt64"
+    --ro-bind "$STEAM_ROOT/steamclient64.dll" "$STEAM_ROOT/steamclient64.dll"
+    --tmpfs /tmp
+    --dir /tmp/.X11-unix
+    --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix
+    --dev /dev
+    --dir /dev/dri
+    --dir /dev/input
+    --proc /proc
+    --bind /dev/shm /dev/shm
+    --dir /tmp/wins-workspace
+    --bind "$RUN_ROOT" /tmp/wins-workspace
+    --bind "$PROFILE_ROOT" /tmp/wins-workspace/home
+    --dir /tmp/wins-c
+    --ro-bind "$GAME_ROOT" /tmp/wins-c
+    --ro-bind "$GAME_ROOT" /tmp/wins-workspace/game
+    --dir /tmp/wins-tool
+    --ro-bind "$WINRUN64" /tmp/wins-tool/winrun64
+    --chdir /tmp/wins-workspace/game
+    --setenv HOME /tmp/wins-workspace/home
+    --setenv USERPROFILE /tmp/wins-workspace/home
+    --setenv APPDATA /tmp/wins-workspace/home/AppData/Roaming
+    --setenv LOCALAPPDATA /tmp/wins-workspace/home/AppData/Local
+    --setenv XDG_CONFIG_HOME /tmp/wins-workspace/home/.config
+    --setenv XDG_CACHE_HOME /tmp/wins-workspace/home/.cache
+    --setenv XDG_DATA_HOME /tmp/wins-workspace/home/.local/share
+    --setenv XDG_RUNTIME_DIR "$PULSE_RUNTIME_DIR"
+    --setenv TMPDIR /tmp/wins-workspace/tmp
+    --setenv TEMP /tmp/wins-workspace/tmp
+    --setenv TMP /tmp/wins-workspace/tmp
+    --setenv DISPLAY "$DISPLAY"
+    --setenv STEAM_COMPAT_APP_ID "$APP_ID"
+    --setenv STEAM_COMPAT_CLIENT_INSTALL_PATH "$STEAM_ROOT"
+    --setenv SteamAppId "$APP_ID"
+    --setenv SteamGameId "$APP_ID"
+    --setenv SteamOS 1
+    --setenv SteamDeck 0
+    --setenv WINS_STEAM_VERB "${WINS_STEAM_VERB:-unset}"
+    --setenv WINS_WINRUN_BOX 1
+)
+if [[ -n "${STEAM_COMPAT_DATA_PATH:-}" ]]; then
+    BWRAP_ARGS+=(--setenv STEAM_COMPAT_DATA_PATH "$STEAM_COMPAT_DATA_PATH")
+else
+    BWRAP_ARGS+=(--unsetenv STEAM_COMPAT_DATA_PATH)
+fi
+if [[ -n "${STEAM_COMPAT_LIBRARY_PATHS:-}" ]]; then
+    BWRAP_ARGS+=(--setenv STEAM_COMPAT_LIBRARY_PATHS "$STEAM_COMPAT_LIBRARY_PATHS")
+else
+    BWRAP_ARGS+=(--unsetenv STEAM_COMPAT_LIBRARY_PATHS)
+fi
+if [[ -n "$STEAM_PID" ]]; then
+    BWRAP_ARGS+=(--setenv WINS_STEAM_PID "$STEAM_PID")
+    BWRAP_ARGS+=(--setenv WINS_STEAM_EXE "$STEAM_EXE")
+else
+    BWRAP_ARGS+=(--unsetenv WINS_STEAM_PID)
+    BWRAP_ARGS+=(--unsetenv WINS_STEAM_EXE)
+fi
+if [[ -n "$CAPTURE_DIR" ]]; then
+    BWRAP_ARGS+=(--dir /tmp/wins-capture)
+    BWRAP_ARGS+=(--bind "$CAPTURE_DIR" /tmp/wins-capture)
+    BWRAP_ARGS+=(--setenv WINS_D3D11_CAPTURE /tmp/wins-capture)
+else
+    BWRAP_ARGS+=(--unsetenv WINS_D3D11_CAPTURE)
+fi
+# Optional draw diagnostics, disabled unless explicitly requested by the user.
+if [[ -n "${WINS_D3D11_TRACE_DRAWS:-}" ]]; then
+    BWRAP_ARGS+=(--setenv WINS_D3D11_TRACE_DRAWS "$WINS_D3D11_TRACE_DRAWS")
+fi
+if [[ -n "${WINS_D3D11_TRACE_FRAME:-}" ]]; then
+    BWRAP_ARGS+=(--setenv WINS_D3D11_TRACE_FRAME "$WINS_D3D11_TRACE_FRAME")
+fi
+if [[ -d /dev/dri ]]; then
+    BWRAP_ARGS+=(--dev-bind-try /dev/dri /dev/dri)
+fi
+# SDL's Linux joystick backend reads evdev nodes. The mount is read-only: the
+# launcher never opens the devices for writing.
+if [[ -d /dev/input ]]; then
+    BWRAP_ARGS+=(--ro-bind-try /dev/input /dev/input)
+fi
+# The NVIDIA driver talks to its own device nodes, not /dev/dri.
+for nv in /dev/nvidiactl /dev/nvidia0 /dev/nvidia-modeset /dev/nvidia-uvm /dev/nvidia-uvm-tools; do
+    [[ -e "$nv" ]] && BWRAP_ARGS+=(--dev-bind-try "$nv" "$nv")
+done
+[[ -d /dev/nvidia-caps ]] && BWRAP_ARGS+=(--dev-bind-try /dev/nvidia-caps /dev/nvidia-caps)
+# PulseAudio uses a Unix socket under the runtime directory. Keep the host path
+# stable inside the cleanroom and make the socket directory writable.
+if [[ -d "$PULSE_RUNTIME_DIR/pulse" ]]; then
+    BWRAP_ARGS+=(--bind "$PULSE_RUNTIME_DIR/pulse" "$PULSE_RUNTIME_DIR/pulse")
+fi
+if [[ -n "${PULSE_SERVER:-}" ]]; then
+    BWRAP_ARGS+=(--setenv PULSE_SERVER "$PULSE_SERVER")
+elif [[ -S "$PULSE_RUNTIME_DIR/pulse/native" ]]; then
+    BWRAP_ARGS+=(--setenv PULSE_SERVER "unix:$PULSE_RUNTIME_DIR/pulse/native")
+fi
+if [[ -n "${XAUTHORITY:-}" && -f "$XAUTHORITY" ]]; then
+    cp -- "$XAUTHORITY" "$RUN_ROOT/Xauthority"
+    chmod 600 "$RUN_ROOT/Xauthority"
+    BWRAP_ARGS+=(--setenv XAUTHORITY /tmp/wins-workspace/Xauthority)
+elif [[ -f "$HOST_HOME/.Xauthority" ]]; then
+    cp -- "$HOST_HOME/.Xauthority" "$RUN_ROOT/Xauthority"
+    chmod 600 "$RUN_ROOT/Xauthority"
+    BWRAP_ARGS+=(--setenv XAUTHORITY /tmp/wins-workspace/Xauthority)
+else
+    BWRAP_ARGS+=(--unsetenv XAUTHORITY)
+fi
+BWRAP_ARGS+=(--unsetenv DBUS_SESSION_BUS_ADDRESS)
+
+LOADER_ARGS=(
+    --pin "DarkSoulsIII.exe=$DS3_EXE_SHA256"
+    --pin "steam_api64.dll=$STEAM_API64_SHA256"
+    --pin "fmodex64.dll=$FMODEX64_SHA256"
+    --pin "fmod_event64.dll=$FMOD_EVENT64_SHA256"
+    --pin "binkw64.dll=$BINKW64_SHA256"
+    --pin "steamclient64.dll=$STEAMCLIENT64_SHA256"
+    --dll-dir /tmp/wins-workspace/game
+    --run /tmp/wins-workspace/game/DarkSoulsIII.exe
+)
+
+LOG="$STATE_ROOT/logs/$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+printf '[WINS Steam] AppID %s, verb %s, Steam IPC %s\n' \
+    "$APP_ID" "${WINS_STEAM_VERB:-unset}" "$STEAM_STATUS" >&2
+printf '[WINS Steam] Loader: %s (sha256 %s)\n' "$WINRUN64" "$WINRUN64_SHA256" >&2
+[[ -z "$CAPTURE_DIR" ]] ||
+    printf '[WINS Steam] D3D11 capture directory: %s\n' "$CAPTURE_DIR" >&2
+printf '[WINS Steam] Loader output: %s\n' "$LOG" >&2
+
+OUTPUT_FIFO="$RUN_ROOT/loader-output.fifo"
+mkfifo -- "$OUTPUT_FIFO"
+tee -- "$LOG" < "$OUTPUT_FIFO" &
+TEE_PID=$!
+# A separate session lets the signal trap terminate the complete loader/game
+# process group. bwrap's die-with-parent setting is an additional orphan guard.
+setsid bwrap --die-with-parent "${BWRAP_ARGS[@]}" -- \
+    /tmp/wins-tool/winrun64 "${LOADER_ARGS[@]}" > "$OUTPUT_FIFO" 2>&1 &
+LOADER_PID=$!
+
+set +e
+wait "$LOADER_PID"
+status=$?
+wait "$TEE_PID"
+tee_status=$?
+set -e
+LOADER_PID=""
+TEE_PID=""
+if [[ "$tee_status" -ne 0 && "$status" -eq 0 ]]; then
+    status="$tee_status"
+fi
+printf '[WINS Steam] Loader exited with status %s\n' "$status" >&2
+exit "$status"

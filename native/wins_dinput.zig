@@ -100,6 +100,23 @@ pub fn keyEvent(dik: u8, down: bool) void {
     const v: u8 = if (down) 0x80 else 0;
     if (g_keys[dik].swap(v, .monotonic) == v) return;
     push(.keyboard, dik, v);
+    if (traceOn()) {
+        var live: u32 = 0;
+        var acq: u32 = 0;
+        lock();
+        for (g_devices) |m| if (m) |d| if (d.kind == .keyboard) {
+            live += 1;
+            if (d.acquired) acq += 1;
+        };
+        unlock();
+        std.debug.print("[WINS:DInput] key DIK 0x{x} {s}: {d} keyboard device(s), {d} acquired\n", .{ dik, if (down) "down" else "up", live, acq });
+    }
+}
+
+var g_trace: i8 = -1;
+fn traceOn() bool {
+    if (g_trace < 0) g_trace = if (std.c.getenv("WINS_DINPUT_TRACE") != null) 1 else 0;
+    return g_trace == 1;
 }
 
 /// Producer: relative mouse motion in mickeys (pixels).
@@ -265,6 +282,7 @@ pub const Device = struct {
     seen_y: i32 = 0,
     seen_z: i32 = 0,
     buffer: []ObjectData = &.{},
+    polls: u32 = 0,
     head: usize = 0,
     count: usize = 0,
     overflow: bool = false,
@@ -303,6 +321,7 @@ fn dev_Release(this: *anyopaque) callconv(W) u32 {
     const d = self(this);
     if (d.ref_count > 0) d.ref_count -= 1;
     const left = d.ref_count;
+    if (traceOn()) std.debug.print("[WINS:DInput] {s} 0x{x}: Release -> {d}\n", .{ @tagName(d.kind), @intFromPtr(d), left });
     if (left == 0) {
         lock();
         for (&g_devices) |*slot| {
@@ -446,7 +465,7 @@ fn dev_GetProperty(this: *anyopaque, prop: usize, ph: ?[*]u32) callconv(W) i32 {
     const h = ph orelse return E_POINTER;
     switch (prop) {
         DIPROP_BUFFERSIZE => h[4] = @intCast(d.buffer.len),
-        DIPROP_AXISMODE => h[4] = @intFromBool(d.absolute),
+        DIPROP_AXISMODE => h[4] = if (d.absolute) 0 else 1, // DIPROPAXISMODE_ABS=0, DIPROPAXISMODE_REL=1
         DIPROP_RANGE => {
             h[4] = @bitCast(d.range_min);
             h[5] = @bitCast(d.range_max);
@@ -477,7 +496,7 @@ fn dev_SetProperty(this: *anyopaque, prop: usize, ph: ?[*]const u32) callconv(W)
             unlock();
             if (old.len != 0) std.heap.page_allocator.free(old);
         },
-        DIPROP_AXISMODE => d.absolute = h[4] == 1,
+        DIPROP_AXISMODE => d.absolute = h[4] == 0, // DIPROPAXISMODE_ABS=0, DIPROPAXISMODE_REL=1
         DIPROP_RANGE => {
             const rmin: i32 = @bitCast(h[4]);
             const rmax: i32 = @bitCast(h[5]);
@@ -503,6 +522,7 @@ fn dev_SetProperty(this: *anyopaque, prop: usize, ph: ?[*]const u32) callconv(W)
 fn dev_Acquire(this: *anyopaque) callconv(W) i32 {
     const d = self(this);
     sayOnce(10 + @as(u5, @intCast(@intFromEnum(d.kind))), "Acquire", @returnAddress());
+    if (traceOn()) std.debug.print("[WINS:DInput] {s} 0x{x}: Acquire (data size {d}, acquired {})\n", .{ @tagName(d.kind), @intFromPtr(d), d.data_size, d.acquired });
     if (d.data_size == 0) return DIERR_INVALIDPARAM; // no data format yet
     if (d.acquired) return DI_NOEFFECT;
     lock();
@@ -521,6 +541,7 @@ fn dev_Acquire(this: *anyopaque) callconv(W) i32 {
 fn dev_Unacquire(this: *anyopaque) callconv(W) i32 {
     const d = self(this);
     sayOnce(13 + @as(u5, @intCast(@intFromEnum(d.kind))), "Unacquire", @returnAddress());
+    if (traceOn()) std.debug.print("[WINS:DInput] {s} 0x{x}: Unacquire\n", .{ @tagName(d.kind), @intFromPtr(d) });
     if (!d.acquired) return DI_NOEFFECT;
     lock();
     d.acquired = false;
@@ -576,13 +597,19 @@ fn dev_GetDeviceState(this: *anyopaque, cb: u32, data: ?[*]u8) callconv(W) i32 {
         .keyboard => {
             lock();
             defer unlock();
+            var any: u32 = 0;
             for (0..256) |k| {
                 if (g_keys[k].load(.monotonic) != 0 or d.latched_keys[k]) {
                     out[k] = 0x80;
                     d.latched_keys[k] = false;
+                    any = @intCast(k);
                 } else {
                     out[k] = 0;
                 }
+            }
+            if (traceOn()) {
+                d.polls += 1;
+                if (any != 0 or d.polls % 600 == 1) std.debug.print("[WINS:DInput] keyboard 0x{x}: GetDeviceState poll {d} tid {d} (DIK 0x{x} down)\n", .{ @intFromPtr(d), d.polls, linux.gettid(), any });
             }
         },
         .mouse => {
@@ -1205,4 +1232,18 @@ test "fast tap latching: key and mouse button taps between GetDeviceState calls 
     try std.testing.expectEqual(@as(u8, 0x80), mstate[12]);
     try std.testing.expectEqual(DI_OK, dev_GetDeviceState(m, 20, &mstate));
     try std.testing.expectEqual(@as(u8, 0), mstate[12]);
+
+    // DIPROP_AXISMODE: DIPROPAXISMODE_REL (1) must keep relative deltas; DIPROPAXISMODE_ABS (0) switches to absolute.
+    const rel_prop = [_]u32{ 20, 16, 0, 0, 1 };
+    try std.testing.expectEqual(DI_OK, dev_SetProperty(m, DIPROP_AXISMODE, &rel_prop));
+    var got_prop = [_]u32{ 20, 16, 0, 0, 99 };
+    try std.testing.expectEqual(DI_OK, dev_GetProperty(m, DIPROP_AXISMODE, &got_prop));
+    try std.testing.expectEqual(@as(u32, 1), got_prop[4]);
+    mouseMove(15, -7);
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(m, 20, &mstate));
+    try std.testing.expectEqual(@as(i32, 15), std.mem.readInt(i32, mstate[0..4], .little));
+    try std.testing.expectEqual(@as(i32, -7), std.mem.readInt(i32, mstate[4..8], .little));
+    try std.testing.expectEqual(DI_OK, dev_GetDeviceState(m, 20, &mstate));
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, mstate[0..4], .little));
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, mstate[4..8], .little));
 }

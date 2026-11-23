@@ -187,6 +187,11 @@ fn GetProcessHeap() callconv(W) usize {
     return HEAP_COOKIE;
 }
 
+/// The process heap handle (PEB.ProcessHeap must hold the same value).
+pub fn processHeapHandle() usize {
+    return HEAP_COOKIE;
+}
+
 /// Shared with winrun32.zig: a block is ours only if this magic is in front
 /// of it. A free that cannot find the magic must not unmap: the address may
 /// belong to the real Steam client.
@@ -631,9 +636,30 @@ fn IsValidCodePage(cp: u32) callconv(W) u32 {
     return 1;
 }
 
+/// CPINFO { UINT MaxCharSize; BYTE DefaultChar[2]; BYTE LeadByte[12]; }.
+/// MaxCharSize must be real: the MSVC CRT derives MB_CUR_MAX from it and
+/// mbtowc(n = 0) fails, so a zeroed CPINFO broke every "%hS" in DS3 (its
+/// Scaleform image URLs all came out as L"S").
 fn GetCPInfo(cp: u32, lpInfo: ?[*]u8) callconv(W) u32 {
-    _ = cp;
-    if (lpInfo) |p| @memset(p[0..18], 0);
+    const p = lpInfo orelse return 0;
+    @memset(p[0..18], 0);
+    const real = switch (cp) {
+        0, 1, 2, 3 => GetACP(), // CP_ACP, CP_OEMCP, CP_MACCP, CP_THREAD_ACP
+        else => cp,
+    };
+    const max: u32 = switch (real) {
+        65001 => 4, // UTF-8
+        65000 => 5, // UTF-7
+        932, 936, 949, 950, 1361 => 2, // DBCS
+        else => 1,
+    };
+    std.mem.writeInt(u32, p[0..4], max, .little);
+    p[4] = '?';
+    switch (real) { // DBCS lead-byte ranges, terminated by a zero pair
+        932 => { p[6] = 0x81; p[7] = 0x9F; p[8] = 0xE0; p[9] = 0xFC; },
+        936, 949, 950 => { p[6] = 0x81; p[7] = 0xFE; },
+        else => {},
+    }
     return 1;
 }
 
@@ -737,13 +763,27 @@ fn CompareStringW(lcid: u32, flags: u32, s1: ?[*]const u16, cch1: i32, s2: ?[*]c
 
 fn LCMapStringW(lcid: u32, flags: u32, src: ?[*]const u16, cch_src: i32, dest: ?[*]u16, cch_dest: i32) callconv(W) i32 {
     _ = lcid;
-    _ = flags;
-    if (cch_src <= 0 or src == null) return 0;
-    const n: usize = @intCast(cch_src);
-    if (cch_dest == 0 or dest == null) return cch_src;
-    const copy_n = @min(n, @as(usize, @intCast(cch_dest)));
-    @memcpy(dest.?[0..copy_n], src.?[0..copy_n]);
-    return @intCast(copy_n);
+    const in = src orelse return 0;
+    if (cch_src == 0) return 0;
+    const n: usize = if (cch_src > 0) @intCast(cch_src) else blk: {
+        var k: usize = 0;
+        while (in[k] != 0) k += 1;
+        break :blk k + 1;
+    };
+    if (cch_dest == 0 or dest == null) return @intCast(n);
+    if (@as(usize, @intCast(cch_dest)) < n) return 0; // ERROR_INSUFFICIENT_BUFFER
+    const LOWER: u32 = 0x100;
+    const UPPER: u32 = 0x200;
+    for (0..n) |i| {
+        var c = in[i];
+        if (flags & UPPER != 0) {
+            if ((c >= 'a' and c <= 'z') or (c >= 0xE0 and c <= 0xFE and c != 0xF7)) c -= 0x20;
+        } else if (flags & LOWER != 0) {
+            if ((c >= 'A' and c <= 'Z') or (c >= 0xC0 and c <= 0xDE and c != 0xD7)) c += 0x20;
+        }
+        dest.?[i] = c;
+    }
+    return @intCast(n);
 }
 
 fn MultiByteToWideChar(cp: u32, flags: u32, mb: ?[*]const u8, cb_mb: i32, wc: ?[*]u16, cch_wc: i32) callconv(W) i32 {
@@ -790,12 +830,53 @@ fn WideCharToMultiByte(cp: u32, flags: u32, wc: ?[*]const u16, cch_wc: i32, mb: 
     return @intCast(out_i);
 }
 
+/// CT_CTYPE1 classes for one UTF-16 unit (ASCII + Latin-1; other letters as
+/// C1_ALPHA). The MSVC CRT builds its ctype tables from this.
+fn ctype1(c: u16) u16 {
+    const UPPER: u16 = 0x1;
+    const LOWER: u16 = 0x2;
+    const DIGIT: u16 = 0x4;
+    const SPACE: u16 = 0x8;
+    const PUNCT: u16 = 0x10;
+    const CNTRL: u16 = 0x20;
+    const BLANK: u16 = 0x40;
+    const XDIGIT: u16 = 0x80;
+    const ALPHA: u16 = 0x100;
+    const DEFINED: u16 = 0x200;
+    var t: u16 = DEFINED;
+    switch (c) {
+        'A'...'Z' => t |= UPPER | ALPHA | (if (c <= 'F') XDIGIT else 0),
+        'a'...'z' => t |= LOWER | ALPHA | (if (c <= 'f') XDIGIT else 0),
+        '0'...'9' => t |= DIGIT | XDIGIT,
+        ' ' => t |= SPACE | BLANK,
+        '\t' => t |= SPACE | BLANK | CNTRL,
+        0x0A, 0x0B, 0x0C, 0x0D => t |= SPACE | CNTRL,
+        0x00...0x08, 0x0E...0x1F, 0x7F...0x9F => t |= CNTRL,
+        0xA0 => t |= SPACE | BLANK,
+        0xC0...0xD6, 0xD8...0xDE => t |= UPPER | ALPHA,
+        0xDF...0xF6, 0xF8...0xFF => t |= LOWER | ALPHA,
+        0x21...0x2F, 0x3A...0x40, 0x5B...0x60, 0x7B...0x7E, 0xA1...0xBF, 0xD7, 0xF7 => t |= PUNCT,
+        else => t |= ALPHA,
+    }
+    return t;
+}
+
 fn GetStringTypeW(flags: u32, src: ?[*]const u16, cch: i32, chartype: ?[*]u16) callconv(W) u32 {
-    _ = flags;
-    _ = src;
-    if (chartype != null and cch > 0) {
-        @memset(chartype.?[0..@intCast(cch)], 0);
-        return 1;
+    const in = src orelse return 0;
+    const out = chartype orelse return 0;
+    const n: usize = if (cch >= 0) @intCast(cch) else blk: {
+        var k: usize = 0;
+        while (in[k] != 0) k += 1;
+        break :blk k + 1;
+    };
+    for (0..n) |i| {
+        const c = in[i];
+        out[i] = switch (flags) {
+            1 => ctype1(c), // CT_CTYPE1
+            2 => if (c < 0x80) (if (c >= '0' and c <= '9') @as(u16, 3) else if (ctype1(c) & 0x100 != 0) @as(u16, 1) else if (c == ' ') @as(u16, 10) else @as(u16, 0)) else 1, // CT_CTYPE2: L1 / EN / WS
+            4 => if (ctype1(c) & 0x100 != 0) @as(u16, 0x8000) else 0, // CT_CTYPE3: C3_ALPHA
+            else => 0,
+        };
     }
     return 1;
 }
@@ -1016,13 +1097,20 @@ fn GetStartupInfoW(si: ?[*]u8) callconv(W) void {
 }
 
 fn FlushFileBuffers(h: usize) callconv(W) u32 {
-    _ = h;
+    if (fdFromHandle(h)) |fd| _ = linux.fsync(fd);
     return 1;
 }
 
 fn SetEndOfFile(h: usize) callconv(W) u32 {
-    _ = h;
-    return 1;
+    const fd = fdFromHandle(h) orelse {
+        setLastError(6);
+        return 0;
+    };
+    const pos = hostLseek(fd, 0, 1) orelse return 0; // SEEK_CUR
+    const e = linux.errno(linux.ftruncate(fd, pos));
+    if (e == .SUCCESS) return 1;
+    setLastError(win32ErrorFromErrno(e));
+    return 0;
 }
 
 /// std's linux.lseek is 64-bit only: it bitcasts the i64 offset straight into
@@ -1280,16 +1368,55 @@ fn rebuildEnvironmentBlocks() void {
     };
 }
 
+/// WINS_DEBUGSTR=1: print the game's OutputDebugString text (first 400 lines).
+var g_dbgstr_n = std.atomic.Value(u32).init(0);
+fn dbgStrOn() bool {
+    const C = struct { var init = false; var on = false; };
+    if (!C.init) {
+        C.init = true;
+        C.on = std.c.getenv("WINS_DEBUGSTR") != null;
+    }
+    return C.on and g_dbgstr_n.fetchAdd(1, .monotonic) < 400;
+}
+
 fn OutputDebugStringA(str: ?[*:0]const u8) callconv(W) void {
-    _ = str;
+    const z = str orelse return;
+    if (!dbgStrOn()) return;
+    std.debug.print("[GAME_DEBUG] {s}\n", .{std.mem.trimEnd(u8, std.mem.sliceTo(z, 0), "\r\n")});
 }
 
 fn OutputDebugStringW(str: ?[*:0]const u16) callconv(W) void {
-    _ = str;
+    const z = str orelse return;
+    if (!dbgStrOn()) return;
+    var buf: [1024]u8 = undefined;
+    var n: usize = 0;
+    for (std.mem.sliceTo(z, 0)) |c| {
+        if (n >= buf.len) break;
+        buf[n] = if (c < 0x80) @intCast(c) else '?';
+        n += 1;
+    }
+    std.debug.print("[GAME_DEBUG] {s}\n", .{std.mem.trimEnd(u8, buf[0..n], "\r\n")});
 }
 
 fn AreFileApisANSI() callconv(W) u32 {
     return 1;
+}
+
+/// Logical CPUs this process may run on (sched_getaffinity), clamped to one
+/// processor group (1..64). DS3 sizes its per-worker D3D11 deferred-context
+/// array from this and its render-job pool always takes 6 of them: the old
+/// hardcoded 4 left the pool reading past the array end (garbage contexts).
+pub fn cpuCount() u32 {
+    var set: linux.cpu_set_t = undefined;
+    @memset(std.mem.asBytes(&set), 0);
+    const rc = linux.syscall3(.sched_getaffinity, 0, @sizeOf(linux.cpu_set_t), @intFromPtr(&set));
+    if (linux.errno(rc) != .SUCCESS) return 4;
+    var n: u32 = 0;
+    for (set) |w| n += @popCount(w);
+    return std.math.clamp(n, 1, 64);
+}
+fn cpuMask(n: u32) u64 {
+    return if (n >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(n)) - 1;
 }
 
 fn GetSystemInfo(si: ?[*]u8) callconv(W) void {
@@ -1299,8 +1426,9 @@ fn GetSystemInfo(si: ?[*]u8) callconv(W) void {
         std.mem.writeInt(u32, p[4..8], 4096, .little); // dwPageSize
         std.mem.writeInt(u64, p[8..16], 0x10000, .little); // lpMinimumApplicationAddress
         std.mem.writeInt(u64, p[16..24], 0x00007FFFFFFEFFFF, .little); // lpMaximumApplicationAddress
-        std.mem.writeInt(u64, p[24..32], 0xF, .little); // dwActiveProcessorMask
-        std.mem.writeInt(u32, p[32..36], 4, .little); // dwNumberOfProcessors
+        const n = cpuCount();
+        std.mem.writeInt(u64, p[24..32], cpuMask(n), .little); // dwActiveProcessorMask
+        std.mem.writeInt(u32, p[32..36], n, .little); // dwNumberOfProcessors
         std.mem.writeInt(u32, p[36..40], 8664, .little); // PROCESSOR_AMD_X8664
         std.mem.writeInt(u32, p[40..44], 65536, .little); // dwAllocationGranularity
         std.mem.writeInt(u16, p[44..46], 6, .little); // wProcessorLevel
@@ -1313,7 +1441,9 @@ fn GetLogicalProcessorInformation(buf: ?[*]u8, ret_len: ?*u32) callconv(W) i32 {
         setLastError(87);
         return 0;
     };
-    const need: u32 = 6 * 32; // 4 RelationProcessorCore + 1 RelationNumaNode + 1 RelationProcessorPackage (x64 = 32B each)
+    // n RelationProcessorCore (one logical each) + 1 RelationNumaNode + 1 RelationProcessorPackage (x64 = 32 B each)
+    const n = cpuCount();
+    const need: u32 = (n + 2) * 32;
     const avail = rl.*;
     rl.* = need;
     if (buf == null or avail < need) {
@@ -1322,17 +1452,17 @@ fn GetLogicalProcessorInformation(buf: ?[*]u8, ret_len: ?*u32) callconv(W) i32 {
     }
     const p = buf.?;
     @memset(p[0..need], 0);
-    for (0..4) |i| {
+    for (0..n) |i| {
         const off = i * 32;
         std.mem.writeInt(u64, p[off..][0..8], @as(u64, 1) << @intCast(i), .little);
         std.mem.writeInt(u32, p[off + 8 ..][0..4], 0, .little); // RelationProcessorCore
     }
-    // RelationNumaNode (Relationship = 1)
-    std.mem.writeInt(u64, p[128..][0..8], 0xF, .little);
-    std.mem.writeInt(u32, p[136..][0..4], 1, .little);
-    // RelationProcessorPackage (Relationship = 3)
-    std.mem.writeInt(u64, p[160..][0..8], 0xF, .little);
-    std.mem.writeInt(u32, p[168..][0..4], 3, .little);
+    const numa = n * 32;
+    std.mem.writeInt(u64, p[numa..][0..8], cpuMask(n), .little);
+    std.mem.writeInt(u32, p[numa + 8 ..][0..4], 1, .little); // RelationNumaNode
+    const pkg = numa + 32;
+    std.mem.writeInt(u64, p[pkg..][0..8], cpuMask(n), .little);
+    std.mem.writeInt(u32, p[pkg + 8 ..][0..4], 3, .little); // RelationProcessorPackage
     return 1;
 }
 
@@ -1565,13 +1695,24 @@ fn narrowToTranslatedPath(name: ?[*:0]const u8, out: *[1024]u8) ?[:0]const u8 {
     return translateWinPath(std.mem.span(name.?), out);
 }
 
+var file_trace_state: i8 = -1;
+fn fileTrace(comptime fmt: []const u8, args: anytype) void {
+    if (file_trace_state < 0) file_trace_state = if (std.c.getenv("WINS_FILE_TRACE") != null) 1 else 0;
+    if (file_trace_state == 1) std.debug.print("[WINS:File] " ++ fmt ++ "\n", args);
+}
+
+/// Dispositions: 1 CREATE_NEW, 2 CREATE_ALWAYS, 3 OPEN_EXISTING, 4 OPEN_ALWAYS,
+/// 5 TRUNCATE_EXISTING. Like Windows, CREATE_ALWAYS/OPEN_ALWAYS on an existing
+/// file succeed with last error ERROR_ALREADY_EXISTS, and failures set it too.
 fn CreateFileW(name: ?[*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disp: u32, flags: u32, template: usize) callconv(W) usize {
     _ = share;
     _ = sa;
-    _ = flags;
     _ = template;
     var path_buf: [1024]u8 = undefined;
-    const host_path = wideToTranslatedPath(name, &path_buf) orelse return INVALID_HANDLE;
+    const host_path = wideToTranslatedPath(name, &path_buf) orelse {
+        setLastError(3);
+        return INVALID_HANDLE;
+    };
 
     var open_flags = linux.O{};
     if (access & 0x40000000 != 0 and access & 0x80000000 != 0) {
@@ -1581,15 +1722,29 @@ fn CreateFileW(name: ?[*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, 
     } else {
         open_flags.ACCMODE = .RDONLY;
     }
-    if (disp == 2) {
-        open_flags.CREAT = true;
-        open_flags.TRUNC = true;
-    } else if (disp == 4) {
-        open_flags.CREAT = true;
+    const existed = linux.errno(linux.faccessat(linux.AT.FDCWD, host_path.ptr, 0, 0)) == .SUCCESS;
+    switch (disp) {
+        1 => {
+            open_flags.CREAT = true;
+            open_flags.EXCL = true;
+        },
+        2 => {
+            open_flags.CREAT = true;
+            open_flags.TRUNC = true;
+        },
+        4 => open_flags.CREAT = true,
+        5 => open_flags.TRUNC = true,
+        else => {},
     }
 
     const rc = linux.open(host_path.ptr, open_flags, 0o666);
-    if (linux.errno(rc) != .SUCCESS) return INVALID_HANDLE;
+    const e = linux.errno(rc);
+    fileTrace("CreateFileW {s} access 0x{x} disp {d} flags 0x{x} -> {s}", .{ host_path, access, disp, flags, @tagName(e) });
+    if (e != .SUCCESS) {
+        setLastError(if (e == .EXIST) 80 else win32ErrorFromErrno(e)); // ERROR_FILE_EXISTS for CREATE_NEW
+        return INVALID_HANDLE;
+    }
+    setLastError(if (existed and (disp == 2 or disp == 4)) 183 else 0);
     return @as(usize, @intCast(rc)) + 0x1000;
 }
 
@@ -1624,8 +1779,11 @@ fn CreateFileA(name: ?[*:0]const u8, access: u32, share: u32, sa: ?*anyopaque, d
 fn DeleteFileW(name: ?[*:0]const u16) callconv(W) u32 {
     var path_buf: [1024]u8 = undefined;
     const host_path = wideToTranslatedPath(name, &path_buf) orelse return 0;
-    const rc = linux.unlink(host_path.ptr);
-    return if (linux.errno(rc) == .SUCCESS) 1 else 0;
+    const e = linux.errno(linux.unlink(host_path.ptr));
+    fileTrace("DeleteFileW {s} -> {s}", .{ host_path, @tagName(e) });
+    if (e == .SUCCESS) return 1;
+    setLastError(win32ErrorFromErrno(e));
+    return 0;
 }
 
 fn DeleteFileA(name: ?[*:0]const u8) callconv(W) u32 {
@@ -2685,8 +2843,9 @@ fn GetModuleFileNameA(mod: usize, buf: ?[*]u8, sz: u32) callconv(W) u32 {
 
 fn GetProcessAffinityMask(proc: usize, proc_mask: ?*usize, sys_mask: ?*usize) callconv(W) u32 {
     _ = proc;
-    if (proc_mask) |p| p.* = 1;
-    if (sys_mask) |s| s.* = 1;
+    const m: usize = @truncate(cpuMask(cpuCount()));
+    if (proc_mask) |p| p.* = m;
+    if (sys_mask) |s| s.* = m;
     return 1;
 }
 
@@ -2771,9 +2930,34 @@ fn ReadDirectoryChangesW(h: usize, buf: ?[*]u8, len: u32, sub: u32, filter: u32,
     return 0;
 }
 
+/// ReadProcessMemory: the current process ((HANDLE)-1 or OpenProcess(own pid))
+/// and other processes opened with OpenProcess (handle = 0x1000 + pid) are read
+/// with process_vm_readv, so an unmapped or PROT_NONE range fails with
+/// ERROR_PARTIAL_COPY (or ERROR_NOACCESS for nothing read) instead of faulting,
+/// as on Windows. Protectors read their own image this way.
 fn ReadProcessMemory(proc: usize, base: ?*const anyopaque, buf: ?[*]u8, sz: usize, num_read: ?*usize) callconv(W) u32 {
-    _ = proc; _ = base; _ = buf; _ = sz;
     if (num_read) |r| r.* = 0;
+    const self_pid: usize = @intCast(std.os.linux.getpid());
+    const pid: usize = if (proc == ~@as(usize, 0)) self_pid else if (proc > 0x1000 and proc < 0x1000 + (1 << 22)) proc - 0x1000 else {
+        setLastError(6); // ERROR_INVALID_HANDLE
+        return 0;
+    };
+    const dst = buf orelse {
+        setLastError(998); // ERROR_NOACCESS
+        return 0;
+    };
+    if (sz == 0) return 1;
+    var local = [_]std.posix.iovec{.{ .base = dst, .len = sz }};
+    var remote = [_]std.posix.iovec_const{.{ .base = @ptrCast(base orelse {
+        setLastError(998);
+        return 0;
+    }), .len = sz }};
+    const got = std.os.linux.process_vm_readv(@intCast(pid), &local, &remote, 0);
+    const n: usize = if (std.os.linux.errno(got) == .SUCCESS) got else 0;
+    if (comptime @import("builtin").link_libc) if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:trace] ReadProcessMemory(pid={d}, 0x{x}, {d}) -> {d} bytes ret=0x{x}\n", .{ pid, @intFromPtr(base), sz, n, @returnAddress() });
+    if (num_read) |r| r.* = n;
+    if (n == sz) return 1;
+    setLastError(if (n == 0) 998 else 299); // ERROR_NOACCESS / ERROR_PARTIAL_COPY
     return 0;
 }
 
@@ -2904,13 +3088,35 @@ fn MulDiv(nNumber: i32, nNumerator: i32, nDenominator: i32) callconv(W) i32 {
 }
 
 fn MoveFileW(from: ?[*:0]const u16, to: ?[*:0]const u16) callconv(W) u32 {
-    _ = from; _ = to;
-    return 1;
+    return MoveFileExW(from, to, 0);
 }
 
+/// MOVEFILE_REPLACE_EXISTING (1) lets rename(2) overwrite; without it an existing
+/// target fails with ERROR_ALREADY_EXISTS like Windows. A null target
+/// (MOVEFILE_DELAY_UNTIL_REBOOT deletion) is accepted and ignored.
 fn MoveFileExW(from: ?[*:0]const u16, to: ?[*:0]const u16, flags: u32) callconv(W) u32 {
-    _ = from; _ = to; _ = flags;
-    return 1;
+    var from_buf: [1024]u8 = undefined;
+    var to_buf: [1024]u8 = undefined;
+    const src = wideToTranslatedPath(from, &from_buf) orelse {
+        setLastError(2);
+        return 0;
+    };
+    if (to == null) return 1;
+    const dst = wideToTranslatedPath(to, &to_buf) orelse {
+        setLastError(3);
+        return 0;
+    };
+    if (flags & 1 == 0) {
+        if (linux.errno(linux.faccessat(linux.AT.FDCWD, dst.ptr, 0, 0)) == .SUCCESS) {
+            setLastError(183); // ERROR_ALREADY_EXISTS
+            return 0;
+        }
+    }
+    const e = linux.errno(linux.rename(src.ptr, dst.ptr));
+    fileTrace("MoveFileExW {s} -> {s} flags 0x{x}: {s}", .{ src, dst, flags, @tagName(e) });
+    if (e == .SUCCESS) return 1;
+    setLastError(win32ErrorFromErrno(e));
+    return 0;
 }
 
 fn GetWindowsDirectoryW(buf: ?[*]u16, sz: u32) callconv(W) u32 {
@@ -3407,9 +3613,20 @@ fn ReplaceFileW(lpReplacedFileName: ?*const u16, lpReplacementFileName: ?*const 
     return 1;
 }
 
+/// File I/O here completes synchronously; ReadFile/WriteFile store the NTSTATUS in
+/// OVERLAPPED.Internal and the byte count in InternalHigh, as Windows does.
+const OverlappedHead = extern struct { Internal: usize, InternalHigh: usize };
 fn GetOverlappedResult(hFile: usize, lpOverlapped: ?*anyopaque, lpNumberOfBytesTransferred: ?*u32, bWait: i32) callconv(W) i32 {
-    _ = hFile; _ = lpOverlapped; _ = bWait;
-    if (lpNumberOfBytesTransferred) |p| p.* = 0;
+    _ = hFile; _ = bWait;
+    const ov: *const OverlappedHead = @ptrCast(@alignCast(lpOverlapped orelse {
+        setLastError(87);
+        return 0;
+    }));
+    if (lpNumberOfBytesTransferred) |p| p.* = @truncate(ov.InternalHigh);
+    if (ov.Internal != 0) {
+        setLastError(if (ov.Internal == 0xC0000011) 38 else 31); // EOF -> ERROR_HANDLE_EOF
+        return 0;
+    }
     return 1;
 }
 

@@ -103,6 +103,15 @@ const XImage = extern struct {
     f: [8]?*const anyopaque,
 };
 
+const XColor = extern struct {
+    pixel: c_ulong = 0,
+    red: c_ushort = 0,
+    green: c_ushort = 0,
+    blue: c_ushort = 0,
+    flags: u8 = 0,
+    pad: u8 = 0,
+};
+
 extern "X11" fn XInitThreads() c_int;
 extern "X11" fn XOpenDisplay(?[*:0]const u8) ?*Display;
 extern "X11" fn XCloseDisplay(*Display) c_int;
@@ -115,10 +124,20 @@ extern "X11" fn XMapWindow(*Display, Window) c_int;
 extern "X11" fn XUnmapWindow(*Display, Window) c_int;
 extern "X11" fn XDestroyWindow(*Display, Window) c_int;
 extern "X11" fn XMoveResizeWindow(*Display, Window, c_int, c_int, c_uint, c_uint) c_int;
+extern "X11" fn XRaiseWindow(*Display, Window) c_int;
 extern "X11" fn XStoreName(*Display, Window, [*:0]const u8) c_int;
 extern "X11" fn XSelectInput(*Display, Window, c_long) c_int;
 extern "X11" fn XInternAtom(*Display, [*:0]const u8, c_int) Atom;
 extern "X11" fn XSetWMProtocols(*Display, Window, [*]Atom, c_int) c_int;
+extern "X11" fn XChangeProperty(*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) c_int;
+extern "X11" fn XSendEvent(*Display, Window, c_int, c_long, *XEvent) c_int;
+extern "X11" fn XWarpPointer(*Display, Window, Window, c_int, c_int, c_uint, c_uint, c_int, c_int) c_int;
+extern "X11" fn XCreateBitmapFromData(*Display, Window, [*]const u8, c_uint, c_uint) c_ulong;
+extern "X11" fn XCreatePixmapCursor(*Display, c_ulong, c_ulong, *XColor, *XColor, c_uint, c_uint) c_ulong;
+extern "X11" fn XDefineCursor(*Display, Window, c_ulong) c_int;
+extern "X11" fn XUndefineCursor(*Display, Window) c_int;
+extern "X11" fn XFreeCursor(*Display, c_ulong) c_int;
+extern "X11" fn XFreePixmap(*Display, c_ulong) c_int;
 extern "X11" fn XPending(*Display) c_int;
 extern "X11" fn XNextEvent(*Display, *XEvent) c_int;
 extern "X11" fn XConnectionNumber(*Display) c_int;
@@ -161,7 +180,7 @@ pub const Connection = struct {
         if (width == 0 or height == 0 or width > 65535 or height > 65535) return error.InvalidSize;
         const window = XCreateSimpleWindow(self.display, XDefaultRootWindow(self.display), x, y, width, height, 0, 0x000000, 0xf0f0f0);
         if (window == 0) return error.CreateFailed;
-        const mask: c_long = (1 << 15) | (1 << 17) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6); // Exposure | StructureNotify | Key/Button/Pointer
+        const mask: c_long = (1 << 15) | (1 << 17) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 21); // Exposure | StructureNotify | Key/Button/Pointer | FocusChange
         _ = XSelectInput(self.display, window, mask);
         var wm_delete = XInternAtom(self.display, "WM_DELETE_WINDOW", 0);
         if (wm_delete != 0) {
@@ -243,5 +262,65 @@ pub const Connection = struct {
     pub fn destroy(self: Connection, window: Window) void {
         _ = XDestroyWindow(self.display, window);
         _ = XSync(self.display, 0);
+    }
+
+    pub fn setDecorations(self: Connection, window: Window, decorated: bool) void {
+        if (window == 0) return;
+        const motif_atom = XInternAtom(self.display, "_MOTIF_WM_HINTS", 0);
+        if (motif_atom == 0) return;
+        const hints = [5]c_ulong{ 2, 0, if (decorated) 1 else 0, 0, 0 }; // MWM_HINTS_DECORATIONS = 2
+        _ = XChangeProperty(self.display, window, motif_atom, motif_atom, 32, 0, @ptrCast(&hints), 5);
+        _ = XFlush(self.display);
+    }
+
+    pub fn setFullscreen(self: Connection, window: Window, fullscreen: bool) void {
+        if (window == 0) return;
+        const wm_state = XInternAtom(self.display, "_NET_WM_STATE", 0);
+        const wm_fs = XInternAtom(self.display, "_NET_WM_STATE_FULLSCREEN", 0);
+        if (wm_state == 0 or wm_fs == 0) return;
+        var ev: XEvent = std.mem.zeroes(XEvent);
+        const cm: *XClientMessageEvent = @ptrCast(&ev);
+        cm.type = 33; // ClientMessage
+        cm.serial = 0;
+        cm.send_event = 1;
+        cm.display = self.display;
+        cm.window = window;
+        cm.message_type = wm_state;
+        cm.format = 32;
+        cm.data[0] = if (fullscreen) 1 else 0; // _NET_WM_STATE_ADD=1, _NET_WM_STATE_REMOVE=0
+        cm.data[1] = @bitCast(wm_fs);
+        cm.data[2] = 0;
+        cm.data[3] = 1; // normal application
+        cm.data[4] = 0;
+        const root = XDefaultRootWindow(self.display);
+        _ = XSendEvent(self.display, root, 0, (1 << 20) | (1 << 19), &ev);
+        if (fullscreen) _ = XRaiseWindow(self.display, window);
+        _ = XFlush(self.display);
+    }
+
+    pub fn warpPointer(self: Connection, window: Window, x: i32, y: i32) void {
+        if (window == 0) return;
+        _ = XWarpPointer(self.display, 0, window, 0, 0, 0, 0, x, y);
+        _ = XFlush(self.display);
+    }
+
+    pub fn setCursorVisible(self: Connection, window: Window, visible: bool) void {
+        if (window == 0) return;
+        if (visible) {
+            _ = XUndefineCursor(self.display, window);
+        } else {
+            const zero: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+            var black: XColor = .{};
+            const bm = XCreateBitmapFromData(self.display, window, &zero, 8, 8);
+            if (bm != 0) {
+                const cur = XCreatePixmapCursor(self.display, bm, bm, &black, &black, 0, 0);
+                if (cur != 0) {
+                    _ = XDefineCursor(self.display, window, cur);
+                    _ = XFreeCursor(self.display, cur);
+                }
+                _ = XFreePixmap(self.display, bm);
+            }
+        }
+        _ = XFlush(self.display);
     }
 };

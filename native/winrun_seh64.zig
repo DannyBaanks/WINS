@@ -195,8 +195,25 @@ pub fn deleteFunctionTable(ptr_or_id: ?*anyopaque) u8 {
     return 0;
 }
 
+/// Diagnostic hook (winrun64 single-step tracer): called on every
+/// AddVectoredExceptionHandler; returning true sets TF on the way out.
+pub var on_add_veh: ?*const fn (rsp: usize) bool = null;
+
+/// Diagnostic hook for other modules (e.g. Present #N in wins_d3d11): if the
+/// hook says so, set TF for the calling thread on the way out.
+pub var arm_hook: ?*const fn (what: u32) bool = null;
+pub fn maybeArmStep(what: u32) void {
+    const hook = arm_hook orelse return;
+    if (hook(what)) asm volatile ("pushfq; orq $0x100, (%%rsp); popfq" ::: .{ .memory = true, .cc = true });
+}
+
 pub fn addVectoredExceptionHandler(first: u32, handler: ?*const anyopaque) ?*anyopaque {
+    defer if (on_add_veh) |hook| {
+        var probe: u8 = 0;
+        if (hook(@intFromPtr(&probe))) asm volatile ("pushfq; orq $0x100, (%%rsp); popfq" ::: .{ .memory = true, .cc = true });
+    };
     const h: VehFn = @ptrCast(@alignCast(handler orelse return null));
+    if (hasTraceEnv()) std.debug.print("[WINS:SEH64] AddVectoredExceptionHandler(first={d}, 0x{x} rva 0x{x})\n", .{ first, @intFromPtr(h), rvaForAddr(@intFromPtr(h)) });
     lockSeh();
     defer g_seh_lock.unlock();
     if (first != 0) {
@@ -216,6 +233,7 @@ pub fn addVectoredExceptionHandler(first: u32, handler: ?*const anyopaque) ?*any
 
 pub fn removeVectoredExceptionHandler(handle: ?*anyopaque) u32 {
     const target: usize = @intFromPtr(handle orelse return 0);
+    if (hasTraceEnv()) std.debug.print("[WINS:SEH64] RemoveVectoredExceptionHandler(0x{x} rva 0x{x})\n", .{ target, rvaForAddr(target) });
     lockSeh();
     defer g_seh_lock.unlock();
     for (&g_vehs) |*slot| {
@@ -523,6 +541,137 @@ pub fn restoreContextNaked() callconv(.naked) noreturn {
     );
 }
 
+/// Reload a complete CONTEXT (all GPRs, XMM0-15, MXCSR, EFLAGS) and jump to
+/// its Rip. Uses 24 bytes below the target Rsp, which Win64 code never relies
+/// on (no red zone).
+pub fn restoreFullContextNaked() callconv(.naked) noreturn {
+    asm volatile (
+        \\ ldmxcsr 0x34(%%rcx)
+        \\ movdqu 0x1a0(%%rcx), %%xmm0
+        \\ movdqu 0x1b0(%%rcx), %%xmm1
+        \\ movdqu 0x1c0(%%rcx), %%xmm2
+        \\ movdqu 0x1d0(%%rcx), %%xmm3
+        \\ movdqu 0x1e0(%%rcx), %%xmm4
+        \\ movdqu 0x1f0(%%rcx), %%xmm5
+        \\ movdqu 0x200(%%rcx), %%xmm6
+        \\ movdqu 0x210(%%rcx), %%xmm7
+        \\ movdqu 0x220(%%rcx), %%xmm8
+        \\ movdqu 0x230(%%rcx), %%xmm9
+        \\ movdqu 0x240(%%rcx), %%xmm10
+        \\ movdqu 0x250(%%rcx), %%xmm11
+        \\ movdqu 0x260(%%rcx), %%xmm12
+        \\ movdqu 0x270(%%rcx), %%xmm13
+        \\ movdqu 0x280(%%rcx), %%xmm14
+        \\ movdqu 0x290(%%rcx), %%xmm15
+        \\ movq 0x98(%%rcx), %%rax
+        \\ subq $24, %%rax
+        \\ movq 0xf8(%%rcx), %%rdx
+        \\ movq %%rdx, 16(%%rax)
+        \\ movq 0x80(%%rcx), %%rdx
+        \\ movq %%rdx, 8(%%rax)
+        \\ movl 0x44(%%rcx), %%edx
+        \\ movq %%rdx, 0(%%rax)
+        \\ movq %%rax, %%rsp
+        \\ movq 0x78(%%rcx), %%rax
+        \\ movq 0x88(%%rcx), %%rdx
+        \\ movq 0x90(%%rcx), %%rbx
+        \\ movq 0xa0(%%rcx), %%rbp
+        \\ movq 0xa8(%%rcx), %%rsi
+        \\ movq 0xb0(%%rcx), %%rdi
+        \\ movq 0xb8(%%rcx), %%r8
+        \\ movq 0xc0(%%rcx), %%r9
+        \\ movq 0xc8(%%rcx), %%r10
+        \\ movq 0xd0(%%rcx), %%r11
+        \\ movq 0xd8(%%rcx), %%r12
+        \\ movq 0xe0(%%rcx), %%r13
+        \\ movq 0xe8(%%rcx), %%r14
+        \\ movq 0xf0(%%rcx), %%r15
+        \\ popfq
+        \\ popq %%rcx
+        \\ retq
+    );
+}
+
+fn resumeContext(ctx: [*]u8, full: bool) noreturn {
+    if (full) {
+        asm volatile ("jmp %[target:P]"
+            :
+            : [target] "s" (&restoreFullContextNaked),
+              [ctx] "{rcx}" (ctx),
+            : .{ .memory = true }
+        );
+        unreachable;
+    }
+    callRestoreContext(ctx);
+}
+
+/// Block the signal handler leaves on the faulting thread's stack for
+/// hwDispatchEntry: the full CONTEXT plus the exception code/parameter.
+const HwBlock = extern struct {
+    ctx: [CTX_SIZE]u8 align(16),
+    code: u32,
+    nparams: u32,
+    params: [3]usize,
+};
+
+fn hwDispatchEntry(blk: *HwBlock) callconv(.c) noreturn {
+    dispatchException(blk.code, 0, blk.nparams, &blk.params, &blk.ctx, true);
+    // dispatchException exits the process when nobody handles the exception.
+    linux.exit_group(@bitCast(blk.code));
+}
+
+/// Raise a Windows exception for a fault that Windows reports to the program
+/// but Linux turns into a signal (int 2d, int3). Instead of running handlers
+/// on the signal frame, rewrite the signal context so that, once the handler
+/// returns, the thread continues in hwDispatchEntry on its own stack (below
+/// this handler's frame, which itself sits below the faulting Rsp) with a complete CONTEXT whose Rip
+/// is `resume_rip`. Handlers may then unwind or resume freely, exactly as
+/// after a Windows trap. `fpstate` is the signal's FXSAVE area (may be null).
+/// Diagnostic: set the trap flag in the context resumed after the next
+/// raiseFromSignal dispatch (single-step tracing, see winrun64 onCrash).
+pub var step_on_resume = std.atomic.Value(bool).init(false);
+
+pub fn raiseFromSignal(gregs: [*]u64, fpstate: ?[*]const u8, code: u32, resume_rip: u64, params: [3]usize) void {
+    const map_from_greg = [16]usize{ 13, 14, 12, 11, 15, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7 };
+    const rsp = gregs[15];
+    // The kernel built the signal frame (ucontext + XSAVE area, several KB)
+    // and this handler's own frames just below the faulting Rsp, so the block
+    // must go below *this* frame, or writing it would clobber the very gregs
+    // and fpstate being edited. On an alternate signal stack, fall back to
+    // the thread stack under the faulting Rsp.
+    var probe: u8 = 0;
+    const here = @intFromPtr(&probe);
+    const top: u64 = if (here < rsp and rsp - here < (1 << 20)) here - 4096 else rsp - 256;
+    const blk_addr = (top - @sizeOf(HwBlock)) & ~@as(u64, 63);
+    const blk: *HwBlock = @ptrFromInt(blk_addr);
+    @memset(&blk.ctx, 0);
+    const c: [*]u8 = &blk.ctx;
+    std.mem.writeInt(u32, c[CTX_FLAGS..][0..4], 0x10001F, .little); // CONTROL|INTEGER|SEGMENTS|FLOATING_POINT
+    std.mem.writeInt(u16, c[0x38..][0..2], 0x33, .little); // SegCs
+    std.mem.writeInt(u16, c[0x42..][0..2], 0x2b, .little); // SegSs
+    const tf: u64 = if (step_on_resume.swap(false, .acq_rel)) 0x100 else 0;
+    std.mem.writeInt(u32, c[CTX_EFLAGS..][0..4], @truncate((gregs[17] & ~@as(u64, 0x100)) | tf), .little);
+    for (0..16) |wreg| writeCtxReg(c, wreg, gregs[map_from_greg[wreg]]);
+    writeCtxRip(c, resume_rip);
+    if (fpstate) |fx| {
+        @memcpy(c[0x100..][0..512], fx[0..512]); // FltSave (FXSAVE layout)
+        @memcpy(c[CTX_XMM0..][0 .. 16 * 16], fx[160..][0 .. 16 * 16]);
+        @memcpy(c[0x34..][0..4], fx[24..][0..4]); // MxCsr
+    } else {
+        std.mem.writeInt(u32, c[0x34..][0..4], 0x1f80, .little);
+    }
+    blk.code = code;
+    blk.nparams = if (code == 0x80000003 and params[0] == 0 and params[1] == 0 and params[2] == 0) 1 else 3;
+    blk.params = params;
+    // Enter hwDispatchEntry as if called: rsp+8 16-byte aligned, fake return 0.
+    const sp = (blk_addr - 64) & ~@as(u64, 15);
+    @as(*u64, @ptrFromInt(sp - 8)).* = 0;
+    gregs[15] = sp - 8; // RSP
+    gregs[16] = @intFromPtr(&hwDispatchEntry); // RIP
+    gregs[8] = blk_addr; // RDI = first SysV argument
+    gregs[17] &= ~@as(u64, 0x100 | 0x400); // clear TF and DF
+}
+
 pub inline fn callCaptureContext(ctx: [*]u8) void {
     asm volatile ("call %[target:P]"
         :
@@ -719,6 +868,13 @@ pub fn raiseExceptionEntry() callconv(.naked) void {
 }
 
 fn raiseExceptionDispatch(code: u32, flags: u32, nargs: u32, args: ?[*]const usize, orig_ctx: [*]u8) callconv(W) void {
+    dispatchException(code, flags, nargs, args, orig_ctx, false);
+}
+
+/// `full_restore`: the context came from a hardware fault, so resuming must
+/// reload every register (volatile ones and XMM0-5/MXCSR included), not just
+/// the callee-saved set RaiseException's caller expects.
+fn dispatchException(code: u32, flags: u32, nargs: u32, args: ?[*]const usize, orig_ctx: [*]u8, full_restore: bool) void {
     if (code == 0x406d1388) return; // MS_VC_EXCEPTION thread naming
 
     var rec: EXCEPTION_RECORD = .{
@@ -753,7 +909,21 @@ fn raiseExceptionDispatch(code: u32, flags: u32, nargs: u32, args: ?[*]const usi
     var exc_ptrs = EXCEPTION_POINTERS{ .ExceptionRecord = &rec, .ContextRecord = orig_ctx };
     for (g_vehs) |maybe_veh| {
         if (maybe_veh) |veh| {
-            if (veh(&exc_ptrs) == -1) callRestoreContext(orig_ctx);
+            var before: [CTX_SIZE]u8 = undefined;
+            if (trace) @memcpy(&before, orig_ctx[0..CTX_SIZE]);
+            const verdict = veh(&exc_ptrs);
+            if (trace) {
+                var off: usize = 0;
+                while (off < CTX_SIZE) : (off += 8) {
+                    const b0 = std.mem.readInt(u64, before[off..][0..8], .little);
+                    const b1 = std.mem.readInt(u64, orig_ctx[off..][0..8], .little);
+                    if (b0 != b1) std.debug.print("[WINS:SEH64]     ctx+0x{x}: 0x{x} -> 0x{x}\n", .{ off, b0, b1 });
+                }
+            }
+            if (trace) std.debug.print("[WINS:SEH64]   veh 0x{x} (rva 0x{x}) -> {d}; rip=0x{x} (rva 0x{x}) rsp=0x{x}\n", .{
+                @intFromPtr(veh), rvaForAddr(@intFromPtr(veh)), verdict, readCtxRip(orig_ctx), rvaForAddr(@intCast(readCtxRip(orig_ctx))), readCtxReg(orig_ctx, 4),
+            });
+            if (verdict == -1) resumeContext(orig_ctx, full_restore);
         }
     }
     while (frames < 128) : (frames += 1) {
@@ -798,7 +968,7 @@ fn raiseExceptionDispatch(code: u32, flags: u32, nargs: u32, args: ?[*]const usi
                 std.debug.print("[WINS:SEH64]   -> action={d}\n", .{action});
             }
             if (action == ExceptionContinueExecution) {
-                callRestoreContext(orig_ctx);
+                resumeContext(orig_ctx, full_restore);
             }
         }
         @memcpy(&ctx, &next_ctx);
@@ -815,6 +985,31 @@ fn raiseExceptionDispatch(code: u32, flags: u32, nargs: u32, args: ?[*]const usi
 /// Dispatch hardware faults (SIGSEGV / SIGFPE / SIGILL) from Linux sigaction
 /// to Windows Vectored Exception Handlers (used heavily by Mono JIT) and SEH.
 /// gregs follows Linux x86-64 mcontext_t gregset_t order (R8=0 .. EFLAGS=17).
+/// Crash-report backtrace: unwinds from the signal context with the images'
+/// .pdata (the same unwinder RtlVirtualUnwind uses) and reports each return
+/// address through `emit`. Stops at the first frame outside any known table or
+/// when the stack stops growing. Diagnostic only.
+pub fn backtrace(gregs: [*]const u64, max: usize, emit: *const fn (usize, usize) void) void {
+    var ctx: [CTX_SIZE]u8 align(16) = [_]u8{0} ** CTX_SIZE;
+    const map_from_greg = [16]usize{ 13, 14, 12, 11, 15, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7 };
+    for (0..16) |wreg| writeCtxReg(&ctx, wreg, gregs[map_from_greg[wreg]]);
+    writeCtxRip(&ctx, gregs[16]);
+    var k: usize = 0;
+    while (k < max) : (k += 1) {
+        const pc = readCtxRip(&ctx);
+        const sp = readCtxReg(&ctx, 4);
+        if (pc == 0) return;
+        emit(k, pc);
+        var base: usize = 0;
+        const entry = lookupFunctionEntry(pc, &base, null);
+        if (entry == null and k > 0) return; // unknown code: no reliable unwind
+        var hd: ?*const anyopaque = null;
+        var ef: u64 = 0;
+        _ = virtualUnwind(0, base, pc, entry, &ctx, &hd, &ef, null);
+        if (readCtxReg(&ctx, 4) <= sp) return;
+    }
+}
+
 pub fn dispatchHardwareException(code: u32, fault_addr: usize, gregs: [*]u64) bool {
     var win_ctx: [CTX_SIZE]u8 align(16) = [_]u8{0} ** CTX_SIZE;
     std.mem.writeInt(u32, win_ctx[CTX_FLAGS..][0..4], 0x10000F, .little);
