@@ -1720,18 +1720,6 @@ var g_warp_target_x: i32 = -1;
 var g_warp_target_y: i32 = -1;
 var g_warp_pending = false;
 
-fn mouseKeyStateMask() usize {
-    var mk: usize = 0;
-    if (kbd.getKeyState(0x01) < 0) mk |= 0x0001; // MK_LBUTTON
-    if (kbd.getKeyState(0x02) < 0) mk |= 0x0002; // MK_RBUTTON
-    if (kbd.getKeyState(kbd.VK_SHIFT) < 0) mk |= 0x0004; // MK_SHIFT
-    if (kbd.getKeyState(kbd.VK_CONTROL) < 0) mk |= 0x0008; // MK_CONTROL
-    if (kbd.getKeyState(0x04) < 0) mk |= 0x0010; // MK_MBUTTON
-    if (kbd.getKeyState(0x05) < 0) mk |= 0x0020; // MK_XBUTTON1
-    if (kbd.getKeyState(0x06) < 0) mk |= 0x0040; // MK_XBUTTON2
-    return mk;
-}
-
 /// One X11 key event -> Win32: VK in wParam, VK-state table (shared with
 /// GetKeyState/GetAsyncKeyState via winrun_directx.feedKeyState), WM_INPUT
 /// when RawInput keyboard is registered, and WM_KEYDOWN/WM_KEYUP (or the
