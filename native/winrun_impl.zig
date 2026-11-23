@@ -184,7 +184,7 @@ fn ImplMode(comptime bug: Bug, comptime gui: bool) type {
             };
         }
 
-        /// pub: winrun64 / winload64 (multi-image x64 loader) reuses this GUI shim table.
+        /// pub: winrun64 / winload64 (the multi-image x64 DLL loader) reuse this GUI shim table.
         pub fn lookup(lib: []const u8, name: []const u8) ?usize {
             if (std.ascii.eqlIgnoreCase(lib, "kernel32.dll")) {
                 @import("winrun_kernel32.zig").last_error_hook = &SetLastError;
