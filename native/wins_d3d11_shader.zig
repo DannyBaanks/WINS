@@ -146,6 +146,8 @@ pub const Translated = struct {
     patch_outputs: []SigElem = &.{},
     tess: TessInfo = .{},
     clip_distance_count: u32 = 0,
+    /// Bitmask of SV_Target0..7 outputs declared by a pixel shader (0 for other stages).
+    ps_out_mask: u8 = 0,
     cb_mask: u16,
     tex_bindings: []TexBinding,
     buf_bindings: []BufBinding = &.{},
@@ -600,10 +602,29 @@ fn formatIndex(a: std.mem.Allocator, iv: IndexVal) ![]const u8 {
     return iv.expr;
 }
 
+threadlocal var tls_in_reg_mask: u64 = 0;
+threadlocal var tls_uses_nan_helpers: bool = false;
+
 fn formatInputArray(a: std.mem.Allocator, op: *const Operand) ![]const u8 {
     if (op.index_dim < 2) return std.fmt.allocPrint(a, "vi{s}[0]", .{try formatIndex(a, op.indices[0])});
     if (op.indices[1].kind == .expr) {
-        return std.fmt.allocPrint(a, "vi{s}[{s}]", .{ try formatIndex(a, op.indices[0]), try formatIndex(a, op.indices[1]) });
+        const cp = try formatIndex(a, op.indices[0]);
+        const reg_expr = try formatIndex(a, op.indices[1]);
+        const mask: u64 = if (tls_in_reg_mask != 0) tls_in_reg_mask else 0xF;
+        var fallback_reg: u32 = 0;
+        for (0..64) |r| {
+            if ((mask & (@as(u64, 1) << @intCast(r))) != 0) {
+                fallback_reg = @intCast(r);
+                break;
+            }
+        }
+        var expr = try std.fmt.allocPrint(a, "vi{d}[{s}]", .{ fallback_reg, cp });
+        for ((fallback_reg + 1)..64) |r| {
+            if ((mask & (@as(u64, 1) << @intCast(r))) != 0) {
+                expr = try std.fmt.allocPrint(a, "(({s} == {d}) ? vi{d}[{s}] : {s})", .{ reg_expr, r, r, cp, expr });
+            }
+        }
+        return expr;
     }
     return std.fmt.allocPrint(a, "vi{s}[{s}]", .{ try formatIndex(a, op.indices[1]), try formatIndex(a, op.indices[0]) });
 }
@@ -669,11 +690,14 @@ fn formatFloatBits(a: std.mem.Allocator, bits: u32, ty: NumType) ![]const u8 {
     return switch (ty) {
         .f => blk: {
             const f: f32 = @bitCast(bits);
-            if (!std.math.isFinite(f)) {
+            if (!std.math.isFinite(f) or ((bits & 0x7F800000) == 0 and (bits & 0x7FFFFFFF) != 0) or bits == 0x80000000) {
                 break :blk std.fmt.allocPrint(a, "uintBitsToFloat(0x{x}u)", .{bits});
             }
             var buf: [64]u8 = undefined;
-            const s = try std.fmt.bufPrint(&buf, "{d:.8}", .{f});
+            const s = if (@abs(f) > 0.0 and @abs(f) < 1e-4)
+                try std.fmt.bufPrint(&buf, "{e:.8}", .{f})
+            else
+                try std.fmt.bufPrint(&buf, "{d:.8}", .{f});
             if (std.mem.indexOfScalar(u8, s, '.') == null and std.mem.indexOfScalar(u8, s, 'e') == null and std.mem.indexOfScalar(u8, s, 'E') == null) {
                 break :blk std.fmt.allocPrint(a, "{s}.0", .{s});
             }
@@ -752,7 +776,8 @@ fn assignDst(a: std.mem.Allocator, out: *std.ArrayList(u8), dst: *const Operand,
     const mask = dst.mask;
     var rhs = rhs_in;
     if (dst.sat and ty == .f) {
-        rhs = try std.fmt.allocPrint(a, "clamp({s}, 0.0, 1.0)", .{rhs});
+        tls_uses_nan_helpers = true;
+        rhs = try std.fmt.allocPrint(a, "d3d_sat({s})", .{rhs});
     }
     rhs = switch (ty) {
         .f => rhs,
@@ -1043,11 +1068,15 @@ pub fn parseInputSignature(gpa: std.mem.Allocator, dxbc: []const u8) ![]SigElem 
 }
 
 pub fn translate(gpa: std.mem.Allocator, dxbc: []const u8) !Translated {
-    return translateInternal(gpa, dxbc, null, &.{}, .{});
+    return translateInternal(gpa, dxbc, null, &.{}, .{}, false);
 }
 
 pub fn translateWithVaryings(gpa: std.mem.Allocator, dxbc: []const u8, vs_outputs: ?[]const SigElem) !Translated {
-    return translateInternal(gpa, dxbc, vs_outputs, &.{}, .{});
+    return translateInternal(gpa, dxbc, vs_outputs, &.{}, .{}, false);
+}
+
+pub fn translatePixel(gpa: std.mem.Allocator, dxbc: []const u8, vs_outputs: ?[]const SigElem, dual_src_blend: bool) !Translated {
+    return translateInternal(gpa, dxbc, vs_outputs, &.{}, .{}, dual_src_blend);
 }
 
 pub fn translateTessellation(
@@ -1057,7 +1086,14 @@ pub fn translateTessellation(
     hs_patch_outputs: []const SigElem,
     hs_tess: TessInfo,
 ) !Translated {
-    return translateInternal(gpa, dxbc, hs_outputs, hs_patch_outputs, hs_tess);
+    return translateInternal(gpa, dxbc, hs_outputs, hs_patch_outputs, hs_tess, false);
+}
+
+fn semNameEql(a_name: []const u8, b_name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(a_name, b_name)) return true;
+    const a_tc = std.ascii.eqlIgnoreCase(a_name, "TEXCOORD") or std.ascii.eqlIgnoreCase(a_name, "TEXCORRD");
+    const b_tc = std.ascii.eqlIgnoreCase(b_name, "TEXCOORD") or std.ascii.eqlIgnoreCase(b_name, "TEXCORRD");
+    return a_tc and b_tc;
 }
 
 fn translateInternal(
@@ -1066,6 +1102,7 @@ fn translateInternal(
     vs_outputs: ?[]const SigElem,
     hs_patch_outputs: []const SigElem,
     hs_tess: TessInfo,
+    dual_src_blend: bool,
 ) !Translated {
     last_error = "";
     _ = hs_patch_outputs;
@@ -1152,9 +1189,11 @@ fn translateInternal(
     var cb_mask: u16 = 0;
     var tex_dims = [_]TexDim{.none} ** MAX_TEX;
     var tex_samp = [_]u8{0xFF} ** MAX_TEX;
+    var tex_extra_samp_mask = [_]u16{0} ** MAX_TEX;
     var tex_regular = [_]bool{false} ** MAX_TEX;
     var tex_shadow = [_]bool{false} ** MAX_TEX;
     var tex_shadow_samp = [_]u8{0xFF} ** MAX_TEX;
+    var tex_shadow_extra_mask = [_]u16{0} ** MAX_TEX;
     var idx_temp_sizes = [_]u32{0} ** 8;
     var icb_vals: ?[]const u32 = null;
     var sv_pos_out_reg: ?u32 = null;
@@ -1179,6 +1218,13 @@ fn translateInternal(
     var clip_outputs = [_]ClipOutput{.{}} ** 8;
     var clip_distance_count: u32 = 0;
 
+    tls_uses_nan_helpers = false;
+    var in_reg_mask: u64 = 0;
+    for (inputs) |in_e| {
+        if (in_e.reg < 64) in_reg_mask |= @as(u64, 1) << @intCast(in_e.reg);
+    }
+    tls_in_reg_mask = in_reg_mask;
+
     if (stage == .vertex or stage == .geometry or isDomainStage(stage)) {
         for (outputs) |o| {
             if (o.sysval == 1 or std.ascii.eqlIgnoreCase(o.name, "SV_Position")) sv_pos_out_reg = o.reg;
@@ -1200,7 +1246,7 @@ fn translateInternal(
     }
     if (program_stage == .domain or program_stage == .vertex) {
         for (outputs) |out_e| {
-            if (out_e.sysval != 6 and !std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) continue;
+            if (out_e.sysval != 2 and out_e.sysval != 6 and !std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) continue;
             for (0..4) |component| {
                 if ((out_e.mask & (@as(u8, 1) << @intCast(component))) == 0) continue;
                 if (clip_distance_count >= clip_outputs.len) return setErr("more than 8 clip distances");
@@ -1418,9 +1464,11 @@ fn translateInternal(
                 const s0 = try decodeOperand(a, toks, &p);
                 const a0 = try formatSrc(a, &s0, dst.mask, .f, stage);
                 if (op == .rsq) {
-                    try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "inversesqrt({s})", .{a0}), .f, stage);
+                    tls_uses_nan_helpers = true;
+                    try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "d3d_rsq({s})", .{a0}), .f, stage);
                 } else if (op == .rcp) {
-                    try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "(1.0 / {s})", .{a0}), .f, stage);
+                    tls_uses_nan_helpers = true;
+                    try assignDst(a, &body, &dst, try std.fmt.allocPrint(a, "d3d_rcp({s})", .{a0}), .f, stage);
                 } else {
                     const s1 = try decodeOperand(a, toks, &p);
                     const a1 = try formatSrc(a, &s1, dst.mask, .f, stage);
@@ -1428,8 +1476,14 @@ fn translateInternal(
                         .add => try std.fmt.allocPrint(a, "({s} + {s})", .{ a0, a1 }),
                         .mul => try std.fmt.allocPrint(a, "({s} * {s})", .{ a0, a1 }),
                         .div => try std.fmt.allocPrint(a, "({s} / {s})", .{ a0, a1 }),
-                        .min => try std.fmt.allocPrint(a, "min({s}, {s})", .{ a0, a1 }),
-                        .max => try std.fmt.allocPrint(a, "max({s}, {s})", .{ a0, a1 }),
+                        .min => blk: {
+                            tls_uses_nan_helpers = true;
+                            break :blk try std.fmt.allocPrint(a, "d3d_min({s}, {s})", .{ a0, a1 });
+                        },
+                        .max => blk: {
+                            tls_uses_nan_helpers = true;
+                            break :blk try std.fmt.allocPrint(a, "d3d_max({s}, {s})", .{ a0, a1 });
+                        },
                         else => unreachable,
                     };
                     try assignDst(a, &body, &dst, rhs, .f, stage);
@@ -1467,7 +1521,10 @@ fn translateInternal(
                 const fn_name = switch (op) {
                     .exp => "exp2",
                     .frc => "fract",
-                    .log => "log2",
+                    .log => blk: {
+                        tls_uses_nan_helpers = true;
+                        break :blk "d3d_log2";
+                    },
                     .round_ni => "floor",
                     .round_pi => "ceil",
                     .round_ne => "roundEven",
@@ -1485,10 +1542,23 @@ fn translateInternal(
                 var dcos = try decodeOperand(a, toks, &p);
                 dcos.sat = sat;
                 const s0 = try decodeOperand(a, toks, &p);
-                const m = if (dsin.op_type != 13) dsin.mask else dcos.mask;
-                const a0 = try formatSrc(a, &s0, m, .f, stage);
-                if (dsin.op_type != 13) try assignDst(a, &body, &dsin, try std.fmt.allocPrint(a, "sin({s})", .{a0}), .f, stage);
-                if (dcos.op_type != 13) try assignDst(a, &body, &dcos, try std.fmt.allocPrint(a, "cos({s})", .{a0}), .f, stage);
+                if (dsin.op_type != 13 and dcos.op_type != 13) {
+                    const tmp = try std.fmt.allocPrint(a, "sc{d}", .{k});
+                    const as = try formatSrc(a, &s0, dsin.mask, .f, stage);
+                    const ac = try formatSrc(a, &s0, dcos.mask, .f, stage);
+                    try appendFmt(&body, a, "    {s} {s}_s = {s};\n    {s} {s}_c = {s};\n", .{
+                        typePrefix(maskCount(dsin.mask), .f), tmp, as,
+                        typePrefix(maskCount(dcos.mask), .f), tmp, ac,
+                    });
+                    try assignDst(a, &body, &dsin, try std.fmt.allocPrint(a, "sin({s}_s)", .{tmp}), .f, stage);
+                    try assignDst(a, &body, &dcos, try std.fmt.allocPrint(a, "cos({s}_c)", .{tmp}), .f, stage);
+                } else if (dsin.op_type != 13) {
+                    const a0 = try formatSrc(a, &s0, dsin.mask, .f, stage);
+                    try assignDst(a, &body, &dsin, try std.fmt.allocPrint(a, "sin({s})", .{a0}), .f, stage);
+                } else if (dcos.op_type != 13) {
+                    const a0 = try formatSrc(a, &s0, dcos.mask, .f, stage);
+                    try assignDst(a, &body, &dcos, try std.fmt.allocPrint(a, "cos({s})", .{a0}), .f, stage);
+                }
             },
             .eq, .ge, .lt, .ne => {
                 const dst = try decodeOperand(a, toks, &p);
@@ -1626,15 +1696,26 @@ fn translateInternal(
                 const is_cmp = (op == .sample_c or op == .sample_c_lz);
                 // ld_ms carries a sample index; WINS backs MS resources with
                 // single-sample GL textures, so it reads sample 0 (lod 0).
+                var samp_suffix: []const u8 = "";
                 if (op == .ld_ms) {
                     _ = try decodeOperand(a, toks, &p);
                 } else if (op != .ld) {
                     const smp = try decodeOperand(a, toks, &p);
                     const sidx: u8 = @intCast(@min(15, smp.indices[0].imm));
                     if (is_cmp) {
-                        if (tex_shadow_samp[reg] == 0xFF) tex_shadow_samp[reg] = sidx;
+                        if (tex_shadow_samp[reg] == 0xFF) {
+                            tex_shadow_samp[reg] = sidx;
+                        } else if (tex_shadow_samp[reg] != sidx) {
+                            tex_shadow_extra_mask[reg] |= @as(u16, 1) << @intCast(sidx);
+                            samp_suffix = try std.fmt.allocPrint(a, "_s{d}", .{sidx});
+                        }
                     } else {
-                        if (tex_samp[reg] == 0xFF) tex_samp[reg] = sidx;
+                        if (tex_samp[reg] == 0xFF) {
+                            tex_samp[reg] = sidx;
+                        } else if (tex_samp[reg] != sidx) {
+                            tex_extra_samp_mask[reg] |= @as(u16, 1) << @intCast(sidx);
+                            samp_suffix = try std.fmt.allocPrint(a, "_s{d}", .{sidx});
+                        }
                     }
                 }
                 var extra_e: []const u8 = "";
@@ -1662,19 +1743,19 @@ fn translateInternal(
                 } else if (is_cmp) blk: {
                     const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
                     if (tdim == .cube_array) {
-                        break :blk try std.fmt.allocPrint(a, "vec4(texture({s}{d}_sh, {s}, {s}))", .{ cname, reg, cexpr, extra_e });
+                        break :blk try std.fmt.allocPrint(a, "vec4(texture({s}{d}_sh{s}, {s}, {s}))", .{ cname, reg, samp_suffix, cexpr, extra_e });
                     }
                     const vec_ty = if (tdim == .cube or tdim == .tex2d_array) "vec4" else "vec3";
-                    break :blk try std.fmt.allocPrint(a, "vec4(texture({s}{d}_sh, {s}({s}, {s})))", .{ cname, reg, vec_ty, cexpr, extra_e });
+                    break :blk try std.fmt.allocPrint(a, "vec4(texture({s}{d}_sh{s}, {s}({s}, {s})))", .{ cname, reg, samp_suffix, vec_ty, cexpr, extra_e });
                 } else if (op == .sample_l) blk: {
                     const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
-                    break :blk try std.fmt.allocPrint(a, "textureLod({s}{d}, {s}, {s})", .{ cname, reg, cexpr, extra_e });
+                    break :blk try std.fmt.allocPrint(a, "textureLod({s}{d}{s}, {s}, {s})", .{ cname, reg, samp_suffix, cexpr, extra_e });
                 } else if (op == .sample_b) blk: {
                     const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
-                    break :blk try std.fmt.allocPrint(a, "texture({s}{d}, {s}, {s})", .{ cname, reg, cexpr, extra_e });
+                    break :blk try std.fmt.allocPrint(a, "texture({s}{d}{s}, {s}, {s})", .{ cname, reg, samp_suffix, cexpr, extra_e });
                 } else blk: {
                     const cexpr = try tex1dCoord(a, tdim, try formatSrc(a, &coord, cmask, .f, stage), .f);
-                    break :blk try std.fmt.allocPrint(a, "texture({s}{d}, {s})", .{ cname, reg, cexpr });
+                    break :blk try std.fmt.allocPrint(a, "texture({s}{d}{s}, {s})", .{ cname, reg, samp_suffix, cexpr });
                 };
                 var swbuf: [5]u8 = undefined;
                 const sw = swzForMask(res.swz, dst.mask, &swbuf);
@@ -1843,9 +1924,16 @@ fn translateInternal(
                 const res = try decodeOperand(a, toks, &p);
                 const smp = try decodeOperand(a, toks, &p);
                 const reg: u8 = @intCast(@min(MAX_TEX - 1, res.indices[0].imm));
+                const sidx: u8 = @intCast(@min(15, smp.indices[0].imm));
                 tex_regular[reg] = true;
-                if (tex_samp[reg] == 0xFF) tex_samp[reg] = @intCast(@min(15, smp.indices[0].imm));
-                const tname = try std.fmt.allocPrint(a, "{s}tex{d}", .{ stagePrefix(stage), reg });
+                var samp_suffix: []const u8 = "";
+                if (tex_samp[reg] == 0xFF) {
+                    tex_samp[reg] = sidx;
+                } else if (tex_samp[reg] != sidx) {
+                    tex_extra_samp_mask[reg] |= @as(u16, 1) << @intCast(sidx);
+                    samp_suffix = try std.fmt.allocPrint(a, "_s{d}", .{sidx});
+                }
+                const tname = try std.fmt.allocPrint(a, "{s}tex{d}{s}", .{ stagePrefix(stage), reg, samp_suffix });
                 const cexpr = try tex1dCoord(a, tex_dims[reg], try formatSrc(a, &coord, sampleCoordMask(tex_dims[reg]), .f, stage), .f);
                 var swbuf: [5]u8 = undefined;
                 if (op == .gather4) {
@@ -2167,9 +2255,20 @@ fn translateInternal(
                 try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d};\n", .{
                     unit, samplerType(tex_dims[i]), prefix, i,
                 });
-                // Fetch-only textures keep their own index (no sampler needed; s# < 16).
-                const samp: u8 = if (tex_samp[i] == 0xFF) @intCast(@min(15, i)) else tex_samp[i];
-                try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
+                // Fetch-only textures keep samp=0xFF so GL binds sampler 0 instead of an unrelated s# slot.
+                try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = tex_samp[i] });
+            }
+            if (tex_extra_samp_mask[i] != 0) {
+                for (0..16) |sidx| {
+                    if ((tex_extra_samp_mask[i] & (@as(u16, 1) << @intCast(sidx))) == 0) continue;
+                    if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
+                    const unit = tex_base + n_units;
+                    n_units += 1;
+                    try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d}_s{d};\n", .{
+                        unit, samplerType(tex_dims[i]), prefix, i, sidx,
+                    });
+                    try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = @intCast(sidx) });
+                }
             }
             if (tex_shadow[i]) {
                 if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
@@ -2180,6 +2279,18 @@ fn translateInternal(
                 });
                 const samp: u8 = if (tex_shadow_samp[i] == 0xFF) @intCast(@min(15, i)) else tex_shadow_samp[i];
                 try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(unit), .dim = tex_dims[i], .samp = samp });
+                if (tex_shadow_extra_mask[i] != 0) {
+                    for (0..16) |sidx| {
+                        if ((tex_shadow_extra_mask[i] & (@as(u16, 1) << @intCast(sidx))) == 0) continue;
+                        if (n_units >= GL_UNITS) return setErr("more than 32 textures in one stage");
+                        const extra_unit = tex_base + n_units;
+                        n_units += 1;
+                        try appendFmt(&hdr, a, "layout(binding = {d}) uniform {s} {s}tex{d}_sh_s{d};\n", .{
+                            extra_unit, samplerTypeShadow(tex_dims[i]), prefix, i, sidx,
+                        });
+                        try tlist.append(gpa, .{ .reg = @intCast(i), .unit = @intCast(extra_unit), .dim = tex_dims[i], .samp = @intCast(sidx) });
+                    }
+                }
             }
         }
     }
@@ -2311,7 +2422,7 @@ fn translateInternal(
             // SV_Depth / SV_Coverage have no register (0xFFFFFFFF): oDepth -> gl_FragDepth.
             if (out_e.reg >= 64) continue;
             if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
-            if (out_e.sysval == 6 or std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) {
+            if (out_e.sysval == 2 or out_e.sysval == 6 or std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) {
                 try appendFmt(&hdr, a, "vec4 vo{d};\n", .{out_e.reg});
                 continue;
             }
@@ -2335,7 +2446,7 @@ fn translateInternal(
             var loc: u32 = in_e.reg;
             if (vs_outputs) |vouts| {
                 for (vouts) |vo| {
-                    if (vo.index == in_e.index and std.ascii.eqlIgnoreCase(vo.name, in_e.name)) {
+                    if (vo.index == in_e.index and semNameEql(vo.name, in_e.name)) {
                         loc = vo.reg;
                         break;
                     }
@@ -2355,7 +2466,7 @@ fn translateInternal(
             var loc: u32 = in_e.reg;
             if (vs_outputs) |vouts| {
                 for (vouts) |vo| {
-                    if (vo.index == in_e.index and std.ascii.eqlIgnoreCase(vo.name, in_e.name)) {
+                    if (vo.index == in_e.index and semNameEql(vo.name, in_e.name)) {
                         loc = vo.reg;
                         break;
                     }
@@ -2378,7 +2489,7 @@ fn translateInternal(
             if (out_e.reg >= 64) continue;
             patch_count = @max(patch_count, out_e.reg + 1);
         }
-        if (patch_count > 0) try appendFmt(&hdr, a, "layout(location = {d}) patch out vec4 pc[{d}];\n", .{ patch_location_base, patch_count });
+        if (patch_count > 0) try appendFmt(&hdr, a, "layout(location = {d}) patch out vec4 pc[{d}];\n", .{ tess.patch_location_base, patch_count });
     } else if (program_stage == .domain) {
         for (inputs) |in_e| {
             if (in_e.reg >= 64) continue;
@@ -2386,7 +2497,7 @@ fn translateInternal(
             var loc: u32 = in_e.reg;
             if (vs_outputs) |vouts| {
                 for (vouts) |vo| {
-                    if (vo.index == in_e.index and std.ascii.eqlIgnoreCase(vo.name, in_e.name)) {
+                    if (vo.index == in_e.index and semNameEql(vo.name, in_e.name)) {
                         loc = vo.reg;
                         break;
                     }
@@ -2403,7 +2514,7 @@ fn translateInternal(
                 try appendFmt(&hdr, a, "vec4 vo{d};\n", .{out_e.reg});
                 continue;
             }
-            if (out_e.sysval == 6 or std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) {
+            if (out_e.sysval == 2 or out_e.sysval == 6 or std.ascii.eqlIgnoreCase(out_e.name, "SV_ClipDistance")) {
                 try appendFmt(&hdr, a, "vec4 vo{d};\n", .{out_e.reg});
                 continue;
             }
@@ -2435,7 +2546,7 @@ fn translateInternal(
                 var loc: u32 = in_e.reg;
                 if (vs_outputs) |vouts| {
                     for (vouts) |vo| {
-                        if (vo.index == in_e.index and std.ascii.eqlIgnoreCase(vo.name, in_e.name)) {
+                        if (vo.index == in_e.index and semNameEql(vo.name, in_e.name)) {
                             loc = vo.reg;
                             break;
                         }
@@ -2448,8 +2559,53 @@ fn translateInternal(
             // SV_Depth / SV_Coverage have no register (0xFFFFFFFF): oDepth -> gl_FragDepth.
             if (out_e.reg >= 64) continue;
             if (!firstUseOfReg(&out_seen, out_e.reg)) continue;
-            try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
+            if (dual_src_blend and out_e.reg <= 1) {
+                try appendFmt(&hdr, a, "layout(location = 0, index = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
+            } else {
+                try appendFmt(&hdr, a, "layout(location = {d}) out vec4 vo{d};\n", .{ out_e.reg, out_e.reg });
+            }
         }
+    }
+
+    var ps_out_mask: u8 = 0;
+    if (program_stage == .pixel) {
+        for (outputs) |out_e| {
+            if (dual_src_blend and out_e.reg <= 1) {
+                ps_out_mask |= 1;
+            } else if (out_e.reg < 8) {
+                ps_out_mask |= @as(u8, 1) << @intCast(out_e.reg);
+            }
+        }
+    }
+
+    if (tls_uses_nan_helpers) {
+        try hdr.appendSlice(a,
+            \\float d3d_sat(float x) { return isnan(x) ? 0.0 : clamp(x, 0.0, 1.0); }
+            \\vec2 d3d_sat(vec2 x) { return mix(clamp(x, 0.0, 1.0), vec2(0.0), isnan(x)); }
+            \\vec3 d3d_sat(vec3 x) { return mix(clamp(x, 0.0, 1.0), vec3(0.0), isnan(x)); }
+            \\vec4 d3d_sat(vec4 x) { return mix(clamp(x, 0.0, 1.0), vec4(0.0), isnan(x)); }
+            \\float d3d_min(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }
+            \\vec2 d3d_min(vec2 a, vec2 b) { return mix(mix(min(a, b), a, isnan(b)), b, isnan(a)); }
+            \\vec3 d3d_min(vec3 a, vec3 b) { return mix(mix(min(a, b), a, isnan(b)), b, isnan(a)); }
+            \\vec4 d3d_min(vec4 a, vec4 b) { return mix(mix(min(a, b), a, isnan(b)), b, isnan(a)); }
+            \\float d3d_max(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }
+            \\vec2 d3d_max(vec2 a, vec2 b) { return mix(mix(max(a, b), a, isnan(b)), b, isnan(a)); }
+            \\vec3 d3d_max(vec3 a, vec3 b) { return mix(mix(max(a, b), a, isnan(b)), b, isnan(a)); }
+            \\vec4 d3d_max(vec4 a, vec4 b) { return mix(mix(max(a, b), a, isnan(b)), b, isnan(a)); }
+            \\float d3d_rsq(float x) { return clamp(inversesqrt(max(x, 0.0)), -3.402823466e38, 3.402823466e38); }
+            \\vec2 d3d_rsq(vec2 x) { return clamp(inversesqrt(max(x, vec2(0.0))), vec2(-3.402823466e38), vec2(3.402823466e38)); }
+            \\vec3 d3d_rsq(vec3 x) { return clamp(inversesqrt(max(x, vec3(0.0))), vec3(-3.402823466e38), vec3(3.402823466e38)); }
+            \\vec4 d3d_rsq(vec4 x) { return clamp(inversesqrt(max(x, vec4(0.0))), vec4(-3.402823466e38), vec4(3.402823466e38)); }
+            \\float d3d_rcp(float x) { return clamp(1.0 / x, -3.402823466e38, 3.402823466e38); }
+            \\vec2 d3d_rcp(vec2 x) { return clamp(1.0 / x, vec2(-3.402823466e38), vec2(3.402823466e38)); }
+            \\vec3 d3d_rcp(vec3 x) { return clamp(1.0 / x, vec3(-3.402823466e38), vec3(3.402823466e38)); }
+            \\vec4 d3d_rcp(vec4 x) { return clamp(1.0 / x, vec4(-3.402823466e38), vec4(3.402823466e38)); }
+            \\float d3d_log2(float x) { return (x <= 0.0) ? -127.0 : log2(x); }
+            \\vec2 d3d_log2(vec2 x) { return mix(log2(max(x, vec2(1.17549435e-38))), vec2(-127.0), lessThanEqual(x, vec2(0.0))); }
+            \\vec3 d3d_log2(vec3 x) { return mix(log2(max(x, vec3(1.17549435e-38))), vec3(-127.0), lessThanEqual(x, vec3(0.0))); }
+            \\vec4 d3d_log2(vec4 x) { return mix(log2(max(x, vec4(1.17549435e-38))), vec4(-127.0), lessThanEqual(x, vec4(0.0))); }
+            \\
+        );
     }
 
     if (program_stage == .hull) {
@@ -2561,6 +2717,7 @@ fn translateInternal(
         .patch_outputs = patch_outputs,
         .tess = tess,
         .clip_distance_count = clip_distance_count,
+        .ps_out_mask = ps_out_mask,
         .cb_mask = cb_mask,
         .tex_bindings = try tlist.toOwnedSlice(gpa),
         .buf_bindings = try blist.toOwnedSlice(gpa),
@@ -2756,4 +2913,116 @@ test "tess factors keep domain-specific outer and inner slots" {
     const line_density = tessFactor(16, 0).?;
     try std.testing.expect(!line_detail.inner and line_detail.index == 0);
     try std.testing.expect(!line_density.inner and line_density.index == 1);
+}
+
+test "subnormal integer immediates and dynamic 2D input register indexing preserve semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s1 = try formatFloatBits(a, 0x00000001, .f);
+    try std.testing.expectEqualStrings("uintBitsToFloat(0x1u)", s1);
+
+    const s_zero = try formatFloatBits(a, 0x00000000, .f);
+    try std.testing.expectEqualStrings("0.00000000", s_zero);
+
+    tls_in_reg_mask = 0b1011; // vi0, vi1, vi3 declared
+    var op: Operand = .{
+        .op_type = 25,
+        .num_comps = 2,
+        .sel_mode = 1,
+        .mask = 0xF,
+        .swz = .{ 0, 1, 2, 3 },
+        .indices = .{
+            .{ .kind = .imm, .imm = 2 }, // control point 2
+            .{ .kind = .expr, .expr = "(idx + 1)" }, // dynamic register
+            .{ .kind = .imm, .imm = 0 },
+        },
+        .index_dim = 2,
+        .imm_u32 = .{ 0, 0, 0, 0 },
+        .neg = false,
+        .abs = false,
+    };
+    const arr = try formatInputArray(a, &op);
+    try std.testing.expectEqualStrings("(((idx + 1) == 3) ? vi3[2] : (((idx + 1) == 1) ? vi1[2] : vi0[2]))", arr);
+}
+
+test "sincos saves source before writing sin and semantic matcher aliases TEXCORRD" {
+    try std.testing.expect(semNameEql("TEXCORRD", "TEXCOORD"));
+    try std.testing.expect(!semNameEql("COLOR", "TEXCOORD"));
+
+    // Minimal PS: dcl_temps 2; sincos r0.x, r1.x, r0.x; ret
+    const version_ps: u32 = 0x50;
+    const dst_r0x: u32 = 2 | (0x1 << 4) | (0 << 12) | (1 << 20);
+    const dst_r1x: u32 = 2 | (0x1 << 4) | (0 << 12) | (1 << 20);
+    const src_r0x: u32 = 2 | (2 << 2) | (0 << 4) | (0 << 12) | (1 << 20);
+    const tokens = [_]u32{
+        version_ps,
+        12,
+        (2 << 24) | 104,
+        2,
+        (7 << 24) | 77,
+        dst_r0x,
+        0,
+        dst_r1x,
+        1,
+        src_r0x,
+        0,
+        (1 << 24) | 62,
+    };
+    var buf: [256]u8 = undefined;
+    var tr = try translatePixel(std.testing.allocator, tessDxbc(&buf, 0, &tokens), null, true);
+    defer tr.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "sc4_s = r[0].x;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "sc4_c = r[0].x;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "r[0].x = sin(sc4_s);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr.glsl, "r[1].x = cos(sc4_c);") != null);
+}
+
+test "pixel shader ps_out_mask tracks declared SV_Target registers and dual-source collapse" {
+    // Build a minimal PS DXBC with OSGN declaring SV_Target0 (reg=0) and SV_Target2 (reg=2).
+    var buf: [256]u8 = undefined;
+    @memset(&buf, 0);
+    @memcpy(buf[0..4], "DXBC");
+    std.mem.writeInt(u32, buf[20..24], 1, .little);
+    std.mem.writeInt(u32, buf[28..32], 2, .little); // OSGN + SHDR
+    const osgn_off: usize = 40;
+    std.mem.writeInt(u32, buf[32..36], osgn_off, .little);
+    @memcpy(buf[osgn_off..][0..4], "OSGN");
+    const osgn_sz: u32 = 8 + 2 * 24 + 12; // 68
+    std.mem.writeInt(u32, buf[osgn_off + 4 ..][0..4], osgn_sz, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 8 ..][0..4], 2, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 12 ..][0..4], 8, .little);
+    const name_off: u32 = 8 + 2 * 24;
+    // Elem 0: SV_Target0 -> reg 0
+    std.mem.writeInt(u32, buf[osgn_off + 16 ..][0..4], name_off, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 20 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 28 ..][0..4], 3, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 32 ..][0..4], 0, .little);
+    buf[osgn_off + 36] = 0xF;
+    // Elem 1: SV_Target2 -> reg 2 (reg 1 intentionally unwritten)
+    std.mem.writeInt(u32, buf[osgn_off + 40 ..][0..4], name_off, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 44 ..][0..4], 2, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 52 ..][0..4], 3, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 56 ..][0..4], 2, .little);
+    buf[osgn_off + 60] = 0xF;
+    @memcpy(buf[osgn_off + 8 + name_off ..][0..10], "SV_Target\x00");
+
+    const shdr_off: usize = osgn_off + 8 + osgn_sz;
+    std.mem.writeInt(u32, buf[36..40], @intCast(shdr_off), .little);
+    @memcpy(buf[shdr_off..][0..4], "SHDR");
+    std.mem.writeInt(u32, buf[shdr_off + 4 ..][0..4], 12, .little);
+    std.mem.writeInt(u32, buf[shdr_off + 8 ..][0..4], 0x00000050, .little); // PS 5.0
+    std.mem.writeInt(u32, buf[shdr_off + 12 ..][0..4], 3, .little);
+    std.mem.writeInt(u32, buf[shdr_off + 16 ..][0..4], (1 << 24) | 62, .little); // ret
+
+    var tr = try translatePixel(std.testing.allocator, buf[0 .. shdr_off + 20], null, false);
+    defer tr.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0b0000_0101), tr.ps_out_mask);
+
+    // Now test dual_src_blend with reg=0 and reg=1 -> both target RT0, so mask must be 0b0000_0001.
+    std.mem.writeInt(u32, buf[osgn_off + 44 ..][0..4], 1, .little);
+    std.mem.writeInt(u32, buf[osgn_off + 56 ..][0..4], 1, .little);
+    var tr_dual = try translatePixel(std.testing.allocator, buf[0 .. shdr_off + 20], null, true);
+    defer tr_dual.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0b0000_0001), tr_dual.ps_out_mask);
 }

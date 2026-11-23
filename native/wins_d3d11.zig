@@ -1409,23 +1409,29 @@ fn devCreateDummyShader(_: ?*anyopaque, bc: [*]const u8, bc_len: usize, _: ?*any
 
 fn d3dBlendToGl(b: u32) glb.GLenum {
     return switch (b) {
-        1 => 0,
-        2 => 1,
-        3 => 0x0300,
-        4 => 0x0301,
-        5 => 0x0302,
-        6 => 0x0303,
-        7 => 0x0304,
-        8 => 0x0305,
-        9 => 0x0306,
-        10 => 0x0307,
-        11 => 0x0308,
-        14 => 0x8001,
-        15 => 0x8002,
-        16 => 0x8003,
-        17 => 0x8004,
+        1 => 0,      // D3D11_BLEND_ZERO
+        2 => 1,      // D3D11_BLEND_ONE
+        3 => 0x0300, // D3D11_BLEND_SRC_COLOR
+        4 => 0x0301, // D3D11_BLEND_INV_SRC_COLOR
+        5 => 0x0302, // D3D11_BLEND_SRC_ALPHA
+        6 => 0x0303, // D3D11_BLEND_INV_SRC_ALPHA
+        7 => 0x0304, // D3D11_BLEND_DEST_ALPHA
+        8 => 0x0305, // D3D11_BLEND_INV_DEST_ALPHA
+        9 => 0x0306, // D3D11_BLEND_DEST_COLOR
+        10 => 0x0307, // D3D11_BLEND_INV_DEST_COLOR
+        11 => 0x0308, // D3D11_BLEND_SRC_ALPHA_SAT
+        14 => 0x8001, // D3D11_BLEND_BLEND_FACTOR -> GL_CONSTANT_COLOR
+        15 => 0x8002, // D3D11_BLEND_INV_BLEND_FACTOR -> GL_ONE_MINUS_CONSTANT_COLOR
+        16 => 0x88F9, // D3D11_BLEND_SRC1_COLOR -> GL_SRC1_COLOR
+        17 => 0x88FA, // D3D11_BLEND_INV_SRC1_COLOR -> GL_ONE_MINUS_SRC1_COLOR
+        18 => 0x8589, // D3D11_BLEND_SRC1_ALPHA -> GL_SRC1_ALPHA
+        19 => 0x858A, // D3D11_BLEND_INV_SRC1_ALPHA -> GL_ONE_MINUS_SRC1_ALPHA
         else => 1,
     };
+}
+
+fn isDualSrcD3dBlend(b: u32) bool {
+    return b >= 16 and b <= 19;
 }
 
 fn d3dBlendOpToGl(op: u32) glb.GLenum {
@@ -1486,9 +1492,12 @@ fn queryGetDataSize(raw: ?*anyopaque) callconv(W) u32 {
 fn devCreateBlendState(_: ?*anyopaque, desc: *const D3D11_BLEND_DESC, pp: ?*?*anyopaque) callconv(W) i32 {
     if (pp == null) return S_FALSE;
     const bs = alloc.create(glb.BlendState) catch return E_FAIL;
+    const r0 = desc.RenderTarget[0];
+    const dual_src = (r0.BlendEnable != 0) and (isDualSrcD3dBlend(r0.SrcBlend) or isDualSrcD3dBlend(r0.DestBlend) or isDualSrcD3dBlend(r0.SrcBlendAlpha) or isDualSrcD3dBlend(r0.DestBlendAlpha));
     bs.* = .{
         .alpha_to_coverage = (desc.AlphaToCoverageEnable != 0),
         .independent = (desc.IndependentBlendEnable != 0),
+        .dual_src = dual_src,
     };
     for (0..8) |i| {
         const r = desc.RenderTarget[i];
@@ -3266,4 +3275,19 @@ pub fn d3d11CreateDeviceAndSwapChain(
         return facCreateSwapChain(getSingletonFactory(), g_device, pSwapChainDesc.?, ppSwapChain.?);
     }
     return S_OK;
+}
+
+test "d3dBlendToGl maps dual-source factors 16..19 to GL_SRC1_* constants" {
+    try std.testing.expectEqual(@as(glb.GLenum, 0x8001), d3dBlendToGl(14));
+    try std.testing.expectEqual(@as(glb.GLenum, 0x8002), d3dBlendToGl(15));
+    try std.testing.expectEqual(@as(glb.GLenum, 0x88F9), d3dBlendToGl(16));
+    try std.testing.expectEqual(@as(glb.GLenum, 0x88FA), d3dBlendToGl(17));
+    try std.testing.expectEqual(@as(glb.GLenum, 0x8589), d3dBlendToGl(18));
+    try std.testing.expectEqual(@as(glb.GLenum, 0x858A), d3dBlendToGl(19));
+    try std.testing.expect(!isDualSrcD3dBlend(15));
+    try std.testing.expect(isDualSrcD3dBlend(16));
+    try std.testing.expect(isDualSrcD3dBlend(17));
+    try std.testing.expect(isDualSrcD3dBlend(18));
+    try std.testing.expect(isDualSrcD3dBlend(19));
+    try std.testing.expect(!isDualSrcD3dBlend(20));
 }

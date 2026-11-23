@@ -17,6 +17,7 @@ extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn access(path: [*:0]const u8, mode: c_int) c_int;
+extern fn unlink(path: [*:0]const u8) c_int;
 
 const XWindowAttributes = extern struct {
     x: c_int,
@@ -307,6 +308,10 @@ pub const View = struct {
 
 pub const Sampler = struct {
     gl_id: GLuint = 0,
+    filter: u32 = 0,
+    addr_u: u32 = 0,
+    addr_v: u32 = 0,
+    cmp_func: u32 = 0,
 };
 
 pub const RtBlendDesc = struct {
@@ -323,6 +328,7 @@ pub const RtBlendDesc = struct {
 pub const BlendState = struct {
     alpha_to_coverage: bool = false,
     independent: bool = false,
+    dual_src: bool = false,
     rt: [8]RtBlendDesc = [_]RtBlendDesc{.{}} ** 8,
 };
 
@@ -879,11 +885,13 @@ const ProgKey = struct {
     ds: u64,
     gs: u64,
     ps: u64,
+    dual_src: bool = false,
 };
 
 const LinkedProg = struct {
     prog: GLuint = 0,
     clip_distance_count: u32 = 0,
+    ps_out_mask: u8 = 0,
     ps_tex_bindings: []const shader.TexBinding = &.{},
     vs_tex_bindings: []const shader.TexBinding = &.{},
     hs_tex_bindings: []const shader.TexBinding = &.{},
@@ -932,14 +940,14 @@ fn compileGlShader(kind: GLenum, src: [:0]const u8, label: []const u8) GLuint {
 
 /// A failed translate/compile/link is cached too (prog = 0): retrying it on every
 /// draw recompiled the same broken GLSL ~80k times and wrote a 600 MB log.
-fn getOrLinkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shader) LinkedProg {
+fn getOrLinkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shader, dual_src: bool) LinkedProg {
     const hs_uid: u64 = if (hs) |h| h.uid else 0;
     const ds_uid: u64 = if (ds) |d| d.uid else 0;
     const gs_uid: u64 = if (gs) |g| g.uid else 0;
     const ps_uid: u64 = if (ps) |p| p.uid else 0;
-    const key: ProgKey = .{ .vs = vs.uid, .hs = hs_uid, .ds = ds_uid, .gs = gs_uid, .ps = ps_uid };
+    const key: ProgKey = .{ .vs = vs.uid, .hs = hs_uid, .ds = ds_uid, .gs = gs_uid, .ps = ps_uid, .dual_src = dual_src };
     if (g_progs.get(key)) |hit| return hit;
-    const res = linkProgram(vs, hs, ds, gs, ps);
+    const res = linkProgram(vs, hs, ds, gs, ps, dual_src);
     if (res.prog == 0) {
         g_progs.put(alloc, key, res) catch {};
         dumpFailedBytecode(vs, ps);
@@ -963,12 +971,12 @@ fn dumpFailedBytecode(vs: *Shader, ps: ?*Shader) void {
     }
 }
 
-fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shader) LinkedProg {
+fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shader, dual_src: bool) LinkedProg {
     const hs_uid: u64 = if (hs) |h| h.uid else 0;
     const ds_uid: u64 = if (ds) |d| d.uid else 0;
     const gs_uid: u64 = if (gs) |g| g.uid else 0;
     const ps_uid: u64 = if (ps) |p| p.uid else 0;
-    const key: ProgKey = .{ .vs = vs.uid, .hs = hs_uid, .ds = ds_uid, .gs = gs_uid, .ps = ps_uid };
+    const key: ProgKey = .{ .vs = vs.uid, .hs = hs_uid, .ds = ds_uid, .gs = gs_uid, .ps = ps_uid, .dual_src = dual_src };
 
     var tv = shader.translateWithVaryings(alloc, vs.bytecode, null) catch |e| {
         std.debug.print("[WINS:D3D11:GL] VS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
@@ -1053,6 +1061,8 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
     var gl_ps: GLuint = 0;
     var ps_tex: []const shader.TexBinding = &.{};
     var ps_buf: []const shader.BufBinding = &.{};
+    var tp_opt: ?shader.Translated = null;
+    defer if (tp_opt) |*tp| tp.deinit(alloc);
     const trace_glsl = (getenv("WINS_D3D11_TRACE_DRAWS") != null);
     if (trace_glsl) {
         const S = struct {
@@ -1064,7 +1074,7 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
         }
     }
     if (ps) |p| {
-        var tp = shader.translateWithVaryings(alloc, p.bytecode, prev_outputs) catch |e| {
+        const tp = shader.translatePixel(alloc, p.bytecode, prev_outputs, dual_src) catch |e| {
             std.debug.print("[WINS:D3D11:GL] PS translate err={s} ({s})\n", .{ @errorName(e), shader.last_error });
             return .{};
         };
@@ -1080,7 +1090,7 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
         gl_ps = compileGlShader(0x8B30, tp.glsl, "PS");
         ps_tex = alloc.dupe(shader.TexBinding, tp.tex_bindings) catch &.{};
         ps_buf = alloc.dupe(shader.BufBinding, tp.buf_bindings) catch &.{};
-        tp.deinit(alloc);
+        tp_opt = tp;
         if (gl_ps == 0) return .{};
     } else {
         // Minimal passthrough FS for depth-only rendering
@@ -1112,6 +1122,7 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
     const res: LinkedProg = .{
         .prog = prog,
         .clip_distance_count = if (td_opt) |td| td.clip_distance_count else tv.clip_distance_count,
+        .ps_out_mask = if (tp_opt) |tp| tp.ps_out_mask else 0,
         .ps_tex_bindings = ps_tex,
         .vs_tex_bindings = vs_tex,
         .hs_tex_bindings = hs_tex,
@@ -1123,9 +1134,167 @@ fn linkProgram(vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shad
         .ds_buf_bindings = ds_buf,
         .gs_buf_bindings = gs_buf,
     };
-    dumpProgram(prog, vs, ps, tv.glsl);
+    dumpProgram(
+        prog,
+        vs,
+        ps,
+        tv.glsl,
+        if (th_opt) |th| th.glsl else null,
+        if (td_opt) |td| td.glsl else null,
+        if (tg_opt) |tg| tg.glsl else null,
+        if (tp_opt) |tp| tp.glsl else null,
+        hs,
+        ds,
+        gs,
+    );
     g_progs.put(alloc, key, res) catch {};
     return res;
+}
+
+// ---- Live 1-Frame RenderDoc Snapshot (triggered by $HOME/snap_req) ----------
+
+var g_snap_active: bool = false;
+var g_snap_file: ?*anyopaque = null;
+var g_snap_dir_buf: [512]u8 = undefined;
+var g_snap_dir_len: usize = 0;
+var g_snap_draw_idx: u32 = 0;
+var g_snap_dumped_progs: std.AutoHashMapUnmanaged(GLuint, void) = .{};
+
+fn snapDir() []const u8 {
+    return g_snap_dir_buf[0..g_snap_dir_len];
+}
+
+fn snapWrite(comptime fmt: []const u8, args: anytype) void {
+    const f = g_snap_file orelse return;
+    var buf: [2048]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    _ = fwrite(s.ptr, 1, s.len, f);
+}
+
+fn snapProbeChanged(a: [4]f32, b: [4]f32) bool {
+    for (0..4) |i| {
+        if (std.math.isNan(a[i]) != std.math.isNan(b[i])) return true;
+        if (std.math.isInf(a[i]) != std.math.isInf(b[i])) return true;
+        if (!std.math.isNan(a[i]) and @abs(a[i] - b[i]) > 1e-4) return true;
+    }
+    return false;
+}
+
+fn snapDumpProg(prog: GLuint, vs: *Shader, hs: ?*Shader, ds: ?*Shader, gs: ?*Shader, ps: ?*Shader, dual_src: bool) void {
+    if (g_snap_dumped_progs.contains(prog)) return;
+    g_snap_dumped_progs.put(alloc, prog, {}) catch return;
+    const dir = snapDir();
+    var tv = shader.translateWithVaryings(alloc, vs.bytecode, null) catch return;
+    defer tv.deinit(alloc);
+    dumpFile(dir, prog, "vs.dxbc", vs.bytecode);
+    dumpFile(dir, prog, "vs.glsl", tv.glsl);
+    var prev_outputs: []const shader.SigElem = tv.outputs;
+    var th_opt: ?shader.Translated = null;
+    var td_opt: ?shader.Translated = null;
+    var tg_opt: ?shader.Translated = null;
+    defer if (th_opt) |*x| x.deinit(alloc);
+    defer if (td_opt) |*x| x.deinit(alloc);
+    defer if (tg_opt) |*x| x.deinit(alloc);
+    if (hs) |h| if (ds) |d| {
+        var hs_link_tess: shader.TessInfo = .{};
+        if (shader.parseInputSignature(alloc, d.bytecode)) |ds_inputs| {
+            defer if (ds_inputs.len > 0) alloc.free(ds_inputs);
+            for (ds_inputs) |in_e| {
+                if (in_e.reg < 64) hs_link_tess.patch_location_base = @max(hs_link_tess.patch_location_base, in_e.reg + 2);
+            }
+        } else |_| {}
+        if (shader.translateTessellation(alloc, h.bytecode, tv.outputs, &.{}, hs_link_tess)) |th| {
+            dumpFile(dir, prog, "hs.dxbc", h.bytecode);
+            dumpFile(dir, prog, "hs.glsl", th.glsl);
+            th_opt = th;
+            if (shader.translateTessellation(alloc, d.bytecode, th.outputs, th.patch_outputs, th.tess)) |td| {
+                dumpFile(dir, prog, "ds.dxbc", d.bytecode);
+                dumpFile(dir, prog, "ds.glsl", td.glsl);
+                prev_outputs = td.outputs;
+                td_opt = td;
+            } else |_| {}
+        } else |_| {}
+    };
+    if (gs) |g| {
+        if (shader.translateWithVaryings(alloc, g.bytecode, prev_outputs)) |tg| {
+            dumpFile(dir, prog, "gs.dxbc", g.bytecode);
+            dumpFile(dir, prog, "gs.glsl", tg.glsl);
+            prev_outputs = tg.outputs;
+            tg_opt = tg;
+        } else |_| {}
+    }
+    if (ps) |p| {
+        if (shader.translatePixel(alloc, p.bytecode, prev_outputs, dual_src)) |tp| {
+            var tp_m = tp;
+            defer tp_m.deinit(alloc);
+            dumpFile(dir, prog, "ps.dxbc", p.bytecode);
+            dumpFile(dir, prog, "ps.glsl", tp_m.glsl);
+        } else |_| {}
+    }
+}
+
+fn snapSavePpm(path: [:0]const u8, w: u32, h: u32) void {
+    const rgba = alloc.alloc(u8, @as(usize, w) * h * 4) catch return;
+    defer alloc.free(rgba);
+    gl.glReadPixels(0, 0, @intCast(w), @intCast(h), 0x1908, 0x1401, rgba.ptr);
+    const rgb = alloc.alloc(u8, @as(usize, w) * h * 3) catch return;
+    defer alloc.free(rgb);
+    for (0..(@as(usize, w) * h)) |p| {
+        rgb[p * 3 + 0] = rgba[p * 4 + 0];
+        rgb[p * 3 + 1] = rgba[p * 4 + 1];
+        rgb[p * 3 + 2] = rgba[p * 4 + 2];
+    }
+    const f = fopen(path.ptr, "wb") orelse return;
+    var hdr_buf: [64]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "P6\n{d} {d}\n255\n", .{ w, h }) catch {
+        _ = fclose(f);
+        return;
+    };
+    _ = fwrite(hdr.ptr, 1, hdr.len, f);
+    _ = fwrite(rgb.ptr, 1, rgb.len, f);
+    _ = fclose(f);
+}
+
+fn snapOnPresent(t: *Texture) void {
+    const S = struct {
+        var checked: bool = false;
+        var enabled: bool = false;
+    };
+    if (!S.checked) {
+        S.checked = true;
+        S.enabled = (getenv("WINS_D3D11_SNAP_TRIG") != null);
+    }
+    if (!S.enabled) return;
+    if (g_snap_active) {
+        var pbuf: [600]u8 = undefined;
+        if (std.fmt.bufPrintZ(&pbuf, "{s}/final.ppm", .{snapDir()})) |ppath| {
+            snapSavePpm(ppath, t.width, t.height);
+        } else |_| {}
+        snapWrite("END present={d} total_draws={d}\n", .{ g_present_count, g_snap_draw_idx });
+        if (g_snap_file) |f| _ = fclose(f);
+        g_snap_file = null;
+        g_snap_active = false;
+        std.debug.print("[WINS:SNAP] finished frame #{d}, draws={d}, dir={s}\n", .{ g_present_count, g_snap_draw_idx, snapDir() });
+        return;
+    }
+    const home_z = getenv("HOME") orelse return;
+    const home = std.mem.span(home_z);
+    var req_buf: [600]u8 = undefined;
+    const req_path = std.fmt.bufPrintZ(&req_buf, "{s}/snap_req", .{home}) catch return;
+    if (access(req_path.ptr, 0) != 0) return;
+    _ = unlink(req_path.ptr);
+    const out_dir = std.fmt.bufPrintZ(&g_snap_dir_buf, "{s}/snap_out", .{home}) catch return;
+    g_snap_dir_len = out_dir.len;
+    _ = linux.mkdir(out_dir.ptr, 0o755);
+    var log_buf: [600]u8 = undefined;
+    const log_path = std.fmt.bufPrintZ(&log_buf, "{s}/draws.log", .{snapDir()}) catch return;
+    g_snap_file = fopen(log_path.ptr, "wb");
+    if (g_snap_file == null) return;
+    g_snap_draw_idx = 0;
+    g_snap_dumped_progs.clearRetainingCapacity();
+    g_snap_active = true;
+    snapWrite("BEGIN after_present={d} bb={d}x{d} fmt={d}\n", .{ g_present_count, t.width, t.height, t.dxgi_fmt });
+    std.debug.print("[WINS:SNAP] armed for next frame (after present #{d}) -> {s}\n", .{ g_present_count, snapDir() });
 }
 
 extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
@@ -1147,19 +1316,32 @@ pub fn dumpFile(dir: []const u8, prog: GLuint, suffix: []const u8, data: []const
 }
 
 /// WINS_D3D11_DUMP_DIR=<dir>: write each newly linked program's DXBC and GLSL
-/// (p<prog>_{vs,ps}.{dxbc,glsl}) for offline inspection. Off by default.
-fn dumpProgram(prog: GLuint, vs: *Shader, ps: ?*Shader, vs_glsl: []const u8) void {
+/// (p<prog>_{vs,hs,ds,gs,ps}.{dxbc,glsl}) for offline inspection. Off by default.
+fn dumpProgram(
+    prog: GLuint,
+    vs: *Shader,
+    ps: ?*Shader,
+    vs_glsl: []const u8,
+    hs_glsl: ?[]const u8,
+    ds_glsl: ?[]const u8,
+    gs_glsl: ?[]const u8,
+    ps_glsl: ?[]const u8,
+    hs: ?*Shader,
+    ds: ?*Shader,
+    gs: ?*Shader,
+) void {
     const dir_z = getenv("WINS_D3D11_DUMP_DIR") orelse return;
     const dir = std.mem.span(dir_z);
     dumpFile(dir, prog, "vs.dxbc", vs.bytecode);
     dumpFile(dir, prog, "vs.glsl", vs_glsl);
-    const p = ps orelse return;
-    dumpFile(dir, prog, "ps.dxbc", p.bytecode);
-    var tv = shader.translateWithVaryings(alloc, vs.bytecode, null) catch return;
-    defer tv.deinit(alloc);
-    var tp = shader.translateWithVaryings(alloc, p.bytecode, tv.outputs) catch return;
-    defer tp.deinit(alloc);
-    dumpFile(dir, prog, "ps.glsl", tp.glsl);
+    if (hs) |h| dumpFile(dir, prog, "hs.dxbc", h.bytecode);
+    if (hs_glsl) |hg| dumpFile(dir, prog, "hs.glsl", hg);
+    if (ds) |d| dumpFile(dir, prog, "ds.dxbc", d.bytecode);
+    if (ds_glsl) |dg| dumpFile(dir, prog, "ds.glsl", dg);
+    if (gs) |g| dumpFile(dir, prog, "gs.dxbc", g.bytecode);
+    if (gs_glsl) |gg| dumpFile(dir, prog, "gs.glsl", gg);
+    if (ps) |p| dumpFile(dir, prog, "ps.dxbc", p.bytecode);
+    if (ps_glsl) |pg| dumpFile(dir, prog, "ps.glsl", pg);
 }
 
 fn cbVec(cb: ?*Buffer, off_regs: u32, reg: u32) [4]f32 {
@@ -1334,9 +1516,13 @@ fn getSrvTex(v: *View) struct { target: GLenum, id: GLuint } {
     }
     const need_srgb = (v.dxgi_fmt != 0 and isSrgbDxgi(v.dxgi_fmt) != isSrgbDxgi(t.dxgi_fmt));
     const want_stencil = (v.dxgi_fmt == 47 or v.dxgi_fmt == 22); // X24_TYPELESS_G8_UINT / X32_TYPELESS_G8X24_UINT
+    const eff_fmt: u32 = if (v.dxgi_fmt != 0) v.dxgi_fmt else t.dxgi_fmt;
+    const want_a8 = (eff_fmt == 65);
+    const want_bgrx = (eff_fmt == 88 or eff_fmt == 93);
+    const need_swizzle_view = (v.dxgi_fmt == 65 and t.dxgi_fmt != 65) or (want_bgrx and t.dxgi_fmt != 88 and t.dxgi_fmt != 93);
     const need_mip = (min_mip != 0 or num_mips != total_mips);
     const need_layer = (min_layer != 0 or num_layers != total_layers or want_target != t.target);
-    if (!need_srgb and !need_mip and !need_layer and !want_stencil) {
+    if (!need_srgb and !need_mip and !need_layer and !want_stencil and !need_swizzle_view) {
         return .{ .target = t.target, .id = t.gl_id };
     }
     if (v.gl_view == 0) {
@@ -1347,9 +1533,20 @@ fn getSrvTex(v: *View) struct { target: GLenum, id: GLuint } {
         gl.glGenTextures(1, &v.gl_view);
         tv(v.gl_view, want_target, t.gl_id, @intCast(gf.internal), min_mip, num_mips, min_layer, num_layers);
         v.gl_view_target = want_target;
-        if (want_stencil) {
+        if (want_stencil or want_a8 or want_bgrx) {
             gl.glBindTexture(want_target, v.gl_view);
-            gl.glTexParameteri(want_target, 0x90EA, 0x1901); // GL_DEPTH_STENCIL_TEXTURE_MODE = GL_STENCIL_INDEX
+            if (want_stencil) {
+                gl.glTexParameteri(want_target, 0x90EA, 0x1901); // GL_DEPTH_STENCIL_TEXTURE_MODE = GL_STENCIL_INDEX
+            }
+            if (want_a8) {
+                gl.glTexParameteri(want_target, 0x8E42, 0);
+                gl.glTexParameteri(want_target, 0x8E43, 0);
+                gl.glTexParameteri(want_target, 0x8E44, 0);
+                gl.glTexParameteri(want_target, 0x8E45, 0x1903);
+            }
+            if (want_bgrx) {
+                gl.glTexParameteri(want_target, 0x8E45, 1); // GL_ONE
+            }
             gl.glBindTexture(want_target, 0);
         }
     }
@@ -1775,6 +1972,8 @@ fn createTexture2DJob(raw: ?*anyopaque) void {
         gl.glTexParameteri(t.target, 0x8E43, 0);
         gl.glTexParameteri(t.target, 0x8E44, 0);
         gl.glTexParameteri(t.target, 0x8E45, 0x1903);
+    } else if (t.dxgi_fmt == 88 or t.dxgi_fmt == 93) {
+        gl.glTexParameteri(t.target, 0x8E45, 1); // B8G8R8X8 -> alpha always 1.0
     }
 
     if (t.target == 0x0DE0) { // TEXTURE_1D (D3D has no compressed 1D formats)
@@ -2046,6 +2245,10 @@ fn texWrap(addr: u32) GLint {
 fn createSamplerJob(raw: ?*anyopaque) void {
     const j: *SampJob = @ptrCast(@alignCast(raw.?));
     const s = j.s;
+    s.filter = j.filter;
+    s.addr_u = j.addr_u;
+    s.addr_v = j.addr_v;
+    s.cmp_func = j.cmp_func;
     gl.glGenSamplers(1, &s.gl_id);
     const point_min = (j.filter & 0x10) == 0;
     const point_mag = (j.filter & 0x04) == 0;
@@ -2160,6 +2363,13 @@ fn clearRtvJob(raw: ?*anyopaque) void {
         slice_view.first_slice = j.rtv.first_slice + @as(u32, @intCast(si));
         _ = bindFramebufferForState(&tmp);
         gl.glClearBufferfv(0x1800, 0, &j.rgba); // GL_COLOR
+    }
+    if (g_snap_active) {
+        const t = j.rtv.tex;
+        snapWrite("CLEAR_RTV gl={d} {d}x{d} fmt={d} rgba=({d:.3},{d:.3},{d:.3},{d:.3})\n", .{
+            if (t) |x| x.gl_id else 0, if (t) |x| x.width else 0, if (t) |x| x.height else 0, rtv_fmt,
+            j.rgba[0], j.rgba[1], j.rgba[2], j.rgba[3],
+        });
     }
     if (getenv("WINS_D3D11_TRACE_DRAWS") != null and g_present_count < 6) {
         const t = j.rtv.tex;
@@ -2571,7 +2781,7 @@ fn bindTextureSlots(bindings: []const shader.TexBinding, srvs: *const [MAX_SRV]?
         } else {
             unbindTextureTargets();
         }
-        const sid: GLuint = if (samps[b.samp]) |smp| smp.gl_id else 0;
+        const sid: GLuint = if (b.samp < 16) (if (samps[b.samp]) |smp| smp.gl_id else 0) else 0;
         gl.glBindSampler(unit, sid);
     }
 }
@@ -2812,6 +3022,9 @@ fn dispatchJob(raw: ?*anyopaque) void {
     }
     // D3D11 orders every Dispatch against what follows; GL needs explicit barriers.
     gl.glMemoryBarrier(0xFFFFFFFF);
+    if (g_snap_active) {
+        snapWrite("DISPATCH prog={d} xyz=({d},{d},{d}) ind={}\n", .{ cs.cs_prog, j.x, j.y, j.z, j.indirect_buf != null });
+    }
     if (g_err_logged < 32) {
         const e = gl.glGetError();
         if (e != 0) {
@@ -2837,7 +3050,8 @@ fn drawJob(raw: ?*anyopaque) void {
     const s = j.s;
     const vs = s.vs orelse return;
     const is_patch = s.topology >= 33 and s.topology <= 64;
-    const lp = getOrLinkProgram(vs, if (is_patch) s.hs else null, if (is_patch) s.ds else null, s.gs, s.ps);
+    const dual_src = if (s.blend) |bl| bl.dual_src else false;
+    const lp = getOrLinkProgram(vs, if (is_patch) s.hs else null, if (is_patch) s.ds else null, s.gs, s.ps, dual_src);
     if (lp.prog == 0) return;
 
     const fb_dim = bindFramebufferForState(s);
@@ -2917,12 +3131,19 @@ fn drawJob(raw: ?*anyopaque) void {
     }
 
     // Blend
+    // D3D11 leaves any bound RTV unmodified when the active PS omits SV_Target{i}
+    // from its OSGN (or when PS is NULL). OpenGL writes undefined values into
+    // enabled draw buffers not written by the FS (NVIDIA duplicates vo0 into
+    // RT1, corrupting DS3's bloom buffer on the sky pass), so mask off RTs not
+    // declared in lp.ps_out_mask.
+    const nrt = @max(@as(u32, 1), @min(8, s.num_rtvs));
     if (s.blend) |bl| {
         gl.glBlendColor(s.blend_factor[0], s.blend_factor[1], s.blend_factor[2], s.blend_factor[3]);
-        const nrt = @max(@as(u32, 1), @min(8, s.num_rtvs));
         for (0..nrt) |i| {
             const rt = bl.rt[if (bl.independent) i else 0];
-            gl.glColorMaski(@intCast(i), if ((rt.write_mask & 1) != 0) 1 else 0, if ((rt.write_mask & 2) != 0) 1 else 0, if ((rt.write_mask & 4) != 0) 1 else 0, if ((rt.write_mask & 8) != 0) 1 else 0);
+            const ps_writes = (lp.ps_out_mask & (@as(u8, 1) << @intCast(i))) != 0;
+            const wm: u8 = if (ps_writes) rt.write_mask else 0;
+            gl.glColorMaski(@intCast(i), if ((wm & 1) != 0) 1 else 0, if ((wm & 2) != 0) 1 else 0, if ((wm & 4) != 0) 1 else 0, if ((wm & 8) != 0) 1 else 0);
             if (rt.enable) {
                 gl.glEnablei(0x0BE2, @intCast(i));
                 gl.glBlendFuncSeparatei(@intCast(i), rt.src_rgb, rt.dst_rgb, rt.src_a, rt.dst_a);
@@ -2933,7 +3154,10 @@ fn drawJob(raw: ?*anyopaque) void {
         }
     } else {
         gl.glDisable(0x0BE2);
-        for (0..@max(@as(u32, 1), @min(8, s.num_rtvs))) |i| gl.glColorMaski(@intCast(i), 1, 1, 1, 1);
+        for (0..nrt) |i| {
+            const m: u8 = if ((lp.ps_out_mask & (@as(u8, 1) << @intCast(i))) != 0) 1 else 0;
+            gl.glColorMaski(@intCast(i), m, m, m, m);
+        }
     }
 
     // Constant Buffers (VS -> bindings 0..15, PS -> bindings 16..31)
@@ -3063,6 +3287,24 @@ fn drawJob(raw: ?*anyopaque) void {
         gl.glPatchParameteri(0x8E72, @intCast(s.topology - 32)); // GL_PATCH_VERTICES
     }
     const mode = glPrimTopology(s.topology);
+    const snap_rt0 = if (s.num_rtvs > 0 and s.rtv[0] != null and s.rtv[0].?.tex != null) s.rtv[0].?.tex.? else null;
+    const snap_probes_ref = [6][2]u32{
+        .{ 1500, 250 }, // upper-right sky
+        .{ 1500, 580 }, // right horizon cloud
+        .{ 300, 580 },  // left horizon cloud
+        .{ 960, 540 },  // center (water splash / character)
+        .{ 1150, 650 }, // lower-right puddle
+        .{ 960, 200 },  // upper-center sky
+    };
+    const snap_do_probes = g_snap_active and snap_rt0 != null and !snap_rt0.?.is_depth and fb_dim.w >= 480 and fb_dim.h >= 270;
+    var snap_before: [6][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 6;
+    if (snap_do_probes) {
+        for (snap_probes_ref, 0..) |pt, pi| {
+            const px: GLint = @intCast(@min(fb_dim.w - 1, pt[0] * fb_dim.w / 1920));
+            const py: GLint = @intCast(@min(fb_dim.h - 1, pt[1] * fb_dim.h / 1080));
+            gl.glReadPixels(px, py, 1, 1, 0x1908, 0x1406, &snap_before[pi]);
+        }
+    }
     if (j.kind == .arrays) {
         gl.glDrawArrays(mode, @intCast(j.start_vertex), @intCast(j.count));
     } else if (j.kind == .arrays_instanced) {
@@ -3098,6 +3340,81 @@ fn drawJob(raw: ?*anyopaque) void {
             } else {
                 gl.glDrawElementsInstanced(mode, @intCast(j.count), idx_ty, ib_ptr, @intCast(j.inst_count));
             }
+        }
+    }
+    if (g_snap_active) {
+        g_snap_draw_idx += 1;
+        var snap_after: [6][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 6;
+        var any_changed = false;
+        if (snap_do_probes) {
+            for (snap_probes_ref, 0..) |pt, pi| {
+                const px: GLint = @intCast(@min(fb_dim.w - 1, pt[0] * fb_dim.w / 1920));
+                const py: GLint = @intCast(@min(fb_dim.h - 1, pt[1] * fb_dim.h / 1080));
+                gl.glReadPixels(px, py, 1, 1, 0x1908, 0x1406, &snap_after[pi]);
+                if (snapProbeChanged(snap_before[pi], snap_after[pi])) any_changed = true;
+            }
+        }
+        const bl_en = if (s.blend) |b| b.rt[0].enable else false;
+        const bl_sr = if (s.blend) |b| b.rt[0].src_rgb else 1;
+        const bl_dr = if (s.blend) |b| b.rt[0].dst_rgb else 0;
+        const bl_sa = if (s.blend) |b| b.rt[0].src_a else 1;
+        const bl_da = if (s.blend) |b| b.rt[0].dst_a else 0;
+        const bl_or = if (s.blend) |b| b.rt[0].op_rgb else 0x8006;
+        const bl_m = if (s.blend) |b| b.rt[0].write_mask else 0xF;
+        const bl_ind = if (s.blend) |b| b.independent else false;
+        const ds_en = if (s.depth_stencil) |d| d.depth_enable else true;
+        const ds_wr = if (s.depth_stencil) |d| d.depth_write else true;
+        const ds_fn = if (s.depth_stencil) |d| d.depth_func else 0x0201;
+        const ds_st = if (s.depth_stencil) |d| d.stencil_enable else false;
+        const rs_cull: u32 = if (s.rasterizer) |r| r.cull_mode else 3;
+        const rs_ccw = if (s.rasterizer) |r| r.front_ccw else false;
+        const rs_sc = if (s.rasterizer) |r| r.scissor_enable else false;
+        const rs_clip = if (s.rasterizer) |r| r.depth_clip else true;
+        const dsv_t = if (s.dsv) |d| d.tex else null;
+        snapWrite("D#{d} prog={d} stg={c}{c}{c}{c}{c} topo={d} k={s} cnt={d} inst={d} fb={d}x{d} nrt={d} rt0={d}(f={d},sw={}) dsv={d}(f={d})", .{
+            g_snap_draw_idx, lp.prog,
+            @as(u8, 'V'),
+            @as(u8, if (is_patch and s.hs != null) 'H' else '-'),
+            @as(u8, if (is_patch and s.ds != null) 'D' else '-'),
+            @as(u8, if (s.gs != null) 'G' else '-'),
+            @as(u8, if (s.ps != null) 'P' else '-'),
+            s.topology, @tagName(j.kind), j.count, j.inst_count, fb_dim.w, fb_dim.h, s.num_rtvs,
+            if (snap_rt0) |r| r.gl_id else 0, if (snap_rt0) |r| r.dxgi_fmt else 0, if (snap_rt0) |r| r.is_swapchain else false,
+            if (dsv_t) |dt| dt.gl_id else 0, if (dsv_t) |dt| dt.dxgi_fmt else 0,
+        });
+        snapWrite(" bl=(en={} {x}/{x}->{x}/{x} op={x} m={x} ind={}) ds=({}/{} fn={x} st={}) rs=(c={d} ccw={} sc={} clp={})\n", .{
+            bl_en, bl_sr, bl_sa, bl_dr, bl_da, bl_or, bl_m, bl_ind,
+            ds_en, ds_wr, ds_fn, ds_st, rs_cull, rs_ccw, rs_sc, rs_clip,
+        });
+        if (any_changed or (is_patch and s.hs != null) or s.gs != null) {
+            if (any_changed) {
+                for (0..6) |pi| {
+                    if (snapProbeChanged(snap_before[pi], snap_after[pi])) {
+                        snapWrite("  CHG p{d}({d},{d}): ({d:.4},{d:.4},{d:.4},{d:.4}) -> ({d:.4},{d:.4},{d:.4},{d:.4})\n", .{
+                            pi, snap_probes_ref[pi][0], snap_probes_ref[pi][1],
+                            snap_before[pi][0], snap_before[pi][1], snap_before[pi][2], snap_before[pi][3],
+                            snap_after[pi][0], snap_after[pi][1], snap_after[pi][2], snap_after[pi][3],
+                        });
+                    }
+                }
+            }
+            for (lp.ps_tex_bindings) |tb| {
+                const rv = s.ps_srv[tb.reg];
+                const smp = if (tb.samp < 16) s.ps_samp[tb.samp] else null;
+                if (rv) |v| {
+                    if (v.tex) |t| {
+                        snapWrite("  PS t{d}(u{d},s{d}) tex={d} {d}x{d} tf={d} vf={d} tgt={x} m={d}+{d} | smp={d}(f={x} u={d} v={d} c={d})\n", .{
+                            tb.reg, tb.unit, tb.samp, t.gl_id, t.width, t.height, t.dxgi_fmt, v.dxgi_fmt, t.target, v.first_mip, v.num_mips,
+                            if (smp) |sm| sm.gl_id else 0, if (smp) |sm| sm.filter else 0, if (smp) |sm| sm.addr_u else 0, if (smp) |sm| sm.addr_v else 0, if (smp) |sm| sm.cmp_func else 0,
+                        });
+                    } else {
+                        snapWrite("  PS t{d}(u{d},s{d}) buf\n", .{ tb.reg, tb.unit, tb.samp });
+                    }
+                } else {
+                    snapWrite("  PS t{d}(u{d},s{d}) NULL\n", .{ tb.reg, tb.unit, tb.samp });
+                }
+            }
+            snapDumpProg(lp.prog, vs, if (is_patch) s.hs else null, if (is_patch) s.ds else null, s.gs, s.ps, dual_src);
         }
     }
     traceProgConstants(s, lp.prog, fb_dim.w, fb_dim.h);
@@ -3148,6 +3465,7 @@ fn drawJob(raw: ?*anyopaque) void {
             const dfmt: u32 = if (s.dsv.?.tex) |t| t.dxgi_fmt else 0;
             std.debug.print("    stencil grid={any} dsv_fmt={d} view_fmt={d} glErr=0x{x}\n", .{ grid, dfmt, s.dsv.?.dxgi_fmt, gl.glGetError() });
             // 48x27 map: stencil digit, or '#' where the colour RT is bright (>96).
+            const has_color_rt = (rt0 != null and !rt0.?.is_depth);
             var y: usize = 0;
             while (y < 27) : (y += 1) {
                 var line: [48]u8 = undefined;
@@ -3157,7 +3475,9 @@ fn drawJob(raw: ?*anyopaque) void {
                     var st: [4]u8 = .{ 0, 0, 0, 0 };
                     var col: [4]u8 = .{ 0, 0, 0, 0 };
                     gl.glReadPixels(px_x, px_y, 1, 1, 0x1901, 0x1401, &st);
-                    gl.glReadPixels(px_x, px_y, 1, 1, 0x1908, 0x1401, &col);
+                    if (has_color_rt) {
+                        gl.glReadPixels(px_x, px_y, 1, 1, 0x1908, 0x1401, &col);
+                    }
                     const lum = (@as(u32, col[0]) + col[1] + col[2]) / 3;
                     line[x] = if (lum > 96) '#' else if (st[0] > 0) @as(u8, '0') + @min(st[0], 9) else '.';
                 }
@@ -3370,6 +3690,7 @@ fn presentJob(raw: ?*anyopaque) void {
     gl.glFramebufferTexture2D(0x8CA8, 0x8CE0, 0x0DE1, t.gl_id, 0);
 
     maybeCaptureFrame(t);
+    snapOnPresent(t);
 
     const sz = gui.getWindowClientSize(j.hwnd);
     const dst_w = @max(1, sz.w);
