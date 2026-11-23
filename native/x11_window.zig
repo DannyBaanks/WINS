@@ -5,7 +5,7 @@ const Display = opaque {};
 pub const Window = c_ulong;
 const GC = ?*anyopaque;
 const Visual = opaque {};
-const Atom = c_ulong;
+pub const Atom = c_ulong;
 
 pub const XEvent = extern struct {
     type: c_int,
@@ -83,6 +83,39 @@ pub const XClientMessageEvent = extern struct {
     data: [5]c_long,
 };
 
+/// SelectionRequest (30): another client asks the selection owner for data.
+pub const XSelectionRequestEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: ?*Display,
+    owner: Window,
+    requestor: Window,
+    selection: Atom,
+    target: Atom,
+    property: Atom,
+    time: c_ulong,
+};
+
+/// SelectionNotify (31): the owner's answer to XConvertSelection (property 0 = refused).
+pub const XSelectionEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: ?*Display,
+    requestor: Window,
+    selection: Atom,
+    target: Atom,
+    property: Atom,
+    time: c_ulong,
+};
+
+pub const SelectionClear: c_int = 29;
+pub const SelectionRequest: c_int = 30;
+pub const SelectionNotify: c_int = 31;
+pub const XA_ATOM: Atom = 4;
+pub const XA_STRING: Atom = 31;
+
 const XImage = extern struct {
     width: c_int,
     height: c_int,
@@ -130,6 +163,14 @@ extern "X11" fn XFreeGC(*Display, GC) c_int;
 extern "X11" fn XCreateImage(*Display, *Visual, c_uint, c_int, c_int, ?[*]u8, c_uint, c_uint, c_int, c_int) ?*XImage;
 extern "X11" fn XPutImage(*Display, Window, GC, *XImage, c_int, c_int, c_int, c_int, c_uint, c_uint) c_int;
 extern "X11" fn XDestroyImage(*XImage) c_int;
+extern "X11" fn XSetSelectionOwner(*Display, Atom, Window, c_ulong) c_int;
+extern "X11" fn XGetSelectionOwner(*Display, Atom) Window;
+extern "X11" fn XConvertSelection(*Display, Atom, Atom, Atom, Window, c_ulong) c_int;
+extern "X11" fn XChangeProperty(*Display, Window, Atom, Atom, c_int, c_int, [*]const u8, c_int) c_int;
+extern "X11" fn XGetWindowProperty(*Display, Window, Atom, c_long, c_long, c_int, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *?[*]u8) c_int;
+extern "X11" fn XSendEvent(*Display, Window, c_int, c_long, *XEvent) c_int;
+extern "X11" fn XCheckTypedWindowEvent(*Display, Window, c_int, *XEvent) c_int;
+extern "X11" fn XFree(?*anyopaque) c_int;
 
 var xinit_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -243,5 +284,64 @@ pub const Connection = struct {
     pub fn destroy(self: Connection, window: Window) void {
         _ = XDestroyWindow(self.display, window);
         _ = XSync(self.display, 0);
+    }
+
+    // --- selections (CLIPBOARD), used by the Win32 clipboard -----------------
+
+    pub fn atom(self: Connection, name: [*:0]const u8) Atom {
+        return XInternAtom(self.display, name, 0);
+    }
+
+    pub fn setSelectionOwner(self: Connection, selection: Atom, window: Window) void {
+        _ = XSetSelectionOwner(self.display, selection, window, 0); // CurrentTime
+        _ = XFlush(self.display);
+    }
+
+    pub fn selectionOwner(self: Connection, selection: Atom) Window {
+        return XGetSelectionOwner(self.display, selection);
+    }
+
+    pub fn convertSelection(self: Connection, selection: Atom, target: Atom, property: Atom, requestor: Window) void {
+        _ = XConvertSelection(self.display, selection, target, property, requestor, 0);
+        _ = XFlush(self.display);
+    }
+
+    /// Replace `property` on `window` with 8-bit data of type `kind`.
+    pub fn setProperty8(self: Connection, window: Window, property: Atom, kind: Atom, data: []const u8) void {
+        _ = XChangeProperty(self.display, window, property, kind, 8, 0, data.ptr, @intCast(data.len));
+    }
+
+    /// Replace `property` on `window` with a list of atoms (format 32 = C longs).
+    pub fn setPropertyAtoms(self: Connection, window: Window, property: Atom, atoms: []const Atom) void {
+        _ = XChangeProperty(self.display, window, property, XA_ATOM, 32, 0, @ptrCast(atoms.ptr), @intCast(atoms.len));
+    }
+
+    pub const Property = struct { kind: Atom, data: []u8 };
+
+    /// Read and delete an 8-bit property into a buffer from `gpa` (null if absent or not 8-bit).
+    pub fn takeProperty8(self: Connection, gpa: std.mem.Allocator, window: Window, property: Atom) ?Property {
+        var kind: Atom = 0;
+        var format: c_int = 0;
+        var n: c_ulong = 0;
+        var after: c_ulong = 0;
+        var data: ?[*]u8 = null;
+        if (XGetWindowProperty(self.display, window, property, 0, 1 << 22, 1, 0, &kind, &format, &n, &after, &data) != 0) return null;
+        defer _ = XFree(data);
+        if (format != 8 or data == null) return null;
+        const out = gpa.dupe(u8, data.?[0..n]) catch return null;
+        return .{ .kind = kind, .data = out };
+    }
+
+    pub fn sendSelectionNotify(self: Connection, req: *const XSelectionRequestEvent, property: Atom) void {
+        var ev: XEvent = std.mem.zeroes(XEvent);
+        const se: *XSelectionEvent = @ptrCast(&ev);
+        se.* = .{ .type = SelectionNotify, .serial = 0, .send_event = 1, .display = self.display, .requestor = req.requestor, .selection = req.selection, .target = req.target, .property = property, .time = req.time };
+        _ = XSendEvent(self.display, req.requestor, 0, 0, &ev);
+        _ = XFlush(self.display);
+    }
+
+    /// Remove and return a pending event of `kind` for `window`, without touching the others.
+    pub fn takeTypedEvent(self: Connection, window: Window, kind: c_int, ev: *XEvent) bool {
+        return XCheckTypedWindowEvent(self.display, window, kind, ev) != 0;
     }
 };
