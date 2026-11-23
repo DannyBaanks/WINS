@@ -9,6 +9,7 @@ const kbd = @import("wins_input64_kbd.zig");
 const dxmod = @import("winrun_directx.zig");
 const dinput = @import("wins_dinput.zig");
 const threads = @import("winrun_threads.zig");
+const clipboard = @import("winrun_clipboard.zig");
 const W: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
 
 const Rect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
@@ -110,6 +111,8 @@ const WM_MBUTTONUP: u32 = 0x0208;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_XBUTTONDOWN: u32 = 0x020B;
 const WM_XBUTTONUP: u32 = 0x020C;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
+const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_GETTEXT: u32 = 0x000D;
 const WM_GETTEXTLENGTH: u32 = 0x000E;
 const WM_SETTEXT: u32 = 0x000C;
@@ -155,6 +158,12 @@ const WinObj = struct {
     tab_item_h: i32 = 24,
     tab_count: u32 = 0,
     tb_btn_count: u32 = 0,
+    /// Toolbar buttons from TB_ADDBUTTONSW: command id and whether it is a separator.
+    tb_ids: [64]i32 = [_]i32{0} ** 64,
+    tb_sep: [64]bool = [_]bool{false} ** 64,
+    tb_known: u32 = 0,
+    tb_owner: usize = 0,
+    tb_pressed: i32 = -1,
     sb_parts_n: usize = 0,
     sb_parts_right: [8]i32 = [_]i32{0} ** 8,
     sb_text: [8][64]u16 = [_][64]u16{[_]u16{0} ** 64} ** 8,
@@ -955,6 +964,7 @@ fn createWindowExW(ex_style: u32, class: ?[*:0]const u16, title: ?[*:0]const u16
         if (slot.height <= 0) slot.height = 24;
         if (slot.width <= 0) slot.width = 1024;
     } else if (winClassEqAscii(slot, "ToolbarWindow32")) {
+        slot.tb_owner = parent;
         if (slot.height <= 0) slot.height = 28;
         if (slot.width <= 0) slot.width = 1024;
     }
@@ -1085,6 +1095,8 @@ fn destroyWindow(window: usize) callconv(W) i32 {
         }
     }
     w.* = .{};
+    if (g_focus == window) g_focus = 0;
+    if (g_capture == window) g_capture = 0;
     if (countTopLevelWindows() == 0) {
         if (connection) |conn| {
             conn.close();
@@ -1245,11 +1257,15 @@ fn paintCommonControlOverlay(w: *const WinObj, tgt: DrawTarget) void {
     } else if (winClassEqAscii(w, "ToolbarWindow32")) {
         gdi.fillRect(tgt.surface, tgt.clip, tgt.ox, tgt.oy, tgt.ox + w.width, tgt.oy + w.height, 0x00EEF0F3);
         gdi.drawLine(tgt.surface, tgt.clip, tgt.ox, tgt.oy + w.height - 1, tgt.ox + w.width, tgt.oy + w.height - 1, 0x00CFD4DA);
-        const nb: usize = @min(if (w.tb_btn_count > 0) @as(usize, w.tb_btn_count) else 24, 32);
+        const nb: usize = @min(if (w.tb_btn_count > 0) @as(usize, w.tb_btn_count) else 24, w.tb_ids.len);
         for (0..nb) |bi| {
-            const bx = tgt.ox + 6 + @as(i32, @intCast(bi)) * 24;
+            const bx = tgt.ox + tbButtonX(w, bi);
             const by = tgt.oy + 3;
             if (bx + 20 > tgt.ox + w.width) break;
+            if (bi < w.tb_known and w.tb_sep[bi]) {
+                gdi.drawLine(tgt.surface, tgt.clip, bx + 3, by + 2, bx + 3, by + 18, 0x00C4C9D0);
+                continue;
+            }
             gdi.fillRect(tgt.surface, tgt.clip, bx, by, bx + 20, by + 20, 0x00FAFBFC);
             gdi.frameRect(tgt.surface, tgt.clip, bx, by, bx + 20, by + 20, 0x00B8C0C8);
             const col: u32 = switch (bi % 4) {
@@ -1406,14 +1422,49 @@ fn defWindowProcW(window: usize, msg: u32, wparam: usize, lparam: usize) callcon
                 0x041d => { // TB_GETITEMRECT
                     if (lparam >= 0x10000) {
                         const rc: *Rect = @ptrFromInt(lparam);
-                        const idx: i32 = @intCast(wparam & 0xff);
-                        rc.* = .{ .left = idx * 24, .top = 0, .right = (idx + 1) * 24, .bottom = 26 };
+                        const idx: usize = wparam & 0xff;
+                        const bx = tbButtonX(w, idx);
+                        const bw: i32 = if (idx < w.tb_known and w.tb_sep[idx]) 8 else 24;
+                        rc.* = .{ .left = bx, .top = 0, .right = bx + bw, .bottom = 26 };
                         return 1;
                     }
                     return 0;
                 },
+                0x0425 => { // TB_SETPARENT: later notifications go to wParam
+                    const old = w.tb_owner;
+                    w.tb_owner = wparam;
+                    return old;
+                },
+                WM_LBUTTONDOWN => {
+                    w.tb_pressed = tbButtonAt(w, @as(i16, @bitCast(@as(u16, @truncate(lparam)))));
+                    return 0;
+                },
+                WM_LBUTTONUP => {
+                    const idx = tbButtonAt(w, @as(i16, @bitCast(@as(u16, @truncate(lparam)))));
+                    const pressed = w.tb_pressed;
+                    w.tb_pressed = -1;
+                    if (idx >= 0 and idx == pressed) {
+                        const k: usize = @intCast(idx);
+                        const id: usize = @as(u32, @bitCast(w.tb_ids[k])) & 0xffff;
+                        const owner = if (w.tb_owner != 0) w.tb_owner else w.parent;
+                        if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:TOOLBAR] button {d} -> WM_COMMAND id={d} to 0x{x}\n", .{ k, id, owner });
+                        _ = sendMessageW(owner, 0x0111, id, window); // WM_COMMAND, BN_CLICKED
+                    }
+                    return 0;
+                },
                 0x043a => return (26 << 16) | 24, // TB_GETBUTTONSIZE
-                0x0444 => { // TB_ADDBUTTONSW
+                0x0444 => { // TB_ADDBUTTONSW: wParam buttons, lParam TBBUTTON[] (32 bytes each on x64)
+                    if (lparam >= 0x10000) {
+                        const base: [*]const u8 = @ptrFromInt(lparam);
+                        for (0..@min(wparam, 256)) |bi| {
+                            const k = w.tb_known;
+                            if (k >= w.tb_ids.len) break;
+                            const b = base + bi * 32;
+                            w.tb_ids[k] = std.mem.readInt(i32, b[4..8], .little);
+                            w.tb_sep[k] = (b[9] & 0x01) != 0; // fsStyle & BTNS_SEP
+                            w.tb_known += 1;
+                        }
+                    }
                     w.tb_btn_count +%= @truncate(wparam);
                     if (w.height < 26) w.height = 28;
                     if (w.width < 240) w.width = 1024;
@@ -1577,22 +1628,78 @@ fn isWindowVisibleTree(w: *const WinObj) bool {
     return true;
 }
 
+/// x of toolbar button `idx` (separators are 8 px wide, buttons 24 px).
+fn tbButtonX(w: *const WinObj, idx: usize) i32 {
+    var x: i32 = 6;
+    for (0..idx) |i| x += if (i < w.tb_known and w.tb_sep[i]) 8 else 24;
+    return x;
+}
+
+/// Index of the (non-separator) toolbar button at client x, or -1.
+fn tbButtonAt(w: *const WinObj, x: i32) i32 {
+    const n: usize = @min(@as(usize, w.tb_known), w.tb_ids.len);
+    for (0..n) |i| {
+        const bx = tbButtonX(w, i);
+        if (w.tb_sep[i]) continue;
+        if (x >= bx and x < bx + 20) return @intCast(i);
+    }
+    return -1;
+}
+
+fn rectsOverlap(a: *const WinObj, b: *const WinObj) bool {
+    return a.x < b.x + b.width and b.x < a.x + a.width and a.y < b.y + b.height and b.y < a.y + a.height;
+}
+
+/// Siblings share one software surface and WINS does not clip them against each
+/// other (WS_CLIPSIBLINGS), so when a window repaints, every visible sibling above
+/// it in Z order (created earlier = lower hwnd) that overlaps it must repaint too,
+/// after it. Without this Notepad++'s tab control, repainted alone when the
+/// document becomes modified, erased the Scintilla view lying on top of it.
+fn propagateOverlapDirt() void {
+    var changed = true;
+    var rounds: usize = 0;
+    while (changed and rounds < 8) : (rounds += 1) {
+        changed = false;
+        for (&windows) |*w| {
+            if (!w.in_use or !w.needs_paint or (w.style & WS_CHILD) == 0 or !isWindowVisibleTree(w)) continue;
+            for (&windows) |*o| {
+                if (!o.in_use or o.needs_paint or o.parent != w.parent or o.hwnd >= w.hwnd) continue;
+                if ((o.style & WS_CHILD) == 0 or !o.visible or o.width <= 0 or o.height <= 0) continue;
+                if (!rectsOverlap(w, o)) continue;
+                markTreeDirty(o.hwnd);
+                changed = true;
+            }
+        }
+    }
+}
+
+/// WM_PAINT for `w` (if dirty) then its children bottom-to-top: highest hwnd
+/// (created last = lowest in Z order) first, so windows on top paint last.
+fn enqueuePaintTree(w: *WinObj, depth: usize) void {
+    if (depth > 16) return;
+    if (w.needs_paint) {
+        w.needs_paint = false;
+        _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_PAINT, .wParam = 0, .lParam = 0, .time = 0, .pt = .{ .x = 0, .y = 0 } });
+    }
+    var upper: usize = std.math.maxInt(usize);
+    while (true) {
+        var next: ?*WinObj = null;
+        for (&windows) |*c| {
+            if (!c.in_use or !c.visible or c.parent != w.hwnd or (c.style & WS_CHILD) == 0 or c.hwnd >= upper) continue;
+            if (next == null or c.hwnd > next.?.hwnd) next = c;
+        }
+        const c = next orelse break;
+        upper = c.hwnd;
+        enqueuePaintTree(c, depth + 1);
+    }
+}
+
 fn enqueueDirtyPaints() void {
-    // Pass 1: top-level windows
+    propagateOverlapDirt();
     for (&windows) |*w| {
-        if (w.in_use and w.needs_paint and (w.style & WS_CHILD) == 0 and isWindowVisibleTree(w)) {
-            w.needs_paint = false;
-            _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_PAINT, .wParam = 0, .lParam = 0, .time = 0, .pt = .{ .x = 0, .y = 0 } });
-        }
+        if (w.in_use and (w.style & WS_CHILD) == 0 and isWindowVisibleTree(w)) enqueuePaintTree(w, 0);
     }
-    // Pass 2: container/tab child windows (e.g. SysTabControl32, ReBarWindow32)
-    for (&windows) |*w| {
-        if (w.in_use and w.needs_paint and (w.style & WS_CHILD) != 0 and (winClassEqAscii(w, "SysTabControl32") or winClassEqAscii(w, "ReBarWindow32")) and isWindowVisibleTree(w)) {
-            w.needs_paint = false;
-            _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_PAINT, .wParam = 0, .lParam = 0, .time = 0, .pt = .{ .x = 0, .y = 0 } });
-        }
-    }
-    // Pass 3: content/leaf child windows (e.g. Scintilla, ToolbarWindow32, msctls_statusbar32)
+    // Anything still dirty (e.g. a child whose parent is not a WINS window).
     for (&windows) |*w| {
         if (w.in_use and w.needs_paint and isWindowVisibleTree(w)) {
             w.needs_paint = false;
@@ -1640,9 +1747,26 @@ fn postKeyEvent(w: *WinObj, conn: *const x11.Connection, ke: *const x11.XKeyEven
             _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = ke.x, .y = ke.y } });
         }
     }
-    const alt = kbd.getKeyState(kbd.VK_MENU) < 0 and kbd.getKeyState(kbd.VK_CONTROL) >= 0;
+    // AltGr (X Mod5, or the ISO_Level3_Shift key itself = VK_RMENU) is Ctrl+Alt on
+    // Windows: plain WM_KEYDOWN/WM_CHAR, so latam/es AltGr+Q still types '@'.
+    const altgr = (ke.state & 0x80) != 0 or vk == 0xA5;
+    const alt = kbd.getKeyState(kbd.VK_MENU) < 0 and kbd.getKeyState(kbd.VK_CONTROL) >= 0 and !altgr;
     const msg: u32 = if (down) (if (alt) WM_SYSKEYDOWN else WM_KEYDOWN) else (if (alt) WM_SYSKEYUP else WM_KEYUP);
-    _ = pushMsg(.{ .hwnd = w.hwnd, .message = msg, .wParam = if (vk != 0) vk else ke.keycode, .lParam = if (down) 1 else 0xC0000001, .time = 0, .pt = .{ .x = ke.x, .y = ke.y } });
+    // Keyboard input goes to the focus window (e.g. the Scintilla child of an
+    // editor), as on Windows; with no focus inside this top-level, to the top-level.
+    const target = keyboardTarget(w);
+    if (down) rememberChar(@truncate(ke.time), if (vk != 0) vk else @truncate(ke.keycode), kbd.charForKeyEvent(ke));
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:KBD] -> hwnd=0x{x}\n", .{target});
+    // Key messages carry the generic VK_SHIFT/VK_CONTROL/VK_MENU, as on Windows
+    // (the left/right VKs only exist in GetKeyState and raw input).
+    const msg_vk: usize = switch (vk) {
+        0xA0, 0xA1 => kbd.VK_SHIFT,
+        0xA2, 0xA3 => kbd.VK_CONTROL,
+        0xA4, 0xA5 => kbd.VK_MENU,
+        0 => ke.keycode,
+        else => vk,
+    };
+    _ = pushMsg(.{ .hwnd = target, .message = msg, .wParam = msg_vk, .lParam = if (down) 1 else 0xC0000001, .time = @truncate(ke.time), .pt = g_cursor });
 }
 
 /// Post a RawInput mouse packet (if registered) + WM_INPUT, and the classic
@@ -1651,6 +1775,10 @@ fn postMouseButton(w: *WinObj, be: *const x11.XButtonEvent, down: bool) void {
     const sp = winScreenPos(w.hwnd);
     g_cursor_x = sp.x + be.x;
     g_cursor_y = sp.y + be.y;
+    // Keep the struct cursor (MSG.pt / GetCursorPos space) in sync with the
+    // scalars: mouseTarget refreshes it on motion, but buttons and warp echoes
+    // do not always pass through it.
+    g_cursor = .{ .x = g_cursor_x, .y = g_cursor_y };
     const vk: u8 = switch (be.button) {
         1 => 0x01, // VK_LBUTTON
         2 => 0x04, // VK_MBUTTON
@@ -1688,24 +1816,151 @@ fn postMouseButton(w: *WinObj, be: *const x11.XButtonEvent, down: bool) void {
             _ = pushMsg(.{ .hwnd = hwnd, .message = WM_INPUT, .wParam = 0, .lParam = h, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
         }
     }
-    const mk = mouseKeyStateMask();
-    switch (be.button) {
-        1 => _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_LBUTTONDOWN else WM_LBUTTONUP, .wParam = mk, .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } }),
-        2 => _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_MBUTTONDOWN else WM_MBUTTONUP, .wParam = mk, .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } }),
-        3 => _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_RBUTTONDOWN else WM_RBUTTONUP, .wParam = mk, .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } }),
-        4, 5 => if (down) {
-            const delta: i16 = if (be.button == 4) 120 else -120;
-            const wp: usize = (@as(usize, @as(u16, @bitCast(delta))) << 16) | (mk & 0xffff);
-            const slp: usize = (@as(usize, @as(u16, @bitCast(@as(i16, @truncate(g_cursor_y))))) << 16) | @as(usize, @as(u16, @bitCast(@as(i16, @truncate(g_cursor_x)))));
-            _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_MOUSEWHEEL, .wParam = wp, .lParam = slp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
+    _ = lp;
+    const t = mouseTarget(w, be.x, be.y);
+    const keys = mouseKeys(be.state, be.button, down);
+    const time: u32 = @truncate(be.time);
+    const msg: u32 = switch (be.button) {
+        1 => if (down) WM_LBUTTONDOWN else WM_LBUTTONUP,
+        2 => if (down) WM_MBUTTONDOWN else WM_MBUTTONUP,
+        3 => if (down) WM_RBUTTONDOWN else WM_RBUTTONUP,
+        4, 5, 6, 7 => {
+            // X11 wheel = buttons 4-7, one press per notch. Windows sends the wheel to
+            // the focus window with screen coordinates in lParam.
+            if (!down) return;
+            const delta: i16 = if (be.button == 4 or be.button == 7) 120 else -120;
+            const wp: usize = (@as(usize, @as(u16, @bitCast(delta))) << 16) | (keys & 0xffff);
+            const wheel_target = if (findWin(g_focus) != null) g_focus else t.hwnd;
+            _ = pushMsg(.{ .hwnd = wheel_target, .message = if (be.button <= 5) WM_MOUSEWHEEL else WM_MOUSEHWHEEL, .wParam = wp, .lParam = packXY(g_cursor.x, g_cursor.y), .time = time, .pt = g_cursor });
+            return;
         },
         8, 9 => {
+            // X11 buttons 8/9 = XBUTTON1/2 (extra mouse buttons); their VK and
+            // DirectInput state were already fed by the prologue above.
             const xbtn: usize = if (be.button == 8) 0x0001 else 0x0002;
-            const wp: usize = (xbtn << 16) | (mk & 0xffff);
-            _ = pushMsg(.{ .hwnd = w.hwnd, .message = if (down) WM_XBUTTONDOWN else WM_XBUTTONUP, .wParam = wp, .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
+            const wp: usize = (xbtn << 16) | (keys & 0xffff);
+            _ = pushMsg(.{ .hwnd = t.hwnd, .message = if (down) WM_XBUTTONDOWN else WM_XBUTTONUP, .wParam = wp, .lParam = packXY(t.x, t.y), .time = time, .pt = g_cursor });
+            return;
         },
-        else => {},
+        else => return,
+    };
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:MOUSE] button={d} down={} -> hwnd=0x{x} ({d},{d})\n", .{ be.button, down, t.hwnd, t.x, t.y });
+    _ = pushMsg(.{ .hwnd = t.hwnd, .message = msg, .wParam = keys, .lParam = packXY(t.x, t.y), .time = time, .pt = g_cursor });
+}
+
+// ---- characters decided at key-event time, consumed by TranslateMessage ----
+const PendingChar = struct { time: u32 = 0, vk: u8 = 0, ch: u16 = 0, live: bool = false };
+var g_pending_chars: [64]PendingChar = [_]PendingChar{.{}} ** 64;
+var g_pending_next: usize = 0;
+
+fn rememberChar(time: u32, vk: u8, ch: u16) void {
+    g_pending_chars[g_pending_next] = .{ .time = time, .vk = vk, .ch = ch, .live = true };
+    g_pending_next = (g_pending_next + 1) % g_pending_chars.len;
+}
+
+/// The character recorded for this key-down (same X time and VK), if the
+/// message came from the X keyboard; null for messages a program posted itself.
+fn takeChar(time: u32, vk: u8) ?u16 {
+    var i: usize = 0;
+    while (i < g_pending_chars.len) : (i += 1) {
+        const k = (g_pending_next + g_pending_chars.len - 1 - i) % g_pending_chars.len;
+        const p = &g_pending_chars[k];
+        if (p.live and p.time == time and p.vk == vk) {
+            p.live = false;
+            return p.ch;
+        }
     }
+    return null;
+}
+
+// ---- focus, capture and pointer routing (desktop programs) ----
+var g_focus: usize = 0;
+var g_capture: usize = 0;
+/// Last pointer position in WINS screen coordinates (the coordinate space of
+/// winScreenPos / ClientToScreen), for GetCursorPos and MSG.pt.
+var g_cursor: Point = .{ .x = 640, .y = 360 };
+/// Time of the last input message retrieved, for GetMessageTime (Scintilla
+/// measures double clicks with it).
+var g_msg_time: u32 = 1000;
+
+fn topLevelOf(hwnd: usize) usize {
+    var cur = findWin(hwnd) orelse return 0;
+    var hops: usize = 0;
+    while (hops < 16 and (cur.style & WS_CHILD) != 0 and cur.parent != 0) : (hops += 1) {
+        cur = findWin(cur.parent) orelse break;
+    }
+    return cur.hwnd;
+}
+
+fn keyboardTarget(w: *const WinObj) usize {
+    if (g_focus != 0 and findWin(g_focus) != null and topLevelOf(g_focus) == w.hwnd) return g_focus;
+    return w.hwnd;
+}
+
+/// Deepest visible child of `root` under (x, y), given in root's client coordinates.
+/// Among overlapping siblings the one created first wins: Windows links a new child
+/// window at the bottom of its siblings' Z order (Notepad++ relies on this: its tab
+/// control, created after the Scintilla views, covers them and must not take their
+/// clicks). hwnds are handed out in creation order, so the lowest hwnd is on top.
+fn hitTestChild(root: usize, x: i32, y: i32) usize {
+    var cur = root;
+    var cx = x;
+    var cy = y;
+    var depth: usize = 0;
+    while (depth < 16) : (depth += 1) {
+        var best: ?*const WinObj = null;
+        for (&windows) |*c| {
+            if (!c.in_use or !c.visible or c.parent != cur or (c.style & WS_CHILD) == 0) continue;
+            if (c.width <= 0 or c.height <= 0) continue;
+            if (cx >= c.x and cx < c.x + c.width and cy >= c.y and cy < c.y + c.height) {
+                if (best == null or c.hwnd < best.?.hwnd) best = c;
+            }
+        }
+        const b = best orelse break;
+        cx -= b.x;
+        cy -= b.y;
+        cur = b.hwnd;
+    }
+    return cur;
+}
+
+const MouseTarget = struct { hwnd: usize, x: i32, y: i32 };
+
+/// Records the pointer position and picks the window a pointer message goes to:
+/// the capture window if one is set, else the deepest child under the pointer.
+/// x, y are relative to `w`'s X11 window (its client area).
+fn mouseTarget(w: *const WinObj, x: i32, y: i32) MouseTarget {
+    const top = winScreenPos(w.hwnd);
+    g_cursor = .{ .x = top.x + x, .y = top.y + y };
+    const target = if (g_capture != 0 and findWin(g_capture) != null) g_capture else hitTestChild(w.hwnd, x, y);
+    const o = winScreenPos(target);
+    return .{ .hwnd = target, .x = g_cursor.x - o.x, .y = g_cursor.y - o.y };
+}
+
+/// MK_* flags from an X11 modifier/button state. X reports the state before the
+/// event; Windows includes the button that just went down and drops the one released.
+fn mouseKeys(state: c_uint, button: c_uint, down: bool) usize {
+    var k: usize = 0;
+    if (state & 1 != 0) k |= 0x04; // ShiftMask -> MK_SHIFT
+    if (state & 4 != 0) k |= 0x08; // ControlMask -> MK_CONTROL
+    if (state & (1 << 8) != 0) k |= 0x01; // Button1 -> MK_LBUTTON
+    if (state & (1 << 9) != 0) k |= 0x10; // Button2 -> MK_MBUTTON
+    if (state & (1 << 10) != 0) k |= 0x02; // Button3 -> MK_RBUTTON
+    const bit: usize = switch (button) {
+        1 => 0x01,
+        2 => 0x10,
+        3 => 0x02,
+        else => 0,
+    };
+    if (down) k |= bit else k &= ~bit;
+    return k;
+}
+
+/// Client coordinates are signed 16-bit in lParam (negative while captured).
+fn packXY(x: i32, y: i32) usize {
+    const ux: u16 = @truncate(@as(u32, @bitCast(x)));
+    const uy: u16 = @truncate(@as(u32, @bitCast(y)));
+    return (@as(usize, uy) << 16) | ux;
 }
 
 fn pumpX11Events(wait_ms: i32) void {
@@ -1730,6 +1985,18 @@ fn pumpX11Events(wait_ms: i32) void {
         conn.nextEvent(&ev);
         const any: *const x11.XAnyEvent = @ptrCast(&ev);
         if (std.c.getenv("WINS_XEV") != null) std.debug.print("[WINS:XEV] type={d} win=0x{x} send={d}\n", .{ ev.type, any.window, any.send_event });
+        switch (ev.type) {
+            x11.SelectionRequest => {
+                clipboard.handleSelectionRequest(conn, @ptrCast(&ev));
+                continue;
+            },
+            x11.SelectionClear => {
+                const se: *const x11.XSelectionEvent = @ptrCast(&ev); // selection at the same offset
+                clipboard.handleSelectionClear(conn, se.selection);
+                continue;
+            },
+            else => {},
+        }
         const w = findWinByX11(any.window) orelse continue;
         switch (ev.type) {
             12 => { // Expose
@@ -1758,6 +2025,7 @@ fn pumpX11Events(wait_ms: i32) void {
                 const sp = winScreenPos(w.hwnd);
                 g_cursor_x = sp.x + me.x;
                 g_cursor_y = sp.y + me.y;
+                g_cursor = .{ .x = g_cursor_x, .y = g_cursor_y };
                 const is_warp = g_warp_pending and (@abs(me.x - g_warp_target_x) <= 2 and @abs(me.y - g_warp_target_y) <= 2);
                 if (is_warp) {
                     g_warp_pending = false;
@@ -1774,8 +2042,10 @@ fn pumpX11Events(wait_ms: i32) void {
                         g_last_mouse_x = g_warp_target_x;
                         g_last_mouse_y = g_warp_target_y;
                     }
-                    const lp: usize = (@as(usize, @intCast(@max(0, me.y))) << 16) | @as(usize, @intCast(@max(0, me.x) & 0xffff));
-                    _ = pushMsg(.{ .hwnd = w.hwnd, .message = WM_MOUSEMOVE, .wParam = mouseKeyStateMask(), .lParam = lp, .time = 0, .pt = .{ .x = g_cursor_x, .y = g_cursor_y } });
+                    // Route to the capture/focus window under the pointer, as on
+                    // Windows; mouseTarget also refreshes g_cursor for MSG.pt.
+                    const t = mouseTarget(w, me.x, me.y);
+                    _ = pushMsg(.{ .hwnd = t.hwnd, .message = WM_MOUSEMOVE, .wParam = mouseKeys(me.state, 0, false), .lParam = packXY(t.x, t.y), .time = @truncate(me.time), .pt = g_cursor });
                     if (g_have_dinput_last) dinput.mouseMove(me.x - g_dinput_last_x, me.y - g_dinput_last_y);
                     g_dinput_last_x = me.x;
                     g_dinput_last_y = me.y;
@@ -1841,6 +2111,7 @@ fn getMessageW(lp_msg: ?*MSG, window: usize, min_filter: u32, max_filter: u32) c
     while (true) {
         if (popMsg()) |m| {
             lp_msg.?.* = m;
+            if (m.time != 0) g_msg_time = m.time;
             if (m.message == WM_QUIT) return 0;
             return 1;
         }
@@ -1884,6 +2155,7 @@ fn peekMessageW(lp_msg: ?*MSG, window: usize, min_filter: u32, max_filter: u32, 
     if (queue_count > 0) {
         if (remove_msg != 0) {
             lp_msg.?.* = popMsg().?;
+            if (lp_msg.?.time != 0) g_msg_time = lp_msg.?.time;
         } else {
             lp_msg.?.* = msg_queue[queue_head];
         }
@@ -1912,7 +2184,7 @@ fn translateMessage(lp_msg: ?*const MSG) callconv(W) i32 {
         if (std.c.getenv("WINS_KBD_NO_CHAR") != null) return 0;
         const vk = @as(u8, @truncate(m.wParam));
         const caps = kbd.getKeyState(0x14) & 1 != 0;
-        const ch = kbd.charForVk(vk, kbd.isShiftDown(), caps);
+        const ch = takeChar(m.time, vk) orelse kbd.charForVk(vk, kbd.isShiftDown(), caps);
         if (ch != 0) {
             const posted = pushMsg(.{
                 .hwnd = m.hwnd,
@@ -3081,27 +3353,31 @@ fn ClientToScreen(hwnd: usize, lpPoint: ?*anyopaque) callconv(W) i32 {
     return 1;
 }
 
+/// X window the clipboard owns CLIPBOARD with: any of the app's top-level X windows.
+fn clipXWindow() x11.Window {
+    for (&windows) |*w| if (w.in_use and w.x11_win != 0) return w.x11_win;
+    return 0;
+}
+
 fn OpenClipboard(hwnd: usize) callconv(W) i32 {
     _ = hwnd;
-    return 1;
+    return if (clipboard.open(connection, clipXWindow())) 1 else 0;
 }
 
 fn CloseClipboard() callconv(W) i32 {
-    return 1;
+    return if (clipboard.close(connection, clipXWindow())) 1 else 0;
 }
 
 fn EmptyClipboard() callconv(W) i32 {
-    return 1;
+    return if (clipboard.empty()) 1 else 0;
 }
 
 fn GetClipboardData(uFormat: u32) callconv(W) ?*anyopaque {
-    _ = uFormat;
-    return null;
+    return @ptrFromInt(clipboard.get(uFormat));
 }
 
 fn SetClipboardData(uFormat: u32, hMem: ?*anyopaque) callconv(W) ?*anyopaque {
-    _ = uFormat;
-    return hMem;
+    return @ptrFromInt(clipboard.set(uFormat, @intFromPtr(hMem)));
 }
 
 fn CreateDialogParamW(hInstance: usize, lpTemplateName: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*const anyopaque, dwInitParam: usize) callconv(W) usize {
@@ -3151,7 +3427,8 @@ fn GetAncestor(hwnd: usize, gaFlags: u32) callconv(W) usize {
 }
 
 fn GetFocus() callconv(W) usize {
-    return activeTopLevel();
+    if (g_focus != 0 and findWin(g_focus) != null) return g_focus;
+    return 1; // no focus set yet: the value this loader always returned before focus tracking
 }
 
 fn GetKeyState(nVirtKey: i32) callconv(W) i16 {
@@ -3159,7 +3436,7 @@ fn GetKeyState(nVirtKey: i32) callconv(W) i16 {
 }
 
 fn GetMessageTime() callconv(W) i32 {
-    return 1000;
+    return @bitCast(g_msg_time);
 }
 
 fn PtInRect(lprc: ?*const anyopaque, pt_packed: u64) callconv(W) i32 {
@@ -3170,22 +3447,27 @@ fn PtInRect(lprc: ?*const anyopaque, pt_packed: u64) callconv(W) i32 {
 }
 
 fn ReleaseCapture() callconv(W) i32 {
+    const old = g_capture;
+    g_capture = 0;
+    if (old != 0 and findWin(old) != null) _ = sendMessageW(old, WM_CAPTURECHANGED, 0, 0);
     return 1;
 }
 
 fn SetCapture(hwnd: usize) callconv(W) usize {
-    return hwnd;
+    const old = g_capture;
+    g_capture = if (findWin(hwnd) != null) hwnd else 0;
+    if (old != 0 and old != g_capture and findWin(old) != null) _ = sendMessageW(old, WM_CAPTURECHANGED, 0, g_capture);
+    return old;
 }
 
 fn GetCapture() callconv(W) usize {
-    return 0;
+    return if (findWin(g_capture) != null) g_capture else 0;
 }
 
 fn GetCursorPos(lpPoint: ?*anyopaque) callconv(W) i32 {
     if (lpPoint) |p| {
         const pt: *Point = @ptrCast(@alignCast(p));
-        pt.x = g_cursor_x;
-        pt.y = g_cursor_y;
+        pt.* = g_cursor;
     }
     return 1;
 }
@@ -3424,8 +3706,17 @@ fn ClipCursor(lpRect: ?*const anyopaque) callconv(W) i32 {
     return 1;
 }
 
+/// Moves keyboard focus and sends WM_KILLFOCUS / WM_SETFOCUS synchronously, as
+/// Windows does. Returns the previous focus window.
 fn SetFocus(hwnd: usize) callconv(W) usize {
-    return hwnd;
+    const prev = if (findWin(g_focus) != null) g_focus else 0;
+    if (hwnd != 0 and findWin(hwnd) == null) return 0;
+    if (hwnd == prev) return prev;
+    g_focus = hwnd;
+    if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:FOCUS] 0x{x} -> 0x{x}\n", .{ prev, hwnd });
+    if (prev != 0) _ = sendMessageW(prev, WM_KILLFOCUS, hwnd, 0);
+    if (hwnd != 0 and g_focus == hwnd) _ = sendMessageW(hwnd, WM_SETFOCUS, prev, 0);
+    return prev;
 }
 
 fn SetForegroundWindow(hwnd: usize) callconv(W) i32 {
@@ -3645,8 +3936,7 @@ fn GetCaretBlinkTime() callconv(W) u32 {
 }
 
 fn IsClipboardFormatAvailable(format: u32) callconv(W) i32 {
-    _ = format;
-    return 0;
+    return if (clipboard.available(connection, format)) 1 else 0;
 }
 
 fn LoadCursorA(hInstance: usize, lpCursorName: ?*const anyopaque) callconv(W) usize {
@@ -4491,8 +4781,7 @@ fn ShowScrollBar(hWnd: usize, wBar: i32, bShow: i32) callconv(W) i32 {
 }
 
 fn RegisterClipboardFormatW(lpszFormat: ?[*:0]const u16) callconv(W) u32 {
-    _ = lpszFormat;
-    return 0xC001;
+    return clipboard.registerFormat(lpszFormat);
 }
 
 fn AddClipboardFormatListener(hwnd: usize) callconv(W) i32 {
@@ -4515,18 +4804,65 @@ fn ChangeClipboardChain(hWndRemove: usize, hWndNewNext: usize) callconv(W) i32 {
     return 1;
 }
 
+/// ACCEL as laid out by Windows (6 bytes: fVirt, pad, key, cmd).
+const Accel = extern struct { fVirt: u8, pad: u8, key: u16, cmd: u16 };
+const ACCEL_TABLE_MAX = 1024;
+const AccelTable = struct { used: bool = false, n: usize = 0, items: [ACCEL_TABLE_MAX]Accel = undefined };
+var accel_tables: [8]AccelTable = [_]AccelTable{.{}} ** 8;
+const HACCEL_BASE: usize = 0xA000;
+
+fn accelTable(h: usize) ?*AccelTable {
+    if (h <= HACCEL_BASE or h > HACCEL_BASE + accel_tables.len) return null;
+    const t = &accel_tables[h - HACCEL_BASE - 1];
+    return if (t.used) t else null;
+}
+
 fn CreateAcceleratorTableW(paccel: ?*anyopaque, cAccel: i32) callconv(W) usize {
-    _ = paccel; _ = cAccel;
-    return 0xA001;
+    const p = paccel orelse return 0;
+    if (cAccel <= 0) return 0;
+    const src: [*]const Accel = @ptrCast(@alignCast(p));
+    for (&accel_tables, 0..) |*t, i| {
+        if (t.used) continue;
+        t.used = true;
+        t.n = @min(@as(usize, @intCast(cAccel)), ACCEL_TABLE_MAX);
+        @memcpy(t.items[0..t.n], src[0..t.n]);
+        return HACCEL_BASE + i + 1;
+    }
+    return 0;
 }
 
 fn DestroyAcceleratorTable(hAccel: usize) callconv(W) i32 {
-    _ = hAccel;
+    const t = accelTable(hAccel) orelse return 0;
+    t.used = false;
     return 1;
 }
 
+/// WM_KEYDOWN/WM_SYSKEYDOWN (FVIRTKEY entries, modifiers must match exactly) or
+/// WM_CHAR/WM_SYSCHAR (character entries) -> WM_COMMAND(1, cmd) to hWnd, and the
+/// key message is consumed so TranslateMessage never turns Ctrl+S into a ^S char.
 fn TranslateAcceleratorW(hWnd: usize, hAccTable: usize, lpMsg: ?*anyopaque) callconv(W) i32 {
-    _ = hWnd; _ = hAccTable; _ = lpMsg;
+    const t = accelTable(hAccTable) orelse return 0;
+    const m: *const MSG = @ptrCast(@alignCast(lpMsg orelse return 0));
+    if (hWnd == 0) return 0;
+    const is_key = m.message == WM_KEYDOWN or m.message == WM_SYSKEYDOWN;
+    const is_char = m.message == WM_CHAR or m.message == WM_SYSCHAR;
+    if (!is_key and !is_char) return 0;
+    var mods: u8 = 0;
+    if (kbd.getKeyState(kbd.VK_SHIFT) < 0) mods |= 0x04; // FSHIFT
+    if (kbd.getKeyState(kbd.VK_CONTROL) < 0) mods |= 0x08; // FCONTROL
+    if (kbd.getKeyState(kbd.VK_MENU) < 0) mods |= 0x10; // FALT
+    const key: u16 = @truncate(m.wParam);
+    for (t.items[0..t.n]) |a| {
+        const virt = (a.fVirt & 0x01) != 0; // FVIRTKEY
+        const hit = if (virt)
+            is_key and a.key == key and (a.fVirt & 0x1c) == mods
+        else
+            is_char and a.key == key and (((a.fVirt & 0x10) != 0) == (m.message == WM_SYSCHAR));
+        if (!hit) continue;
+        if (std.c.getenv("WINS_TRACE") != null) std.debug.print("[WINS:ACCEL] key=0x{x} mods=0x{x} -> WM_COMMAND id={d} to 0x{x}\n", .{ key, mods, a.cmd, hWnd });
+        _ = sendMessageW(hWnd, 0x0111, (@as(usize, 1) << 16) | a.cmd, 0); // WM_COMMAND, from accelerator
+        return 1;
+    }
     return 0;
 }
 
@@ -4560,14 +4896,38 @@ fn EndDeferWindowPos(hWinPosInfo: usize) callconv(W) i32 {
     return 1;
 }
 
-fn WindowFromPoint(point: usize) callconv(W) usize {
-    _ = point;
-    return 0;
+fn unpackPoint(pt: usize) Point {
+    return .{ .x = @bitCast(@as(u32, @truncate(pt))), .y = @bitCast(@as(u32, @truncate(pt >> 32))) };
 }
 
+/// POINT by value (x low 32 bits, y high 32), WINS screen coordinates.
+fn WindowFromPoint(point: usize) callconv(W) usize {
+    const p = unpackPoint(point);
+    var hit: usize = 0;
+    for (&windows) |*w| {
+        if (!w.in_use or w.x11_win == 0 or !w.visible) continue;
+        const o = winScreenPos(w.hwnd);
+        if (p.x >= o.x and p.x < o.x + w.width and p.y >= o.y and p.y < o.y + w.height)
+            hit = hitTestChild(w.hwnd, p.x - o.x, p.y - o.y);
+    }
+    return hit;
+}
+
+/// Direct child of `hwnd` containing `pt` (hwnd's client coordinates); `hwnd`
+/// itself when no child does; 0 outside hwnd. CWP_SKIPINVISIBLE = 1.
 fn ChildWindowFromPointEx(hwnd: usize, pt: usize, flags: u32) callconv(W) usize {
-    _ = hwnd; _ = pt; _ = flags;
-    return 0;
+    const self = findWin(hwnd) orelse return 0;
+    const p = unpackPoint(pt);
+    if (p.x < 0 or p.y < 0 or p.x >= self.width or p.y >= self.height) return 0;
+    var best: usize = hwnd;
+    for (&windows) |*c| {
+        if (!c.in_use or c.parent != hwnd or (c.style & WS_CHILD) == 0) continue;
+        if (flags & 1 != 0 and !c.visible) continue;
+        if (p.x >= c.x and p.x < c.x + c.width and p.y >= c.y and p.y < c.y + c.height) {
+            if (best == hwnd or c.hwnd < best) best = c.hwnd; // first-created sibling is on top
+        }
+    }
+    return best;
 }
 
 fn CreateDialogIndirectParamW(hInstance: usize, lpTemplate: ?*const anyopaque, hWndParent: usize, lpDialogFunc: ?*anyopaque, dwInitParam: usize) callconv(W) usize {

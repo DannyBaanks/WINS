@@ -3187,9 +3187,9 @@ fn SetFileInformationByHandle(h: usize, class: u32, buf: ?*const anyopaque, sz: 
 // 8. Lookup Dispatch Table
 // ---------------------------------------------------------------------------
 
-fn GlobalAlloc(uFlags: u32, dwBytes: usize) callconv(W) ?*anyopaque {
-    _ = uFlags;
-    const ptr = HeapAlloc(HEAP_COOKIE, 0, dwBytes) orelse return null;
+pub fn GlobalAlloc(uFlags: u32, dwBytes: usize) callconv(W) ?*anyopaque {
+    const zero: u32 = if (uFlags & 0x40 != 0) 0x08 else 0; // GMEM_ZEROINIT -> HEAP_ZERO_MEMORY
+    const ptr = HeapAlloc(HEAP_COOKIE, zero, dwBytes) orelse return null;
     for (&global_locks) |*e| if (e.ptr == 0) { e.ptr = @intFromPtr(ptr); e.count = 0; break; };
     return ptr;
 }
@@ -3209,7 +3209,7 @@ fn GlobalUnlock(hMem: ?*anyopaque) callconv(W) i32 {
 const GlobalLockEntry = struct { ptr: usize = 0, count: u32 = 0 };
 var global_locks: [256]GlobalLockEntry = [_]GlobalLockEntry{.{}} ** 256;
 
-fn GlobalFree(hMem: ?*anyopaque) callconv(W) ?*anyopaque {
+pub fn GlobalFree(hMem: ?*anyopaque) callconv(W) ?*anyopaque {
     if (hMem) |p| for (&global_locks) |*e| if (e.ptr == @intFromPtr(p)) { e.* = .{}; break; };
     _ = HeapFree(HEAP_COOKIE, 0, if (hMem) |p| @ptrCast(p) else null);
     return null;
@@ -4002,9 +4002,11 @@ fn QueryFullProcessImageNameW(hProcess: usize, dwFlags: u32, lpExeName: ?[*:0]u1
     return 1;
 }
 
-fn GlobalSize(hMem: usize) callconv(W) usize {
-    _ = hMem;
-    return 4096;
+/// Bytes requested from GlobalAlloc (0 for a handle it did not make). The
+/// clipboard reads text through GlobalLock + GlobalSize, so this must be exact.
+pub fn GlobalSize(hMem: usize) callconv(W) usize {
+    if (hMem == 0) return 0;
+    return HeapSize(HEAP_COOKIE, 0, @ptrFromInt(hMem));
 }
 
 fn CopyFileExW(lpExistingFileName: ?[*:0]const u16, lpNewFileName: ?[*:0]const u16, lpProgressRoutine: ?*anyopaque, lpData: ?*anyopaque, pbCancel: ?*i32, dwCopyFlags: u32) callconv(W) i32 {
